@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/htap-common",
+    "crates/htap-rowstore",
+    "crates/htap-colstore",
+    "crates/htap-catalog",
+    "crates/htap-txn",
+    "crates/htap-convert",
+    "crates/htap-coord",
+    "crates/htap-sql",
+    "crates/htap-server",
+    "crates/htap-movement",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+parking_lot = "0.12"
+crc32c = "0.6"
+roaring = "0.10"
+lz4_flex = "0.11"
+zstd = "0.13"
+async-trait = "0.1"
+futures = "0.3"
+sqlparser = "0.62"
+proptest = "1"
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+inherits = "release"

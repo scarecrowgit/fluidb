@@ -1,0 +1,5 @@
+examples
+target/
+*.log
+data/
+.DS_Store
