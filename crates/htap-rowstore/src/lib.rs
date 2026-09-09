@@ -31,7 +31,9 @@
 #![warn(missing_docs)]
 
 pub mod memtable;
+pub mod sst;
 pub mod wal;
 
 pub use memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
+pub use sst::{SstMetadata, SstOptions, SstReader, SstWriter, DEFAULT_SST_BLOCK_BYTES};
 pub use wal::{Lsn, Wal, WalOptions, WalRecord, WalReplay};
