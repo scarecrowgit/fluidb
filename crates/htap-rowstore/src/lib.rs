@@ -1,6 +1,7 @@
 //! LSM row store (WAL, memtable, SST, PK index).
 //!
-//! Only the write-ahead log is implemented so far; see [`wal`].
+//! See [`wal`] for write-ahead logging and [`memtable`] for the in-memory
+//! MVCC write buffer.
 //!
 //! ```
 //! use htap_common::{Row, Value, Version};
@@ -29,6 +30,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod memtable;
 pub mod wal;
 
+pub use memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
 pub use wal::{Lsn, Wal, WalOptions, WalRecord, WalReplay};
