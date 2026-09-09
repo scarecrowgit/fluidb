@@ -60,8 +60,9 @@
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use htap_common::{HtapError, Result, Row, Schema, Value};
+use htap_common::{ColumnDef, DataType, HtapError, Result, Row, Schema, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::encoding::{
@@ -69,9 +70,9 @@ use crate::encoding::{
     decompress_payload, encode_dictionary, encode_null_bitmap, encode_plain, encode_typed_value,
 };
 use crate::types::{
-    validate_row, validate_segment_schema, ColumnEncoding, ColumnVector, SegmentOptions,
-    MAX_BLOCK_ROWS, MAX_BLOCK_STORED_BYTES, MAX_BLOCK_UNCOMPRESSED_BYTES, MAX_FOOTER_BYTES,
-    MAX_SEGMENT_BLOCKS, MAX_SEGMENT_COLUMNS,
+    validate_row, validate_segment_schema, ColumnEncoding, ColumnVector, ScanRequest, ScanResult,
+    SegmentOptions, MAX_BLOCK_ROWS, MAX_BLOCK_STORED_BYTES, MAX_BLOCK_UNCOMPRESSED_BYTES,
+    MAX_FOOTER_BYTES, MAX_SEGMENT_BLOCKS, MAX_SEGMENT_COLUMNS,
 };
 
 /// Header magic identifier for Segment v1 files.
@@ -429,7 +430,7 @@ impl SegmentWriter {
 /// Reader for inspecting and decoding durable columnar segment files.
 pub struct SegmentReader {
     metadata: SegmentMetadata,
-    file: File,
+    file: Mutex<File>,
     column_blocks: Vec<Vec<BlockMeta>>,
 }
 
@@ -871,7 +872,7 @@ impl SegmentReader {
 
         Ok(Self {
             metadata,
-            file,
+            file: Mutex::new(file),
             column_blocks,
         })
     }
@@ -902,13 +903,7 @@ impl SegmentReader {
             .and_then(|blocks| blocks.get(block_idx))
     }
 
-    /// Reads, verifies, and decodes a specific column block into a [`ColumnVector`].
-    ///
-    /// # Errors
-    /// Returns [`HtapError::InvalidArgument`] if indices are out of bounds.
-    /// Returns [`HtapError::Corruption`] if CRC, size limits, bitmap agreement, or encodings fail validation.
-    /// Returns [`HtapError::Io`] on file read errors.
-    pub fn read_block(&mut self, column_idx: usize, block_idx: usize) -> Result<ColumnVector> {
+    fn read_and_verify_frame(&self, column_idx: usize, block_idx: usize) -> Result<VerifiedFrame> {
         let meta = self
             .block_meta(column_idx, block_idx)
             .ok_or_else(|| {
@@ -926,10 +921,14 @@ impl SegmentReader {
             .expect("column index verified within schema bounds")
             .clone();
 
-        self.file.seek(SeekFrom::Start(meta.offset))?;
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|e| HtapError::Internal(e.to_string()))?;
+        file.seek(SeekFrom::Start(meta.offset))?;
 
         let mut frame_header = [0u8; FRAME_HEADER_LEN];
-        self.file.read_exact(&mut frame_header)?;
+        file.read_exact(&mut frame_header)?;
 
         let hdr_col_idx = u32::from_le_bytes(frame_header[0..4].try_into().unwrap()) as usize;
         let hdr_row_start = u64::from_le_bytes(frame_header[4..12].try_into().unwrap());
@@ -984,7 +983,7 @@ impl SegmentReader {
 
         let body_len = hdr_null_bm_len + hdr_stored_payload_len;
         let mut body = vec![0u8; body_len];
-        self.file.read_exact(&mut body)?;
+        file.read_exact(&mut body)?;
 
         // Verify CRC before decompression
         let actual_crc = crc32c::crc32c(&body);
@@ -1014,29 +1013,58 @@ impl SegmentReader {
             )));
         }
 
+        let stored_payload = body[hdr_null_bm_len..].to_vec();
+
+        Ok(VerifiedFrame {
+            meta,
+            col_def,
+            validity,
+            non_null_count,
+            stored_payload,
+        })
+    }
+
+    pub(crate) fn read_block_validity(
+        &self,
+        column_idx: usize,
+        block_idx: usize,
+    ) -> Result<Vec<bool>> {
+        let frame = self.read_and_verify_frame(column_idx, block_idx)?;
+        Ok(frame.validity)
+    }
+
+    pub(crate) fn read_block_internal(
+        &self,
+        column_idx: usize,
+        block_idx: usize,
+    ) -> Result<ColumnVector> {
+        let frame = self.read_and_verify_frame(column_idx, block_idx)?;
+
         // Decompress payload
-        let stored_payload = &body[hdr_null_bm_len..];
-        let raw_payload = decompress_payload(stored_payload, meta.raw_bytes as usize)?;
+        let raw_payload = decompress_payload(&frame.stored_payload, frame.meta.raw_bytes as usize)?;
 
         // Decode values
-        let non_null_values = match meta.encoding {
-            ColumnEncoding::Plain => decode_plain(col_def.data_type, &raw_payload, non_null_count)?,
+        let non_null_values = match frame.meta.encoding {
+            ColumnEncoding::Plain => {
+                decode_plain(frame.col_def.data_type, &raw_payload, frame.non_null_count)?
+            }
             ColumnEncoding::Dictionary => {
-                decode_dictionary(col_def.data_type, &raw_payload, non_null_count)?
+                decode_dictionary(frame.col_def.data_type, &raw_payload, frame.non_null_count)?
             }
         };
 
-        if non_null_values.len() != non_null_count {
+        if non_null_values.len() != frame.non_null_count {
             return Err(HtapError::Corruption(format!(
-                "decoded non-null values count {} does not match bitmap non-null count {non_null_count}",
-                non_null_values.len()
+                "decoded non-null values count {} does not match bitmap non-null count {}",
+                non_null_values.len(),
+                frame.non_null_count
             )));
         }
 
         // Validate non-null values against zone map bounds
-        if meta.has_not_null {
-            let min_v = meta.min_value.as_ref().unwrap();
-            let max_v = meta.max_value.as_ref().unwrap();
+        if frame.meta.has_not_null {
+            let min_v = frame.meta.min_value.as_ref().unwrap();
+            let max_v = frame.meta.max_value.as_ref().unwrap();
             for v in &non_null_values {
                 if v < min_v || v > max_v {
                     return Err(HtapError::Corruption(format!(
@@ -1046,133 +1074,168 @@ impl SegmentReader {
             }
         }
 
-        // Build ColumnVector
-        let mut val_iter = non_null_values.into_iter();
-        let vector = match col_def.data_type {
-            htap_common::DataType::Bool => {
-                let mut values = Vec::with_capacity(validity.len());
-                for &is_valid in &validity {
-                    if is_valid {
-                        if let Some(Value::Bool(b)) = val_iter.next() {
-                            values.push(b);
-                        } else {
-                            return Err(HtapError::Corruption(
-                                "type mismatch reconstructing bool vector".into(),
-                            ));
-                        }
-                    } else {
-                        values.push(false);
-                    }
-                }
-                ColumnVector::Bool { values, validity }
-            }
-            htap_common::DataType::Int32 => {
-                let mut values = Vec::with_capacity(validity.len());
-                for &is_valid in &validity {
-                    if is_valid {
-                        if let Some(Value::Int32(i)) = val_iter.next() {
-                            values.push(i);
-                        } else {
-                            return Err(HtapError::Corruption(
-                                "type mismatch reconstructing int32 vector".into(),
-                            ));
-                        }
-                    } else {
-                        values.push(0);
-                    }
-                }
-                ColumnVector::Int32 { values, validity }
-            }
-            htap_common::DataType::Int64 => {
-                let mut values = Vec::with_capacity(validity.len());
-                for &is_valid in &validity {
-                    if is_valid {
-                        if let Some(Value::Int64(i)) = val_iter.next() {
-                            values.push(i);
-                        } else {
-                            return Err(HtapError::Corruption(
-                                "type mismatch reconstructing int64 vector".into(),
-                            ));
-                        }
-                    } else {
-                        values.push(0);
-                    }
-                }
-                ColumnVector::Int64 { values, validity }
-            }
-            htap_common::DataType::Timestamp => {
-                let mut values = Vec::with_capacity(validity.len());
-                for &is_valid in &validity {
-                    if is_valid {
-                        if let Some(Value::Timestamp(t)) = val_iter.next() {
-                            values.push(t);
-                        } else {
-                            return Err(HtapError::Corruption(
-                                "type mismatch reconstructing timestamp vector".into(),
-                            ));
-                        }
-                    } else {
-                        values.push(0);
-                    }
-                }
-                ColumnVector::Timestamp { values, validity }
-            }
-            htap_common::DataType::Float64 => {
-                let mut values = Vec::with_capacity(validity.len());
-                for &is_valid in &validity {
-                    if is_valid {
-                        if let Some(Value::Float64(f)) = val_iter.next() {
-                            values.push(f);
-                        } else {
-                            return Err(HtapError::Corruption(
-                                "type mismatch reconstructing float64 vector".into(),
-                            ));
-                        }
-                    } else {
-                        values.push(0.0);
-                    }
-                }
-                ColumnVector::Float64 { values, validity }
-            }
-            htap_common::DataType::String => {
-                let mut values = Vec::with_capacity(validity.len());
-                for &is_valid in &validity {
-                    if is_valid {
-                        if let Some(Value::String(s)) = val_iter.next() {
-                            values.push(s);
-                        } else {
-                            return Err(HtapError::Corruption(
-                                "type mismatch reconstructing string vector".into(),
-                            ));
-                        }
-                    } else {
-                        values.push(String::new());
-                    }
-                }
-                ColumnVector::String { values, validity }
-            }
-            htap_common::DataType::Bytes => {
-                let mut values = Vec::with_capacity(validity.len());
-                for &is_valid in &validity {
-                    if is_valid {
-                        if let Some(Value::Bytes(b)) = val_iter.next() {
-                            values.push(b);
-                        } else {
-                            return Err(HtapError::Corruption(
-                                "type mismatch reconstructing bytes vector".into(),
-                            ));
-                        }
-                    } else {
-                        values.push(Vec::new());
-                    }
-                }
-                ColumnVector::Bytes { values, validity }
-            }
-        };
-
-        vector.validate()?;
-        Ok(vector)
+        build_column_vector(frame.col_def.data_type, frame.validity, non_null_values)
     }
+
+    /// Reads, verifies, and decodes a specific column block into a [`ColumnVector`].
+    ///
+    /// # Errors
+    /// Returns [`HtapError::InvalidArgument`] if indices are out of bounds.
+    /// Returns [`HtapError::Corruption`] if CRC, size limits, bitmap agreement, or encodings fail validation.
+    /// Returns [`HtapError::Io`] on file read errors.
+    pub fn read_block(&mut self, column_idx: usize, block_idx: usize) -> Result<ColumnVector> {
+        self.read_block_internal(column_idx, block_idx)
+    }
+
+    /// Executes a vectorized scan with conservative zone-map pushdown and selective decoding.
+    ///
+    /// # Errors
+    /// Returns [`HtapError::InvalidArgument`] if `request` fails validation against the segment schema.
+    /// Returns [`HtapError::Corruption`] if any decoded block frame fails integrity or decompression checks.
+    /// Returns [`HtapError::Io`] on file read errors.
+    pub fn scan(&self, request: &ScanRequest) -> Result<ScanResult> {
+        crate::scan::execute_scan(self, request)
+    }
+}
+
+struct VerifiedFrame {
+    meta: BlockMeta,
+    col_def: ColumnDef,
+    validity: Vec<bool>,
+    non_null_count: usize,
+    stored_payload: Vec<u8>,
+}
+
+fn build_column_vector(
+    data_type: DataType,
+    validity: Vec<bool>,
+    non_null_values: Vec<Value>,
+) -> Result<ColumnVector> {
+    let mut val_iter = non_null_values.into_iter();
+    let vector = match data_type {
+        DataType::Bool => {
+            let mut values = Vec::with_capacity(validity.len());
+            for &is_valid in &validity {
+                if is_valid {
+                    if let Some(Value::Bool(b)) = val_iter.next() {
+                        values.push(b);
+                    } else {
+                        return Err(HtapError::Corruption(
+                            "type mismatch reconstructing bool vector".into(),
+                        ));
+                    }
+                } else {
+                    values.push(false);
+                }
+            }
+            ColumnVector::Bool { values, validity }
+        }
+        DataType::Int32 => {
+            let mut values = Vec::with_capacity(validity.len());
+            for &is_valid in &validity {
+                if is_valid {
+                    if let Some(Value::Int32(i)) = val_iter.next() {
+                        values.push(i);
+                    } else {
+                        return Err(HtapError::Corruption(
+                            "type mismatch reconstructing int32 vector".into(),
+                        ));
+                    }
+                } else {
+                    values.push(0);
+                }
+            }
+            ColumnVector::Int32 { values, validity }
+        }
+        DataType::Int64 => {
+            let mut values = Vec::with_capacity(validity.len());
+            for &is_valid in &validity {
+                if is_valid {
+                    if let Some(Value::Int64(i)) = val_iter.next() {
+                        values.push(i);
+                    } else {
+                        return Err(HtapError::Corruption(
+                            "type mismatch reconstructing int64 vector".into(),
+                        ));
+                    }
+                } else {
+                    values.push(0);
+                }
+            }
+            ColumnVector::Int64 { values, validity }
+        }
+        DataType::Timestamp => {
+            let mut values = Vec::with_capacity(validity.len());
+            for &is_valid in &validity {
+                if is_valid {
+                    if let Some(Value::Timestamp(t)) = val_iter.next() {
+                        values.push(t);
+                    } else {
+                        return Err(HtapError::Corruption(
+                            "type mismatch reconstructing timestamp vector".into(),
+                        ));
+                    }
+                } else {
+                    values.push(0);
+                }
+            }
+            ColumnVector::Timestamp { values, validity }
+        }
+        DataType::Float64 => {
+            let mut values = Vec::with_capacity(validity.len());
+            for &is_valid in &validity {
+                if is_valid {
+                    if let Some(Value::Float64(f)) = val_iter.next() {
+                        values.push(f);
+                    } else {
+                        return Err(HtapError::Corruption(
+                            "type mismatch reconstructing float64 vector".into(),
+                        ));
+                    }
+                } else {
+                    values.push(0.0);
+                }
+            }
+            ColumnVector::Float64 { values, validity }
+        }
+        DataType::String => {
+            let mut values = Vec::with_capacity(validity.len());
+            for &is_valid in &validity {
+                if is_valid {
+                    if let Some(Value::String(s)) = val_iter.next() {
+                        values.push(s);
+                    } else {
+                        return Err(HtapError::Corruption(
+                            "type mismatch reconstructing string vector".into(),
+                        ));
+                    }
+                } else {
+                    values.push(String::new());
+                }
+            }
+            ColumnVector::String { values, validity }
+        }
+        DataType::Bytes => {
+            let mut values = Vec::with_capacity(validity.len());
+            for &is_valid in &validity {
+                if is_valid {
+                    if let Some(Value::Bytes(b)) = val_iter.next() {
+                        values.push(b);
+                    } else {
+                        return Err(HtapError::Corruption(
+                            "type mismatch reconstructing bytes vector".into(),
+                        ));
+                    }
+                } else {
+                    values.push(Vec::new());
+                }
+            }
+            ColumnVector::Bytes { values, validity }
+        }
+    };
+
+    vector.validate()?;
+    Ok(vector)
 }
 
 #[cfg(test)]

@@ -7,9 +7,11 @@
 #![warn(missing_docs)]
 
 pub mod encoding;
+pub mod scan;
 pub mod segment;
 pub mod types;
 
+pub use scan::{can_block_contain_matches, execute_scan, filter_column_vector};
 pub use segment::{
     BlockMeta, SegmentMetadata, SegmentReader, SegmentWriter, FORMAT_VERSION, FRAME_HEADER_LEN,
     HEADER_LEN, HEADER_MAGIC, TRAILER_LEN, TRAILER_MAGIC,
