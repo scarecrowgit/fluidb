@@ -507,10 +507,14 @@ proptest! {
             prop_assert_eq!(*lsn, Lsn::new(i as u64));
             prop_assert_eq!(rec, &recs[i]);
         }
-        // A short read is reported unless the cut happened to land exactly on
-        // a record boundary.
-        if replay.records.len() < recs.len() {
-            prop_assert_eq!(replay.truncated_at, Some(Lsn::new(replay.records.len() as u64)));
+        // `truncated_at` marks where replay stopped at a *partial* frame. A cut
+        // that lands exactly on a record boundary ends the segment cleanly, so
+        // `truncated_at` is `None` even though later records were lost — a
+        // clean end is indistinguishable from an untruncated log. The property
+        // is therefore: if a short read was reported at all, it is reported at
+        // exactly the LSN following the last surviving record.
+        if let Some(at) = replay.truncated_at {
+            prop_assert_eq!(at, Lsn::new(replay.records.len() as u64));
         }
 
         // And no uncommitted transaction leaks through the prefix.

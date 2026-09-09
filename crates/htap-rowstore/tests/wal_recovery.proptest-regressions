@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3c725420e95279cdd3528168ee5c3f901321b6647e964080d5b2ebbd77819823 # shrinks to recs = [Put { txn_id: 0, partition_id: 0, key: [10, 100, 100, 100], row: Row { values: [Int64(1000000000000000000), String("Aaࠀ\0"), Null] }, version: Version(100) }, Delete { txn_id: 0, partition_id: 0, key: [17, 240, 66, 1, 204, 75, 165, 30, 53, 153, 139, 56, 189, 205, 153, 244, 227, 90, 131, 228, 97, 254], version: Version(300) }, Checkpoint { version: Version(305) }, Commit { txn_id: 0, version: Version(556) }, Put { txn_id: 5, partition_id: 3, key: [], row: Row { values: [Int64(5278017666460909010), String("\u{7f}\u{7f}\u{d2858}\r\u{202e}\u{1b}\u{1}\rn\r*\tRȺ`G\u{4e226}u\u{8cbc0}=!g\"/🕴~"), Null] }, version: Version(129) }, Checkpoint { version: Version(170) }, Delete { txn_id: 1, partition_id: 1, key: [231, 11, 42, 95, 167, 130, 109, 15, 198, 127, 181, 181, 214, 2, 49, 150, 205], version: Version(568) }, Checkpoint { version: Version(540) }, Commit { txn_id: 1, version: Version(654) }, Commit { txn_id: 3, version: Version(954) }, Delete { txn_id: 2, partition_id: 2, key: [254, 53, 18, 203, 160, 199, 250, 123, 191, 173, 68, 168, 252, 225, 152, 100, 152, 185, 141, 237, 13, 240], version: Version(701) }], cut = 0.3000632628971034
