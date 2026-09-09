@@ -193,7 +193,14 @@ dependencies = [
 name = "htap-txn"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "htap-common",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
