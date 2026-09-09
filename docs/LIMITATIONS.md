@@ -34,6 +34,43 @@ Cross-reference: ADR-006 in [`DECISIONS.md`](./DECISIONS.md).
 
 ---
 
+## Durability testing is bounded by process-level fault injection
+
+The write-ahead log in `htap-rowstore` is covered by an integration test
+(`crates/htap-rowstore/tests/wal_crash.rs`, test
+`kill_9_loses_no_committed_data`) that spawns a real child process, lets it
+durably commit transactions and report their ids, then terminates it with
+`SIGKILL` and asserts that every reported commit is recovered by replay.
+
+### What this proves, and what it does not
+
+The test proves **replay integrity across abrupt process death**. It does not
+prove **fsync durability**. This was verified by mutation testing:
+
+| Mutation | Result |
+| -------- | ------ |
+| Drop the `write_all` in `append()` | Test FAILS (correctly detects data loss) |
+| Stub `sync()` to a no-op | Test still PASSES (does not detect the bug) |
+
+The reason is that `SIGKILL` destroys the process but not the operating system
+page cache. Bytes written with `write_all` but never fsynced remain readable by
+a subsequent reader on the same machine. Only a machine-level failure — power
+loss, kernel panic, or a simulated block-device failure — distinguishes the two
+cases.
+
+### Completion plan
+
+To close this gap, either (a) run the crash child inside a VM or container
+whose storage is dropped without flushing, (b) interpose a FUSE or
+device-mapper layer that discards non-fsynced writes on fault injection, or
+(c) use a filesystem fault-injection tool such as `dm-flakey` in the chaos
+suite planned for Phase 7.
+
+Until one of these is in place, the fsync path is verified by code inspection
+only.
+
+---
+
 ## Scope
 
 - The brief describes a production HTAP database engine: an LSM row store, a
@@ -55,7 +92,7 @@ Cross-reference: ADR-006 in [`DECISIONS.md`](./DECISIONS.md).
 | Phase | Status | Known gaps |
 | ----- | ------ | ---------- |
 | Phase 0 — Research and workspace bootstrap | `Complete` | None. |
-| Phase 1 — Row store | `Not started` | — |
+| Phase 1 — Row store | `In progress` | WAL complete (framing, torn-write detection, transaction atomicity on replay, segment GC, real SIGKILL test). Memtable, SSTs, primary-key index and MVCC snapshot reads not yet implemented. fsync durability unverified — see above. |
 | Phase 2 — Columnar store | `Not started` | — |
 | Phase 3 — SQL layer | `Not started` | — |
 | Phase 4 — HTAP conversion | `Not started` | — |
