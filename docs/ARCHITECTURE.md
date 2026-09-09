@@ -7,9 +7,11 @@ This document describes the intended system. Every component carries a status:
 - `planned` — designed, not yet built.
 
 **Current state of the repository.** The cargo workspace skeleton, `htap-common`
-(the `Version` MVCC domain, `FencingToken`, and shared error types), and
-`htap-rowstore` (WAL, memtable, SST writer/reader, and LSM row-store engine) are
-`implemented`. Later components described below remain `planned`.
+(the `Version` MVCC domain, `FencingToken`, and shared error types),
+`htap-rowstore` (WAL, memtable, SST writer/reader, and LSM row-store engine), and
+`htap-colstore` (immutable encoded/compressed segments, typed zone maps, and vectorized scans)
+are `implemented`. Later components described below remain `planned` (including SQL binding,
+transactional MVCC integration, conversion state machines, and rowstore routing).
 See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
@@ -58,7 +60,7 @@ See [`PROGRESS.md`](./PROGRESS.md).
    | WAL, memtable,       |                       | immutable segments,  |
    | SSTs, PK index,      |<---- delta store ---->| column chunks,       |
    | MVCC snapshot engine |      + delete vec     | per-page zone maps   |
-   | IMPLEMENTED          |                       | planned              |
+   | IMPLEMENTED          |                       | IMPLEMENTED          |
    +----------+-----------+                       +-----------+----------+
               |                                               |
               +-----------------------+-----------------------+
@@ -100,12 +102,19 @@ therefore a **deployment choice, not a rewrite**.
 
 ## Dual-format storage
 
-**Status: `in progress`** (`htap-rowstore` is `implemented`, `htap-colstore` is `planned`).
+**Status: `in progress`** (`htap-rowstore` and `htap-colstore` are `implemented`; integration, delta store, and conversion are `planned`).
 
 | Format | Crate | Structure | Status |
 | ------ | ----- | --------- | ------ |
 | Row store (OLTP) | `htap-rowstore` | LSM: WAL, memtable, immutable sorted runs (SSTs), primary-key index, MVCC versions. | `implemented` |
-| Column store (OLAP) | `htap-colstore` | Immutable segments of encoded, compressed column chunks with per-page zone maps. | `planned` |
+| Column store (OLAP) | `htap-colstore` | Immutable segments of encoded (plain/dictionary), compressed (zstd) column blocks with typed zone maps and vectorized scanning. | `implemented` |
+
+The `htap-colstore` implementation delivers the standalone columnar engine MVP:
+durable binary segment files, plain and dictionary column encodings, optional zstd compression,
+per-block CRC32C integrity checksums, typed zone maps (min, max, and nullability flags),
+and vectorized scan execution with conservative pushdown pruning and selective column decoding.
+At this stage, `htap-colstore` does not integrate with the SQL query engine, transactional MVCC
+version visibility, online conversion state machines, or rowstore query routing.
 
 Both formats share **one MVCC version domain** (`htap-common::Version`, which
 is `implemented`) and **one WAL**, so a single transaction can touch both
