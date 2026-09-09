@@ -49,6 +49,14 @@
 //! replayed stream down to records of transactions that actually committed,
 //! which is what makes recovery lose nothing committed and expose nothing
 //! uncommitted.
+//!
+//! # Segment Continuity
+//!
+//! Multi-segment logs must be contiguous. The first retained segment may start
+//! at any LSN (to permit garbage collection of older segments), but every
+//! subsequent segment file name's LSN must strictly equal the `next_lsn` from the
+//! preceding segment's scan. Any gap or overlap between segments is rejected
+//! as log corruption.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -300,7 +308,16 @@ impl Wal {
         let mut active_len = 0u64;
 
         let last_idx = listed.len().saturating_sub(1);
+        let mut expected_next_lsn: Option<Lsn> = None;
         for (idx, (first_lsn, path)) in listed.into_iter().enumerate() {
+            if let Some(expected) = expected_next_lsn {
+                if first_lsn != expected {
+                    return Err(HtapError::Corruption(format!(
+                        "WAL segment continuity error: segment {} starts at {first_lsn}, expected {expected}",
+                        path.display()
+                    )));
+                }
+            }
             let scan = read_segment(&path, first_lsn)?;
             if let Some(at) = scan.stopped {
                 if idx == last_idx {
@@ -338,6 +355,7 @@ impl Wal {
                 next_lsn = scan.next_lsn;
                 active = Some(file);
             }
+            expected_next_lsn = Some(scan.next_lsn);
         }
 
         Ok(Wal {
@@ -413,7 +431,16 @@ impl Wal {
             return Ok(replay);
         }
 
+        let mut expected_next_lsn: Option<Lsn> = None;
         for (first_lsn, path) in list_segments(dir)? {
+            if let Some(expected) = expected_next_lsn {
+                if first_lsn != expected {
+                    return Err(HtapError::Corruption(format!(
+                        "WAL segment continuity error: segment {} starts at {first_lsn}, expected {expected}",
+                        path.display()
+                    )));
+                }
+            }
             replay.segments_read += 1;
             let scan = read_segment(&path, first_lsn)?;
             replay.records.extend(scan.records);
@@ -423,6 +450,7 @@ impl Wal {
                 replay.truncated_at = Some(at);
                 break;
             }
+            expected_next_lsn = Some(scan.next_lsn);
         }
         Ok(replay)
     }

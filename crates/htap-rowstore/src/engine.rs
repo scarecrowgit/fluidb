@@ -46,7 +46,7 @@ use htap_common::{HtapError, Result, Row, Version};
 use parking_lot::{Mutex, RwLock};
 
 use crate::manifest::{sync_dir, Manifest, ManifestSstEntry};
-use crate::memtable::{Memtable, ValueKind};
+use crate::memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
 use crate::sst::{SstOptions, SstReader, SstWriter};
 use crate::wal::{Wal, WalOptions, WalRecord};
 
@@ -70,6 +70,32 @@ impl Snapshot {
 impl From<Version> for Snapshot {
     fn from(version: Version) -> Self {
         Self { version }
+    }
+}
+
+/// A prepared transaction that has been validated for structural correctness
+/// and batch constraints, but not yet applied or published.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedTransaction {
+    txn_id: u64,
+    snapshot: Snapshot,
+    mutations: Vec<Mutation>,
+}
+
+impl PreparedTransaction {
+    /// Return the owning transaction ID.
+    pub fn txn_id(&self) -> u64 {
+        self.txn_id
+    }
+
+    /// Return the snapshot version this transaction was prepared against.
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot
+    }
+
+    /// Return the slice of mutations in this prepared batch.
+    pub fn mutations(&self) -> &[Mutation] {
+        &self.mutations
     }
 }
 
@@ -160,6 +186,7 @@ struct ReadState {
     immutables: Vec<Arc<Memtable>>,
     ssts: Vec<Arc<SstReader>>,
     visible_version: Version,
+    committed_version: Version,
 }
 
 /// LSM row store engine.
@@ -308,15 +335,15 @@ impl Engine {
             }
         }
 
-        // 7. visible_version = max(SST max_versions, replayed commit versions)
-        let mut visible_version = Version::INITIAL;
+        // 7. visible_version and committed_version = max(SST max_versions, replayed commit versions)
+        let mut recovered_version = Version::INITIAL;
         for sst_meta in &manifest.ssts {
             if let Some(v) = sst_meta.max_version {
-                visible_version = visible_version.max(v);
+                recovered_version = recovered_version.max(v);
             }
         }
         for v in commit_versions.values() {
-            visible_version = visible_version.max(*v);
+            recovered_version = recovered_version.max(*v);
         }
 
         let commit_state = CommitState {
@@ -329,7 +356,8 @@ impl Engine {
             active,
             immutables: Vec::new(),
             ssts: sst_readers,
-            visible_version,
+            visible_version: recovered_version,
+            committed_version: recovered_version,
         };
 
         Ok(Self {
@@ -349,6 +377,11 @@ impl Engine {
     /// Return the current highest visible commit version.
     pub fn visible_version(&self) -> Version {
         self.read_state.read().visible_version
+    }
+
+    /// Return the current highest durable committed version.
+    pub fn committed_version(&self) -> Version {
+        self.read_state.read().committed_version
     }
 
     /// Retrieve a row by partition ID and user key at the given snapshot version.
@@ -375,9 +408,10 @@ impl Engine {
     /// Only if a source returns `None` does search continue to older sources.
     pub fn get(&self, partition_id: u64, key: &[u8], snapshot: Snapshot) -> Result<Option<Row>> {
         let read_guard = self.read_state.read();
+        let effective_version = snapshot.version.min(read_guard.visible_version);
 
         // 1. Active memtable
-        if let Some(entry) = read_guard.active.get(partition_id, key, snapshot.version) {
+        if let Some(entry) = read_guard.active.get(partition_id, key, effective_version) {
             return match entry.value {
                 ValueKind::Put(row) => Ok(Some(row)),
                 ValueKind::Delete => Ok(None),
@@ -386,7 +420,7 @@ impl Engine {
 
         // 2. Immutable memtables (newest first)
         for imm in &read_guard.immutables {
-            if let Some(entry) = imm.get(partition_id, key, snapshot.version) {
+            if let Some(entry) = imm.get(partition_id, key, effective_version) {
                 return match entry.value {
                     ValueKind::Put(row) => Ok(Some(row)),
                     ValueKind::Delete => Ok(None),
@@ -396,7 +430,7 @@ impl Engine {
 
         // 3. SST readers (newest first)
         for sst in &read_guard.ssts {
-            if let Some(entry) = sst.get(partition_id, key, snapshot.version)? {
+            if let Some(entry) = sst.get(partition_id, key, effective_version)? {
                 return match entry.value {
                     ValueKind::Put(row) => Ok(Some(row)),
                     ValueKind::Delete => Ok(None),
@@ -407,27 +441,16 @@ impl Engine {
         Ok(None)
     }
 
-    /// Commit a batch of mutations under Snapshot Isolation.
+    /// Prepare a transaction by validating its batch of mutations.
     ///
-    /// # Commit Protocol
-    ///
-    /// 1. Reject empty batches and duplicate `(partition_id, key)` pairs within the batch.
-    /// 2. **Conflict Check (first-writer-wins):** Find the newest committed version across
-    ///    active memtable, immutable memtables, and SSTs. If any mutated key has a version
-    ///    `> snapshot.version`, abort with [`HtapError::Conflict`] without writing to the WAL.
-    /// 3. Assign `commit_version = visible_version.next()`.
-    /// 4. Append mutations and commit record to WAL, then fsync.
-    /// 5. Apply mutations to active memtable and advance `visible_version = commit_version`.
-    /// 6. If active memtable size exceeds `memtable_bytes`, trigger a flush.
-    pub fn commit(
+    /// Validates against empty batches and duplicate `(partition_id, key)` pairs.
+    /// Performs no conflict checks, WAL writes, memtable modifications, or visibility changes.
+    pub fn prepare(
         &self,
         txn_id: u64,
         snapshot: Snapshot,
         mutations: Vec<Mutation>,
-    ) -> Result<Version> {
-        let mut commit_guard = self.commit_lock.lock();
-
-        // 1. Validate batch
+    ) -> Result<PreparedTransaction> {
         if mutations.is_empty() {
             return Err(HtapError::InvalidArgument(
                 "mutation batch cannot be empty".into(),
@@ -449,93 +472,303 @@ impl Engine {
             }
         }
 
+        Ok(PreparedTransaction {
+            txn_id,
+            snapshot,
+            mutations,
+        })
+    }
+
+    /// Apply a previously prepared transaction with an externally assigned commit version.
+    ///
+    /// Under the commit mutex:
+    /// 1. Requires `version == committed_version.next()`.
+    /// 2. Performs first-writer-wins conflict detection against active memtable,
+    ///    immutable memtables, and SSTs at the prepared snapshot version.
+    /// 3. Appends mutation records and the commit record to the WAL and syncs to disk.
+    /// 4. Applies mutations to active memtable and advances `committed_version`.
+    ///    Does NOT advance `visible_version`.
+    /// 5. Automatically triggers a flush if the active memtable threshold is exceeded.
+    pub fn apply_prepared(&self, prepared: PreparedTransaction, version: Version) -> Result<()> {
+        let mut commit_guard = self.commit_lock.lock();
+        self.apply_prepared_locked(&mut commit_guard, prepared, version)
+    }
+
+    fn apply_prepared_locked(
+        &self,
+        commit_guard: &mut CommitState,
+        prepared: PreparedTransaction,
+        version: Version,
+    ) -> Result<()> {
+        // 1. Version continuity check
+        let expected_version = {
+            let read_guard = self.read_state.read();
+            read_guard.committed_version.next()
+        };
+        if version != expected_version {
+            return Err(HtapError::InvalidArgument(format!(
+                "invalid commit version {version}: expected next committed version {expected_version}"
+            )));
+        }
+
         // 2. Conflict check (first-writer-wins)
         {
             let read_guard = self.read_state.read();
-            for &(partition_id, key) in &seen_keys {
+            for m in &prepared.mutations {
+                let (partition_id, key) = match m {
+                    Mutation::Put {
+                        partition_id, key, ..
+                    } => (*partition_id, key.as_slice()),
+                    Mutation::Delete { partition_id, key } => (*partition_id, key.as_slice()),
+                };
                 if let Some(newest_version) =
                     Self::find_newest_version(&read_guard, partition_id, key)?
                 {
-                    if newest_version > snapshot.version {
+                    if newest_version > prepared.snapshot.version {
                         return Err(HtapError::Conflict(format!(
                             "write-write conflict on partition {partition_id}, key {key:?}: newest committed version {newest_version} > snapshot {}",
-                            snapshot.version
+                            prepared.snapshot.version
                         )));
                     }
                 }
             }
         }
 
-        // 3. Assign commit version
-        let commit_version = self.read_state.read().visible_version.next();
-
-        // 4. Append mutations and commit record to WAL
-        for m in &mutations {
+        // 3. Append mutations and commit record to WAL
+        for m in &prepared.mutations {
             let rec = match m {
                 Mutation::Put {
                     partition_id,
                     key,
                     row,
                 } => WalRecord::Put {
-                    txn_id,
+                    txn_id: prepared.txn_id,
                     partition_id: *partition_id,
                     key: key.clone(),
                     row: row.clone(),
-                    version: commit_version,
+                    version,
                 },
                 Mutation::Delete { partition_id, key } => WalRecord::Delete {
-                    txn_id,
+                    txn_id: prepared.txn_id,
                     partition_id: *partition_id,
                     key: key.clone(),
-                    version: commit_version,
+                    version,
                 },
             };
             commit_guard.wal.append(&rec)?;
         }
 
         commit_guard.wal.append_commit(&WalRecord::Commit {
-            txn_id,
-            version: commit_version,
+            txn_id: prepared.txn_id,
+            version,
         })?;
 
-        // 5. Apply mutations to active memtable and update visible_version
+        // 4. Apply mutations to active memtable and update committed_version
         {
             let mut read_guard = self.read_state.write();
-            for m in mutations {
+            for m in prepared.mutations {
                 match m {
                     Mutation::Put {
                         partition_id,
                         key,
                         row,
                     } => {
-                        read_guard.active.apply(
-                            partition_id,
-                            key,
-                            commit_version,
-                            ValueKind::Put(row),
-                        )?;
+                        read_guard
+                            .active
+                            .apply(partition_id, key, version, ValueKind::Put(row))?;
                     }
                     Mutation::Delete { partition_id, key } => {
-                        read_guard.active.apply(
-                            partition_id,
-                            key,
-                            commit_version,
-                            ValueKind::Delete,
-                        )?;
+                        read_guard
+                            .active
+                            .apply(partition_id, key, version, ValueKind::Delete)?;
                     }
                 }
             }
-            read_guard.visible_version = commit_version;
+            read_guard.committed_version = version;
         }
 
-        // 6. Check memtable size for auto-flush
+        // 5. Check memtable size for auto-flush
         let should_flush =
             self.read_state.read().active.approximate_size_bytes() >= self.options.memtable_bytes;
         if should_flush {
-            self.flush_locked(&mut commit_guard)?;
+            self.flush_locked(commit_guard)?;
         }
 
+        Ok(())
+    }
+
+    /// Publish an applied commit version, advancing the global visible watermark.
+    ///
+    /// - Idempotent for `version <= visible_version`.
+    /// - For new publications, requires `version == visible_version.next()` and
+    ///   `version <= committed_version`.
+    /// - Rejects future, skipped, or unapplied versions.
+    /// - Performs no WAL writes.
+    pub fn publish(&self, version: Version) -> Result<()> {
+        let _commit_guard = self.commit_lock.lock();
+        self.publish_locked(version)
+    }
+
+    /// Internal publish implementation under the commit mutex.
+    ///
+    /// Assumes `commit_lock` is already held.
+    fn publish_locked(&self, version: Version) -> Result<()> {
+        let mut read_guard = self.read_state.write();
+        if version <= read_guard.visible_version {
+            return Ok(());
+        }
+        if version != read_guard.visible_version.next() {
+            return Err(HtapError::InvalidArgument(format!(
+                "cannot publish version {version}: expected next visible version {}",
+                read_guard.visible_version.next()
+            )));
+        }
+        if version > read_guard.committed_version {
+            return Err(HtapError::InvalidArgument(format!(
+                "cannot publish unapplied version {version}: committed version is {}",
+                read_guard.committed_version
+            )));
+        }
+        read_guard.visible_version = version;
+        Ok(())
+    }
+
+    /// Commit a batch of mutations under Snapshot Isolation.
+    ///
+    /// # Commit Protocol
+    ///
+    /// 1. Reject empty batches and duplicate `(partition_id, key)` pairs within the batch.
+    /// 2. Under commit lock, verify no un-published versions are pending (`committed_version == visible_version`).
+    /// 3. Assign `commit_version = committed_version.next()`.
+    /// 4. Recheck first-writer-wins conflicts, append to WAL, and apply to active memtable.
+    /// 5. Immediately publish `commit_version`.
+    pub fn commit(
+        &self,
+        txn_id: u64,
+        snapshot: Snapshot,
+        mutations: Vec<Mutation>,
+    ) -> Result<Version> {
+        let prepared = self.prepare(txn_id, snapshot, mutations)?;
+        let mut commit_guard = self.commit_lock.lock();
+
+        let (committed_version, visible_version) = {
+            let read_guard = self.read_state.read();
+            (read_guard.committed_version, read_guard.visible_version)
+        };
+        if committed_version != visible_version {
+            return Err(HtapError::Conflict(format!(
+                "cannot execute legacy commit while un-published versions are pending: committed {committed_version} != visible {visible_version}"
+            )));
+        }
+
+        let commit_version = committed_version.next();
+        self.apply_prepared_locked(&mut commit_guard, prepared, commit_version)?;
+        self.publish_locked(commit_version)?;
         Ok(commit_version)
+    }
+
+    /// Scan and materialize all MVCC entries for `partition_id` visible at `snapshot`.
+    ///
+    /// Returns every distinct physical MVCC version `<= min(snapshot.version, visible_version)`
+    /// across active memtable, immutable memtables, and SST readers, filtered to
+    /// `partition_id`, sorted by [`InternalKey`], including tombstones.
+    ///
+    /// Exact internal keys across layers are deduplicated. Conflicting values for the
+    /// same internal key return [`HtapError::Corruption`].
+    pub fn scan_partition(
+        &self,
+        partition_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<Vec<MemtableEntry>> {
+        let read_guard = self.read_state.read();
+        let effective_version = snapshot.version.min(read_guard.visible_version);
+
+        let mut map: std::collections::BTreeMap<InternalKey, ValueKind> =
+            std::collections::BTreeMap::new();
+
+        // 1. Active memtable
+        for entry in read_guard.active.iter() {
+            if entry.key.partition_id < partition_id {
+                continue;
+            }
+            if entry.key.partition_id > partition_id {
+                break;
+            }
+            if entry.key.version <= effective_version {
+                match map.get(&entry.key) {
+                    Some(existing) if existing != &entry.value => {
+                        return Err(HtapError::Corruption(format!(
+                            "conflicting values for internal key {:?} across layers",
+                            entry.key
+                        )));
+                    }
+                    Some(_) => {}
+                    None => {
+                        map.insert(entry.key.clone(), entry.value.clone());
+                    }
+                }
+            }
+        }
+
+        // 2. Immutable memtables (newest first)
+        for imm in &read_guard.immutables {
+            for entry in imm.iter() {
+                if entry.key.partition_id < partition_id {
+                    continue;
+                }
+                if entry.key.partition_id > partition_id {
+                    break;
+                }
+                if entry.key.version <= effective_version {
+                    match map.get(&entry.key) {
+                        Some(existing) if existing != &entry.value => {
+                            return Err(HtapError::Corruption(format!(
+                                "conflicting values for internal key {:?} across layers",
+                                entry.key
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            map.insert(entry.key.clone(), entry.value.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. SST readers (newest first)
+        for sst in &read_guard.ssts {
+            let iter = sst.iter()?;
+            for entry_res in iter {
+                let entry = entry_res?;
+                if entry.key.partition_id < partition_id {
+                    continue;
+                }
+                if entry.key.partition_id > partition_id {
+                    break;
+                }
+                if entry.key.version <= effective_version {
+                    match map.get(&entry.key) {
+                        Some(existing) if existing != &entry.value => {
+                            return Err(HtapError::Corruption(format!(
+                                "conflicting values for internal key {:?} across layers",
+                                entry.key
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            map.insert(entry.key, entry.value);
+                        }
+                    }
+                }
+            }
+        }
+
+        let result = map
+            .into_iter()
+            .map(|(key, value)| MemtableEntry { key, value })
+            .collect();
+        Ok(result)
     }
 
     /// Flush the active memtable to a new SST file on disk.

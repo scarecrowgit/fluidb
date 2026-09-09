@@ -3,7 +3,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use htap_common::{HtapError, Row, Value, Version};
-use htap_rowstore::{Engine, EngineOptions, Mutation, SstOptions, Wal, WalOptions, WalRecord};
+use htap_rowstore::{
+    Engine, EngineOptions, Mutation, Snapshot, SstOptions, Wal, WalOptions, WalRecord,
+};
 
 fn make_row(val: i64) -> Row {
     Row::new(vec![Value::Int64(val)])
@@ -658,4 +660,71 @@ fn test_options_builder() {
     assert_eq!(opts.memtable_bytes, 1024);
     assert_eq!(opts.sst.block_bytes, 4096);
     assert!(!opts.wal.sync_on_commit);
+}
+
+#[test]
+fn test_engine_prepare_apply_publish_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(EngineOptions::new(dir.path())).unwrap();
+
+    let s0 = engine.snapshot();
+    let prep = engine
+        .prepare(
+            1,
+            s0,
+            vec![Mutation::Put {
+                partition_id: 0,
+                key: b"k1".to_vec(),
+                row: make_row(100),
+            }],
+        )
+        .unwrap();
+
+    let v2 = Version::new(2);
+    engine.apply_prepared(prep, v2).unwrap();
+
+    assert_eq!(engine.committed_version(), v2);
+    assert_eq!(engine.visible_version(), Version::INITIAL);
+
+    // Snapshot capping prevents observing un-published v2
+    assert_eq!(engine.get(0, b"k1", Snapshot::new(v2)).unwrap(), None);
+
+    // Publish makes it visible
+    engine.publish(v2).unwrap();
+    assert_eq!(engine.visible_version(), v2);
+    assert_eq!(
+        engine.get(0, b"k1", Snapshot::new(v2)).unwrap(),
+        Some(make_row(100))
+    );
+}
+
+#[test]
+fn test_engine_scan_partition_ordering_and_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(EngineOptions::new(dir.path())).unwrap();
+
+    let v2 = engine
+        .commit(
+            1,
+            engine.snapshot(),
+            vec![
+                Mutation::Put {
+                    partition_id: 0,
+                    key: b"b".to_vec(),
+                    row: make_row(2),
+                },
+                Mutation::Put {
+                    partition_id: 0,
+                    key: b"a".to_vec(),
+                    row: make_row(1),
+                },
+            ],
+        )
+        .unwrap();
+
+    let entries = engine.scan_partition(0, Snapshot::new(v2)).unwrap();
+    assert_eq!(entries.len(), 2);
+    // Ordered by InternalKey: user_key "a" before "b"
+    assert_eq!(entries[0].key.user_key, b"a");
+    assert_eq!(entries[1].key.user_key, b"b");
 }

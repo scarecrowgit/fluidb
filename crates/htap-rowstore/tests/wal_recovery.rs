@@ -43,6 +43,65 @@ fn segment_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
+fn segment_continuity_gap_is_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wal = Wal::open(WalOptions::new(dir.path()).with_max_segment_bytes(512)).unwrap();
+    for i in 0..100 {
+        wal.append(&put(1, i)).unwrap();
+    }
+    wal.sync().unwrap();
+    drop(wal);
+
+    let files = segment_files(dir.path());
+    assert!(files.len() >= 3);
+    // Remove the middle segment to create a gap
+    std::fs::remove_file(&files[1]).unwrap();
+
+    let err = Wal::replay(dir.path()).unwrap_err();
+    assert!(matches!(err, htap_common::HtapError::Corruption(_)));
+}
+
+#[test]
+fn segment_continuity_overlap_is_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wal = Wal::open(WalOptions::new(dir.path()).with_max_segment_bytes(512)).unwrap();
+    for i in 0..100 {
+        wal.append(&put(1, i)).unwrap();
+    }
+    wal.sync().unwrap();
+    drop(wal);
+
+    let files = segment_files(dir.path());
+    assert!(files.len() >= 3);
+    // Rename the last segment to have an LSN smaller than files[1]'s next_lsn (overlap)
+    let overlapping_name = dir.path().join(format!("{:020}.wal", 1));
+    std::fs::rename(&files[2], &overlapping_name).unwrap();
+
+    let err = Wal::replay(dir.path()).unwrap_err();
+    assert!(matches!(err, htap_common::HtapError::Corruption(_)));
+}
+
+#[test]
+fn segment_continuity_permits_nonzero_first_retained_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wal = Wal::open(WalOptions::new(dir.path()).with_max_segment_bytes(512)).unwrap();
+    for i in 0..100 {
+        wal.append(&put(1, i)).unwrap();
+    }
+    wal.sync().unwrap();
+    drop(wal);
+
+    let files = segment_files(dir.path());
+    assert!(files.len() >= 3);
+    // Remove the first segment to simulate prefix GC
+    std::fs::remove_file(&files[0]).unwrap();
+
+    let replay = Wal::replay(dir.path()).unwrap();
+    assert_eq!(replay.segments_read, files.len() - 1);
+    assert!(!replay.records.is_empty());
+}
+
+#[test]
 fn round_trip_of_every_record_variant() {
     let dir = tempfile::tempdir().unwrap();
     let recs = vec![
