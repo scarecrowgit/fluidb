@@ -6,8 +6,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod encoding;
+pub mod segment;
 pub mod types;
 
+pub use segment::{
+    BlockMeta, SegmentMetadata, SegmentReader, SegmentWriter, FORMAT_VERSION, FRAME_HEADER_LEN,
+    HEADER_LEN, HEADER_MAGIC, TRAILER_LEN, TRAILER_MAGIC,
+};
 pub use types::{
     validate_row, validate_segment_schema, validate_value, ColumnEncoding, ColumnVector, Predicate,
     RecordBatch, ScanRequest, ScanResult, ScanStats, SegmentOptions, DEFAULT_ROWS_PER_BLOCK,
