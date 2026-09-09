@@ -1,10 +1,16 @@
-//! Schema, tables, partitions, tablets, metadata
+//! Schema, tables, partitions, tablets, and metadata catalog.
+//!
+//! Provides a validated, serde-persistable catalog model and crash-safe
+//! local repository for later conversion, SQL, distribution, and coordination.
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod local;
+pub mod model;
+pub mod store;
+
+pub use local::LocalCatalogStore;
+pub use model::{
+    CatalogSnapshot, NodeId, PartitionDescriptor, PartitionId, ReplicaDescriptor, ReplicaId,
+    StorageDescriptor, StorageFormat, TableDescriptor, TableId, TabletDescriptor, TabletId,
+};
+pub use store::CatalogStore;
