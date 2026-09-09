@@ -36,11 +36,13 @@ Cross-reference: ADR-006 in [`DECISIONS.md`](./DECISIONS.md).
 
 ## Durability testing is bounded by process-level fault injection
 
-The write-ahead log in `htap-rowstore` is covered by an integration test
-(`crates/htap-rowstore/tests/wal_crash.rs`, test
-`kill_9_loses_no_committed_data`) that spawns a real child process, lets it
-durably commit transactions and report their ids, then terminates it with
-`SIGKILL` and asserts that every reported commit is recovered by replay.
+The write-ahead log and LSM engine in `htap-rowstore` are covered by integration
+tests (`crates/htap-rowstore/tests/wal_crash.rs`, test
+`kill_9_loses_no_committed_data`, and `crates/htap-rowstore/tests/engine_crash.rs`,
+test `engine_kill_9_recovers_all_reported_commits`) that spawn a real child process,
+let it durably commit transactions and report their ids (including periodic SST flushes),
+then terminate it with `SIGKILL` and assert that every reported commit is recovered upon
+reopening.
 
 ### What this proves, and what it does not
 
@@ -92,7 +94,7 @@ only.
 | Phase | Status | Known gaps |
 | ----- | ------ | ---------- |
 | Phase 0 — Research and workspace bootstrap | `Complete` | None. |
-| Phase 1 — Row store | `In progress` | WAL complete (framing, torn-write detection, transaction atomicity on replay, segment GC, real SIGKILL test). Memtable, SSTs, primary-key index and MVCC snapshot reads not yet implemented. fsync durability unverified — see above. |
+| Phase 1 — Row store | `Complete` | fsync durability unverified — see above: SIGKILL tests prove restart/replay integrity across abrupt process death, not physical power-loss durability. |
 | Phase 2 — Columnar store | `Not started` | — |
 | Phase 3 — SQL layer | `Not started` | — |
 | Phase 4 — HTAP conversion | `Not started` | — |

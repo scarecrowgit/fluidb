@@ -6,9 +6,10 @@ This document describes the intended system. Every component carries a status:
 - `in progress` — partially built.
 - `planned` — designed, not yet built.
 
-**Current state of the repository.** Only the cargo workspace skeleton and
-`htap-common` (the `Version` MVCC domain, `FencingToken`, and the shared error
-types) are `implemented`. Every other component described below is `planned`.
+**Current state of the repository.** The cargo workspace skeleton, `htap-common`
+(the `Version` MVCC domain, `FencingToken`, and shared error types), and
+`htap-rowstore` (WAL, memtable, SST writer/reader, and LSM row-store engine) are
+`implemented`. Later components described below remain `planned`.
 See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
@@ -55,9 +56,9 @@ See [`PROGRESS.md`](./PROGRESS.md).
    +----------v-----------+                       +-----------v----------+
    | htap-rowstore (OLTP) |                       | htap-colstore (OLAP) |
    | WAL, memtable,       |                       | immutable segments,  |
-   | sorted runs, PK      |<---- delta store ---->| column chunks,       |
-   | index, delete vectors|      + delete vec     | per-page zone maps   |
-   | planned              |                       | planned              |
+   | SSTs, PK index,      |<---- delta store ---->| column chunks,       |
+   | MVCC snapshot engine |      + delete vec     | per-page zone maps   |
+   | IMPLEMENTED          |                       | planned              |
    +----------+-----------+                       +-----------+----------+
               |                                               |
               +-----------------------+-----------------------+
@@ -99,12 +100,12 @@ therefore a **deployment choice, not a rewrite**.
 
 ## Dual-format storage
 
-**Status: `planned`.**
+**Status: `in progress`** (`htap-rowstore` is `implemented`, `htap-colstore` is `planned`).
 
-| Format | Crate | Structure |
-| ------ | ----- | --------- |
-| Row store (OLTP) | `htap-rowstore` | LSM: WAL, memtable, immutable sorted runs, primary-key index, MVCC versions. |
-| Column store (OLAP) | `htap-colstore` | Immutable segments of encoded, compressed column chunks with per-page zone maps. |
+| Format | Crate | Structure | Status |
+| ------ | ----- | --------- | ------ |
+| Row store (OLTP) | `htap-rowstore` | LSM: WAL, memtable, immutable sorted runs (SSTs), primary-key index, MVCC versions. | `implemented` |
+| Column store (OLAP) | `htap-colstore` | Immutable segments of encoded, compressed column chunks with per-page zone maps. | `planned` |
 
 Both formats share **one MVCC version domain** (`htap-common::Version`, which
 is `implemented`) and **one WAL**, so a single transaction can touch both
