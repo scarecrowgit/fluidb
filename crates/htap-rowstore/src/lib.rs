@@ -30,10 +30,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod engine;
+pub mod manifest;
 pub mod memtable;
 pub mod sst;
 pub mod wal;
 
+pub use engine::{Engine, EngineOptions, Mutation, Snapshot, DEFAULT_MEMTABLE_BYTES};
+pub use manifest::{Manifest, ManifestSstEntry};
 pub use memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
 pub use sst::{SstMetadata, SstOptions, SstReader, SstWriter, DEFAULT_SST_BLOCK_BYTES};
 pub use wal::{Lsn, Wal, WalOptions, WalRecord, WalReplay};
