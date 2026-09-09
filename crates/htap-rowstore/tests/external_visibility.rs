@@ -306,12 +306,19 @@ fn test_reopen_behavior_for_durable_applied_records() {
     // Reopen engine
     let engine2 = Engine::open(opts).unwrap();
 
-    // Durable committed records recovered from WAL/SST become visible after restart
-    assert_eq!(engine2.visible_version(), v2);
+    // Applied-but-unpublished data stays hidden across reopen until explicit publish
+    assert_eq!(engine2.visible_version(), Version::INITIAL);
     assert_eq!(engine2.committed_version(), v2);
 
     let s = engine2.snapshot();
-    assert_eq!(engine2.get(0, b"k1", s).unwrap(), Some(r1));
+    assert_eq!(engine2.get(0, b"k1", s).unwrap(), None);
+
+    // Explicit publish makes it visible
+    engine2.publish(v2).unwrap();
+    assert_eq!(engine2.visible_version(), v2);
+
+    let s2 = engine2.snapshot();
+    assert_eq!(engine2.get(0, b"k1", s2).unwrap(), Some(r1));
 }
 
 #[test]

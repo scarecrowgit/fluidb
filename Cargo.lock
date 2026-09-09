@@ -195,6 +195,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "htap-common",
+ "htap-rowstore",
  "parking_lot",
  "serde",
  "serde_json",

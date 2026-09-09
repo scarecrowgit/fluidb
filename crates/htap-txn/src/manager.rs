@@ -421,7 +421,14 @@ impl TransactionManager {
             // Apply exact participant payloads in sorted order
             for work in &works {
                 let p = registry.get(&work.participant_id).unwrap();
-                p.apply(txn_id, commit_version, &work.payload)?;
+                p.apply(txn_id, commit_version, &work.payload)
+                    .map_err(|err| match err {
+                        HtapError::InvalidArgument(msg) => HtapError::Corruption(format!(
+                            "corrupted participant {} payload during journal recovery for txn {txn_id}: {msg}",
+                            work.participant_id
+                        )),
+                        other => other,
+                    })?;
             }
 
             // Publish in sorted order

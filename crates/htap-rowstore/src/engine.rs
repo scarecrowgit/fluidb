@@ -38,10 +38,12 @@
 //! tombstone immediately yields `Ok(None)` and terminates search. Older layers are never
 //! consulted, preventing resurrection of deleted rows.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use htap_common::Mutation;
 use htap_common::{HtapError, Result, Row, Version};
 use parking_lot::{Mutex, RwLock};
 
@@ -97,27 +99,6 @@ impl PreparedTransaction {
     pub fn mutations(&self) -> &[Mutation] {
         &self.mutations
     }
-}
-
-/// A write mutation on a single row key within a partition.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Mutation {
-    /// Insert or update a row.
-    Put {
-        /// Target partition identifier.
-        partition_id: u64,
-        /// Primary key bytes.
-        key: Vec<u8>,
-        /// Row value.
-        row: Row,
-    },
-    /// Delete a row (leaves an MVCC tombstone).
-    Delete {
-        /// Target partition identifier.
-        partition_id: u64,
-        /// Primary key bytes.
-        key: Vec<u8>,
-    },
 }
 
 /// Configuration options for the LSM [`Engine`].
@@ -177,6 +158,42 @@ struct CommitState {
     wal: Wal,
     next_sst_id: u64,
     manifest: Manifest,
+    applied_txns: HashMap<u64, Version>,
+}
+
+/// Fixed visible watermark marker header magic ("HTAPVIS1").
+const VISIBLE_MAGIC: &[u8; 8] = b"HTAPVIS1";
+
+/// Write visible version marker file atomically to disk.
+fn write_visible_version(dir: &Path, version: Version) -> Result<()> {
+    let tmp_path = dir.join("VISIBLE.tmp");
+    let target_path = dir.join("VISIBLE");
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(VISIBLE_MAGIC);
+    buf[8..16].copy_from_slice(&version.get().to_le_bytes());
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(&buf)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp_path, &target_path)?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
+/// Read visible version marker file from disk, if present.
+fn read_visible_version(dir: &Path) -> Result<Option<Version>> {
+    let visible_path = dir.join("VISIBLE");
+    if !visible_path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read(&visible_path)?;
+    if data.len() != 16 || &data[..8] != VISIBLE_MAGIC {
+        return Err(HtapError::Corruption(
+            "corrupted VISIBLE marker file".into(),
+        ));
+    }
+    let raw = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    Ok(Some(Version::new(raw)))
 }
 
 /// Internal read state protected by `read_state` RwLock.
@@ -241,6 +258,7 @@ impl Engine {
 
         // 3. Best-effort delete orphan *.tmp and unlisted *.sst
         let _ = std::fs::remove_file(options.dir.join("MANIFEST.tmp"));
+        let _ = std::fs::remove_file(options.dir.join("VISIBLE.tmp"));
         let valid_sst_ids: HashSet<u64> = manifest.ssts.iter().map(|s| s.id).collect();
         if let Ok(entries) = std::fs::read_dir(&sst_dir) {
             for entry in entries.flatten() {
@@ -335,7 +353,8 @@ impl Engine {
             }
         }
 
-        // 7. visible_version and committed_version = max(SST max_versions, replayed commit versions)
+        // 7. visible_version from VISIBLE marker (defaults to INITIAL if absent);
+        //    committed_version = max(SST max_versions, replayed commit versions)
         let mut recovered_version = Version::INITIAL;
         for sst_meta in &manifest.ssts {
             if let Some(v) = sst_meta.max_version {
@@ -346,17 +365,25 @@ impl Engine {
             recovered_version = recovered_version.max(*v);
         }
 
+        let visible_version = read_visible_version(&options.dir)?.unwrap_or(Version::INITIAL);
+        if visible_version > recovered_version {
+            return Err(HtapError::Corruption(format!(
+                "visible version {visible_version} exceeds recovered committed version {recovered_version}"
+            )));
+        }
+
         let commit_state = CommitState {
             wal,
             next_sst_id,
             manifest,
+            applied_txns: commit_versions,
         };
 
         let read_state = ReadState {
             active,
             immutables: Vec::new(),
             ssts: sst_readers,
-            visible_version: recovered_version,
+            visible_version,
             committed_version: recovered_version,
         };
 
@@ -500,6 +527,19 @@ impl Engine {
         prepared: PreparedTransaction,
         version: Version,
     ) -> Result<()> {
+        // 0. Idempotency check: if txn_id != 0 and already applied at the exact version, return Ok(())
+        if prepared.txn_id != 0 {
+            if let Some(&existing_version) = commit_guard.applied_txns.get(&prepared.txn_id) {
+                if existing_version == version {
+                    return Ok(());
+                }
+                return Err(HtapError::Conflict(format!(
+                    "transaction {} already applied at version {existing_version}, cannot reapply at {version}",
+                    prepared.txn_id
+                )));
+            }
+        }
+
         // 1. Version continuity check
         let expected_version = {
             let read_guard = self.read_state.read();
@@ -587,6 +627,10 @@ impl Engine {
             read_guard.committed_version = version;
         }
 
+        if prepared.txn_id != 0 {
+            commit_guard.applied_txns.insert(prepared.txn_id, version);
+        }
+
         // 5. Check memtable size for auto-flush
         let should_flush =
             self.read_state.read().active.approximate_size_bytes() >= self.options.memtable_bytes;
@@ -595,6 +639,36 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    /// Idempotently apply a batch of mutations for an externally coordinated transaction.
+    ///
+    /// - If `txn_id` has already been applied at `version`, returns `Ok(())` without duplicate writes.
+    /// - If `txn_id` was already applied at a different version, returns [`HtapError::Conflict`].
+    /// - Validates that mutations are non-empty and have no duplicate keys.
+    /// - Requires `version == committed_version.next()`.
+    /// - Does NOT advance `visible_version` (data remains hidden until published).
+    pub fn apply_external(
+        &self,
+        txn_id: u64,
+        version: Version,
+        mutations: Vec<Mutation>,
+    ) -> Result<()> {
+        let mut commit_guard = self.commit_lock.lock();
+
+        if txn_id != 0 {
+            if let Some(&existing_version) = commit_guard.applied_txns.get(&txn_id) {
+                if existing_version == version {
+                    return Ok(());
+                }
+                return Err(HtapError::Conflict(format!(
+                    "transaction {txn_id} was already applied at version {existing_version}, cannot reapply at {version}"
+                )));
+            }
+        }
+
+        let prepared = self.prepare(txn_id, Snapshot::new(Version::new(u64::MAX)), mutations)?;
+        self.apply_prepared_locked(&mut commit_guard, prepared, version)
     }
 
     /// Publish an applied commit version, advancing the global visible watermark.
@@ -629,6 +703,7 @@ impl Engine {
                 read_guard.committed_version
             )));
         }
+        write_visible_version(&self.options.dir, version)?;
         read_guard.visible_version = version;
         Ok(())
     }

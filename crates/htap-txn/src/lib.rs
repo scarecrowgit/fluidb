@@ -7,6 +7,7 @@
 pub mod journal;
 pub mod manager;
 pub mod participant;
+pub mod rowstore;
 
 pub use journal::{
     decode_frame_slice, encode_frame, FrameStatus, Journal, JournalOptions, JournalRecord,
@@ -17,3 +18,4 @@ pub use participant::{
     order_arc_participants, order_participants, CommittedTransaction, ParticipantId,
     ParticipantWork, TransactionId, TransactionRequest, TxnId, TxnParticipant, MAX_PAYLOAD_SIZE,
 };
+pub use rowstore::RowstoreParticipant;

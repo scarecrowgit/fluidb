@@ -34,6 +34,20 @@ Cross-reference: ADR-006 in [`DECISIONS.md`](./DECISIONS.md).
 
 ---
 
+## Rowstore external coordination: single-participant contiguous version subset
+
+The transaction manager (`htap-txn`) coordinates two-phase commit across participants, using `RowstoreParticipant` to wrap an LSM `Engine`. The rowstore external coordination behavior supports restart-safe visibility (where applied-but-unpublished transactions stay completely hidden across reopen until explicitly published) and idempotent external re-apply during recovery.
+
+### Exact limitation: dense contiguous versions
+
+Rowstore MVCC visibility uses a single scalar watermark (`visible_version`) and enforces sequential monotonic progression (`version == visible_version.next()`). Full sparse global version support across multiple partitions/participants with version gaps (where transactions touch only a subset of participants, leaving non-contiguous version sequences on any single participant) is deferred:
+
+- **Single scalar watermark:** A scalar watermark treats all records with `version <= visible_version` as readable. If a participant were to jump visibility across a sparse gap (e.g. from version 2 to 5) while intermediate transactions were concurrently in flight or applied but unpublished, those intermediate writes would become visible prematurely.
+- **Ordered publication invariant:** `Engine::publish` enforces `version == visible_version.next()` to prevent out-of-order publication races across concurrent publishers.
+- **Supported subset:** The implemented correct subset supports all single-participant contiguous transaction flows (such as single-rowstore coordinator transactions with monotonically consecutive versions), crash recovery replay, idempotent duplicate apply, and restart-safe visibility isolation via the durable `VISIBLE` watermark file. Multi-participant sparse global version jumps require either an active-transaction tracking bitmap/list or hybrid logical clocks.
+
+---
+
 ## Durability testing is bounded by process-level fault injection
 
 The write-ahead log and LSM engine in `htap-rowstore` are covered by integration

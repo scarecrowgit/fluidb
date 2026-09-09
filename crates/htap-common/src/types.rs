@@ -337,6 +337,45 @@ impl Row {
     }
 }
 
+/// A write mutation on a single row key within a partition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Mutation {
+    /// Insert or update a row.
+    Put {
+        /// Target partition identifier.
+        partition_id: u64,
+        /// Primary key bytes.
+        key: Vec<u8>,
+        /// Row value.
+        row: Row,
+    },
+    /// Delete a row (leaves an MVCC tombstone).
+    Delete {
+        /// Target partition identifier.
+        partition_id: u64,
+        /// Primary key bytes.
+        key: Vec<u8>,
+    },
+}
+
+impl Mutation {
+    /// Target partition identifier.
+    pub fn partition_id(&self) -> u64 {
+        match self {
+            Mutation::Put { partition_id, .. } | Mutation::Delete { partition_id, .. } => {
+                *partition_id
+            }
+        }
+    }
+
+    /// Primary key bytes.
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Mutation::Put { key, .. } | Mutation::Delete { key, .. } => key.as_slice(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

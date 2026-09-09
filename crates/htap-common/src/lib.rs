@@ -38,5 +38,5 @@ pub mod version;
 
 pub use error::{HtapError, Result};
 pub use keycodec::{encode_key, encode_key_prefix};
-pub use types::{ColumnDef, DataType, Row, Schema, Value};
+pub use types::{ColumnDef, DataType, Mutation, Row, Schema, Value};
 pub use version::{FencingToken, Version};
