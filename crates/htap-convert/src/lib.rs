@@ -1,4 +1,6 @@
-//! Row<->column conversion engine and durable tablet columnar manifests.
+//! Row-to-column conversion engine and durable tablet columnar manifests.
+//!
+//! Conversion is row-to-column only; bidirectional/reverse conversion is not supported.
 //!
 //! Provides the crash-safe [`TabletColumnManifest`], writer helpers for columnar segments,
 //! and envelope serialization with CRC32-C verification.
@@ -14,13 +16,12 @@ use std::sync::Arc;
 
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{
-    ColumnManifestRef, ConversionDescriptor, ConversionPhase, PartitionId, StorageDescriptor,
-    StorageFormat, TabletId,
+    CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase, PartitionId,
+    StorageDescriptor, StorageFormat, TabletId,
 };
 pub use htap_catalog::{MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS};
-use htap_colstore::{
-    validate_segment_schema, ScanRequest, SegmentOptions, SegmentReader, SegmentWriter,
-};
+pub use htap_colstore::SegmentOptions;
+use htap_colstore::{validate_segment_schema, ScanRequest, SegmentReader, SegmentWriter};
 use htap_common::{
     encode_key, read_file_exact_bounded, HtapError, Result, Row, Schema, Value, Version,
 };
@@ -1151,10 +1152,11 @@ pub fn convert_partition(
 }
 
 /// Read visible rows for a partition, overlaying rowstore mutations on top of columnar data.
+/// Snapshot-aware core read for a partition at `snapshot`, overlaying rowstore mutations on columnar segments
+/// using an already loaded [`CatalogSnapshot`].
 ///
 /// Keeps the rowstore authoritative:
-/// - If the partition is in `StorageDescriptor::Row` or has no columnar manifest, reads directly
-///   from rowstore at `snapshot`.
+/// - If the partition is [`StorageDescriptor::Row`] or has no column manifest, reads directly from the rowstore.
 /// - If the target `snapshot` version is strictly less than the manifest `base_version`, reads
 ///   from rowstore historical MVCC data to avoid reading uncommitted future columnar state.
 /// - If `snapshot` version is `>= manifest base_version`, reads base columnar rows from segment
@@ -1162,17 +1164,13 @@ pub fn convert_partition(
 ///   up to `snapshot` version (Puts update/insert, Deletes tombstone/remove).
 ///
 /// Returns rows sorted by primary key.
-pub fn read_column_partition(
-    catalog: &dyn CatalogStore,
+pub fn read_column_partition_core(
+    cat_snap: &CatalogSnapshot,
     rowstore: &Engine,
     colstore_root: &Path,
     partition_id: PartitionId,
     snapshot: impl Into<Snapshot>,
 ) -> Result<Vec<Row>> {
-    let cat_snap = catalog
-        .load()?
-        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
-
     let part_desc = cat_snap
         .partition(partition_id)
         .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?;
@@ -1270,6 +1268,22 @@ pub fn read_column_partition(
     }
 
     Ok(map.into_values().collect())
+}
+
+/// Reads visible rows for a partition at `snapshot`, overlaying rowstore mutations on columnar segments.
+///
+/// Convenience wrapper over [`read_column_partition_core`] that loads the catalog snapshot from `catalog`.
+pub fn read_column_partition(
+    catalog: &dyn CatalogStore,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    partition_id: PartitionId,
+    snapshot: impl Into<Snapshot>,
+) -> Result<Vec<Row>> {
+    let cat_snap = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+    read_column_partition_core(&cat_snap, rowstore, colstore_root, partition_id, snapshot)
 }
 
 /// Local single-node row-to-column conversion and columnar materialization engine.

@@ -47,6 +47,8 @@ pub enum Route {
         /// Encoded primary key bytes.
         key: Vec<u8>,
     },
+    /// Analytical scan query route.
+    OlapScan,
 }
 
 /// Classifies a catalog-bound statement into an execution route given the target storage descriptor.
@@ -60,6 +62,9 @@ pub enum Route {
 ///   [`htap_common::encode_key`] for [`StorageDescriptor::Row`], [`StorageDescriptor::Column`], and
 ///   [`StorageDescriptor::Converting`], as the rowstore remains authoritative for point reads during and
 ///   after conversion.
+/// - [`BoundStatement::AnalyticSelect`] routes to [`Route::OlapScan`] across [`StorageDescriptor::Row`],
+///   [`StorageDescriptor::Column`], and [`StorageDescriptor::Converting`]. Storage descriptors are accepted
+///   as local server capability (the server will validate columnar manifests or fallback paths during execution).
 ///
 /// # Errors
 /// Returns [`HtapError`] if primary key encoding fails.
@@ -78,6 +83,11 @@ pub fn classify_route(statement: &BoundStatement, storage: &StorageDescriptor) -
                 let key = encode_key(&select.key)?;
                 Ok(Route::RowstorePointRead { key })
             }
+        },
+        BoundStatement::AnalyticSelect(_) => match storage {
+            StorageDescriptor::Row
+            | StorageDescriptor::Column
+            | StorageDescriptor::Converting { .. } => Ok(Route::OlapScan),
         },
     }
 }
@@ -193,6 +203,41 @@ mod tests {
             Route::RowstorePointRead {
                 key: expected_bytes
             }
+        );
+    }
+
+    #[test]
+    fn test_olap_scan_route() {
+        use crate::ast::{AnalyticExpr, AnalyticSelect};
+
+        let schema = make_test_schema();
+        let select_stmt = BoundStatement::AnalyticSelect(AnalyticSelect::new(
+            "t",
+            vec![AnalyticExpr::Column {
+                index: 0,
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            None,
+            vec![],
+            schema,
+        ));
+
+        let row = StorageDescriptor::Row;
+        let col = StorageDescriptor::Column;
+        let conv = StorageDescriptor::Converting {
+            from: StorageFormat::Row,
+            to: StorageFormat::Column,
+            generation: 1,
+        };
+
+        // All storage descriptors accept analytical select queries routing to OlapScan
+        assert_eq!(classify_route(&select_stmt, &row).unwrap(), Route::OlapScan);
+        assert_eq!(classify_route(&select_stmt, &col).unwrap(), Route::OlapScan);
+        assert_eq!(
+            classify_route(&select_stmt, &conv).unwrap(),
+            Route::OlapScan
         );
     }
 }

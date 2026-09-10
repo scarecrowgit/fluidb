@@ -448,9 +448,10 @@ fn test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point() {
         other => panic!("expected query result, got {other:?}"),
     }
 
-    // Unsupported non-point statements remain rejected under Column
+    // Analytical queries against Column partition without manifest are rejected
     let err_scan = server.execute("SELECT val FROM c_table;").unwrap_err();
     assert!(matches!(err_scan, HtapError::InvalidArgument(_)));
+    assert!(err_scan.to_string().contains("has no column manifest"));
 
     let err_unsupported = server
         .execute("SELECT val FROM c_table WHERE id = 1 ORDER BY val;")
@@ -509,9 +510,26 @@ fn test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point() {
         other => panic!("expected query result, got {other:?}"),
     }
 
-    // Unsupported non-point statements remain rejected under Converting
-    let err_scan2 = server.execute("SELECT val FROM c_table;").unwrap_err();
-    assert!(matches!(err_scan2, HtapError::InvalidArgument(_)));
+    // Converting partition in SnapshotPinned phase without manifest uses rowstore fallback
+    let scan2 = server.execute("SELECT val FROM c_table;").unwrap();
+    match scan2 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 0);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    server
+        .execute("INSERT INTO c_table (id, val) VALUES (3, 'c');")
+        .unwrap();
+    let scan3 = server.execute("SELECT val FROM c_table;").unwrap();
+    match scan3 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("c".into())));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
 
     let err_unsupported2 = server
         .execute("SELECT val FROM c_table WHERE id = 2 ORDER BY val;")
@@ -1096,5 +1114,487 @@ fn test_create_table_overflow_typed_errors() {
                 counter: "replica_id"
             }
         ));
+    }
+}
+
+#[test]
+fn test_analytic_row_scan_and_filters() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, age INT, bio VARCHAR, score DOUBLE);")
+        .unwrap();
+
+    server
+        .execute("INSERT INTO users (id, name, age, bio, score) VALUES (1, 'Alice', 30, 'engineer', 95.5);")
+        .unwrap();
+    server
+        .execute("INSERT INTO users (id, name, age, bio, score) VALUES (2, 'Bob', 25, NULL, 80.0);")
+        .unwrap();
+    server
+        .execute("INSERT INTO users (id, name, age, bio, score) VALUES (3, 'Charlie', 35, 'designer', 88.0);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO users (id, name, age, bio, score) VALUES (4, 'Dave', 40, NULL, 72.5);",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO users (id, name, age, bio, score) VALUES (5, 'Eve', 25, 'lead', 99.0);",
+        )
+        .unwrap();
+
+    // 1. Point route remains completely untouched and independent
+    let point_res = server
+        .execute("SELECT name FROM users WHERE id = 1;")
+        .unwrap();
+    match point_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Alice".into())));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 2. Full table scan with specific projection
+    let scan_res = server.execute("SELECT id, name, age FROM users;").unwrap();
+    match scan_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 5);
+            assert_eq!(qr.columns().len(), 3);
+            assert_eq!(qr.columns()[0].name, "id");
+            assert_eq!(qr.columns()[1].name, "name");
+            assert_eq!(qr.columns()[2].name, "age");
+            // Deterministic PK order: 1, 2, 3, 4, 5
+            for i in 0..5 {
+                assert_eq!(qr.rows()[i].get(0), Some(&Value::Int64((i + 1) as i64)));
+            }
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 3. Full table scan with wildcard SELECT *
+    let wildcard_res = server.execute("SELECT * FROM users;").unwrap();
+    match wildcard_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 5);
+            assert_eq!(qr.columns().len(), 5);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 4. Conjunction of comparison filters: age >= 25 AND age <= 35 AND id != 2
+    // Matching rows: (1, Alice, 30), (3, Charlie, 35), (5, Eve, 25)
+    let filter_res = server
+        .execute("SELECT name, age FROM users WHERE age >= 25 AND age <= 35 AND id != 2;")
+        .unwrap();
+    match filter_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Alice".into())));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::String("Charlie".into())));
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::String("Eve".into())));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 5. Filter with IS NULL: bio IS NULL
+    // Matching rows: (2, Bob), (4, Dave)
+    let null_res = server
+        .execute("SELECT id, name FROM users WHERE bio IS NULL;")
+        .unwrap();
+    match null_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 2);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(2)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(4)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 6. Filter with IS NOT NULL: bio IS NOT NULL
+    // Matching rows: (1, Alice), (3, Charlie), (5, Eve)
+    let not_null_res = server
+        .execute("SELECT id, name FROM users WHERE bio IS NOT NULL;")
+        .unwrap();
+    match not_null_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(1)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(3)));
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::Int64(5)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 7. Filter resulting in 0 matching rows returns empty QueryResult with valid schema
+    let empty_res = server
+        .execute("SELECT id, name FROM users WHERE age > 100;")
+        .unwrap();
+    match empty_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 0);
+            assert_eq!(qr.columns().len(), 2);
+            assert_eq!(qr.columns()[0].name, "id");
+            assert_eq!(qr.columns()[1].name, "name");
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_analytic_aggregates_nulls_and_empty() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, age INT, bio VARCHAR, score DOUBLE);")
+        .unwrap();
+
+    // 1. Global aggregation on EMPTY table:
+    // COUNT(*) -> 0, COUNT(col) -> 0, SUM -> NULL, MIN -> NULL, MAX -> NULL
+    // Returns exactly one row.
+    let empty_agg = server
+        .execute("SELECT COUNT(*), COUNT(age), SUM(age), MIN(age), MAX(age) FROM users;")
+        .unwrap();
+    match empty_agg {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0), Some(&Value::Int64(0)));
+            assert_eq!(row.get(1), Some(&Value::Int64(0)));
+            assert_eq!(row.get(2), Some(&Value::Null));
+            assert_eq!(row.get(3), Some(&Value::Null));
+            assert_eq!(row.get(4), Some(&Value::Null));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Insert rows with mixed NULLs
+    server
+        .execute("INSERT INTO users (id, age, bio, score) VALUES (1, 30, 'eng', 10.5);")
+        .unwrap();
+    server
+        .execute("INSERT INTO users (id, age, bio, score) VALUES (2, NULL, NULL, 20.5);")
+        .unwrap();
+    server
+        .execute("INSERT INTO users (id, age, bio, score) VALUES (3, 20, NULL, 30.0);")
+        .unwrap();
+
+    // 2. Aggregates with null handling
+    let agg_res = server
+        .execute(
+            "SELECT COUNT(*), COUNT(age), SUM(age), MIN(age), MAX(age), SUM(score) FROM users;",
+        )
+        .unwrap();
+    match agg_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0), Some(&Value::Int64(3))); // COUNT(*)
+            assert_eq!(row.get(1), Some(&Value::Int64(2))); // COUNT(age) skips row 2
+            assert_eq!(row.get(2), Some(&Value::Int64(50))); // SUM(age) = 30 + 20
+            assert_eq!(row.get(3), Some(&Value::Int32(20))); // MIN(age) = 20
+            assert_eq!(row.get(4), Some(&Value::Int32(30))); // MAX(age) = 30
+            assert_eq!(row.get(5), Some(&Value::Float64(61.0))); // SUM(score) = 10.5 + 20.5 + 30.0
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 3. All-NULL column aggregation
+    let all_null_agg = server
+        .execute("SELECT COUNT(bio), MIN(bio), MAX(bio) FROM users WHERE age IS NULL;")
+        .unwrap();
+    match all_null_agg {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0), Some(&Value::Int64(0)));
+            assert_eq!(row.get(1), Some(&Value::Null));
+            assert_eq!(row.get(2), Some(&Value::Null));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 4. Arithmetic overflow on SUM returns clear InvalidArgument error
+    server
+        .execute("CREATE TABLE overflow_test (id BIGINT PRIMARY KEY, val BIGINT);")
+        .unwrap();
+    server
+        .execute(&format!(
+            "INSERT INTO overflow_test (id, val) VALUES (1, {});",
+            i64::MAX
+        ))
+        .unwrap();
+    server
+        .execute("INSERT INTO overflow_test (id, val) VALUES (2, 1);")
+        .unwrap();
+
+    let err_overflow = server
+        .execute("SELECT SUM(val) FROM overflow_test;")
+        .unwrap_err();
+    assert!(
+        matches!(err_overflow, HtapError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err_overflow:?}"
+    );
+    assert!(err_overflow.to_string().contains("overflow"));
+}
+
+#[test]
+fn test_analytic_group_by_and_null_group() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute(
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, category VARCHAR, qty INT, price DOUBLE);",
+        )
+        .unwrap();
+
+    // 1. Empty table with GROUP BY returns ZERO rows
+    let empty_grouped = server
+        .execute("SELECT category, COUNT(*), SUM(qty) FROM items GROUP BY category;")
+        .unwrap();
+    match empty_grouped {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 0);
+            assert_eq!(qr.columns().len(), 3);
+            assert_eq!(qr.columns()[0].name, "category");
+            assert_eq!(qr.columns()[1].name, "COUNT(*)");
+            assert_eq!(qr.columns()[2].name, "SUM(qty)");
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Insert rows with multiple groups, including NULL category
+    server
+        .execute("INSERT INTO items (id, category, qty, price) VALUES (1, 'book', 2, 15.0);")
+        .unwrap();
+    server
+        .execute("INSERT INTO items (id, category, qty, price) VALUES (2, 'book', 3, 20.0);")
+        .unwrap();
+    server
+        .execute("INSERT INTO items (id, category, qty, price) VALUES (3, 'food', 5, 5.0);")
+        .unwrap();
+    server
+        .execute("INSERT INTO items (id, category, qty, price) VALUES (4, NULL, 1, 10.0);")
+        .unwrap();
+    server
+        .execute("INSERT INTO items (id, category, qty, price) VALUES (5, NULL, 4, 12.0);")
+        .unwrap();
+
+    // 2. Grouped aggregation with deterministic BTreeMap ordering and SQL NULL group
+    // In Value order: NULL comes before non-null strings ('book', 'food').
+    let grouped_res = server
+        .execute("SELECT category, COUNT(*), COUNT(category), SUM(qty), MIN(price), MAX(price) FROM items GROUP BY category;")
+        .unwrap();
+    match grouped_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+
+            // Group 1: NULL category
+            let r0 = &qr.rows()[0];
+            assert_eq!(r0.get(0), Some(&Value::Null));
+            assert_eq!(r0.get(1), Some(&Value::Int64(2))); // COUNT(*) = 2
+            assert_eq!(r0.get(2), Some(&Value::Int64(0))); // COUNT(category) = 0
+            assert_eq!(r0.get(3), Some(&Value::Int64(5))); // SUM(qty) = 1 + 4 = 5
+            assert_eq!(r0.get(4), Some(&Value::Float64(10.0))); // MIN(price)
+            assert_eq!(r0.get(5), Some(&Value::Float64(12.0))); // MAX(price)
+
+            // Group 2: 'book'
+            let r1 = &qr.rows()[1];
+            assert_eq!(r1.get(0), Some(&Value::String("book".into())));
+            assert_eq!(r1.get(1), Some(&Value::Int64(2)));
+            assert_eq!(r1.get(2), Some(&Value::Int64(2)));
+            assert_eq!(r1.get(3), Some(&Value::Int64(5))); // 2 + 3 = 5
+            assert_eq!(r1.get(4), Some(&Value::Float64(15.0)));
+            assert_eq!(r1.get(5), Some(&Value::Float64(20.0)));
+
+            // Group 3: 'food'
+            let r2 = &qr.rows()[2];
+            assert_eq!(r2.get(0), Some(&Value::String("food".into())));
+            assert_eq!(r2.get(1), Some(&Value::Int64(1)));
+            assert_eq!(r2.get(2), Some(&Value::Int64(1)));
+            assert_eq!(r2.get(3), Some(&Value::Int64(5)));
+            assert_eq!(r2.get(4), Some(&Value::Float64(5.0)));
+            assert_eq!(r2.get(5), Some(&Value::Float64(5.0)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 3. Filter with GROUP BY resulting in 0 matches returns 0 rows
+    let zero_group = server
+        .execute("SELECT category, COUNT(*) FROM items WHERE qty > 100 GROUP BY category;")
+        .unwrap();
+    match zero_group {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 0);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_analytic_unsupported_clauses() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, age INT);")
+        .unwrap();
+
+    // ORDER BY is unsupported
+    let err_order = server
+        .execute("SELECT * FROM users ORDER BY age;")
+        .unwrap_err();
+    assert!(matches!(err_order, HtapError::Unsupported(_)));
+
+    // LIMIT is unsupported
+    let err_limit = server.execute("SELECT * FROM users LIMIT 10;").unwrap_err();
+    assert!(matches!(err_limit, HtapError::Unsupported(_)));
+
+    // JOIN is unsupported
+    let err_join = server
+        .execute("SELECT * FROM users u1 JOIN users u2 ON u1.id = u2.id;")
+        .unwrap_err();
+    assert!(
+        matches!(err_join, HtapError::Unsupported(_))
+            || matches!(err_join, HtapError::InvalidArgument(_))
+    );
+
+    // AVG is unsupported
+    let err_avg = server.execute("SELECT AVG(age) FROM users;").unwrap_err();
+    assert!(matches!(err_avg, HtapError::Unsupported(_)));
+
+    // Arithmetic expressions in projection unsupported
+    let err_expr = server.execute("SELECT age + 1 FROM users;").unwrap_err();
+    assert!(matches!(err_expr, HtapError::Unsupported(_)));
+}
+
+#[test]
+fn test_analytic_materialized_column_base_plus_delta() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, val VARCHAR, num INT);")
+        .unwrap();
+
+    // Commit 3 initial rows in Row storage
+    server
+        .execute("INSERT INTO t (id, val, num) VALUES (1, 'v1', 10);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, val, num) VALUES (2, 'v2', 20);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, val, num) VALUES (3, 'v3', 30);")
+        .unwrap();
+
+    // Convert table to columnar format using server's colstore directory
+    let manifest = server.convert_table("t").unwrap();
+    assert_eq!(manifest.total_rows(), 3);
+    assert_eq!(manifest.segment_count(), 1);
+
+    // Verify analytical query reads base columnar rows
+    let scan1 = server.execute("SELECT * FROM t;").unwrap();
+    match scan1 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(1)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(2)));
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::Int64(3)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let agg1 = server.execute("SELECT COUNT(*), SUM(num) FROM t;").unwrap();
+    match agg1 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(3)));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int64(60)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Now apply post-base deltas in rowstore:
+    // 1. Delete key 1
+    // 2. Update key 2
+    // 3. Insert key 4
+    server.execute("DELETE FROM t WHERE id = 1;").unwrap();
+    server
+        .execute("INSERT INTO t (id, val, num) VALUES (2, 'v2_updated', 25);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, val, num) VALUES (4, 'v4', 40);")
+        .unwrap();
+
+    // Verify point read route remains untouched and authoritative
+    let point_del = server.execute("SELECT val FROM t WHERE id = 1;").unwrap();
+    match point_del {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+    let point_upd = server.execute("SELECT val FROM t WHERE id = 2;").unwrap();
+    match point_upd {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(
+                qr.rows()[0].get(0),
+                Some(&Value::String("v2_updated".into()))
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Verify analytical scan overlays base columnar rows with rowstore deltas:
+    // Keys remaining: 2 (updated), 3 (base), 4 (new)
+    // Deterministic PK order: 2, 3, 4
+    let scan2 = server.execute("SELECT id, val, num FROM t;").unwrap();
+    match scan2 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(2)));
+            assert_eq!(
+                qr.rows()[0].get(1),
+                Some(&Value::String("v2_updated".into()))
+            );
+            assert_eq!(qr.rows()[0].get(2), Some(&Value::Int32(25)));
+
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(3)));
+            assert_eq!(qr.rows()[1].get(1), Some(&Value::String("v3".into())));
+            assert_eq!(qr.rows()[1].get(2), Some(&Value::Int32(30)));
+
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::Int64(4)));
+            assert_eq!(qr.rows()[2].get(1), Some(&Value::String("v4".into())));
+            assert_eq!(qr.rows()[2].get(2), Some(&Value::Int32(40)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Verify aggregation over base + deltas
+    let agg2 = server
+        .execute("SELECT COUNT(*), SUM(num), MIN(num), MAX(num) FROM t;")
+        .unwrap();
+    match agg2 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(3))); // 3 rows
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int64(95))); // 25 + 30 + 40 = 95
+            assert_eq!(qr.rows()[0].get(2), Some(&Value::Int32(25)));
+            assert_eq!(qr.rows()[0].get(3), Some(&Value::Int32(40)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Verify filter over base + deltas
+    let filter2 = server
+        .execute("SELECT val FROM t WHERE num >= 30;")
+        .unwrap();
+    match filter2 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 2);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("v3".into())));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::String("v4".into())));
+        }
+        other => panic!("expected Query, got {other:?}"),
     }
 }

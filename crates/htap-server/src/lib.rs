@@ -7,7 +7,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::path::PathBuf;
+pub mod olap;
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use htap_catalog::local::LocalCatalogStore;
@@ -24,7 +26,9 @@ use htap_movement::{
     CopyOptions, CopyReport, LocalDataMover, MovementJob, TabletCloneOptions, TabletPackageManifest,
 };
 use htap_rowstore::{Engine, EngineOptions, Snapshot};
-use htap_sql::ast::{BoundStatement, CreateTable, DeleteByPrimaryKey, Insert, PointSelect};
+use htap_sql::ast::{
+    AnalyticSelect, BoundStatement, CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
+};
 use htap_sql::result::StatementResult;
 use htap_sql::route::{classify_route, Route};
 use htap_txn::{
@@ -38,11 +42,12 @@ use parking_lot::Mutex;
 /// LSM-based rowstore persistence, and data movement within a single local directory.
 pub struct LocalServer {
     _lock: ProcessLock,
-    catalog: LocalCatalogStore,
+    catalog: Arc<LocalCatalogStore>,
     engine: Arc<Engine>,
     txn_manager: TransactionManager,
     data_mover: LocalDataMover,
     execution_lock: Mutex<()>,
+    colstore_dir: PathBuf,
 }
 
 impl LocalServer {
@@ -57,6 +62,7 @@ impl LocalServer {
     /// - `root/rowstore` - Directory for rowstore LSM data (WAL, SSTs, manifest).
     /// - `root/txn.journal` - Journal file for 2PC transaction coordination.
     /// - `root/movement` - Directory for data movement jobs and tablet packages.
+    /// - `root/colstore` - Directory for columnar storage segments and tablet manifests.
     ///
     /// Recovery registers a stable [`RowstoreParticipant`] with ID 1 and
     /// replays committed transactions from the transaction journal.
@@ -73,7 +79,7 @@ impl LocalServer {
         let lock_guard = ProcessLock::acquire(&canonical_root)?;
 
         let catalog_dir = canonical_root.join("catalog");
-        let catalog = LocalCatalogStore::open(catalog_dir)?;
+        let catalog = Arc::new(LocalCatalogStore::open(catalog_dir)?);
 
         let rowstore_dir = canonical_root.join("rowstore");
         let engine = Arc::new(Engine::open(EngineOptions::new(rowstore_dir))?);
@@ -92,6 +98,9 @@ impl LocalServer {
         let movement_dir = canonical_root.join("movement");
         let data_mover = LocalDataMover::new(movement_dir)?;
 
+        let colstore_dir = canonical_root.join("colstore");
+        std::fs::create_dir_all(&colstore_dir)?;
+
         Ok(Self {
             _lock: lock_guard,
             catalog,
@@ -99,6 +108,7 @@ impl LocalServer {
             txn_manager,
             data_mover,
             execution_lock: Mutex::new(()),
+            colstore_dir,
         })
     }
 
@@ -160,6 +170,15 @@ impl LocalServer {
                     _ => unreachable!(),
                 };
                 self.execute_select(select, table_desc, partition.id, key)
+            }
+            BoundStatement::AnalyticSelect(select) => {
+                let (table_desc, partition) =
+                    self.resolve_single_partition_table(&select.table, &catalog)?;
+                let _route = classify_route(
+                    &BoundStatement::AnalyticSelect(select.clone()),
+                    &partition.storage,
+                )?;
+                self.execute_analytic_select(select, table_desc, partition, &catalog)
             }
         }
     }
@@ -471,6 +490,110 @@ impl LocalServer {
         };
 
         Ok(StatementResult::query(projected_columns, rows))
+    }
+
+    fn execute_analytic_select(
+        &self,
+        select: AnalyticSelect,
+        _table_desc: &TableDescriptor,
+        partition: &PartitionDescriptor,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        let snapshot = Snapshot::new(self.txn_manager.visible_version());
+        let tablet_id = partition.tablets[0];
+        let tablet = catalog
+            .tablet(tablet_id)
+            .ok_or_else(|| HtapError::Internal(format!("tablet {tablet_id} not found")))?;
+
+        let rows = match &partition.storage {
+            StorageDescriptor::Row => {
+                let entries = self
+                    .engine
+                    .scan_partition(partition.id.as_u64(), snapshot)?;
+                htap_convert::collapse_entries_to_rows(&entries)
+            }
+            StorageDescriptor::Column => {
+                let cat_manifest = tablet.column_manifest.as_ref().ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "partition {} has Column storage but tablet {tablet_id} has no column manifest in catalog",
+                        partition.id
+                    ))
+                })?;
+                let disk_manifest = htap_convert::open(&self.colstore_dir, tablet_id)?;
+                if disk_manifest.generation != cat_manifest.generation {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "column manifest generation mismatch for tablet {tablet_id}: disk {} != catalog {}",
+                        disk_manifest.generation, cat_manifest.generation
+                    )));
+                }
+                htap_convert::read_column_partition_core(
+                    catalog,
+                    &self.engine,
+                    &self.colstore_dir,
+                    partition.id,
+                    snapshot,
+                )?
+            }
+            StorageDescriptor::Converting { .. } => match &tablet.column_manifest {
+                Some(cat_manifest) => {
+                    let disk_manifest = htap_convert::open(&self.colstore_dir, tablet_id)?;
+                    if disk_manifest.generation != cat_manifest.generation {
+                        return Err(HtapError::InvalidArgument(format!(
+                                "column manifest generation mismatch for converting tablet {tablet_id}: disk {} != catalog {}",
+                                disk_manifest.generation, cat_manifest.generation
+                            )));
+                    }
+                    htap_convert::read_column_partition_core(
+                        catalog,
+                        &self.engine,
+                        &self.colstore_dir,
+                        partition.id,
+                        snapshot,
+                    )?
+                }
+                None => {
+                    let is_snapshot_pinned = partition
+                        .conversion
+                        .as_ref()
+                        .map(|c| c.phase == htap_catalog::ConversionPhase::SnapshotPinned)
+                        .unwrap_or(false);
+                    if is_snapshot_pinned {
+                        let entries = self
+                            .engine
+                            .scan_partition(partition.id.as_u64(), snapshot)?;
+                        htap_convert::collapse_entries_to_rows(&entries)
+                    } else {
+                        return Err(HtapError::InvalidArgument(format!(
+                                "partition {} is converting without manifest but phase is not SnapshotPinned",
+                                partition.id
+                            )));
+                    }
+                }
+            },
+        };
+
+        let result = olap::execute_analytic_select(&select, rows)?;
+        Ok(StatementResult::Query(result))
+    }
+
+    /// Returns the columnar storage root directory for this local server.
+    pub fn colstore_dir(&self) -> &Path {
+        &self.colstore_dir
+    }
+
+    /// Converts a single-partition table from row to column format using the server's colstore directory.
+    pub fn convert_table(&self, table_name: &str) -> Result<htap_convert::TabletColumnManifest> {
+        let _guard = self.execution_lock.lock();
+        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+        let (_, partition) = self.resolve_single_partition_table(table_name, &catalog)?;
+        let partition_id = partition.id;
+        let converter = htap_convert::LocalConverter::new(
+            Arc::clone(&self.catalog) as Arc<dyn CatalogStore>,
+            Arc::clone(&self.engine),
+            &self.colstore_dir,
+            htap_convert::SegmentOptions::default(),
+        );
+        converter.convert_partition(partition_id)
     }
 }
 

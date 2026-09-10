@@ -1173,28 +1173,27 @@ fn test_negative_select_and_delete() {
         "SELECT nonexistent FROM users WHERE id = 1",
         // Unknown column in WHERE
         "SELECT * FROM users WHERE nonexistent = 1",
-        // Predicate on non-PK column
-        "SELECT * FROM users WHERE name = 'alice'",
-        // Non-PK column combined with PK in WHERE
-        "SELECT * FROM users WHERE id = 1 AND name = 'alice'",
-        // Partial PK predicate on composite PK table
-        "SELECT * FROM orders WHERE tenant_id = 1",
         // Duplicate PK predicate
         "SELECT * FROM users WHERE id = 1 AND id = 2",
         // OR in WHERE predicate
         "SELECT * FROM users WHERE id = 1 OR id = 2",
-        // Non-equality operators
-        "SELECT * FROM users WHERE id > 1",
-        "SELECT * FROM users WHERE id != 1",
-        "SELECT * FROM users WHERE id IS NULL",
         // NULL literal in WHERE
         "SELECT * FROM users WHERE id = NULL",
         // Reversed operands (value = col)
         "SELECT * FROM users WHERE 1 = id",
         "DELETE FROM users WHERE 1 = id",
-        // Missing WHERE clause
-        "SELECT * FROM users",
+        // Missing WHERE clause in DELETE
         "DELETE FROM users",
+        // Predicate on non-PK column in DELETE
+        "DELETE FROM users WHERE name = 'alice'",
+        // Non-PK column combined with PK in WHERE in DELETE
+        "DELETE FROM users WHERE id = 1 AND name = 'alice'",
+        // Partial PK predicate on composite PK table in DELETE
+        "DELETE FROM orders WHERE tenant_id = 1",
+        // Non-equality operators in DELETE
+        "DELETE FROM users WHERE id > 1",
+        "DELETE FROM users WHERE id != 1",
+        "DELETE FROM users WHERE id IS NULL",
         // Expression in WHERE value
         "SELECT * FROM users WHERE id = 1 + 1",
         // Placeholder in WHERE value
@@ -1236,8 +1235,8 @@ fn test_negative_select_and_delete() {
         // LIMIT
         "SELECT * FROM users WHERE id = 1 LIMIT 1",
         "DELETE FROM users WHERE id = 1 LIMIT 1",
-        // GROUP BY / HAVING / DISTINCT
-        "SELECT * FROM users WHERE id = 1 GROUP BY id",
+        // GROUP BY ALL / HAVING / DISTINCT
+        "SELECT * FROM users GROUP BY ALL",
         "SELECT * FROM users WHERE id = 1 HAVING id = 1",
         "SELECT DISTINCT id FROM users WHERE id = 1",
         // CTEs / Set ops
@@ -1247,6 +1246,389 @@ fn test_negative_select_and_delete() {
         "UPDATE users SET name = 'bob' WHERE id = 1",
         "DROP TABLE users",
         "ALTER TABLE users ADD COLUMN foo INT",
+    ];
+
+    for case in unsupported_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::Unsupported(_))),
+            "expected Unsupported for {case:?}, got {res:?}"
+        );
+    }
+}
+
+#[test]
+fn test_bind_analytic_select_valid() {
+    use htap_sql::{AggregateFunction, AnalyticExpr, AnalyticFilter, ComparisonOp};
+
+    let catalog = make_test_catalog();
+
+    // 1. Full table scan with SELECT *
+    let sql = "SELECT * FROM users";
+    let bound = parse_and_bind(sql, &catalog).expect("valid full table scan");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.table, "users");
+            assert_eq!(select.projection.len(), 4);
+            assert!(select.filter.is_none());
+            assert!(select.group_by.is_empty());
+            assert_eq!(select.output_schema.len(), 4);
+            assert_eq!(select.output_schema.column(0).unwrap().name, "id");
+            assert_eq!(
+                select.output_schema.column(0).unwrap().data_type,
+                CommonDataType::Int32
+            );
+            assert!(!select.output_schema.column(0).unwrap().nullable);
+            assert_eq!(select.output_schema.column(2).unwrap().name, "age");
+            assert!(select.output_schema.column(2).unwrap().nullable);
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 2. Specific column projection with exact metadata
+    let sql = "SELECT bio, name, age FROM users";
+    let bound = parse_and_bind(sql, &catalog).expect("valid specific column projection");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.table, "users");
+            assert_eq!(select.projection.len(), 3);
+            assert_eq!(
+                select.projection,
+                vec![
+                    AnalyticExpr::Column {
+                        index: 3,
+                        name: "bio".into(),
+                        data_type: CommonDataType::String,
+                        nullable: true,
+                    },
+                    AnalyticExpr::Column {
+                        index: 1,
+                        name: "name".into(),
+                        data_type: CommonDataType::String,
+                        nullable: false,
+                    },
+                    AnalyticExpr::Column {
+                        index: 2,
+                        name: "age".into(),
+                        data_type: CommonDataType::Int32,
+                        nullable: true,
+                    },
+                ]
+            );
+            assert_eq!(
+                select
+                    .output_schema
+                    .columns()
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.data_type, c.nullable))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("bio", CommonDataType::String, true),
+                    ("name", CommonDataType::String, false),
+                    ("age", CommonDataType::Int32, true),
+                ]
+            );
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 3. Filter tree with Eq, NotEq, Lt, Lte, Gt, Gte
+    let sql = "SELECT id FROM users WHERE age >= 18 AND age <= 65 AND id != 99 AND name = 'alice' AND age > 20 AND id < 100";
+    let bound = parse_and_bind(sql, &catalog).expect("valid range and comparison filter");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            let filter = select.filter.expect("filter should be present");
+            let leaves = filter.leaves();
+            assert_eq!(leaves.len(), 6);
+            assert_eq!(
+                leaves[0],
+                &AnalyticFilter::Comparison {
+                    column: 2,
+                    op: ComparisonOp::Gte,
+                    value: CommonValue::Int32(18),
+                }
+            );
+            assert_eq!(
+                leaves[1],
+                &AnalyticFilter::Comparison {
+                    column: 2,
+                    op: ComparisonOp::Lte,
+                    value: CommonValue::Int32(65),
+                }
+            );
+            assert_eq!(
+                leaves[2],
+                &AnalyticFilter::Comparison {
+                    column: 0,
+                    op: ComparisonOp::NotEq,
+                    value: CommonValue::Int32(99),
+                }
+            );
+            assert_eq!(
+                leaves[3],
+                &AnalyticFilter::Comparison {
+                    column: 1,
+                    op: ComparisonOp::Eq,
+                    value: CommonValue::String("alice".into()),
+                }
+            );
+            assert_eq!(
+                leaves[4],
+                &AnalyticFilter::Comparison {
+                    column: 2,
+                    op: ComparisonOp::Gt,
+                    value: CommonValue::Int32(20),
+                }
+            );
+            assert_eq!(
+                leaves[5],
+                &AnalyticFilter::Comparison {
+                    column: 0,
+                    op: ComparisonOp::Lt,
+                    value: CommonValue::Int32(100),
+                }
+            );
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 4. Filter with IsNull and IsNotNull
+    let sql = "SELECT * FROM users WHERE bio IS NULL AND age IS NOT NULL";
+    let bound = parse_and_bind(sql, &catalog).expect("valid IS NULL / IS NOT NULL filter");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            let filter = select.filter.expect("filter present");
+            let leaves = filter.leaves();
+            assert_eq!(leaves.len(), 2);
+            assert_eq!(leaves[0], &AnalyticFilter::IsNull { column: 3 });
+            assert_eq!(leaves[1], &AnalyticFilter::IsNotNull { column: 2 });
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 5. Approved aggregates without GROUP BY (scalar aggregation)
+    let sql = "SELECT COUNT(*), COUNT(bio), SUM(age), MIN(age), MAX(age) FROM users";
+    let bound = parse_and_bind(sql, &catalog).expect("valid scalar aggregates");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.projection.len(), 5);
+            assert_eq!(
+                select.projection[0],
+                AnalyticExpr::Aggregate {
+                    function: AggregateFunction::CountStar,
+                    column_index: None,
+                    name: "COUNT(*)".into(),
+                    data_type: CommonDataType::Int64,
+                    nullable: false,
+                }
+            );
+            assert_eq!(
+                select.projection[1],
+                AnalyticExpr::Aggregate {
+                    function: AggregateFunction::Count,
+                    column_index: Some(3),
+                    name: "COUNT(bio)".into(),
+                    data_type: CommonDataType::Int64,
+                    nullable: false,
+                }
+            );
+            assert_eq!(
+                select.projection[2],
+                AnalyticExpr::Aggregate {
+                    function: AggregateFunction::Sum,
+                    column_index: Some(2),
+                    name: "SUM(age)".into(),
+                    data_type: CommonDataType::Int64,
+                    nullable: true,
+                }
+            );
+            assert_eq!(
+                select.projection[3],
+                AnalyticExpr::Aggregate {
+                    function: AggregateFunction::Min,
+                    column_index: Some(2),
+                    name: "MIN(age)".into(),
+                    data_type: CommonDataType::Int32,
+                    nullable: true,
+                }
+            );
+            assert_eq!(
+                select.projection[4],
+                AnalyticExpr::Aggregate {
+                    function: AggregateFunction::Max,
+                    column_index: Some(2),
+                    name: "MAX(age)".into(),
+                    data_type: CommonDataType::Int32,
+                    nullable: true,
+                }
+            );
+            assert_eq!(
+                select
+                    .output_schema
+                    .columns()
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.data_type, c.nullable))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("COUNT(*)", CommonDataType::Int64, false),
+                    ("COUNT(bio)", CommonDataType::Int64, false),
+                    ("SUM(age)", CommonDataType::Int64, true),
+                    ("MIN(age)", CommonDataType::Int32, true),
+                    ("MAX(age)", CommonDataType::Int32, true),
+                ]
+            );
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 6. SUM on Float64 column
+    let sql = "SELECT SUM(amount) FROM orders";
+    let bound = parse_and_bind(sql, &catalog).expect("valid Float64 SUM");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(
+                select.projection[0],
+                AnalyticExpr::Aggregate {
+                    function: AggregateFunction::Sum,
+                    column_index: Some(2),
+                    name: "SUM(amount)".into(),
+                    data_type: CommonDataType::Float64,
+                    nullable: true,
+                }
+            );
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 7. Aggregates with GROUP BY
+    let sql = "SELECT tenant_id, COUNT(*), SUM(amount) FROM orders GROUP BY tenant_id";
+    let bound = parse_and_bind(sql, &catalog).expect("valid GROUP BY aggregation");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.group_by, vec![0]);
+            assert_eq!(select.projection.len(), 3);
+            assert_eq!(
+                select.output_schema.columns()[0],
+                CommonColumnDef {
+                    name: "tenant_id".into(),
+                    data_type: CommonDataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                }
+            );
+            assert_eq!(
+                select.output_schema.columns()[1],
+                CommonColumnDef {
+                    name: "COUNT(*)".into(),
+                    data_type: CommonDataType::Int64,
+                    nullable: false,
+                    primary_key: false,
+                }
+            );
+            assert_eq!(
+                select.output_schema.columns()[2],
+                CommonColumnDef {
+                    name: "SUM(amount)".into(),
+                    data_type: CommonDataType::Float64,
+                    nullable: true,
+                    primary_key: false,
+                }
+            );
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 8. Multi-column GROUP BY
+    let sql = "SELECT tenant_id, order_id, COUNT(*) FROM orders GROUP BY order_id, tenant_id";
+    let bound = parse_and_bind(sql, &catalog).expect("valid multi-column GROUP BY");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.group_by, vec![1, 0]);
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 9. GROUP BY without projecting grouping column
+    let sql = "SELECT COUNT(*) FROM orders GROUP BY tenant_id";
+    let bound = parse_and_bind(sql, &catalog).expect("valid GROUP BY without projecting group col");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.group_by, vec![0]);
+            assert_eq!(select.projection.len(), 1);
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 10. Complete PK filter with aggregate binds as AnalyticSelect (not PointSelect)
+    let sql = "SELECT COUNT(*) FROM users WHERE id = 1";
+    let bound = parse_and_bind(sql, &catalog).expect("valid aggregate with PK filter");
+    assert!(matches!(bound, BoundStatement::AnalyticSelect(_)));
+
+    // 11. Partial PK filter binds as AnalyticSelect
+    let sql = "SELECT amount FROM orders WHERE tenant_id = 42";
+    let bound = parse_and_bind(sql, &catalog).expect("valid partial PK query");
+    assert!(matches!(bound, BoundStatement::AnalyticSelect(_)));
+
+    // 12. Non-PK filter with complete PK still binds as AnalyticSelect
+    let sql = "SELECT * FROM users WHERE id = 1 AND name = 'alice'";
+    let bound = parse_and_bind(sql, &catalog).expect("valid PK + non-PK filter query");
+    assert!(matches!(bound, BoundStatement::AnalyticSelect(_)));
+}
+
+#[test]
+fn test_bind_analytic_select_negative() {
+    let catalog = make_test_catalog();
+
+    let invalid_cases = [
+        // Non-aggregate projected column not in GROUP BY (when aggregate present)
+        "SELECT id, name, COUNT(*) FROM users GROUP BY id",
+        // Non-aggregate projected column without GROUP BY when aggregate present
+        "SELECT id, COUNT(*) FROM users",
+        // Non-aggregate projected column not in GROUP BY (without aggregates)
+        "SELECT id, name FROM users GROUP BY id",
+        // Unknown column in GROUP BY
+        "SELECT COUNT(*) FROM users GROUP BY nonexistent",
+        // Duplicate column in GROUP BY
+        "SELECT COUNT(*) FROM users GROUP BY id, id",
+        // Expression in GROUP BY
+        "SELECT COUNT(*) FROM users GROUP BY id + 1",
+        // Duplicate output column names
+        "SELECT id, id FROM users",
+        // SUM on non-numeric column (String)
+        "SELECT SUM(name) FROM users",
+        // SUM on non-numeric column (Bytes)
+        "SELECT SUM(data) FROM bytes_table",
+        // Aggregate with multiple arguments
+        "SELECT COUNT(id, name) FROM users",
+        // NOT operator in WHERE
+        "SELECT * FROM users WHERE NOT (id = 1)",
+        // Cross-column comparison in WHERE
+        "SELECT * FROM users WHERE id = age",
+        // Reversed operands in inequality
+        "SELECT * FROM users WHERE 10 < age",
+        // Reversed operands in equality
+        "SELECT * FROM users WHERE 'alice' = name",
+    ];
+
+    for case in invalid_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected InvalidArgument for {case:?}, got {res:?}"
+        );
+    }
+
+    let unsupported_cases = [
+        // AVG function
+        "SELECT AVG(age) FROM users",
+        "SELECT AVG(amount) FROM orders",
+        // DISTINCT in aggregate
+        "SELECT COUNT(DISTINCT id) FROM users",
+        "SELECT SUM(DISTINCT amount) FROM orders",
+        // Column alias
+        "SELECT id AS user_id FROM users",
+        // Aggregate alias
+        "SELECT COUNT(*) AS total FROM users",
     ];
 
     for case in unsupported_cases {

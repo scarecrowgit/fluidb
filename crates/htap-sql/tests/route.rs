@@ -92,21 +92,57 @@ fn test_route_classification() {
         );
     }
 
-    // 5. Non-point queries and unsupported operations remain rejected
+    // 5. Analytical SELECT queries route to Route::OlapScan across all storage descriptors
     let scan_sql = "SELECT amount FROM orders";
     let parsed_scan = parse_one(scan_sql).expect("parse scan");
-    let scan_err = bind(&parsed_scan, &catalog).expect_err("scan should fail binding");
-    assert!(
-        matches!(scan_err, HtapError::InvalidArgument(_)),
-        "expected InvalidArgument for full table scan without WHERE, got {scan_err:?}"
-    );
+    let bound_scan = bind(&parsed_scan, &catalog).expect("bind scan");
+    assert!(matches!(bound_scan, BoundStatement::AnalyticSelect(_)));
+    for storage in [&row_storage, &col_storage, &conv_storage] {
+        assert_eq!(
+            classify_route(&bound_scan, storage).expect("scan route"),
+            Route::OlapScan
+        );
+    }
 
     let partial_key_sql = "SELECT amount FROM orders WHERE tenant_id = 42";
     let parsed_partial = parse_one(partial_key_sql).expect("parse partial PK");
-    let partial_err = bind(&parsed_partial, &catalog).expect_err("partial PK query should fail");
+    let bound_partial = bind(&parsed_partial, &catalog).expect("bind partial PK");
+    assert!(matches!(bound_partial, BoundStatement::AnalyticSelect(_)));
+    for storage in [&row_storage, &col_storage, &conv_storage] {
+        assert_eq!(
+            classify_route(&bound_partial, storage).expect("partial PK route"),
+            Route::OlapScan
+        );
+    }
+
+    let aggregate_sql = "SELECT COUNT(*), SUM(amount) FROM orders";
+    let parsed_aggregate = parse_one(aggregate_sql).expect("parse aggregate");
+    let bound_aggregate = bind(&parsed_aggregate, &catalog).expect("bind aggregate");
+    assert!(matches!(bound_aggregate, BoundStatement::AnalyticSelect(_)));
+    for storage in [&row_storage, &col_storage, &conv_storage] {
+        assert_eq!(
+            classify_route(&bound_aggregate, storage).expect("aggregate route"),
+            Route::OlapScan
+        );
+    }
+
+    // 6. Non-point DELETE remains rejected
+    let full_delete_sql = "DELETE FROM orders";
+    let parsed_full_delete = parse_one(full_delete_sql).expect("parse full delete");
+    let full_delete_err =
+        bind(&parsed_full_delete, &catalog).expect_err("full delete should fail binding");
     assert!(
-        matches!(partial_err, HtapError::InvalidArgument(_)),
-        "expected InvalidArgument for partial PK, got {partial_err:?}"
+        matches!(full_delete_err, HtapError::InvalidArgument(_)),
+        "expected InvalidArgument for full delete without WHERE, got {full_delete_err:?}"
+    );
+
+    let partial_delete_sql = "DELETE FROM orders WHERE tenant_id = 42";
+    let parsed_partial_delete = parse_one(partial_delete_sql).expect("parse partial delete");
+    let partial_delete_err =
+        bind(&parsed_partial_delete, &catalog).expect_err("partial PK delete should fail");
+    assert!(
+        matches!(partial_delete_err, HtapError::InvalidArgument(_)),
+        "expected InvalidArgument for partial PK delete, got {partial_delete_err:?}"
     );
 
     let unsupported_sql =

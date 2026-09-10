@@ -1059,3 +1059,95 @@ fn test_convert_partition_generation_overflow_no_catalog_mutation() {
         StorageDescriptor::Row
     );
 }
+
+#[test]
+fn test_snapshot_aware_core_read() {
+    use htap_convert::read_column_partition_core;
+
+    let dir = tempdir().unwrap();
+    let (cat_store, engine, _table_id, part_id, tablet_id, _schema) = make_test_setup(dir.path());
+    let colstore_dir = dir.path().join("colstore");
+
+    // Commit 3 initial rows in Row format
+    commit_put(&engine, part_id.as_u64(), 10, Some("val_10"));
+    commit_put(&engine, part_id.as_u64(), 20, Some("val_20"));
+    commit_put(&engine, part_id.as_u64(), 30, Some("val_30"));
+
+    let snap_v1 = engine.snapshot();
+
+    // 1. Core read with Row partition
+    let cat_snap1 = cat_store.load().unwrap().unwrap();
+    let rows_row =
+        read_column_partition_core(&cat_snap1, &engine, &colstore_dir, part_id, snap_v1).unwrap();
+    assert_eq!(rows_row.len(), 3);
+    assert_eq!(rows_row[0].get(0), Some(&Value::Int64(10)));
+    assert_eq!(rows_row[1].get(0), Some(&Value::Int64(20)));
+    assert_eq!(rows_row[2].get(0), Some(&Value::Int64(30)));
+
+    // 2. Convert to Column
+    let converter = LocalConverter::new(
+        cat_store.clone(),
+        engine.clone(),
+        &colstore_dir,
+        SegmentOptions::new().with_rows_per_block(2),
+    );
+    let manifest = converter.convert_partition(part_id).unwrap();
+    assert_eq!(manifest.tablet_id, tablet_id);
+    let base_snap = engine.snapshot();
+
+    // 3. Commit mutations after base version:
+    // Update key 20, Delete key 10, Insert key 25
+    commit_put(&engine, part_id.as_u64(), 20, Some("val_20_updated"));
+    commit_delete(&engine, part_id.as_u64(), 10);
+    commit_put(&engine, part_id.as_u64(), 25, Some("val_25_new"));
+
+    let latest_snap = engine.snapshot();
+
+    let cat_snap2 = cat_store.load().unwrap().unwrap();
+    assert_eq!(
+        cat_snap2.partition(part_id).unwrap().storage,
+        StorageDescriptor::Column
+    );
+
+    // 4. Historical read before base version falls back to rowstore
+    let hist_rows =
+        read_column_partition_core(&cat_snap2, &engine, &colstore_dir, part_id, snap_v1).unwrap();
+    assert_eq!(hist_rows.len(), 3);
+    assert_eq!(hist_rows[0].get(0), Some(&Value::Int64(10)));
+    assert_eq!(hist_rows[1].get(0), Some(&Value::Int64(20)));
+    assert_eq!(
+        hist_rows[1].get(1),
+        Some(&Value::String("val_20".to_string()))
+    );
+    assert_eq!(hist_rows[2].get(0), Some(&Value::Int64(30)));
+
+    // 5. Read at base snapshot: columnar base rows (10, 20, 30)
+    let base_rows =
+        read_column_partition_core(&cat_snap2, &engine, &colstore_dir, part_id, base_snap).unwrap();
+    assert_eq!(base_rows.len(), 3);
+    assert_eq!(base_rows[0].get(0), Some(&Value::Int64(10)));
+    assert_eq!(base_rows[1].get(0), Some(&Value::Int64(20)));
+    assert_eq!(base_rows[2].get(0), Some(&Value::Int64(30)));
+
+    // 6. Read at latest snapshot: base segment + delta overlay (key 10 deleted, key 20 updated, key 25 added, key 30 intact)
+    // Deterministic PK order: 20, 25, 30
+    let latest_rows =
+        read_column_partition_core(&cat_snap2, &engine, &colstore_dir, part_id, latest_snap)
+            .unwrap();
+    assert_eq!(latest_rows.len(), 3);
+    assert_eq!(latest_rows[0].get(0), Some(&Value::Int64(20)));
+    assert_eq!(
+        latest_rows[0].get(1),
+        Some(&Value::String("val_20_updated".to_string()))
+    );
+    assert_eq!(latest_rows[1].get(0), Some(&Value::Int64(25)));
+    assert_eq!(
+        latest_rows[1].get(1),
+        Some(&Value::String("val_25_new".to_string()))
+    );
+    assert_eq!(latest_rows[2].get(0), Some(&Value::Int64(30)));
+    assert_eq!(
+        latest_rows[2].get(1),
+        Some(&Value::String("val_30".to_string()))
+    );
+}

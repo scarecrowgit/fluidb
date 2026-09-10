@@ -7,12 +7,16 @@ use htap_common::types::{
 };
 use sqlparser::ast::{
     BinaryOperator, ColumnOption, CreateTable as SqlCreateTable, CreateTableOptions,
-    Delete as SqlDelete, Expr, FromTable, GroupByExpr, IndexColumn, Insert as SqlInsert,
-    ObjectName, ObjectNamePart, OrderByExpr, PrimaryKeyConstraint, Query, SelectItem, SetExpr,
-    Statement, TableConstraint, TableFactor, TableObject, UnaryOperator,
+    Delete as SqlDelete, DuplicateTreatment, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, IndexColumn, Insert as SqlInsert, ObjectName, ObjectNamePart,
+    OrderByExpr, PrimaryKeyConstraint, Query, SelectItem, SetExpr, Statement, TableConstraint,
+    TableFactor, TableObject, UnaryOperator,
 };
 
-use crate::ast::{BoundStatement, CreateTable, DeleteByPrimaryKey, Insert, PointSelect};
+use crate::ast::{
+    AggregateFunction, AnalyticExpr, AnalyticFilter, AnalyticSelect, BoundStatement, ComparisonOp,
+    CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
+};
 
 /// Binds an AST [`Statement`] against the [`CatalogSnapshot`], performing strict semantic
 /// validation and type checking, and returning a [`BoundStatement`].
@@ -1186,13 +1190,6 @@ fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatemen
             "PREWHERE not supported in SELECT".into(),
         ));
     }
-    if matches!(select.group_by, GroupByExpr::Expressions(ref exprs, _) if !exprs.is_empty())
-        || matches!(select.group_by, GroupByExpr::All(_))
-    {
-        return Err(HtapError::Unsupported(
-            "GROUP BY not supported in SELECT".into(),
-        ));
-    }
     if select.having.is_some() {
         return Err(HtapError::Unsupported(
             "HAVING not supported in SELECT".into(),
@@ -1267,59 +1264,693 @@ fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatemen
         ));
     }
 
-    let projection = if select.projection.len() == 1
-        && matches!(select.projection[0], SelectItem::Wildcard(_))
-    {
-        (0..table_desc.schema.len()).collect()
-    } else {
-        let mut proj = Vec::with_capacity(select.projection.len());
-        for item in &select.projection {
-            match item {
-                SelectItem::Wildcard(_) => {
-                    return Err(HtapError::InvalidArgument(
-                        "wildcard '*' cannot be combined with specific columns".into(),
-                    ));
+    let has_group_by = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        GroupByExpr::All(_) => true,
+    };
+
+    let is_candidate = !has_group_by
+        && select.selection.is_some()
+        && is_simple_or_wildcard_projection(&select.projection)
+        && is_pk_equality_where(select.selection.as_ref().unwrap(), table_desc);
+
+    if is_candidate {
+        let projection = if select.projection.len() == 1
+            && matches!(select.projection[0], SelectItem::Wildcard(_))
+        {
+            (0..table_desc.schema.len()).collect()
+        } else {
+            let mut proj = Vec::with_capacity(select.projection.len());
+            for item in &select.projection {
+                match item {
+                    SelectItem::Wildcard(_) => {
+                        return Err(HtapError::InvalidArgument(
+                            "wildcard '*' cannot be combined with specific columns".into(),
+                        ));
+                    }
+                    SelectItem::QualifiedWildcard(..) => {
+                        return Err(HtapError::Unsupported(
+                            "qualified wildcard not supported in projection".into(),
+                        ));
+                    }
+                    SelectItem::ExprWithAlias { .. } | SelectItem::ExprWithAliases { .. } => {
+                        return Err(HtapError::Unsupported(
+                            "aliases not supported in projection".into(),
+                        ));
+                    }
+                    SelectItem::UnnamedExpr(expr) => match expr {
+                        Expr::Identifier(ident) => {
+                            let col_name = &ident.value;
+                            let col_idx =
+                                table_desc.schema.column_index(col_name).ok_or_else(|| {
+                                    HtapError::InvalidArgument(format!(
+                                        "unknown column '{col_name}' in table '{table_name}'"
+                                    ))
+                                })?;
+                            proj.push(col_idx);
+                        }
+                        Expr::CompoundIdentifier(_) => {
+                            return Err(HtapError::Unsupported(
+                                "qualified column names not supported in projection".into(),
+                            ));
+                        }
+                        _ => {
+                            return Err(HtapError::Unsupported(
+                                "expressions not supported in projection".into(),
+                            ));
+                        }
+                    },
                 }
-                SelectItem::QualifiedWildcard(..) => {
-                    return Err(HtapError::Unsupported(
-                        "qualified wildcard not supported in projection".into(),
-                    ));
+            }
+            proj
+        };
+
+        let key = bind_pk_where_predicate(table_desc, select.selection.as_ref())?;
+        return Ok(BoundStatement::Select(PointSelect::new(
+            table_name, projection, key,
+        )));
+    }
+
+    // Otherwise, bind as AnalyticSelect:
+    let projection = bind_analytic_projection(&select.projection, table_desc, &table_name)?;
+    let group_by = bind_analytic_group_by(&select.group_by, table_desc)?;
+
+    // Validate grouping rules
+    let has_aggregates = projection.iter().any(|e| e.is_aggregate());
+    if has_aggregates {
+        for expr in &projection {
+            if let AnalyticExpr::Column { index, name, .. } = expr {
+                if !group_by.contains(index) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "column '{name}' must appear in the GROUP BY clause or be used in an aggregate function"
+                    )));
                 }
-                SelectItem::ExprWithAlias { .. } | SelectItem::ExprWithAliases { .. } => {
-                    return Err(HtapError::Unsupported(
-                        "aliases not supported in projection".into(),
-                    ));
+            }
+        }
+    } else if !group_by.is_empty() {
+        for expr in &projection {
+            if let AnalyticExpr::Column { index, name, .. } = expr {
+                if !group_by.contains(index) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "column '{name}' must appear in the GROUP BY clause"
+                    )));
                 }
-                SelectItem::UnnamedExpr(expr) => match expr {
+            }
+        }
+    }
+
+    let filter = bind_analytic_filter(select.selection.as_ref(), table_desc)?;
+
+    let output_columns: Vec<CommonColumnDef> =
+        projection.iter().map(|e| e.to_column_def()).collect();
+    let output_schema = Schema::new(output_columns)?;
+
+    Ok(BoundStatement::AnalyticSelect(AnalyticSelect::new(
+        table_name,
+        projection,
+        filter,
+        group_by,
+        output_schema,
+    )))
+}
+
+fn is_simple_or_wildcard_projection(projection: &[SelectItem]) -> bool {
+    if projection.is_empty() {
+        return false;
+    }
+    if projection.len() == 1 && matches!(projection[0], SelectItem::Wildcard(_)) {
+        return true;
+    }
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(_)) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_pk_equality_where(expr: &Expr, table_desc: &TableDescriptor) -> bool {
+    let mut leaves = Vec::new();
+    if collect_and_leaves(expr, &mut leaves).is_err() {
+        return false;
+    }
+    if leaves.len() != table_desc.primary_key.len() {
+        return false;
+    }
+    let mut seen_pk = std::collections::HashSet::new();
+    for leaf in leaves {
+        let mut unnested = leaf;
+        while let Expr::Nested(inner) = unnested {
+            unnested = inner;
+        }
+        match unnested {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
+                let mut l = &**left;
+                while let Expr::Nested(inner) = l {
+                    l = inner;
+                }
+                let mut r = &**right;
+                while let Expr::Nested(inner) = r {
+                    r = inner;
+                }
+                if matches!(l, Expr::Value(_)) || matches!(r, Expr::Identifier(_)) {
+                    return false;
+                }
+                match l {
                     Expr::Identifier(ident) => {
-                        let col_name = &ident.value;
-                        let col_idx =
-                            table_desc.schema.column_index(col_name).ok_or_else(|| {
+                        if let Some(idx) = table_desc.schema.column_index(&ident.value) {
+                            if table_desc.primary_key.contains(&idx) && seen_pk.insert(idx) {
+                                continue;
+                            }
+                        }
+                        return false;
+                    }
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    seen_pk.len() == table_desc.primary_key.len()
+}
+
+fn bind_analytic_projection(
+    items: &[SelectItem],
+    table_desc: &TableDescriptor,
+    table_name: &str,
+) -> Result<Vec<AnalyticExpr>> {
+    if items.len() == 1 && matches!(items[0], SelectItem::Wildcard(_)) {
+        return Ok((0..table_desc.schema.len())
+            .map(|i| {
+                let col = table_desc.schema.column(i).unwrap();
+                AnalyticExpr::Column {
+                    index: i,
+                    name: col.name.clone(),
+                    data_type: col.data_type,
+                    nullable: col.nullable,
+                }
+            })
+            .collect());
+    }
+
+    let mut projection = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) => {
+                return Err(HtapError::InvalidArgument(
+                    "wildcard '*' cannot be combined with specific columns".into(),
+                ));
+            }
+            SelectItem::QualifiedWildcard(..) => {
+                return Err(HtapError::Unsupported(
+                    "qualified wildcard not supported in projection".into(),
+                ));
+            }
+            SelectItem::ExprWithAlias { .. } | SelectItem::ExprWithAliases { .. } => {
+                return Err(HtapError::Unsupported(
+                    "aliases not supported in projection".into(),
+                ));
+            }
+            SelectItem::UnnamedExpr(expr) => match expr {
+                Expr::Identifier(ident) => {
+                    let col_idx =
+                        table_desc
+                            .schema
+                            .column_index(&ident.value)
+                            .ok_or_else(|| {
                                 HtapError::InvalidArgument(format!(
-                                    "unknown column '{col_name}' in table '{table_name}'"
+                                    "unknown column '{}' in table '{table_name}'",
+                                    ident.value
                                 ))
                             })?;
-                        proj.push(col_idx);
-                    }
+                    let col = table_desc.schema.column(col_idx).unwrap();
+                    projection.push(AnalyticExpr::Column {
+                        index: col_idx,
+                        name: col.name.clone(),
+                        data_type: col.data_type,
+                        nullable: col.nullable,
+                    });
+                }
+                Expr::CompoundIdentifier(_) => {
+                    return Err(HtapError::Unsupported(
+                        "qualified column names not supported in projection".into(),
+                    ));
+                }
+                Expr::Function(func) => {
+                    let expr = bind_analytic_function(func, table_desc, table_name)?;
+                    projection.push(expr);
+                }
+                _ => {
+                    return Err(HtapError::Unsupported(
+                        "expressions not supported in projection".into(),
+                    ));
+                }
+            },
+        }
+    }
+    Ok(projection)
+}
+
+fn bind_analytic_function(
+    func: &sqlparser::ast::Function,
+    table_desc: &TableDescriptor,
+    table_name: &str,
+) -> Result<AnalyticExpr> {
+    let func_name = extract_unqualified_name(&func.name)?.to_ascii_uppercase();
+    if func.over.is_some() {
+        return Err(HtapError::Unsupported(
+            "window functions (OVER clause) not supported".into(),
+        ));
+    }
+    if func.filter.is_some() {
+        return Err(HtapError::Unsupported(
+            "aggregate FILTER clause not supported".into(),
+        ));
+    }
+    let list = match &func.args {
+        FunctionArguments::List(list) => list,
+        FunctionArguments::None => {
+            return Err(HtapError::InvalidArgument(format!(
+                "function '{func_name}' requires arguments"
+            )));
+        }
+        FunctionArguments::Subquery(_) => {
+            return Err(HtapError::Unsupported(
+                "subqueries in function arguments not supported".into(),
+            ));
+        }
+    };
+    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        return Err(HtapError::Unsupported(
+            "DISTINCT in aggregate functions not supported".into(),
+        ));
+    }
+    if !list.clauses.is_empty() {
+        return Err(HtapError::Unsupported(
+            "clauses in aggregate functions not supported".into(),
+        ));
+    }
+
+    match func_name.as_str() {
+        "COUNT" => {
+            if list.args.len() != 1 {
+                return Err(HtapError::InvalidArgument(format!(
+                    "COUNT requires exactly 1 argument, found {}",
+                    list.args.len()
+                )));
+            }
+            match &list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(AnalyticExpr::Aggregate {
+                    function: AggregateFunction::CountStar,
+                    column_index: None,
+                    name: "COUNT(*)".to_string(),
+                    data_type: CommonDataType::Int64,
+                    nullable: false,
+                }),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+                    let col_idx =
+                        table_desc
+                            .schema
+                            .column_index(&ident.value)
+                            .ok_or_else(|| {
+                                HtapError::InvalidArgument(format!(
+                                    "unknown column '{}' in table '{table_name}'",
+                                    ident.value
+                                ))
+                            })?;
+                    Ok(AnalyticExpr::Aggregate {
+                        function: AggregateFunction::Count,
+                        column_index: Some(col_idx),
+                        name: format!("COUNT({})", ident.value),
+                        data_type: CommonDataType::Int64,
+                        nullable: false,
+                    })
+                }
+                _ => Err(HtapError::InvalidArgument(
+                    "COUNT argument must be '*' or a column identifier".into(),
+                )),
+            }
+        }
+        "SUM" => {
+            if list.args.len() != 1 {
+                return Err(HtapError::InvalidArgument(format!(
+                    "SUM requires exactly 1 argument, found {}",
+                    list.args.len()
+                )));
+            }
+            match &list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+                    let col_idx =
+                        table_desc
+                            .schema
+                            .column_index(&ident.value)
+                            .ok_or_else(|| {
+                                HtapError::InvalidArgument(format!(
+                                    "unknown column '{}' in table '{table_name}'",
+                                    ident.value
+                                ))
+                            })?;
+                    let col = table_desc.schema.column(col_idx).unwrap();
+                    let (data_type, name) = match col.data_type {
+                        CommonDataType::Int32 | CommonDataType::Int64 => {
+                            (CommonDataType::Int64, format!("SUM({})", ident.value))
+                        }
+                        CommonDataType::Float64 => {
+                            (CommonDataType::Float64, format!("SUM({})", ident.value))
+                        }
+                        other => {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "SUM cannot be applied to non-numeric column '{}' of type {other:?}",
+                                ident.value
+                            )));
+                        }
+                    };
+                    Ok(AnalyticExpr::Aggregate {
+                        function: AggregateFunction::Sum,
+                        column_index: Some(col_idx),
+                        name,
+                        data_type,
+                        nullable: true,
+                    })
+                }
+                _ => Err(HtapError::InvalidArgument(
+                    "SUM argument must be a column identifier".into(),
+                )),
+            }
+        }
+        "MIN" => {
+            if list.args.len() != 1 {
+                return Err(HtapError::InvalidArgument(format!(
+                    "MIN requires exactly 1 argument, found {}",
+                    list.args.len()
+                )));
+            }
+            match &list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+                    let col_idx =
+                        table_desc
+                            .schema
+                            .column_index(&ident.value)
+                            .ok_or_else(|| {
+                                HtapError::InvalidArgument(format!(
+                                    "unknown column '{}' in table '{table_name}'",
+                                    ident.value
+                                ))
+                            })?;
+                    let col = table_desc.schema.column(col_idx).unwrap();
+                    Ok(AnalyticExpr::Aggregate {
+                        function: AggregateFunction::Min,
+                        column_index: Some(col_idx),
+                        name: format!("MIN({})", ident.value),
+                        data_type: col.data_type,
+                        nullable: true,
+                    })
+                }
+                _ => Err(HtapError::InvalidArgument(
+                    "MIN argument must be a column identifier".into(),
+                )),
+            }
+        }
+        "MAX" => {
+            if list.args.len() != 1 {
+                return Err(HtapError::InvalidArgument(format!(
+                    "MAX requires exactly 1 argument, found {}",
+                    list.args.len()
+                )));
+            }
+            match &list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+                    let col_idx =
+                        table_desc
+                            .schema
+                            .column_index(&ident.value)
+                            .ok_or_else(|| {
+                                HtapError::InvalidArgument(format!(
+                                    "unknown column '{}' in table '{table_name}'",
+                                    ident.value
+                                ))
+                            })?;
+                    let col = table_desc.schema.column(col_idx).unwrap();
+                    Ok(AnalyticExpr::Aggregate {
+                        function: AggregateFunction::Max,
+                        column_index: Some(col_idx),
+                        name: format!("MAX({})", ident.value),
+                        data_type: col.data_type,
+                        nullable: true,
+                    })
+                }
+                _ => Err(HtapError::InvalidArgument(
+                    "MAX argument must be a column identifier".into(),
+                )),
+            }
+        }
+        "AVG" => Err(HtapError::Unsupported(
+            "AVG aggregate function is not supported".into(),
+        )),
+        other => Err(HtapError::Unsupported(format!(
+            "unsupported aggregate function: '{other}'"
+        ))),
+    }
+}
+
+fn bind_analytic_group_by(
+    group_by: &GroupByExpr,
+    table_desc: &TableDescriptor,
+) -> Result<Vec<usize>> {
+    match group_by {
+        GroupByExpr::All(_) => Err(HtapError::Unsupported(
+            "GROUP BY ALL is not supported".into(),
+        )),
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(HtapError::Unsupported(
+                    "GROUP BY modifiers not supported".into(),
+                ));
+            }
+            let mut indices = Vec::with_capacity(exprs.len());
+            let mut seen = std::collections::HashSet::with_capacity(exprs.len());
+            for expr in exprs {
+                let col_name = match expr {
+                    Expr::Identifier(ident) => &ident.value,
                     Expr::CompoundIdentifier(_) => {
                         return Err(HtapError::Unsupported(
-                            "qualified column names not supported in projection".into(),
+                            "qualified column names not supported in GROUP BY".into(),
                         ));
                     }
                     _ => {
-                        return Err(HtapError::Unsupported(
-                            "expressions not supported in projection".into(),
-                        ));
+                        return Err(HtapError::InvalidArgument(format!(
+                            "GROUP BY expression must be a simple column identifier, found: {expr}"
+                        )));
                     }
-                },
+                };
+                let col_idx = table_desc.schema.column_index(col_name).ok_or_else(|| {
+                    HtapError::InvalidArgument(format!("unknown column '{col_name}' in GROUP BY"))
+                })?;
+                if !seen.insert(col_idx) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate column '{col_name}' in GROUP BY"
+                    )));
+                }
+                indices.push(col_idx);
             }
+            Ok(indices)
         }
-        proj
+    }
+}
+
+fn bind_analytic_filter(
+    selection: Option<&Expr>,
+    table_desc: &TableDescriptor,
+) -> Result<Option<AnalyticFilter>> {
+    let expr = match selection {
+        Some(e) => e,
+        None => return Ok(None),
     };
 
-    let key = bind_pk_where_predicate(table_desc, select.selection.as_ref())?;
+    let mut leaves = Vec::new();
+    collect_and_leaves(expr, &mut leaves)?;
 
-    Ok(BoundStatement::Select(PointSelect::new(
-        table_name, projection, key,
-    )))
+    if leaves.is_empty() {
+        return Err(HtapError::InvalidArgument("empty WHERE clause".into()));
+    }
+
+    let mut seen_eq_cols = std::collections::HashSet::new();
+    let mut bound_leaves = Vec::with_capacity(leaves.len());
+
+    for leaf in leaves {
+        let mut unnested = leaf;
+        while let Expr::Nested(inner) = unnested {
+            unnested = inner;
+        }
+
+        match unnested {
+            Expr::IsNull(inner) => {
+                let mut col_expr = &**inner;
+                while let Expr::Nested(i) = col_expr {
+                    col_expr = i;
+                }
+                let col_name = match col_expr {
+                    Expr::Identifier(ident) => &ident.value,
+                    Expr::CompoundIdentifier(_) => {
+                        return Err(HtapError::Unsupported(
+                            "qualified column names not supported in WHERE clause".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(HtapError::InvalidArgument(
+                            "IS NULL requires a column identifier".into(),
+                        ));
+                    }
+                };
+                let col_idx = table_desc.schema.column_index(col_name).ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "unknown column '{col_name}' in table '{}'",
+                        table_desc.name
+                    ))
+                })?;
+                bound_leaves.push(AnalyticFilter::IsNull { column: col_idx });
+            }
+            Expr::IsNotNull(inner) => {
+                let mut col_expr = &**inner;
+                while let Expr::Nested(i) = col_expr {
+                    col_expr = i;
+                }
+                let col_name = match col_expr {
+                    Expr::Identifier(ident) => &ident.value,
+                    Expr::CompoundIdentifier(_) => {
+                        return Err(HtapError::Unsupported(
+                            "qualified column names not supported in WHERE clause".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(HtapError::InvalidArgument(
+                            "IS NOT NULL requires a column identifier".into(),
+                        ));
+                    }
+                };
+                let col_idx = table_desc.schema.column_index(col_name).ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "unknown column '{col_name}' in table '{}'",
+                        table_desc.name
+                    ))
+                })?;
+                bound_leaves.push(AnalyticFilter::IsNotNull { column: col_idx });
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let comp_op = match op {
+                    BinaryOperator::Eq => ComparisonOp::Eq,
+                    BinaryOperator::NotEq => ComparisonOp::NotEq,
+                    BinaryOperator::Lt => ComparisonOp::Lt,
+                    BinaryOperator::LtEq => ComparisonOp::Lte,
+                    BinaryOperator::Gt => ComparisonOp::Gt,
+                    BinaryOperator::GtEq => ComparisonOp::Gte,
+                    BinaryOperator::Or => {
+                        return Err(HtapError::InvalidArgument(
+                            "OR is not supported in WHERE clause".into(),
+                        ));
+                    }
+                    other => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "unsupported operator in WHERE clause: '{other}'"
+                        )));
+                    }
+                };
+
+                let mut l = &**left;
+                while let Expr::Nested(inner) = l {
+                    l = inner;
+                }
+                let mut r = &**right;
+                while let Expr::Nested(inner) = r {
+                    r = inner;
+                }
+
+                if matches!(l, Expr::Value(_)) || matches!(r, Expr::Identifier(_)) {
+                    if matches!(l, Expr::Identifier(_)) && matches!(r, Expr::Identifier(_)) {
+                        return Err(HtapError::InvalidArgument(
+                            "cross-column comparisons not supported in WHERE clause".into(),
+                        ));
+                    }
+                    return Err(HtapError::InvalidArgument(
+                        "reversed operands in comparison predicate: expected column <op> value"
+                            .into(),
+                    ));
+                }
+
+                let col_name = match l {
+                    Expr::Identifier(ident) => &ident.value,
+                    Expr::CompoundIdentifier(_) => {
+                        return Err(HtapError::Unsupported(
+                            "qualified column names not supported in WHERE clause".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(HtapError::InvalidArgument(
+                            "left side of comparison must be a column identifier".into(),
+                        ));
+                    }
+                };
+
+                let col_idx = table_desc.schema.column_index(col_name).ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "unknown column '{col_name}' in table '{}'",
+                        table_desc.name
+                    ))
+                })?;
+
+                if comp_op == ComparisonOp::Eq && !seen_eq_cols.insert(col_idx) {
+                    let col_def = table_desc
+                        .schema
+                        .column(col_idx)
+                        .expect("column must exist");
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate predicate on column '{}'",
+                        col_def.name
+                    )));
+                }
+
+                if matches!(r, Expr::Value(ref v) if matches!(v.value, sqlparser::ast::Value::Null))
+                {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "NULL literal not permitted in comparison predicate for column '{col_name}'; use IS NULL or IS NOT NULL"
+                    )));
+                }
+
+                let col_def = table_desc
+                    .schema
+                    .column(col_idx)
+                    .expect("column must exist");
+                let parsed_value = parse_literal_value(r, col_def)?;
+                bound_leaves.push(AnalyticFilter::Comparison {
+                    column: col_idx,
+                    op: comp_op,
+                    value: parsed_value,
+                });
+            }
+            Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                ..
+            } => {
+                return Err(HtapError::InvalidArgument(
+                    "NOT is not supported in WHERE clause".into(),
+                ));
+            }
+            other => {
+                return Err(HtapError::InvalidArgument(format!(
+                    "unsupported predicate in WHERE clause: {other}"
+                )));
+            }
+        }
+    }
+
+    if bound_leaves.len() == 1 {
+        Ok(Some(bound_leaves.remove(0)))
+    } else {
+        Ok(Some(AnalyticFilter::And(bound_leaves)))
+    }
 }

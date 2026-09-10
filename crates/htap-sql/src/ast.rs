@@ -1,7 +1,7 @@
 //! SQL Abstract Syntax Tree and bound statement definitions.
 
 use htap_common::error::{HtapError, Result};
-use htap_common::types::{Row, Schema, Value};
+use htap_common::types::{ColumnDef, DataType, Row, Schema, Value};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -40,6 +40,8 @@ pub enum BoundStatement {
     Delete(DeleteByPrimaryKey),
     /// Single-row SELECT by primary key with column projection.
     Select(PointSelect),
+    /// Analytical SELECT statement with column/aggregate projections, filters, and optional grouping.
+    AnalyticSelect(AnalyticSelect),
 }
 
 /// Bound representation of a CREATE TABLE statement.
@@ -124,6 +126,205 @@ impl PointSelect {
     }
 }
 
+/// Comparison operators supported in analytical query filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonOp {
+    /// Equal (`=`).
+    Eq,
+    /// Not equal (`!=` or `<>`).
+    NotEq,
+    /// Less than (`<`).
+    Lt,
+    /// Less than or equal (`<=`).
+    Lte,
+    /// Greater than (`>`).
+    Gt,
+    /// Greater than or equal (`>=`).
+    Gte,
+}
+
+impl std::fmt::Display for ComparisonOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eq => write!(f, "="),
+            Self::NotEq => write!(f, "!="),
+            Self::Lt => write!(f, "<"),
+            Self::Lte => write!(f, "<="),
+            Self::Gt => write!(f, ">"),
+            Self::Gte => write!(f, ">="),
+        }
+    }
+}
+
+/// Documented typed filter tree for analytical queries.
+///
+/// In this execution slice, only conjunctions (`AND`) of column-vs-literal comparisons
+/// and nullability checks (`IS NULL` / `IS NOT NULL`) are supported. Disjunctions (`OR`),
+/// negations (`NOT`), expressions, subqueries, and cross-column comparisons are rejected.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnalyticFilter {
+    /// Conjunction of filter expressions (logical AND).
+    And(Vec<AnalyticFilter>),
+    /// Column comparison with a typed literal value: `column op value`.
+    Comparison {
+        /// Zero-based column index in the source table schema.
+        column: usize,
+        /// Comparison operator.
+        op: ComparisonOp,
+        /// Non-NULL typed literal value.
+        value: Value,
+    },
+    /// Nullability check: `column IS NULL`.
+    IsNull {
+        /// Zero-based column index in the source table schema.
+        column: usize,
+    },
+    /// Nullability check: `column IS NOT NULL`.
+    IsNotNull {
+        /// Zero-based column index in the source table schema.
+        column: usize,
+    },
+}
+
+impl AnalyticFilter {
+    /// Recursively collects all leaf predicates in this filter tree.
+    pub fn leaves(&self) -> Vec<&AnalyticFilter> {
+        match self {
+            Self::And(children) => children.iter().flat_map(|c| c.leaves()).collect(),
+            leaf => vec![leaf],
+        }
+    }
+}
+
+/// Supported aggregate functions in analytical queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunction {
+    /// `COUNT(*)`: counts total matching rows. Output is non-nullable `Int64`.
+    CountStar,
+    /// `COUNT(column)`: counts non-null values of the specified column. Output is non-nullable `Int64`.
+    Count,
+    /// `SUM(column)`: sums values of a numeric column. Output is nullable `Int64` or `Float64`.
+    Sum,
+    /// `MIN(column)`: finds minimum value of a column. Output has source column's type, nullable.
+    Min,
+    /// `MAX(column)`: finds maximum value of a column. Output has source column's type, nullable.
+    Max,
+}
+
+/// An analytical projection expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnalyticExpr {
+    /// Direct column projection from the source schema.
+    Column {
+        /// Zero-based column index in the table schema.
+        index: usize,
+        /// Column name.
+        name: String,
+        /// Data type.
+        data_type: DataType,
+        /// Nullability.
+        nullable: bool,
+    },
+    /// Approved aggregate function.
+    Aggregate {
+        /// Aggregate function kind.
+        function: AggregateFunction,
+        /// Source column index in the table schema (`None` for `COUNT(*)`).
+        column_index: Option<usize>,
+        /// Projection column name (e.g., "COUNT(*)", "SUM(col)").
+        name: String,
+        /// Result data type.
+        data_type: DataType,
+        /// Result nullability.
+        nullable: bool,
+    },
+}
+
+impl AnalyticExpr {
+    /// Returns the output column name for this expression.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Column { name, .. } | Self::Aggregate { name, .. } => name,
+        }
+    }
+
+    /// Returns the output data type for this expression.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            Self::Column { data_type, .. } | Self::Aggregate { data_type, .. } => *data_type,
+        }
+    }
+
+    /// Returns whether the output expression can evaluate to NULL.
+    pub fn nullable(&self) -> bool {
+        match self {
+            Self::Column { nullable, .. } | Self::Aggregate { nullable, .. } => *nullable,
+        }
+    }
+
+    /// Returns `true` if this projection expression is an aggregate function.
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, Self::Aggregate { .. })
+    }
+
+    /// Returns the source column index, if applicable.
+    pub fn column_index(&self) -> Option<usize> {
+        match self {
+            Self::Column { index, .. } => Some(*index),
+            Self::Aggregate { column_index, .. } => *column_index,
+        }
+    }
+
+    /// Converts this projection expression into an output [`ColumnDef`].
+    pub fn to_column_def(&self) -> ColumnDef {
+        ColumnDef {
+            name: self.name().to_string(),
+            data_type: self.data_type(),
+            nullable: self.nullable(),
+            primary_key: false,
+        }
+    }
+}
+
+/// Bound representation of an analytical SELECT query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyticSelect {
+    /// Target table name.
+    pub table: String,
+    /// Projected expressions (columns and approved aggregates).
+    pub projection: Vec<AnalyticExpr>,
+    /// Optional typed filter tree (AND-only conjunctions of comparisons).
+    pub filter: Option<AnalyticFilter>,
+    /// Column indices in source table schema for `GROUP BY`.
+    pub group_by: Vec<usize>,
+    /// Pre-computed output schema for the analytical query result.
+    pub output_schema: Schema,
+}
+
+impl AnalyticSelect {
+    /// Create a new [`AnalyticSelect`] bound statement.
+    pub fn new(
+        table: impl Into<String>,
+        projection: Vec<AnalyticExpr>,
+        filter: Option<AnalyticFilter>,
+        group_by: Vec<usize>,
+        output_schema: Schema,
+    ) -> Self {
+        Self {
+            table: table.into(),
+            projection,
+            filter,
+            group_by,
+            output_schema,
+        }
+    }
+
+    /// Returns the output schema of the analytical query.
+    pub fn output_schema(&self) -> &Schema {
+        &self.output_schema
+    }
+}
+
 impl From<CreateTable> for BoundStatement {
     fn from(stmt: CreateTable) -> Self {
         Self::CreateTable(stmt)
@@ -148,6 +349,12 @@ impl From<PointSelect> for BoundStatement {
     }
 }
 
+impl From<AnalyticSelect> for BoundStatement {
+    fn from(stmt: AnalyticSelect) -> Self {
+        Self::AnalyticSelect(stmt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,7 +370,7 @@ mod tests {
         }])
         .unwrap();
 
-        let create = CreateTable::new("users", schema, vec![0]);
+        let create = CreateTable::new("users", schema.clone(), vec![0]);
         let bound_create: BoundStatement = create.clone().into();
         assert_eq!(bound_create, BoundStatement::CreateTable(create));
 
@@ -178,5 +385,20 @@ mod tests {
         let select = PointSelect::new("users", vec![0], vec![Value::Int64(1)]);
         let bound_select: BoundStatement = select.clone().into();
         assert_eq!(bound_select, BoundStatement::Select(select));
+
+        let analytic = AnalyticSelect::new(
+            "users",
+            vec![AnalyticExpr::Column {
+                index: 0,
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            None,
+            vec![],
+            schema,
+        );
+        let bound_analytic: BoundStatement = analytic.clone().into();
+        assert_eq!(bound_analytic, BoundStatement::AnalyticSelect(analytic));
     }
 }

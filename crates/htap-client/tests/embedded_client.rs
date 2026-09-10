@@ -298,12 +298,12 @@ fn test_embedded_client_unsupported_sql_preserves_error_categories() {
         "expected NotFound for missing table, got {err_not_found:?}"
     );
 
-    // 5. Full table scan without WHERE primary key -> InvalidArgument
-    let err_scan = client.execute("SELECT * FROM products;").unwrap_err();
-    assert!(
-        matches!(err_scan, HtapError::InvalidArgument(_)),
-        "expected InvalidArgument for full scan without PK, got {err_scan:?}"
-    );
+    // 5. Valid analytical query executes successfully
+    let scan_res = client.execute("SELECT * FROM products;").unwrap();
+    match scan_res {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
 
     // 6. Unsupported statement type UPDATE -> Unsupported
     let err_update = client
@@ -323,12 +323,12 @@ fn test_embedded_client_unsupported_sql_preserves_error_categories() {
         "expected Unsupported for ORDER BY, got {err_order:?}"
     );
 
-    // 8. Unsupported query modifier GROUP BY -> Unsupported
-    let err_group = client
-        .execute("SELECT name FROM products WHERE id = 1 GROUP BY name;")
+    // 8. Unsupported query modifier HAVING -> Unsupported
+    let err_having = client
+        .execute("SELECT name FROM products GROUP BY name HAVING count(*) > 1;")
         .unwrap_err();
     assert!(
-        matches!(err_group, HtapError::Unsupported(_)),
-        "expected Unsupported for GROUP BY, got {err_group:?}"
+        matches!(err_having, HtapError::Unsupported(_)),
+        "expected Unsupported for HAVING, got {err_having:?}"
     );
 }

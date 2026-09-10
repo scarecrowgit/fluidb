@@ -8,6 +8,7 @@ license.workspace = true
 fs2 = { workspace = true }
 htap-catalog = { path = "../htap-catalog" }
 htap-common = { path = "../htap-common" }
+htap-convert = { path = "../htap-convert" }
 htap-movement = { path = "../htap-movement" }
 htap-rowstore = { path = "../htap-rowstore" }
 htap-sql = { path = "../htap-sql" }

@@ -474,6 +474,7 @@ dependencies = [
  "fs2",
  "htap-catalog",
  "htap-common",
+ "htap-convert",
  "htap-movement",
  "htap-rowstore",
  "htap-sql",
