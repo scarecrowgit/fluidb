@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use htap_common::{HtapError, Mutation, Row, Value, Version};
-use htap_rowstore::{Engine, EngineOptions, Snapshot};
+use htap_rowstore::{Engine, EngineIoOp, EngineOptions, Snapshot};
 use htap_txn::{
     Journal, JournalRecord, ParticipantId, ParticipantWork, RowstoreParticipant, TransactionId,
     TransactionManager, TxnParticipant, TxnState,
@@ -469,5 +469,123 @@ fn test_concurrent_commits_serializes_decisions_and_maintains_rowstore_ordering(
         } else {
             assert_eq!(row, None);
         }
+    }
+}
+
+#[test]
+fn test_rowstore_failure_durable_pending_reopen_recover_and_c1_ledger() {
+    let journal_dir = tempfile::tempdir().unwrap();
+    let rowstore_dir = tempfile::tempdir().unwrap();
+
+    let journal_path = journal_dir.path().join("txn.journal");
+    let participant_id = ParticipantId::new(10);
+
+    let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tripped_clone = tripped.clone();
+
+    // Hook to fail SST write once on auto-flush
+    let hook = Arc::new(move |op| {
+        if op == EngineIoOp::SstWrite
+            && !tripped_clone.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            Err(HtapError::Io(std::io::Error::other(
+                "injected sst write failure during manager commit",
+            )))
+        } else {
+            Ok(())
+        }
+    });
+
+    let rowstore_opts = EngineOptions::new(rowstore_dir.path())
+        .with_memtable_bytes(1)
+        .with_io_fault_hook(hook);
+
+    {
+        let manager = TransactionManager::open(&journal_path).unwrap();
+        let engine = Arc::new(Engine::open(rowstore_opts).unwrap());
+        let participant = Arc::new(RowstoreParticipant::new(
+            participant_id,
+            Arc::clone(&engine),
+        ));
+        manager.register_participant(participant);
+
+        let mut txn = manager.begin().unwrap();
+        let mutations = vec![Mutation::Put {
+            partition_id: 0,
+            key: b"k1".to_vec(),
+            row: make_row(42),
+        }];
+        txn.add_participant(
+            participant_id,
+            RowstoreParticipant::encode_payload(&mutations).unwrap(),
+        );
+
+        // Manager commit reaches participant.apply, auto-flush triggers SST write fault
+        let err = manager.commit(&mut txn).unwrap_err();
+        assert!(
+            err.is_durable_pending(),
+            "expected DurablePending from manager commit, got {err:?}"
+        );
+        match &err {
+            HtapError::DurablePending {
+                txn_id, version, ..
+            } => {
+                assert_eq!(*txn_id, txn.id().as_u64());
+                assert_eq!(*version, Version::new(2));
+            }
+            _ => unreachable!(),
+        }
+
+        // In rowstore: committed_version is 2, visible_version is INITIAL
+        assert_eq!(engine.committed_version(), Version::new(2));
+        assert_eq!(engine.visible_version(), Version::INITIAL);
+        assert_eq!(engine.get(0, b"k1", engine.snapshot()).unwrap(), None);
+
+        // Dropping manager and engine to simulate restart
+    }
+
+    // Step 2: Reopen and recover via TransactionManager
+    {
+        let clean_rowstore_opts = EngineOptions::new(rowstore_dir.path());
+        let engine = Arc::new(Engine::open(clean_rowstore_opts).unwrap());
+        let participant = Arc::new(RowstoreParticipant::new(
+            participant_id,
+            Arc::clone(&engine),
+        ));
+
+        let manager = TransactionManager::open(&journal_path).unwrap();
+        manager.register_participant(participant);
+
+        let report = manager.recover().unwrap();
+        assert_eq!(report.committed_txns.len(), 1);
+        assert_eq!(report.committed_txns[0], TransactionId::new(1));
+
+        // After manager recovery, visible version is advanced and data is visible
+        assert_eq!(engine.visible_version(), Version::new(2));
+        assert_eq!(engine.committed_version(), Version::new(2));
+        assert_eq!(
+            engine.get(0, b"k1", engine.snapshot()).unwrap(),
+            Some(make_row(42))
+        );
+
+        // Flush rowstore to persist SST and populate C1 manifest ledger
+        engine.flush().unwrap();
+    }
+
+    // Step 3: Reopen rowstore again and verify C1 manifest ledger entry survives
+    {
+        let clean_rowstore_opts = EngineOptions::new(rowstore_dir.path());
+        let engine = Engine::open(clean_rowstore_opts).unwrap();
+        assert_eq!(engine.visible_version(), Version::new(2));
+        assert_eq!(engine.committed_version(), Version::new(2));
+        assert_eq!(
+            engine.get(0, b"k1", engine.snapshot()).unwrap(),
+            Some(make_row(42))
+        );
+
+        // Scan partition contains exactly 1 entry
+        let scan = engine.scan_partition(0, engine.snapshot()).unwrap();
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].key.user_key, b"k1");
     }
 }

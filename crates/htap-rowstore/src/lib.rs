@@ -37,7 +37,8 @@ pub mod sst;
 pub mod wal;
 
 pub use engine::{
-    Engine, EngineOptions, Mutation, PreparedTransaction, Snapshot, DEFAULT_MEMTABLE_BYTES,
+    Engine, EngineIoOp, EngineOptions, IoFaultHook, Mutation, PreparedTransaction, Snapshot,
+    DEFAULT_MEMTABLE_BYTES,
 };
 pub use manifest::{
     Manifest, ManifestLedgerEntry, ManifestSstEntry, FORMAT_VERSION, FORMAT_VERSION_V1,

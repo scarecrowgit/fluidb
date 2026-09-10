@@ -102,8 +102,20 @@ impl PreparedTransaction {
     }
 }
 
+/// Named I/O operations for engine fault injection testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EngineIoOp {
+    /// Writing an SST file during flush.
+    SstWrite,
+    /// Writing the visible watermark marker file during publish.
+    VisibleMarkerWrite,
+}
+
+/// Callback type for injecting deterministic I/O faults at named engine boundaries.
+pub type IoFaultHook = Arc<dyn Fn(EngineIoOp) -> Result<()> + Send + Sync>;
+
 /// Configuration options for the LSM [`Engine`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineOptions {
     /// Base directory holding WAL segments, SSTs, and MANIFEST.
     pub dir: PathBuf,
@@ -113,6 +125,23 @@ pub struct EngineOptions {
     pub sst: SstOptions,
     /// Write-ahead log options (segment size, sync-on-commit).
     pub wal: WalOptions,
+    /// Optional test-oriented fault hook invoked at named I/O boundaries.
+    pub io_fault_hook: Option<IoFaultHook>,
+}
+
+impl std::fmt::Debug for EngineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineOptions")
+            .field("dir", &self.dir)
+            .field("memtable_bytes", &self.memtable_bytes)
+            .field("sst", &self.sst)
+            .field("wal", &self.wal)
+            .field(
+                "io_fault_hook",
+                &self.io_fault_hook.as_ref().map(|_| "<io_fault_hook>"),
+            )
+            .finish()
+    }
 }
 
 impl EngineOptions {
@@ -125,6 +154,7 @@ impl EngineOptions {
             wal: WalOptions::new(wal_dir),
             dir,
             memtable_bytes: DEFAULT_MEMTABLE_BYTES,
+            io_fault_hook: None,
         }
     }
 
@@ -151,6 +181,13 @@ impl EngineOptions {
         self.wal = options;
         self
     }
+
+    /// Set a test-oriented fault hook invoked at named I/O boundaries.
+    #[must_use]
+    pub fn with_io_fault_hook(mut self, hook: IoFaultHook) -> Self {
+        self.io_fault_hook = Some(hook);
+        self
+    }
 }
 
 /// Internal commit state protected by `commit_lock`.
@@ -166,17 +203,31 @@ struct CommitState {
 const VISIBLE_MAGIC: &[u8; 8] = b"HTAPVIS1";
 
 /// Write visible version marker file atomically to disk.
-fn write_visible_version(dir: &Path, version: Version) -> Result<()> {
+fn write_visible_version(
+    dir: &Path,
+    version: Version,
+    fault_hook: Option<&IoFaultHook>,
+) -> Result<()> {
+    if let Some(hook) = fault_hook {
+        hook(EngineIoOp::VisibleMarkerWrite)?;
+    }
     let tmp_path = dir.join("VISIBLE.tmp");
     let target_path = dir.join("VISIBLE");
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(VISIBLE_MAGIC);
     buf[8..16].copy_from_slice(&version.get().to_le_bytes());
-    let mut file = std::fs::File::create(&tmp_path)?;
-    file.write_all(&buf)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp_path, &target_path)?;
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, &target_path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(HtapError::Io(e));
+    }
     sync_dir(dir)?;
     Ok(())
 }
@@ -650,39 +701,68 @@ impl Engine {
             version,
         })?;
 
+        // --- Durability boundary ---
+        // Transaction commit is fsynced and durable in WAL.
+        // Every failure after this point MUST return HtapError::DurablePending.
+
         // 4. Apply mutations to active memtable and update committed_version
-        {
+        let apply_res = {
             let mut read_guard = self.read_state.write();
-            for m in prepared.mutations {
-                match m {
+            let mut res = Ok(());
+            for m in &prepared.mutations {
+                let r = match m {
                     Mutation::Put {
                         partition_id,
                         key,
                         row,
-                    } => {
-                        read_guard
-                            .active
-                            .apply(partition_id, key, version, ValueKind::Put(row))?;
-                    }
-                    Mutation::Delete { partition_id, key } => {
-                        read_guard
-                            .active
-                            .apply(partition_id, key, version, ValueKind::Delete)?;
-                    }
+                    } => read_guard.active.apply(
+                        *partition_id,
+                        key.clone(),
+                        version,
+                        ValueKind::Put(row.clone()),
+                    ),
+                    Mutation::Delete { partition_id, key } => read_guard.active.apply(
+                        *partition_id,
+                        key.clone(),
+                        version,
+                        ValueKind::Delete,
+                    ),
+                };
+                if let Err(e) = r {
+                    res = Err(e);
+                    break;
                 }
             }
             read_guard.committed_version = version;
-        }
+            res
+        };
 
         if prepared.txn_id != 0 {
             commit_guard.applied_txns.insert(prepared.txn_id, version);
         }
 
+        if let Err(err) = apply_res {
+            return Err(HtapError::DurablePending {
+                txn_id: prepared.txn_id,
+                version,
+                reason: format!("memtable apply failed: {err}"),
+            });
+        }
+
         // 5. Check memtable size for auto-flush
-        let should_flush =
-            self.read_state.read().active.approximate_size_bytes() >= self.options.memtable_bytes;
+        let should_flush = {
+            let read_guard = self.read_state.read();
+            read_guard.active.approximate_size_bytes() >= self.options.memtable_bytes
+                || !read_guard.immutables.is_empty()
+        };
         if should_flush {
-            self.flush_locked(commit_guard)?;
+            if let Err(err) = self.flush_locked(commit_guard) {
+                return Err(HtapError::DurablePending {
+                    txn_id: prepared.txn_id,
+                    version,
+                    reason: format!("automatic flush failed: {err}"),
+                });
+            }
         }
 
         Ok(())
@@ -758,7 +838,11 @@ impl Engine {
                 read_guard.committed_version
             )));
         }
-        write_visible_version(&self.options.dir, version)?;
+        write_visible_version(
+            &self.options.dir,
+            version,
+            self.options.io_fault_hook.as_ref(),
+        )?;
         read_guard.visible_version = version;
         Ok(())
     }
@@ -793,7 +877,13 @@ impl Engine {
 
         let commit_version = committed_version.next();
         self.apply_prepared_locked(&mut commit_guard, prepared, commit_version)?;
-        self.publish_locked(commit_version)?;
+        if let Err(err) = self.publish_locked(commit_version) {
+            return Err(HtapError::DurablePending {
+                txn_id,
+                version: commit_version,
+                reason: format!("publish failed: {err}"),
+            });
+        }
         Ok(commit_version)
     }
 
@@ -926,74 +1016,86 @@ impl Engine {
     /// - A crash between 5 and 7 causes recovery to replay records already in the SST,
     ///   which [`Memtable::apply`] tolerates idempotently.
     fn flush_locked(&self, commit_guard: &mut CommitState) -> Result<()> {
-        // 1. Check if active memtable is empty
-        {
-            let read_guard = self.read_state.read();
-            if read_guard.active.is_empty() {
-                return Ok(());
+        loop {
+            // 1. Select candidate memtable to flush.
+            // Retained failed immutable memtables must be selected/retried before newer active.
+            // ReadState stores immutables newest-first, so the oldest pending immutable is immutables.last().
+            let to_flush = {
+                let mut read_guard = self.read_state.write();
+                if let Some(oldest_imm) = read_guard.immutables.last().cloned() {
+                    oldest_imm
+                } else if !read_guard.active.is_empty() {
+                    let old = std::mem::take(&mut read_guard.active);
+                    let old = Arc::new(old);
+                    read_guard.immutables.insert(0, Arc::clone(&old));
+                    old
+                } else {
+                    return Ok(());
+                }
+            };
+
+            // 2. Write detached entries to sst/<id>.sst.tmp
+            let sst_id = commit_guard.next_sst_id;
+            commit_guard.next_sst_id += 1;
+
+            let sst_dir = self.options.dir.join("sst");
+            let tmp_path = sst_dir.join(format!("{sst_id}.sst.tmp"));
+            let sst_path = sst_dir.join(format!("{sst_id}.sst"));
+
+            if let Some(hook) = &self.options.io_fault_hook {
+                hook(EngineIoOp::SstWrite)?;
             }
+
+            let write_res = SstWriter::write(
+                &tmp_path,
+                sst_id,
+                to_flush.iter().cloned(),
+                &self.options.sst,
+            );
+            let meta = match write_res {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+            };
+
+            // 3. Rename to sst/<id>.sst and fsync sst/ directory
+            if let Err(e) = std::fs::rename(&tmp_path, &sst_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(HtapError::Io(e));
+            }
+            sync_dir(&sst_dir)?;
+
+            // 4. Write and fsync MANIFEST
+            let mut new_manifest = commit_guard.manifest.clone();
+            new_manifest.prepend(ManifestSstEntry::from(&meta));
+            let mut ledger_entries: Vec<ManifestLedgerEntry> = commit_guard
+                .applied_txns
+                .iter()
+                .map(|(&txn_id, &version)| ManifestLedgerEntry::new(txn_id, version))
+                .collect();
+            ledger_entries.sort_unstable_by_key(|e| e.txn_id);
+            new_manifest.applied_txns = ledger_entries;
+            Manifest::atomic_publish(&self.options.dir, &new_manifest)?;
+            commit_guard.manifest = new_manifest;
+
+            // 5. Install new SstReader and drop immutable memtable
+            let reader = Arc::new(SstReader::open(&sst_path)?);
+            {
+                let mut read_guard = self.read_state.write();
+                read_guard.ssts.insert(0, reader);
+                read_guard.immutables.retain(|m| !Arc::ptr_eq(m, &to_flush));
+            }
+
+            // 6. Checkpoint WAL and GC superseded segments
+            let flushed_max_version = meta.max_version.unwrap_or(Version::INITIAL);
+            commit_guard.wal.append(&WalRecord::Checkpoint {
+                version: flushed_max_version,
+            })?;
+            commit_guard.wal.sync()?;
+            let _ = commit_guard.wal.gc(flushed_max_version)?;
         }
-
-        // 2. Move active into immutable list; install fresh active memtable
-        let old_active = {
-            let mut read_guard = self.read_state.write();
-            let old = std::mem::take(&mut read_guard.active);
-            let old = Arc::new(old);
-            read_guard.immutables.insert(0, Arc::clone(&old));
-            old
-        };
-
-        // 3. Write detached entries to sst/<id>.sst.tmp
-        let sst_id = commit_guard.next_sst_id;
-        commit_guard.next_sst_id += 1;
-
-        let sst_dir = self.options.dir.join("sst");
-        let tmp_path = sst_dir.join(format!("{sst_id}.sst.tmp"));
-        let sst_path = sst_dir.join(format!("{sst_id}.sst"));
-
-        let meta = SstWriter::write(
-            &tmp_path,
-            sst_id,
-            old_active.iter().cloned(),
-            &self.options.sst,
-        )?;
-
-        // 4. Rename to sst/<id>.sst and fsync sst/ directory
-        std::fs::rename(&tmp_path, &sst_path)?;
-        sync_dir(&sst_dir)?;
-
-        // 5. Write and fsync MANIFEST
-        let mut new_manifest = commit_guard.manifest.clone();
-        new_manifest.prepend(ManifestSstEntry::from(&meta));
-        let mut ledger_entries: Vec<ManifestLedgerEntry> = commit_guard
-            .applied_txns
-            .iter()
-            .map(|(&txn_id, &version)| ManifestLedgerEntry::new(txn_id, version))
-            .collect();
-        ledger_entries.sort_unstable_by_key(|e| e.txn_id);
-        new_manifest.applied_txns = ledger_entries;
-        Manifest::atomic_publish(&self.options.dir, &new_manifest)?;
-        commit_guard.manifest = new_manifest;
-
-        // 6. Install new SstReader and drop immutable memtable
-        let reader = Arc::new(SstReader::open(&sst_path)?);
-        {
-            let mut read_guard = self.read_state.write();
-            read_guard.ssts.insert(0, reader);
-            read_guard
-                .immutables
-                .retain(|m| !Arc::ptr_eq(m, &old_active));
-        }
-
-        // 7. Checkpoint WAL and GC superseded segments
-        let flushed_max_version = meta.max_version.unwrap_or(Version::INITIAL);
-        commit_guard.wal.append(&WalRecord::Checkpoint {
-            version: flushed_max_version,
-        })?;
-        commit_guard.wal.sync()?;
-        let _ = commit_guard.wal.gc(flushed_max_version)?;
-
-        Ok(())
     }
 
     /// Find the newest committed version of a key across active memtable,
