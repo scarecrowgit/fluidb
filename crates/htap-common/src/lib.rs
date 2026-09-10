@@ -17,7 +17,7 @@
 //!     if t < last {
 //!         return Err(HtapError::Fenced { expected: last.get(), got: t.get() });
 //!     }
-//!     Ok(v.next())
+//!     v.checked_next()
 //! }
 //!
 //! let v = bump(Version::INITIAL, FencingToken::new(2), FencingToken::INITIAL)?;

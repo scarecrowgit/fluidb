@@ -1021,3 +1021,41 @@ fn test_retry_from_segments_written_and_ready_to_publish() {
     let m2 = converter.convert_partition(part_id).unwrap();
     assert_eq!(m2, m);
 }
+
+#[test]
+fn test_convert_partition_generation_overflow_no_catalog_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cat_store, engine, _table_id, part_id, _tablet_id, _schema) = make_test_setup(tmp.path());
+    let colstore_dir = tmp.path().join("colstore");
+
+    // Set catalog generation to u64::MAX
+    let snap = cat_store.load().unwrap().unwrap();
+    let mut snap_max = snap.clone();
+    snap_max.generation = u64::MAX;
+    cat_store
+        .compare_and_set(snap.generation, snap_max)
+        .unwrap();
+
+    let converter = LocalConverter::new(
+        cat_store.clone(),
+        engine.clone(),
+        &colstore_dir,
+        SegmentOptions::new(),
+    );
+
+    let err = converter.convert_partition(part_id).unwrap_err();
+    assert!(matches!(
+        err,
+        HtapError::CounterOverflow {
+            counter: "catalog_generation"
+        }
+    ));
+
+    // Verify catalog generation and partition state were not mutated
+    let final_cat = cat_store.load().unwrap().unwrap();
+    assert_eq!(final_cat.generation, u64::MAX);
+    assert_eq!(
+        final_cat.partition(part_id).unwrap().storage,
+        StorageDescriptor::Row
+    );
+}

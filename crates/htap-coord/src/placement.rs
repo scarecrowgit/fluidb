@@ -274,9 +274,12 @@ pub fn plan_placement(
             tablet_nodes.insert(chosen_node);
             healthy_nodes.insert(chosen_node);
 
-            max_replica_id_u64 = max_replica_id_u64.checked_add(1).ok_or_else(|| {
-                HtapError::Internal("replica ID overflow: maximum u64 reached".into())
-            })?;
+            max_replica_id_u64 =
+                max_replica_id_u64
+                    .checked_add(1)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "replica_id",
+                    })?;
 
             let addition =
                 PlacementAddition::new(tablet.id, chosen_node, ReplicaId::new(max_replica_id_u64));
@@ -366,7 +369,13 @@ pub fn stage_placement_addition(
             }
         }
         next_snapshot.replicas.push(staged.clone());
-        next_snapshot.generation = snapshot.generation + 1;
+        next_snapshot.generation =
+            snapshot
+                .generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
 
         match coordinator.fenced_catalog_compare_and_set(
             scope,
@@ -454,13 +463,23 @@ pub fn activate_placement_addition(
         for rep in &mut next_snap.replicas {
             if rep.id == target_rep.id {
                 rep.healthy = true;
-                rep.generation += 1;
+                rep.generation =
+                    rep.generation
+                        .checked_add(1)
+                        .ok_or(HtapError::CounterOverflow {
+                            counter: "replica_generation",
+                        })?;
                 updated = Some(rep.clone());
                 break;
             }
         }
         let updated = updated.expect("target replica must exist");
-        next_snap.generation = snap.generation + 1;
+        next_snap.generation =
+            snap.generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
 
         match coordinator.fenced_catalog_compare_and_set(
             scope,

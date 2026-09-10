@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::error::{HtapError, Result};
+
 /// Monotonic MVCC version. Shared by the row store and column store so a
 /// transaction can touch both. Version 1 is the empty/initial version;
 /// the first write lands at version 2.
@@ -30,6 +32,15 @@ impl Version {
     #[must_use]
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
+    }
+
+    /// Return the strictly next version, or [`HtapError::CounterOverflow`] on overflow.
+    #[inline]
+    pub fn checked_next(self) -> Result<Self> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(HtapError::CounterOverflow { counter: "version" })
     }
 }
 
@@ -68,6 +79,17 @@ impl FencingToken {
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
     }
+
+    /// Return the strictly next token, or [`HtapError::CounterOverflow`] on overflow.
+    #[inline]
+    pub fn checked_next(self) -> Result<Self> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "fencing_token",
+            })
+    }
 }
 
 impl fmt::Display for FencingToken {
@@ -90,6 +112,16 @@ mod tests {
         assert_eq!(v1, Version::INITIAL);
         assert_eq!(v1.to_string(), "v1");
         assert_eq!(v2.to_string(), "v2");
+
+        let v_checked = v1.checked_next().unwrap();
+        assert_eq!(v_checked, v2);
+
+        let v_max = Version::new(u64::MAX);
+        let err = v_max.checked_next().unwrap_err();
+        assert!(matches!(
+            err,
+            HtapError::CounterOverflow { counter: "version" }
+        ));
     }
 
     #[test]
@@ -102,5 +134,17 @@ mod tests {
         assert!(t1 >= FencingToken::new(10));
         assert!(t1 < FencingToken::new(11));
         assert_eq!(t1.to_string(), "fence#10");
+
+        let t_checked = t1.checked_next().unwrap();
+        assert_eq!(t_checked, t2);
+
+        let t_max = FencingToken::new(u64::MAX);
+        let err = t_max.checked_next().unwrap_err();
+        assert!(matches!(
+            err,
+            HtapError::CounterOverflow {
+                counter: "fencing_token"
+            }
+        ));
     }
 }

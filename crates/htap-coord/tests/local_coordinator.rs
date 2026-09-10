@@ -570,3 +570,121 @@ fn test_coordinator_bounds_oversized_and_short() {
     let err = LocalCoordinator::open(tmp.path()).unwrap_err();
     assert!(matches!(err, HtapError::Corruption(_)));
 }
+
+#[test]
+fn test_fencing_token_overflow_persisted_and_in_memory_unchanged() {
+    use htap_common::FencingToken;
+    use htap_coord::{encode_state, CoordinatorState, Leadership, COORDINATOR_FILE_NAME};
+
+    let tmp = TempDir::new().unwrap();
+    let coord_path = tmp.path().join(COORDINATOR_FILE_NAME);
+
+    // 1. Create a state with next_token = u64::MAX
+    let state = CoordinatorState {
+        members: [NodeId::new(1)].into_iter().collect(),
+        leaders: [(
+            "scope1".to_string(),
+            Leadership::new("scope1", NodeId::new(1), FencingToken::new(1)),
+        )]
+        .into_iter()
+        .collect(),
+        scope_tokens: [("scope1".to_string(), 1)].into_iter().collect(),
+        next_token: u64::MAX,
+    };
+    let encoded = encode_state(&state).unwrap();
+    fs::write(&coord_path, &encoded).unwrap();
+
+    let coord = LocalCoordinator::open(tmp.path()).unwrap();
+
+    // Verify initial leadership is readable
+    let initial_l = coord.current_leadership("scope1").unwrap().unwrap();
+    assert_eq!(initial_l.token, FencingToken::new(1));
+
+    // Read initial persisted bytes
+    let initial_disk_bytes = fs::read(&coord_path).unwrap();
+
+    // 2. acquire_leadership must return CounterOverflow
+    let err = coord
+        .acquire_leadership("scope2", NodeId::new(1))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        HtapError::CounterOverflow {
+            counter: "fencing_token"
+        }
+    ));
+
+    // In-memory state unchanged: scope2 not held
+    assert!(coord.current_leadership("scope2").unwrap().is_none());
+    // Persisted state on disk completely unchanged
+    let current_disk_bytes = fs::read(&coord_path).unwrap();
+    assert_eq!(initial_disk_bytes, current_disk_bytes);
+
+    // 3. replace_leadership must return CounterOverflow
+    let err_replace = coord
+        .replace_leadership("scope1", NodeId::new(2))
+        .unwrap_err();
+    assert!(matches!(
+        err_replace,
+        HtapError::CounterOverflow {
+            counter: "fencing_token"
+        }
+    ));
+
+    // In-memory state unchanged: scope1 still held by Node 1 with token 1
+    let l_after = coord.current_leadership("scope1").unwrap().unwrap();
+    assert_eq!(l_after.holder, NodeId::new(1));
+    assert_eq!(l_after.token, FencingToken::new(1));
+    // Persisted state on disk completely unchanged
+    assert_eq!(fs::read(&coord_path).unwrap(), initial_disk_bytes);
+}
+
+#[test]
+fn test_decode_state_and_validate_fence_overflow() {
+    use htap_common::FencingToken;
+    use htap_coord::{decode_state, encode_state, CoordinatorState, Leadership};
+
+    // 1. decode_state with max_token == u64::MAX fails with CounterOverflow
+    let state = CoordinatorState {
+        members: Default::default(),
+        leaders: [(
+            "scope1".to_string(),
+            Leadership::new("scope1", NodeId::new(1), FencingToken::new(u64::MAX)),
+        )]
+        .into_iter()
+        .collect(),
+        scope_tokens: Default::default(),
+        next_token: 1,
+    };
+    let encoded = encode_state(&state).unwrap();
+    let err = decode_state(&encoded).unwrap_err();
+    assert!(matches!(
+        err,
+        HtapError::CounterOverflow {
+            counter: "fencing_token"
+        }
+    ));
+
+    // 2. LocalCoordinator::open with scope_tokens last_tok == u64::MAX fails decode with CounterOverflow
+    let tmp = TempDir::new().unwrap();
+    let state2 = CoordinatorState {
+        members: Default::default(),
+        leaders: Default::default(),
+        scope_tokens: [("exhausted".to_string(), u64::MAX)].into_iter().collect(),
+        next_token: 1,
+    };
+    let encoded2 = encode_state(&state2).unwrap();
+    fs::write(
+        tmp.path().join(htap_coord::COORDINATOR_FILE_NAME),
+        &encoded2,
+    )
+    .unwrap();
+
+    let open_err = LocalCoordinator::open(tmp.path()).unwrap_err();
+    assert!(matches!(
+        open_err,
+        HtapError::CounterOverflow {
+            counter: "fencing_token"
+        }
+    ));
+}

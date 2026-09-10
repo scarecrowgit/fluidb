@@ -3,8 +3,8 @@
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{
-    ConversionDescriptor, ConversionPhase, NodeId, ReplicaDescriptor, ReplicaId, StorageDescriptor,
-    StorageFormat, TableId, TabletId,
+    ConversionDescriptor, ConversionPhase, NodeId, PartitionId, ReplicaDescriptor, ReplicaId,
+    StorageDescriptor, StorageFormat, TableId, TabletId,
 };
 use htap_common::types::{DataType, Value};
 use htap_common::version::Version;
@@ -948,5 +948,153 @@ fn test_wal_gc_recovery_with_transaction_manager() {
             assert_eq!(row.get(0), Some(&Value::Int32(300)));
         }
         other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_create_table_overflow_typed_errors() {
+    // 1. Generation overflow
+    {
+        let dir = TempDir::new().unwrap();
+        let server = LocalServer::open(dir.path()).unwrap();
+        server
+            .execute("CREATE TABLE t1 (id INT PRIMARY KEY);")
+            .unwrap();
+
+        let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+        let snap = cat_store.load().unwrap().unwrap();
+        let mut snap_gen_max = snap.clone();
+        snap_gen_max.generation = u64::MAX;
+        cat_store
+            .compare_and_set(snap.generation, snap_gen_max)
+            .unwrap();
+
+        let err_gen = server
+            .execute("CREATE TABLE t2 (id INT PRIMARY KEY);")
+            .unwrap_err();
+        assert!(matches!(
+            err_gen,
+            HtapError::CounterOverflow {
+                counter: "catalog_generation"
+            }
+        ));
+    }
+
+    // 2. TableId overflow
+    {
+        let dir = TempDir::new().unwrap();
+        let server = LocalServer::open(dir.path()).unwrap();
+        server
+            .execute("CREATE TABLE t1 (id INT PRIMARY KEY);")
+            .unwrap();
+
+        let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+        let snap = cat_store.load().unwrap().unwrap();
+        let mut snap_tbl_max = snap.clone();
+        snap_tbl_max.generation = snap.generation + 1;
+        snap_tbl_max.tables[0].id = TableId::new(u64::MAX);
+        snap_tbl_max.partitions[0].table_id = TableId::new(u64::MAX);
+        cat_store
+            .compare_and_set(snap.generation, snap_tbl_max)
+            .unwrap();
+
+        let err_tbl = server
+            .execute("CREATE TABLE t2 (id INT PRIMARY KEY);")
+            .unwrap_err();
+        assert!(matches!(
+            err_tbl,
+            HtapError::CounterOverflow {
+                counter: "table_id"
+            }
+        ));
+    }
+
+    // 3. PartitionId overflow
+    {
+        let dir = TempDir::new().unwrap();
+        let server = LocalServer::open(dir.path()).unwrap();
+        server
+            .execute("CREATE TABLE t1 (id INT PRIMARY KEY);")
+            .unwrap();
+
+        let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+        let snap = cat_store.load().unwrap().unwrap();
+        let mut snap_part_max = snap.clone();
+        snap_part_max.generation = snap.generation + 1;
+        snap_part_max.partitions[0].id = PartitionId::new(u64::MAX);
+        snap_part_max.tables[0].partitions = vec![PartitionId::new(u64::MAX)];
+        snap_part_max.tablets[0].partition_id = PartitionId::new(u64::MAX);
+        cat_store
+            .compare_and_set(snap.generation, snap_part_max)
+            .unwrap();
+
+        let err_part = server
+            .execute("CREATE TABLE t2 (id INT PRIMARY KEY);")
+            .unwrap_err();
+        assert!(matches!(
+            err_part,
+            HtapError::CounterOverflow {
+                counter: "partition_id"
+            }
+        ));
+    }
+
+    // 4. TabletId overflow
+    {
+        let dir = TempDir::new().unwrap();
+        let server = LocalServer::open(dir.path()).unwrap();
+        server
+            .execute("CREATE TABLE t1 (id INT PRIMARY KEY);")
+            .unwrap();
+
+        let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+        let snap = cat_store.load().unwrap().unwrap();
+        let mut snap_tab_max = snap.clone();
+        snap_tab_max.generation = snap.generation + 1;
+        snap_tab_max.tablets[0].id = TabletId::new(u64::MAX);
+        snap_tab_max.partitions[0].tablets = vec![TabletId::new(u64::MAX)];
+        snap_tab_max.replicas[0].tablet_id = TabletId::new(u64::MAX);
+        cat_store
+            .compare_and_set(snap.generation, snap_tab_max)
+            .unwrap();
+
+        let err_tab = server
+            .execute("CREATE TABLE t2 (id INT PRIMARY KEY);")
+            .unwrap_err();
+        assert!(matches!(
+            err_tab,
+            HtapError::CounterOverflow {
+                counter: "tablet_id"
+            }
+        ));
+    }
+
+    // 5. ReplicaId overflow
+    {
+        let dir = TempDir::new().unwrap();
+        let server = LocalServer::open(dir.path()).unwrap();
+        server
+            .execute("CREATE TABLE t1 (id INT PRIMARY KEY);")
+            .unwrap();
+
+        let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+        let snap = cat_store.load().unwrap().unwrap();
+        let mut snap_rep_max = snap.clone();
+        snap_rep_max.generation = snap.generation + 1;
+        snap_rep_max.replicas[0].id = ReplicaId::new(u64::MAX);
+        snap_rep_max.tablets[0].replicas = vec![ReplicaId::new(u64::MAX)];
+        cat_store
+            .compare_and_set(snap.generation, snap_rep_max)
+            .unwrap();
+
+        let err_rep = server
+            .execute("CREATE TABLE t2 (id INT PRIMARY KEY);")
+            .unwrap_err();
+        assert!(matches!(
+            err_rep,
+            HtapError::CounterOverflow {
+                counter: "replica_id"
+            }
+        ));
     }
 }

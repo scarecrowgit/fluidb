@@ -308,7 +308,9 @@ impl Engine {
             }
             sst_readers.push(Arc::new(reader));
         }
-        let next_sst_id = max_sst_id + 1;
+        let next_sst_id = max_sst_id
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow { counter: "sst_id" })?;
 
         // 3. Best-effort delete orphan *.tmp and unlisted *.sst
         let _ = std::fs::remove_file(options.dir.join("MANIFEST.tmp"));
@@ -643,7 +645,7 @@ impl Engine {
         // 1. Version continuity check
         let expected_version = {
             let read_guard = self.read_state.read();
-            read_guard.committed_version.next()
+            read_guard.committed_version.checked_next()?
         };
         if version != expected_version {
             return Err(HtapError::InvalidArgument(format!(
@@ -828,10 +830,10 @@ impl Engine {
         if version <= read_guard.visible_version {
             return Ok(());
         }
-        if version != read_guard.visible_version.next() {
+        let next_visible = read_guard.visible_version.checked_next()?;
+        if version != next_visible {
             return Err(HtapError::InvalidArgument(format!(
-                "cannot publish version {version}: expected next visible version {}",
-                read_guard.visible_version.next()
+                "cannot publish version {version}: expected next visible version {next_visible}"
             )));
         }
         if version > read_guard.committed_version {
@@ -877,7 +879,7 @@ impl Engine {
             )));
         }
 
-        let commit_version = committed_version.next();
+        let commit_version = committed_version.checked_next()?;
         self.apply_prepared_locked(&mut commit_guard, prepared, commit_version)?;
         if let Err(err) = self.publish_locked(commit_version) {
             return Err(HtapError::DurablePending {
@@ -1019,7 +1021,22 @@ impl Engine {
     ///   which [`Memtable::apply`] tolerates idempotently.
     fn flush_locked(&self, commit_guard: &mut CommitState) -> Result<()> {
         loop {
-            // 1. Select candidate memtable to flush.
+            // 1. Check if there is anything to flush before allocating an SST ID
+            let has_flush_work = {
+                let read_guard = self.read_state.read();
+                read_guard.immutables.last().is_some() || !read_guard.active.is_empty()
+            };
+            if !has_flush_work {
+                return Ok(());
+            }
+
+            // Checked SST ID allocation before modifying memtable state or creating files
+            let sst_id = commit_guard.next_sst_id;
+            let next_sst_id = sst_id
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow { counter: "sst_id" })?;
+
+            // Select candidate memtable to flush.
             // Retained failed immutable memtables must be selected/retried before newer active.
             // ReadState stores immutables newest-first, so the oldest pending immutable is immutables.last().
             let to_flush = {
@@ -1036,9 +1053,9 @@ impl Engine {
                 }
             };
 
+            commit_guard.next_sst_id = next_sst_id;
+
             // 2. Write detached entries to sst/<id>.sst.tmp
-            let sst_id = commit_guard.next_sst_id;
-            commit_guard.next_sst_id += 1;
 
             let sst_dir = self.options.dir.join("sst");
             let tmp_path = sst_dir.join(format!("{sst_id}.sst.tmp"));
@@ -1130,5 +1147,208 @@ impl Engine {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use htap_common::{Mutation, Row, Value};
+    use tempfile::tempdir;
+
+    fn make_row(val: i64) -> Row {
+        Row::new(vec![Value::Int64(val)])
+    }
+
+    #[test]
+    fn test_sst_id_overflow_manual_flush_no_memtable_loss() {
+        let dir = tempdir().unwrap();
+        let options = EngineOptions::new(dir.path());
+        let engine = Engine::open(options).unwrap();
+
+        let s0 = engine.snapshot();
+        let row = make_row(42);
+        engine
+            .commit(
+                1,
+                s0,
+                vec![Mutation::Put {
+                    partition_id: 0,
+                    key: b"k1".to_vec(),
+                    row: row.clone(),
+                }],
+            )
+            .unwrap();
+
+        let s1 = engine.snapshot();
+        assert_eq!(engine.get(0, b"k1", s1).unwrap(), Some(row.clone()));
+
+        // Set next_sst_id to u64::MAX
+        {
+            let mut cg = engine.commit_lock.lock();
+            cg.next_sst_id = u64::MAX;
+        }
+
+        let flush_err = engine.flush().unwrap_err();
+        assert!(matches!(
+            flush_err,
+            HtapError::CounterOverflow { counter: "sst_id" }
+        ));
+
+        // Verify next_sst_id was not wrapped
+        {
+            let cg = engine.commit_lock.lock();
+            assert_eq!(cg.next_sst_id, u64::MAX);
+        }
+
+        // Verify data was NOT lost from memtable!
+        assert_eq!(engine.get(0, b"k1", s1).unwrap(), Some(row));
+
+        // Verify no .sst file exists
+        let sst_dir = dir.path().join("sst");
+        if sst_dir.exists() {
+            let sst_files: Vec<_> = std::fs::read_dir(&sst_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
+                .collect();
+            assert_eq!(sst_files.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_sst_id_overflow_auto_flush_preserves_durable_pending() {
+        let dir = tempdir().unwrap();
+        let mut options = EngineOptions::new(dir.path());
+        options.memtable_bytes = 1; // force auto-flush
+        let engine = Engine::open(options).unwrap();
+
+        // Set next_sst_id to u64::MAX before committing
+        {
+            let mut cg = engine.commit_lock.lock();
+            cg.next_sst_id = u64::MAX;
+        }
+
+        let s0 = engine.snapshot();
+        let row = make_row(100);
+        let commit_err = engine
+            .commit(
+                1,
+                s0,
+                vec![Mutation::Put {
+                    partition_id: 0,
+                    key: b"key-auto".to_vec(),
+                    row: row.clone(),
+                }],
+            )
+            .unwrap_err();
+
+        // Must preserve DurablePending semantics
+        assert!(matches!(commit_err, HtapError::DurablePending { .. }));
+        if let HtapError::DurablePending { reason, .. } = commit_err {
+            assert!(
+                reason.contains("Counter overflow") || reason.contains("sst_id"),
+                "reason should contain counter overflow: {reason}"
+            );
+        }
+
+        // Active memtable retains the committed data
+        assert!(engine
+            .read_state
+            .read()
+            .active
+            .get(0, b"key-auto", Version::new(2))
+            .is_some());
+
+        // Upon publishing the durable version, row becomes visible to queries
+        engine.publish(Version::new(2)).unwrap();
+        assert_eq!(
+            engine.get(0, b"key-auto", engine.snapshot()).unwrap(),
+            Some(row)
+        );
+    }
+
+    #[test]
+    fn test_version_exhaustion_on_commit_and_apply_external() {
+        let dir = tempdir().unwrap();
+        let options = EngineOptions::new(dir.path());
+        let engine = Engine::open(options).unwrap();
+
+        // 1. Commit version exhaustion
+        {
+            let mut rg = engine.read_state.write();
+            rg.committed_version = Version::new(u64::MAX);
+            rg.visible_version = Version::new(u64::MAX);
+        }
+
+        let s_max = Snapshot::new(Version::new(u64::MAX));
+        let commit_err = engine
+            .commit(
+                1,
+                s_max,
+                vec![Mutation::Put {
+                    partition_id: 0,
+                    key: b"k".to_vec(),
+                    row: make_row(1),
+                }],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            commit_err,
+            HtapError::CounterOverflow { counter: "version" }
+        ));
+
+        // 2. External apply version continuity exhaustion
+        let apply_err = engine
+            .apply_external(
+                2,
+                Version::new(2),
+                vec![Mutation::Put {
+                    partition_id: 0,
+                    key: b"k2".to_vec(),
+                    row: make_row(2),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            apply_err,
+            HtapError::CounterOverflow { counter: "version" }
+        ));
+    }
+
+    #[test]
+    fn test_open_overflow_with_max_sst_id() {
+        let dir = tempdir().unwrap();
+        // Create an sst directory and manifest pointing to sst with id = u64::MAX
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        // Write an actual dummy SST file with id u64::MAX so SstReader doesn't fail on missing file
+        let dummy_sst_path = sst_dir.join(format!("{}.sst", u64::MAX));
+        let _meta = crate::sst::SstWriter::write(
+            &dummy_sst_path,
+            u64::MAX,
+            std::iter::empty(),
+            &crate::sst::SstOptions::default(),
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            ssts: vec![ManifestSstEntry {
+                id: u64::MAX,
+                entry_count: 0,
+                min_version: None,
+                max_version: None,
+            }],
+            applied_txns: vec![],
+        };
+        Manifest::atomic_publish(dir.path(), &manifest).unwrap();
+
+        let options = EngineOptions::new(dir.path());
+        let open_err = Engine::open(options).unwrap_err();
+        assert!(matches!(
+            open_err,
+            HtapError::CounterOverflow { counter: "sst_id" }
+        ));
     }
 }

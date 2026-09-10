@@ -271,8 +271,11 @@ impl LocalCoordinator {
                 })
             }
         } else if let Some(&last_tok) = state.scope_tokens.get(scope) {
+            let expected = last_tok.checked_add(1).ok_or(HtapError::CounterOverflow {
+                counter: "fencing_token",
+            })?;
             Err(HtapError::Fenced {
-                expected: last_tok + 1,
+                expected,
                 got: token.get(),
             })
         } else {
@@ -324,7 +327,13 @@ impl Coordinator for LocalCoordinator {
 
         let mut new_state = state.clone();
         let token = FencingToken::new(new_state.next_token);
-        new_state.next_token += 1;
+        let next_token = new_state
+            .next_token
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "fencing_token",
+            })?;
+        new_state.next_token = next_token;
         let leadership = Leadership::new(scope, holder, token);
         new_state
             .leaders
@@ -358,7 +367,13 @@ impl Coordinator for LocalCoordinator {
         let mut state = self.lock.lock();
         let mut new_state = state.clone();
         let token = FencingToken::new(new_state.next_token);
-        new_state.next_token += 1;
+        let next_token = new_state
+            .next_token
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "fencing_token",
+            })?;
+        new_state.next_token = next_token;
         let leadership = Leadership::new(scope, holder, token);
         new_state
             .leaders
@@ -485,7 +500,9 @@ pub fn decode_state(bytes: &[u8]) -> Result<CoordinatorState> {
         .unwrap_or(0);
 
     if state.next_token <= max_token {
-        state.next_token = max_token + 1;
+        state.next_token = max_token.checked_add(1).ok_or(HtapError::CounterOverflow {
+            counter: "fencing_token",
+        })?;
     }
     if state.next_token == 0 {
         state.next_token = 1;

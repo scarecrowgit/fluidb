@@ -775,3 +775,59 @@ fn test_tablet_package_file_bounds_and_caps() {
     let err = verify_package(&ctx.mover, &options, ctx.cat_store.as_ref()).unwrap_err();
     assert!(matches!(err, HtapError::Corruption(_)));
 }
+
+#[test]
+fn test_repair_tablet_overflow_boundaries_no_catalog_mutation() {
+    let ctx = create_test_context();
+    let options = TabletCloneOptions::new("job-overflow-test", ctx.tablet_id, ctx.target_rep_id);
+    clone_tablet(&ctx.mover, &options, ctx.cat_store.as_ref(), &ctx.engine).unwrap();
+
+    // 1. Replica generation overflow
+    let snap = ctx.cat_store.load().unwrap().unwrap();
+    let mut snap_rep_max = snap.clone();
+    snap_rep_max.generation = snap.generation + 1;
+    for rep in &mut snap_rep_max.replicas {
+        if rep.id == ctx.target_rep_id {
+            rep.generation = u64::MAX;
+        }
+    }
+    ctx.cat_store
+        .compare_and_set(snap.generation, snap_rep_max)
+        .unwrap();
+
+    let err_rep = repair_tablet(&ctx.mover, &options, ctx.cat_store.as_ref()).unwrap_err();
+    assert!(matches!(
+        err_rep,
+        HtapError::CounterOverflow {
+            counter: "replica_generation"
+        }
+    ));
+    // Verify target replica was not marked healthy
+    let cur_snap = ctx.cat_store.load().unwrap().unwrap();
+    let rep = cur_snap.replica(ctx.target_rep_id).unwrap();
+    assert!(!rep.healthy);
+
+    // 2. Catalog generation overflow
+    let mut snap_cat_max = cur_snap.clone();
+    snap_cat_max.generation = u64::MAX;
+    for rep in &mut snap_cat_max.replicas {
+        if rep.id == ctx.target_rep_id {
+            rep.generation = 1; // reset replica gen so catalog gen is tested
+        }
+    }
+    ctx.cat_store
+        .compare_and_set(cur_snap.generation, snap_cat_max)
+        .unwrap();
+
+    let err_cat = repair_tablet(&ctx.mover, &options, ctx.cat_store.as_ref()).unwrap_err();
+    assert!(matches!(
+        err_cat,
+        HtapError::CounterOverflow {
+            counter: "catalog_generation"
+        }
+    ));
+    // Verify catalog generation was not mutated
+    let final_snap = ctx.cat_store.load().unwrap().unwrap();
+    assert_eq!(final_snap.generation, u64::MAX);
+    assert!(!final_snap.replica(ctx.target_rep_id).unwrap().healthy);
+}

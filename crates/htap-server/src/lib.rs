@@ -265,7 +265,9 @@ impl LocalServer {
             .unwrap_or(0);
         let next_table_id = max_table_id
             .checked_add(1)
-            .ok_or_else(|| HtapError::Internal("TableId overflow".into()))?;
+            .ok_or(HtapError::CounterOverflow {
+                counter: "table_id",
+            })?;
         let table_id = TableId::new(next_table_id);
 
         let max_partition_id = catalog
@@ -274,9 +276,12 @@ impl LocalServer {
             .map(|p| p.id.as_u64())
             .max()
             .unwrap_or(0);
-        let next_partition_id = max_partition_id
-            .checked_add(1)
-            .ok_or_else(|| HtapError::Internal("PartitionId overflow".into()))?;
+        let next_partition_id =
+            max_partition_id
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "partition_id",
+                })?;
         let partition_id = PartitionId::new(next_partition_id);
 
         let max_tablet_id = catalog
@@ -287,7 +292,9 @@ impl LocalServer {
             .unwrap_or(0);
         let next_tablet_id = max_tablet_id
             .checked_add(1)
-            .ok_or_else(|| HtapError::Internal("TabletId overflow".into()))?;
+            .ok_or(HtapError::CounterOverflow {
+                counter: "tablet_id",
+            })?;
         let tablet_id = TabletId::new(next_tablet_id);
 
         let max_replica_id = catalog
@@ -298,13 +305,18 @@ impl LocalServer {
             .unwrap_or(0);
         let next_replica_id = max_replica_id
             .checked_add(1)
-            .ok_or_else(|| HtapError::Internal("ReplicaId overflow".into()))?;
+            .ok_or(HtapError::CounterOverflow {
+                counter: "replica_id",
+            })?;
         let replica_id = ReplicaId::new(next_replica_id);
 
-        let next_generation = catalog
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| HtapError::Internal("Catalog generation overflow".into()))?;
+        let next_generation =
+            catalog
+                .generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
 
         let table_desc = TableDescriptor::new(
             table_id,

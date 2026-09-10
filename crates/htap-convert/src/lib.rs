@@ -847,7 +847,13 @@ pub fn convert_partition(
                 visible_v
             };
 
-            let next_gen = current_cat.generation + 1;
+            let next_gen =
+                current_cat
+                    .generation
+                    .checked_add(1)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "catalog_generation",
+                    })?;
             let mut next_cat = current_cat.clone();
             next_cat.generation = next_gen;
 
@@ -937,7 +943,12 @@ pub fn convert_partition(
         }
 
         if conv1.phase == ConversionPhase::SnapshotPinned {
-            let next_gen = cat1.generation + 1;
+            let next_gen = cat1
+                .generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
             let mut cat_sw = cat1.clone();
             cat_sw.generation = next_gen;
 
@@ -995,7 +1006,12 @@ pub fn convert_partition(
         }
 
         if conv2.phase == ConversionPhase::SegmentsWritten {
-            let next_gen = cat2.generation + 1;
+            let next_gen = cat2
+                .generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
             let mut cat_rtp = cat2.clone();
             cat_rtp.generation = next_gen;
 
@@ -1083,7 +1099,12 @@ pub fn convert_partition(
     let rel_path = format!("tablet-{}/{}", tablet_id.as_u64(), MANIFEST_FILE_NAME);
     let manifest_ref = manifest.to_manifest_ref(rel_path);
 
-    let final_gen = cat3.generation + 1;
+    let final_gen = cat3
+        .generation
+        .checked_add(1)
+        .ok_or(HtapError::CounterOverflow {
+            counter: "catalog_generation",
+        })?;
     let mut final_cat = cat3.clone();
     final_cat.generation = final_gen;
 

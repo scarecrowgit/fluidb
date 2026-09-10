@@ -811,13 +811,24 @@ pub fn repair_tablet(
         for rep in &mut next_snapshot.replicas {
             if rep.id == manifest.target_replica_id {
                 rep.healthy = true;
-                rep.generation += 1;
+                rep.generation =
+                    rep.generation
+                        .checked_add(1)
+                        .ok_or(HtapError::CounterOverflow {
+                            counter: "replica_generation",
+                        })?;
                 updated_replica = Some(rep.clone());
                 break;
             }
         }
         let updated = updated_replica.expect("target replica must exist");
-        next_snapshot.generation = snapshot.generation + 1;
+        next_snapshot.generation =
+            snapshot
+                .generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
 
         match catalog.compare_and_set(snapshot.generation, next_snapshot) {
             Ok(()) => return Ok(updated),

@@ -25,6 +25,9 @@ pub enum HtapError {
     #[error("Fenced: expected token >= {expected}, got {got}")]
     Fenced { expected: u64, got: u64 },
 
+    #[error("Counter overflow: {counter}")]
+    CounterOverflow { counter: &'static str },
+
     /// Transaction commit was fsynced and is durable, but post-commit
     /// execution (apply or publish) failed. Transaction cannot be rolled back;
     /// recovery/completion is required.
@@ -81,6 +84,9 @@ mod tests {
             got: 3,
         };
         assert_eq!(err_fence.to_string(), "Fenced: expected token >= 5, got 3");
+
+        let err_overflow = HtapError::CounterOverflow { counter: "version" };
+        assert_eq!(err_overflow.to_string(), "Counter overflow: version");
 
         let err_dp = HtapError::DurablePending {
             txn_id: 42,

@@ -215,16 +215,31 @@ impl TransactionManager {
     }
 
     /// Allocate a new monotonic transaction ID.
-    pub fn next_txn_id(&self) -> TransactionId {
-        TransactionId::new(self.next_txn_id.fetch_add(1, Ordering::SeqCst))
+    pub fn next_txn_id(&self) -> Result<TransactionId> {
+        let mut current = self.next_txn_id.load(Ordering::SeqCst);
+        loop {
+            let next = current
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow { counter: "txn_id" })?;
+            match self.next_txn_id.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(val) => return Ok(TransactionId::new(val)),
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Allocate a new monotonic commit version.
-    fn allocate_version(&self) -> Version {
+    pub fn allocate_version(&self) -> Result<Version> {
         let mut v = self.next_version.lock();
         let assigned = *v;
-        *v = v.next();
-        assigned
+        let next = assigned.checked_next()?;
+        *v = next;
+        Ok(assigned)
     }
 
     /// Return the current visible MVCC version.
@@ -239,7 +254,7 @@ impl TransactionManager {
 
     /// Begin a new synchronous transaction.
     pub fn begin(&self) -> Result<Transaction> {
-        let id = self.next_txn_id();
+        let id = self.next_txn_id()?;
         let read_version = self.visible_version();
         Ok(Transaction::new(id, read_version))
     }
@@ -310,6 +325,18 @@ impl TransactionManager {
 
         txn.state = TxnState::Prepared;
 
+        // Check that commit version successor can be allocated before durable decision / mutations
+        {
+            let next_v = self.next_version.lock();
+            if let Err(err) = next_v.checked_next() {
+                for prep in prepared.iter().rev() {
+                    let _ = prep.abort(txn.id);
+                }
+                txn.state = TxnState::Aborted;
+                return Err(err);
+            }
+        }
+
         // 3. Fsync Intent record
         let intent_record = JournalRecord::Intent {
             txn_id: txn.id,
@@ -328,7 +355,7 @@ impl TransactionManager {
         }
 
         // 4. Assign monotonic commit version
-        let version = self.allocate_version();
+        let version = self.allocate_version()?;
         txn.commit_version = Some(version);
 
         // Linearization point boundary entered: once Commit frame append begins,
@@ -415,8 +442,10 @@ impl TransactionManager {
         // 8. Advance visible version only after all succeed
         {
             let mut vis = self.visible_version.lock();
-            if version == vis.next() {
-                *vis = version;
+            if let Ok(next_vis) = vis.checked_next() {
+                if version == next_vis {
+                    *vis = version;
+                }
             }
         }
 
@@ -603,8 +632,13 @@ impl TransactionManager {
             unresolved_reasons.insert(unresolved_id, reason);
         }
 
-        self.next_txn_id.store(max_txn_id + 1, Ordering::SeqCst);
-        *self.next_version.lock() = max_version.next();
+        let next_txn = max_txn_id
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow { counter: "txn_id" })?;
+        let next_v = max_version.checked_next()?;
+
+        self.next_txn_id.store(next_txn, Ordering::SeqCst);
+        *self.next_version.lock() = next_v;
         *self.visible_version.lock() = max_version;
 
         Ok(RecoveryReport {
@@ -736,5 +770,130 @@ mod tests {
                 "100:publish:1:v2".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_txn_id_and_version_allocation_overflow_at_u64_max() {
+        let temp = NamedTempFile::new().unwrap();
+        let tm = TransactionManager::open(temp.path()).unwrap();
+
+        // 1. next_txn_id overflow
+        tm.next_txn_id.store(u64::MAX, Ordering::SeqCst);
+        let err = tm.next_txn_id().unwrap_err();
+        assert!(matches!(
+            err,
+            HtapError::CounterOverflow { counter: "txn_id" }
+        ));
+        // Verify state is not wrapped
+        assert_eq!(tm.next_txn_id.load(Ordering::SeqCst), u64::MAX);
+
+        // begin() also fails with the same error
+        let begin_err = tm.begin().unwrap_err();
+        assert!(matches!(
+            begin_err,
+            HtapError::CounterOverflow { counter: "txn_id" }
+        ));
+
+        // 2. allocate_version overflow
+        *tm.next_version.lock() = Version::new(u64::MAX);
+        let ver_err = tm.allocate_version().unwrap_err();
+        assert!(matches!(
+            ver_err,
+            HtapError::CounterOverflow { counter: "version" }
+        ));
+        // Verify state is not wrapped
+        assert_eq!(tm.next_version(), Version::new(u64::MAX));
+    }
+
+    #[test]
+    fn test_commit_version_overflow_no_journal_mutation() {
+        let temp = NamedTempFile::new().unwrap();
+        let tm = TransactionManager::open(temp.path()).unwrap();
+        let s1 = Arc::new(MockStore::new(ParticipantId::new(1)));
+        tm.register_participant(s1.clone());
+
+        // Normal begin
+        let mut txn = tm.begin().unwrap();
+        txn.add_participant(1, b"payload");
+
+        // Set next_version to u64::MAX before commit
+        *tm.next_version.lock() = Version::new(u64::MAX);
+
+        let initial_journal_len = std::fs::metadata(temp.path()).unwrap().len();
+
+        let commit_err = tm.commit(&mut txn).unwrap_err();
+        assert!(matches!(
+            commit_err,
+            HtapError::CounterOverflow { counter: "version" }
+        ));
+
+        // Participant was aborted
+        assert_eq!(
+            s1.events(),
+            vec![
+                format!("1:prepare:v1:{:?}", b"payload"),
+                format!("1:abort:{}", txn.id())
+            ]
+        );
+        assert_eq!(txn.state(), TxnState::Aborted);
+
+        // Journal must not have mutated (no Intent or Commit appended)
+        let final_journal_len = std::fs::metadata(temp.path()).unwrap().len();
+        assert_eq!(
+            initial_journal_len, final_journal_len,
+            "journal must not be mutated on version overflow"
+        );
+    }
+
+    #[test]
+    fn test_recovery_overflow_at_u64_max() {
+        let temp = NamedTempFile::new().unwrap();
+        // Write an Intent and Commit record with version u64::MAX
+        {
+            let mut j = Journal::open(temp.path()).unwrap();
+            let intent = JournalRecord::Intent {
+                txn_id: TransactionId::new(10),
+                snapshot: Version::INITIAL,
+                participants: vec![],
+            };
+            let commit = JournalRecord::Commit {
+                txn_id: TransactionId::new(10),
+                version: Version::new(u64::MAX),
+            };
+            j.append(&intent).unwrap();
+            j.append(&commit).unwrap();
+            j.sync().unwrap();
+        }
+
+        let tm = TransactionManager::open(temp.path()).unwrap();
+        let err = tm.recover().unwrap_err();
+        assert!(matches!(
+            err,
+            HtapError::CounterOverflow { counter: "version" }
+        ));
+
+        // Now test max_txn_id at u64::MAX
+        let temp2 = NamedTempFile::new().unwrap();
+        {
+            let mut j = Journal::open(temp2.path()).unwrap();
+            let intent = JournalRecord::Intent {
+                txn_id: TransactionId::new(u64::MAX),
+                snapshot: Version::INITIAL,
+                participants: vec![],
+            };
+            let commit = JournalRecord::Commit {
+                txn_id: TransactionId::new(u64::MAX),
+                version: Version::new(2),
+            };
+            j.append(&intent).unwrap();
+            j.append(&commit).unwrap();
+            j.sync().unwrap();
+        }
+        let tm2 = TransactionManager::open(temp2.path()).unwrap();
+        let err2 = tm2.recover().unwrap_err();
+        assert!(matches!(
+            err2,
+            HtapError::CounterOverflow { counter: "txn_id" }
+        ));
     }
 }

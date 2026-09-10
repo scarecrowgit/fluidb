@@ -762,3 +762,112 @@ fn test_activate_placement_plan_helper() {
     assert_eq!(activated_replicas.len(), 1);
     assert!(activated_replicas[0].healthy);
 }
+
+#[test]
+fn test_placement_overflow_boundaries_no_catalog_mutation() {
+    use htap_coord::placement::PlacementAddition;
+
+    let tmp_coord = TempDir::new().unwrap();
+    let tmp_cat = TempDir::new().unwrap();
+    let coord = LocalCoordinator::open(tmp_coord.path()).unwrap();
+    let catalog = LocalCatalogStore::open(tmp_cat.path()).unwrap();
+
+    let scope = "cluster";
+    let leader = coord.acquire_leadership(scope, NodeId::new(1)).unwrap();
+
+    // 1. plan_placement replica_id overflow
+    let (mut snap, _) = create_single_tablet_fixture(
+        TableId::new(1),
+        PartitionId::new(1),
+        TabletId::new(1),
+        ReplicaId::new(1),
+        NodeId::new(1),
+    );
+    snap.replicas[0].id = ReplicaId::new(u64::MAX);
+    snap.tablets[0].replicas = vec![ReplicaId::new(u64::MAX)];
+    catalog.compare_and_set(0, snap.clone()).unwrap();
+
+    let plan_err =
+        plan_placement(&snap, &[NodeId::new(1), NodeId::new(2), NodeId::new(3)], 2).unwrap_err();
+    assert!(matches!(
+        plan_err,
+        HtapError::CounterOverflow {
+            counter: "replica_id"
+        }
+    ));
+
+    // 2. stage_placement_addition catalog generation overflow
+    let tmp_cat2 = TempDir::new().unwrap();
+    let catalog2 = LocalCatalogStore::open(tmp_cat2.path()).unwrap();
+    let (mut snap_gen_max, _) = create_single_tablet_fixture(
+        TableId::new(1),
+        PartitionId::new(1),
+        TabletId::new(1),
+        ReplicaId::new(1),
+        NodeId::new(1),
+    );
+    snap_gen_max.generation = u64::MAX;
+    catalog2.compare_and_set(0, snap_gen_max.clone()).unwrap();
+
+    let addition = PlacementAddition::new(TabletId::new(1), NodeId::new(2), ReplicaId::new(100));
+    let stage_err =
+        stage_placement_addition(&coord, scope, leader.token, &catalog2, &addition).unwrap_err();
+    assert!(matches!(
+        stage_err,
+        HtapError::CounterOverflow {
+            counter: "catalog_generation"
+        }
+    ));
+    // Verify catalog generation was not mutated
+    assert_eq!(catalog2.current_generation().unwrap(), u64::MAX);
+
+    // 3. activate_placement_addition replica generation overflow
+    let tmp_cat3 = TempDir::new().unwrap();
+    let catalog3 = LocalCatalogStore::open(tmp_cat3.path()).unwrap();
+    let mover_dir = TempDir::new().unwrap();
+    let mover = LocalDataMover::new(mover_dir.path()).unwrap();
+    let rowstore_dir = TempDir::new().unwrap();
+    let rowstore = Arc::new(Engine::open(EngineOptions::new(rowstore_dir.path())).unwrap());
+
+    let (mut snap_rep_gen, _) = create_single_tablet_fixture(
+        TableId::new(1),
+        PartitionId::new(1),
+        TabletId::new(1),
+        ReplicaId::new(1),
+        NodeId::new(1),
+    );
+    // Add target replica staged unready with generation u64::MAX
+    let staged_max = ReplicaDescriptor::new(
+        ReplicaId::new(200),
+        TabletId::new(1),
+        NodeId::new(2),
+        false,
+        false,
+        u64::MAX,
+    );
+    snap_rep_gen.replicas.push(staged_max);
+    snap_rep_gen.tablets[0].replicas.push(ReplicaId::new(200));
+    catalog3.compare_and_set(0, snap_rep_gen.clone()).unwrap();
+
+    let addition_rep =
+        PlacementAddition::new(TabletId::new(1), NodeId::new(2), ReplicaId::new(200));
+    let act_err = activate_placement_addition(
+        &coord,
+        scope,
+        leader.token,
+        &catalog3,
+        rowstore.as_ref(),
+        &mover,
+        &addition_rep,
+        "job-test",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        act_err,
+        HtapError::CounterOverflow {
+            counter: "replica_generation"
+        }
+    ));
+    // Verify catalog generation was not mutated
+    assert_eq!(catalog3.current_generation().unwrap(), 1);
+}
