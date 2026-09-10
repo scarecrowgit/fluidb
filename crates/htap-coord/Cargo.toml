@@ -6,3 +6,12 @@ license.workspace = true
 
 [dependencies]
 htap-common = { path = "../htap-common" }
+htap-catalog = { path = "../htap-catalog" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crc32c = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+

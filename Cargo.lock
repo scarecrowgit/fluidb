@@ -188,7 +188,13 @@ dependencies = [
 name = "htap-coord"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
+ "htap-catalog",
  "htap-common",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
