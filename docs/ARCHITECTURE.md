@@ -151,7 +151,7 @@ sequenceDiagram
     participant Catalog as LocalCatalogStore
     participant TxnMgr as TransactionManager
     participant Journal as txn.journal
-    participant Participant as RowstoreParticipant (ID 1)
+    participant RowstorePart as RowstoreParticipant (ID 1)
     participant Engine as Rowstore Engine
 
     Caller->>Client: execute(sql) [INSERT or DELETE]
@@ -168,18 +168,18 @@ sequenceDiagram
 
     Server->>TxnMgr: commit_request(TransactionRequest)
     Note over TxnMgr: Acquire manager lock (serializes commit decision)
-    TxnMgr->>Participant: prepare(snapshot, payload)
-    Participant-->>TxnMgr: Ok
+    TxnMgr->>RowstorePart: prepare(snapshot, payload)
+    RowstorePart-->>TxnMgr: Ok
     TxnMgr->>Journal: Append & fsync INTENT frame
     TxnMgr->>Journal: Append & fsync COMMIT frame (irrevocable)
-    TxnMgr->>Participant: apply(txn_id, version, payload)
-    Participant->>Engine: apply(mutations) -> write WAL & memtable
-    Engine-->>Participant: Ok
-    Participant-->>TxnMgr: Ok
-    TxnMgr->>Participant: publish(txn_id, version)
-    Participant->>Engine: publish(version)
-    Engine-->>Participant: Ok
-    Participant-->>TxnMgr: Ok
+    TxnMgr->>RowstorePart: apply(txn_id, version, payload)
+    RowstorePart->>Engine: apply(mutations) -> write WAL & memtable
+    Engine-->>RowstorePart: Ok
+    RowstorePart-->>TxnMgr: Ok
+    TxnMgr->>RowstorePart: publish(txn_id, version)
+    RowstorePart->>Engine: publish(version)
+    Engine-->>RowstorePart: Ok
+    RowstorePart-->>TxnMgr: Ok
     TxnMgr->>TxnMgr: Advance visible_version watermark
     TxnMgr-->>Server: CommittedTransaction { version, ... }
     Note over Server: Release execution_lock
