@@ -39,6 +39,7 @@ sqlparser = "0.62"
 proptest = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+csv = "1"
 
 [profile.release]
 opt-level = 3
