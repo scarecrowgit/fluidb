@@ -18,6 +18,7 @@ use htap_catalog::{
 };
 use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
+use htap_common::lock::ProcessLock;
 use htap_common::types::{ColumnDef, Mutation, Row, Value};
 use htap_movement::{
     CopyOptions, CopyReport, LocalDataMover, MovementJob, TabletCloneOptions, TabletPackageManifest,
@@ -36,6 +37,7 @@ use parking_lot::Mutex;
 /// Encapsulates catalog metadata management, transactional write logging,
 /// LSM-based rowstore persistence, and data movement within a single local directory.
 pub struct LocalServer {
+    _lock: ProcessLock,
     catalog: LocalCatalogStore,
     engine: Arc<Engine>,
     txn_manager: TransactionManager,
@@ -46,7 +48,11 @@ pub struct LocalServer {
 impl LocalServer {
     /// Opens or recovers a local server instance rooted at `root`.
     ///
+    /// Canonicalizes/creates `root` and acquires an exclusive non-blocking advisory
+    /// lock at `<root>/LOCK` before opening catalog, engine, txn journal, or movement directories.
+    ///
     /// The root directory layout contains:
+    /// - `root/LOCK` - Advisory lock file ensuring single-process exclusive root ownership.
     /// - `root/catalog` - Directory for durable catalog snapshots.
     /// - `root/rowstore` - Directory for rowstore LSM data (WAL, SSTs, manifest).
     /// - `root/txn.journal` - Journal file for 2PC transaction coordination.
@@ -57,19 +63,22 @@ impl LocalServer {
     ///
     /// # Errors
     ///
-    /// Returns [`HtapError`] if initialization, catalog loading, or transaction
-    /// recovery fails.
+    /// Returns [`HtapError::Conflict`] if the root directory is already locked by another
+    /// process. Returns other [`HtapError`] variants if initialization, catalog loading,
+    /// or transaction recovery fails.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
+        let canonical_root = root.canonicalize()?;
+        let lock_guard = ProcessLock::acquire(&canonical_root)?;
 
-        let catalog_dir = root.join("catalog");
+        let catalog_dir = canonical_root.join("catalog");
         let catalog = LocalCatalogStore::open(catalog_dir)?;
 
-        let rowstore_dir = root.join("rowstore");
+        let rowstore_dir = canonical_root.join("rowstore");
         let engine = Arc::new(Engine::open(EngineOptions::new(rowstore_dir))?);
 
-        let txn_journal_path = root.join("txn.journal");
+        let txn_journal_path = canonical_root.join("txn.journal");
         let txn_manager = TransactionManager::open(txn_journal_path)?;
 
         let participant = Arc::new(RowstoreParticipant::new(
@@ -80,10 +89,11 @@ impl LocalServer {
 
         txn_manager.recover()?;
 
-        let movement_dir = root.join("movement");
+        let movement_dir = canonical_root.join("movement");
         let data_mover = LocalDataMover::new(movement_dir)?;
 
         Ok(Self {
+            _lock: lock_guard,
             catalog,
             engine,
             txn_manager,

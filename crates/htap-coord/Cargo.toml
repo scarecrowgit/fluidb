@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fs2 = { workspace = true }
 htap-common = { path = "../htap-common" }
 htap-catalog = { path = "../htap-catalog" }
 htap-movement = { path = "../htap-movement" }

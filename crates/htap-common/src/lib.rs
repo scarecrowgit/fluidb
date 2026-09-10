@@ -33,10 +33,12 @@
 
 pub mod error;
 pub mod keycodec;
+pub mod lock;
 pub mod types;
 pub mod version;
 
 pub use error::{HtapError, Result};
 pub use keycodec::{encode_key, encode_key_prefix};
+pub use lock::{ProcessLock, LOCK_FILE_NAME};
 pub use types::{ColumnDef, DataType, Mutation, Row, Schema, Value};
 pub use version::{FencingToken, Version};

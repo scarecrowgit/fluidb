@@ -40,6 +40,7 @@ futures = "0.3"
 sqlparser = "0.62"
 proptest = "1"
 tempfile = "3"
+fs2 = "0.4.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 csv = "1"
 

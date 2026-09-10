@@ -766,3 +766,115 @@ fn test_server_data_mover_clone_verify_repair() {
     let rep = updated_snap.replica(follower_rep_id).unwrap();
     assert!(rep.healthy);
 }
+
+fn child_binary() -> std::path::PathBuf {
+    let mut dir = std::env::current_exe().expect("test executable path");
+    dir.pop(); // .../target/<profile>/deps
+    if dir.ends_with("deps") {
+        dir.pop(); // .../target/<profile>
+    }
+    let exe = format!("server_lock_child{}", std::env::consts::EXE_SUFFIX);
+    let candidate = dir.join(&exe);
+    if !candidate.is_file() {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "htap-server", "--bin", "server_lock_child"])
+            .status()
+            .expect("building server_lock_child");
+        assert!(status.success(), "cargo build server_lock_child failed");
+    }
+    assert!(
+        candidate.is_file(),
+        "server_lock_child binary not found at {}",
+        candidate.display()
+    );
+    candidate
+}
+
+#[test]
+fn test_subprocess_exclusive_lock_contention_and_symlink() {
+    use std::io::BufRead;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // 1. Spawn child holding lock
+    let mut child = std::process::Command::new(child_binary())
+        .arg(root)
+        .arg("hold")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("spawn server_lock_child");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read from child");
+    assert_eq!(line.trim(), "LOCKED");
+
+    // 2. Child is holding lock. Opening from parent process must fail with Conflict.
+    let err = match LocalServer::open(root) {
+        Err(e) => e,
+        Ok(_) => panic!("expected LocalServer::open to fail with Conflict"),
+    };
+    assert!(
+        matches!(err, HtapError::Conflict(_)),
+        "expected Conflict error, got {err:?}"
+    );
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("exclusive root lock contention"),
+        "error message did not mention contention: {err_msg}"
+    );
+    assert!(
+        err_msg.contains(&format!("pid={}", child.id())),
+        "error message should contain child pid: {err_msg}"
+    );
+
+    // 3. Symlink alias test where supported: opening via symlink must also fail with Conflict
+    #[cfg(unix)]
+    {
+        let symlink_parent = TempDir::new().unwrap();
+        let symlink_path = symlink_parent.path().join("server_symlink_alias");
+        std::os::unix::fs::symlink(root, &symlink_path).unwrap();
+
+        let sym_err = match LocalServer::open(&symlink_path) {
+            Err(e) => e,
+            Ok(_) => panic!("expected LocalServer::open on symlink to fail with Conflict"),
+        };
+        assert!(
+            matches!(sym_err, HtapError::Conflict(_)),
+            "expected Conflict on symlink open, got {sym_err:?}"
+        );
+        let sym_err_msg = sym_err.to_string();
+        assert!(
+            sym_err_msg.contains("exclusive root lock contention"),
+            "symlink error message: {sym_err_msg}"
+        );
+    }
+
+    // 4. Second child opening same root must also fail with Conflict (exit code 42)
+    let child2_output = std::process::Command::new(child_binary())
+        .arg(root)
+        .arg("try_once")
+        .output()
+        .expect("spawn second child");
+    assert_eq!(
+        child2_output.status.code(),
+        Some(42),
+        "second child should exit with Conflict status code 42"
+    );
+
+    // 5. Release child lock by dropping its stdin (closing stream) and waiting for exit
+    drop(child.stdin.take());
+    let status = child.wait().expect("wait on child");
+    assert!(status.success(), "child did not exit cleanly: {status:?}");
+
+    // 6. After child exits, reopen succeeds and operates normally
+    let server = LocalServer::open(root).expect("reopen after child exit should succeed");
+    let res = server
+        .execute("CREATE TABLE test_tbl (id BIGINT PRIMARY KEY, v VARCHAR);")
+        .expect("statement should succeed");
+    assert!(matches!(res, StatementResult::Command(_)));
+}

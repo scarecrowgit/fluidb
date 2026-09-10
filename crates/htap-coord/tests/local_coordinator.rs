@@ -127,6 +127,8 @@ fn test_member_ordering() {
     coord.remove_node(NodeId::new(999)).unwrap();
     assert_eq!(coord.list_nodes().unwrap(), expected_after_removal);
 
+    drop(coord);
+
     // Reopen preserves deterministic member order
     let reopened = LocalCoordinator::open(tmp.path()).unwrap();
     assert_eq!(reopened.list_nodes().unwrap(), expected_after_removal);
@@ -438,4 +440,110 @@ fn test_coordinator_object_safety() {
 
     boxed.remove_member(NodeId::new(1)).unwrap();
     assert_eq!(boxed.list_members().unwrap(), vec![NodeId::new(2)]);
+}
+
+fn coord_child_binary() -> std::path::PathBuf {
+    let mut dir = std::env::current_exe().expect("test executable path");
+    dir.pop(); // .../target/<profile>/deps
+    if dir.ends_with("deps") {
+        dir.pop(); // .../target/<profile>
+    }
+    let exe = format!("coord_lock_child{}", std::env::consts::EXE_SUFFIX);
+    let candidate = dir.join(&exe);
+    if !candidate.is_file() {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "htap-coord", "--bin", "coord_lock_child"])
+            .status()
+            .expect("building coord_lock_child");
+        assert!(status.success(), "cargo build coord_lock_child failed");
+    }
+    assert!(
+        candidate.is_file(),
+        "coord_lock_child binary not found at {}",
+        candidate.display()
+    );
+    candidate
+}
+
+#[test]
+fn test_subprocess_exclusive_lock_contention_and_symlink() {
+    use std::io::BufRead;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // 1. Spawn child holding lock
+    let mut child = std::process::Command::new(coord_child_binary())
+        .arg(root)
+        .arg("hold")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("spawn coord_lock_child");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read from child");
+    assert_eq!(line.trim(), "LOCKED");
+
+    // 2. Child is holding lock. Opening from parent process must fail with Conflict.
+    let err = LocalCoordinator::open(root).unwrap_err();
+    assert!(
+        matches!(err, HtapError::Conflict(_)),
+        "expected Conflict error, got {err:?}"
+    );
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("exclusive root lock contention"),
+        "error message did not mention contention: {err_msg}"
+    );
+    assert!(
+        err_msg.contains(&format!("pid={}", child.id())),
+        "error message should contain child pid: {err_msg}"
+    );
+
+    // 3. Symlink alias test where supported: opening via symlink must also fail with Conflict
+    #[cfg(unix)]
+    {
+        let symlink_parent = TempDir::new().unwrap();
+        let symlink_path = symlink_parent.path().join("coord_symlink_alias");
+        std::os::unix::fs::symlink(root, &symlink_path).unwrap();
+
+        let sym_err = LocalCoordinator::open(&symlink_path).unwrap_err();
+        assert!(
+            matches!(sym_err, HtapError::Conflict(_)),
+            "expected Conflict on symlink open, got {sym_err:?}"
+        );
+        let sym_err_msg = sym_err.to_string();
+        assert!(
+            sym_err_msg.contains("exclusive root lock contention"),
+            "symlink error message: {sym_err_msg}"
+        );
+    }
+
+    // 4. Second child opening same root must also fail with Conflict (exit code 42)
+    let child2_output = std::process::Command::new(coord_child_binary())
+        .arg(root)
+        .arg("try_once")
+        .output()
+        .expect("spawn second child");
+    assert_eq!(
+        child2_output.status.code(),
+        Some(42),
+        "second child should exit with Conflict status code 42"
+    );
+
+    // 5. Release child lock by dropping its stdin and waiting for exit
+    drop(child.stdin.take());
+    let status = child.wait().expect("wait on child");
+    assert!(status.success(), "child did not exit cleanly: {status:?}");
+
+    // 6. After child exits, reopen succeeds and operates normally
+    let coord = LocalCoordinator::open(root).expect("reopen after child exit should succeed");
+    coord
+        .register_node(NodeId::new(42))
+        .expect("register should succeed");
+    assert_eq!(coord.list_nodes().unwrap(), vec![NodeId::new(42)]);
 }

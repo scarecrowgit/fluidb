@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{CatalogSnapshot, NodeId};
+use htap_common::lock::ProcessLock;
 use htap_common::{FencingToken, HtapError, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -201,36 +202,49 @@ impl Default for CoordinatorState {
 ///
 /// # Concurrency & Cross-Process Limitations
 /// All coordinator operations within a single process are serialized using an internal mutex.
-/// **Cross-process concurrency is unsupported:** multiple processes must not access the same
-/// coordinator root directory concurrently without external coordination.
+/// Cross-process root directory access is strictly exclusive: `LocalCoordinator::open`
+/// acquires an OS-level advisory lock at `<root>/LOCK`. Concurrent access by multiple processes
+/// against the same root directory is rejected with [`HtapError::Conflict`].
 #[derive(Debug)]
 pub struct LocalCoordinator {
     root: PathBuf,
+    _lock: ProcessLock,
     lock: Mutex<CoordinatorState>,
 }
 
 impl LocalCoordinator {
     /// Open or initialize a local coordinator at the specified directory path.
     ///
+    /// Canonicalizes/creates `root` and acquires an exclusive non-blocking advisory
+    /// lock at `<root>/LOCK` before opening or publishing coordinator state files.
+    ///
     /// If the directory does not exist, it will be created.
     /// If a published `COORDINATOR` file exists, its integrity is verified on startup.
     /// If no `COORDINATOR` file exists, an initial state envelope is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError::Conflict`] if the root directory is already locked by another
+    /// process. Returns other [`HtapError`] variants if state reading or publishing fails.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        let canonical_root = root.canonicalize()?;
+        let lock_guard = ProcessLock::acquire(&canonical_root)?;
 
-        let coord_path = root.join(COORDINATOR_FILE_NAME);
+        let coord_path = canonical_root.join(COORDINATOR_FILE_NAME);
         let state = if coord_path.exists() {
             let bytes = fs::read(&coord_path)?;
             decode_state(&bytes)?
         } else {
             let initial = CoordinatorState::default();
-            atomic_publish(&root, &initial)?;
+            atomic_publish(&canonical_root, &initial)?;
             initial
         };
 
         Ok(Self {
-            root,
+            root: canonical_root,
+            _lock: lock_guard,
             lock: Mutex::new(state),
         })
     }

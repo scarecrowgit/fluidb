@@ -16,16 +16,19 @@ The following production operational facilities are **not implemented**:
 - **No observability or monitoring infrastructure:** No Prometheus metrics endpoints, OpenTelemetry exporters, health-check probes, or operational telemetry daemons.
 - **No container or container orchestration:** No Docker images, Containerfile, Docker Compose setups, or Kubernetes manifests.
 - **No High Availability (HA) or multi-node consensus:** No Raft cluster consensus, ZooKeeper cluster integration, or automatic failover.
-- **No multi-process ownership:** `LocalServer` and `LocalCoordinator` do not use inter-process file locking (e.g., `flock`). Concurrent access to the same root directory by multiple operating system processes is **unsafe** and strictly unsupported.
+- **Single-Process Exclusive Root Ownership:** `LocalServer` and `LocalCoordinator` enforce exclusive ownership of their root directories using an OS-level non-blocking advisory lock (`<root>/LOCK` via `flock`). Canonicalized directory paths and symlink aliases are resolved prior to lock acquisition. Contention from a second process (or redundant instance) immediately fails with `HtapError::Conflict`.
+- **No Concurrent Multi-Process Shared-Root Operation:** Exclusive root ownership guarantees that only one process accesses a server or coordinator root at a time; concurrent multi-process shared-root operations and concurrent writers are strictly unsupported.
+- **Low-Level Standalone Component Hazard:** Standalone subsystem opens (`htap_rowstore::Engine::open`, `htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) do not acquire the root lock when invoked directly outside of `LocalServer`; concurrent direct opens of these low-level components against a shared root remain **unsafe**.
 
 ---
 
 ## LocalServer Filesystem Layout
 
-When a `LocalServer` is opened at a specified `root` directory (`LocalServer::open(root)`), it manages four dedicated sub-paths:
+When a `LocalServer` is opened at a specified `root` directory (`LocalServer::open(root)`), it manages four dedicated sub-paths and an advisory lock:
 
 ```text
 <root>/
+├── LOCK                    # Exclusive process advisory lock and diagnostic PID/start-time
 ├── catalog/
 │   ├── CATALOG             # Durable catalog snapshot state
 │   └── CATALOG.tmp         # Staging file for atomic replacement
@@ -41,6 +44,11 @@ When a `LocalServer` is opened at a specified `root` directory (`LocalServer::op
 ```
 
 ### Component Details
+
+0. **`LOCK` (`ProcessLock`):**
+   - Non-blocking exclusive advisory lock (`flock`) acquired during `LocalServer::open(root)`.
+   - Protects the server root against concurrent access from multiple processes or symlink aliases.
+   - Contains diagnostic metadata (`pid=...;start_time=...`) while the held OS kernel lock serves as the authoritative boundary.
 
 1. **`catalog/` (`LocalCatalogStore`):**
    - Tracks table definitions, schema, partition descriptors, tablets, and replica topologies.
@@ -70,6 +78,7 @@ The `LocalCoordinator` manages cluster membership, scoped leadership leases, and
 
 ```text
 <coord_root>/
+├── LOCK                    # Exclusive process advisory lock and diagnostic PID/start-time
 ├── COORDINATOR             # Durable coordinator state envelope (HTAPCRD1)
 └── COORDINATOR.tmp         # Staging file for atomic publish
 ```
