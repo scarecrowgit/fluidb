@@ -2,10 +2,14 @@
 
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
-use htap_catalog::{ConversionDescriptor, ConversionPhase, StorageDescriptor, StorageFormat};
+use htap_catalog::{
+    ConversionDescriptor, ConversionPhase, NodeId, ReplicaDescriptor, ReplicaId, StorageDescriptor,
+    StorageFormat, TableId, TabletId,
+};
 use htap_common::types::{DataType, Value};
 use htap_common::version::Version;
 use htap_common::HtapError;
+use htap_movement::{CopyOptions, DataFormat, MovementJobPhase, TabletCloneOptions};
 use htap_server::LocalServer;
 use htap_sql::result::{CommandResult, StatementResult};
 use tempfile::TempDir;
@@ -513,4 +517,252 @@ fn test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point() {
         .execute("SELECT val FROM c_table WHERE id = 2 ORDER BY val;")
         .unwrap_err();
     assert!(matches!(err_unsupported2, HtapError::Unsupported(_)));
+}
+
+#[test]
+fn test_server_data_mover_integration() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    // 1. Create SQL table
+    let ddl_res = server
+        .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, age INT);")
+        .unwrap();
+    assert_eq!(ddl_res, StatementResult::ddl(1));
+
+    // 2. Obtain known local IDs (table/partition/tablet 1)
+    let catalog_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let snap = catalog_store
+        .load()
+        .unwrap()
+        .expect("catalog snapshot must exist");
+    let table = snap.table_by_name("users").unwrap();
+    let table_id = table.id;
+    let partition_id = table.partitions[0];
+    let partition = snap.partition(partition_id).unwrap();
+    let tablet_id = partition.tablets[0];
+
+    assert_eq!(table_id, TableId::new(1));
+    assert_eq!(partition_id.as_u64(), 1);
+    assert_eq!(tablet_id, TabletId::new(1));
+
+    // 3. Import CSV through server.data_mover using the same server state
+    let csv_path = dir.path().join("users.csv");
+    std::fs::write(&csv_path, "id,name,age\n1,Alice,30\n2,Bob,25\n").unwrap();
+
+    let copy_opts = CopyOptions::new(
+        "import_users_1",
+        table_id,
+        tablet_id,
+        DataFormat::Csv,
+        &csv_path,
+    );
+    let report = server.data_mover().copy_from_csv(&copy_opts).unwrap();
+    assert_eq!(report.records_read, 2);
+    assert_eq!(report.records_committed, 2);
+    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.records_skipped, 0);
+
+    // 4. Point-select through server.execute
+    let sel1 = server
+        .execute("SELECT name, age FROM users WHERE id = 1;")
+        .unwrap();
+    match sel1 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Alice".into())));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int32(30)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    let sel2 = server
+        .execute("SELECT name, age FROM users WHERE id = 2;")
+        .unwrap();
+    match sel2 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Bob".into())));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int32(25)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // 5. Verify movement job exists under root/movement
+    let job_file = dir
+        .path()
+        .join("movement")
+        .join("jobs")
+        .join("import_users_1")
+        .join("JOB");
+    assert!(
+        job_file.is_file(),
+        "movement job file must exist under root/movement"
+    );
+
+    let job = server
+        .data_mover()
+        .load_job("import_users_1")
+        .unwrap()
+        .expect("job must be loadable via server data_mover");
+    assert_eq!(job.phase, MovementJobPhase::Complete);
+    assert_eq!(job.counters.records_committed, 2);
+
+    // 6. Drop/reopen server and verify catalog/data/job persistence
+    drop(server);
+
+    let reopened = LocalServer::open(dir.path()).unwrap();
+
+    // Verify catalog persistence
+    let snap_reopened = LocalCatalogStore::open(dir.path().join("catalog"))
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    assert!(snap_reopened.table_by_name("users").is_some());
+
+    // Verify data persistence via point-select on reopened server
+    let sel1_reopened = reopened
+        .execute("SELECT name, age FROM users WHERE id = 1;")
+        .unwrap();
+    match sel1_reopened {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Alice".into())));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int32(30)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // Verify job persistence via reopened server data_mover
+    let job_reopened = reopened
+        .data_mover()
+        .load_job("import_users_1")
+        .unwrap()
+        .expect("movement job must persist across reopen");
+    assert_eq!(job_reopened.phase, MovementJobPhase::Complete);
+    assert_eq!(job_reopened.counters.records_committed, 2);
+
+    // 7. Perform server DML and verify commit/version continuity where observable
+    // Prior movement batch committed at Version 2; subsequent DML commits at Version 3.
+    let insert_res = reopened
+        .execute("INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);")
+        .unwrap();
+    assert_eq!(insert_res, StatementResult::dml(1, Some(Version::new(3))));
+
+    let sel3 = reopened
+        .execute("SELECT name, age FROM users WHERE id = 3;")
+        .unwrap();
+    match sel3 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Charlie".into())));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int32(35)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // 8. Verify export and JSONL reader import on reopened server with version continuity
+    let export_csv_path = dir.path().join("export_users.csv");
+    let export_opts = CopyOptions::new(
+        "export_users_1",
+        table_id,
+        tablet_id,
+        DataFormat::Csv,
+        &export_csv_path,
+    );
+    let exp_report = reopened.data_mover().copy_to_csv(&export_opts).unwrap();
+    assert_eq!(exp_report.records_read, 3);
+    assert_eq!(exp_report.rows_written, 3);
+
+    let exported_csv = std::fs::read_to_string(&export_csv_path).unwrap();
+    assert!(exported_csv.contains("Alice"));
+    assert!(exported_csv.contains("Bob"));
+    assert!(exported_csv.contains("Charlie"));
+
+    // JSONL reader import commits batch at Version 4
+    let jsonl_data = "{\"id\":4,\"name\":\"Dana\",\"age\":28}\n";
+    let jsonl_opts = CopyOptions::new(
+        "import_users_jsonl",
+        table_id,
+        tablet_id,
+        DataFormat::JsonLines,
+        dir.path().join("ignored.jsonl"),
+    );
+    let jsonl_report = reopened
+        .data_mover()
+        .copy_from_jsonl_reader(&jsonl_opts, jsonl_data.as_bytes())
+        .unwrap();
+    assert_eq!(jsonl_report.records_read, 1);
+    assert_eq!(jsonl_report.records_committed, 1);
+
+    let sel4 = reopened
+        .execute("SELECT name, age FROM users WHERE id = 4;")
+        .unwrap();
+    match sel4 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Dana".into())));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int32(28)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // Subsequent DML after JSONL batch commits at Version 5
+    let delete_res = reopened.execute("DELETE FROM users WHERE id = 4;").unwrap();
+    assert_eq!(delete_res, StatementResult::dml(1, Some(Version::new(5))));
+}
+
+#[test]
+fn test_server_data_mover_clone_verify_repair() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    server
+        .execute("CREATE TABLE docs (id BIGINT PRIMARY KEY, body VARCHAR);")
+        .unwrap();
+
+    server
+        .execute("INSERT INTO docs (id, body) VALUES (1, 'first'), (2, 'second');")
+        .unwrap();
+
+    // Register an unhealthy follower replica in tablet 1
+    let catalog_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let mut snap = catalog_store.load().unwrap().unwrap();
+    let follower_rep_id = ReplicaId::new(2);
+    snap.replicas.push(ReplicaDescriptor::new(
+        follower_rep_id,
+        TabletId::new(1),
+        NodeId::new(2),
+        false, // is_leader
+        false, // healthy
+        snap.generation + 1,
+    ));
+    snap.tablets[0].replicas.push(follower_rep_id);
+    snap.generation += 1;
+    catalog_store.compare_and_set(1, snap).unwrap();
+
+    let clone_opts = TabletCloneOptions::new("clone_docs_1", TabletId::new(1), follower_rep_id);
+
+    // 1. Clone tablet via server data_mover
+    let manifest = server.data_mover().clone_tablet(&clone_opts).unwrap();
+    assert_eq!(manifest.job_id, "clone_docs_1");
+    assert_eq!(manifest.source_tablet_id, TabletId::new(1));
+    assert_eq!(manifest.target_replica_id, follower_rep_id);
+    assert_eq!(manifest.row_count, 2);
+
+    // 2. Verify clone package via server data_mover
+    let verified = server.data_mover().verify_package(&clone_opts).unwrap();
+    assert_eq!(verified.row_count, 2);
+    assert_eq!(verified.payload_checksum, manifest.payload_checksum);
+
+    // 3. Repair replica via server data_mover
+    let repaired = server.data_mover().repair_tablet(&clone_opts).unwrap();
+    assert_eq!(repaired.id, follower_rep_id);
+    assert!(repaired.healthy);
+
+    // Verify catalog reflects repaired healthy status
+    let updated_snap = catalog_store.load().unwrap().unwrap();
+    let rep = updated_snap.replica(follower_rep_id).unwrap();
+    assert!(rep.healthy);
 }

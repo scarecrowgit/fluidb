@@ -83,8 +83,8 @@ See [`PROGRESS.md`](./PROGRESS.md).
    +----------------------+  +----------------------+  +-----------------+
    | htap-catalog         |  | htap-coord   planned |  | htap-movement   |
    | durable local store, |  | local | Raft | ZK    |  | placement,      |
-   | topology, recovery   |  | fencing tokens       |  | repair  planned |
-   | in progress          |  |                      |  |                 |
+   | topology, recovery   |  | fencing tokens       |  | repair (local)  |
+   | in progress          |  |                      |  | IMPLEMENTED     |
    +----------------------+  +----------------------+  +-----------------+
 
    +---------------------------------------------------------------+
@@ -300,8 +300,7 @@ guarantee rather than re-implementing it.
 
 ## Sharding
 
-**Status: `planned`** (the `htap-catalog` and `htap-movement` crates exist as
-skeletons).
+**Status: `in progress`** (the `htap-catalog` and `htap-movement` crates implement single-node tablet sharding, clone packages, and replica repair; multi-node coordination is planned).
 
 ```text
 Table

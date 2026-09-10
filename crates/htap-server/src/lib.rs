@@ -2,7 +2,7 @@
 //!
 //! Provides [`LocalServer`], an embedded synchronous server coordinating SQL
 //! parsing, semantic binding, catalog topology updates, transaction management,
-//! and LSM rowstore storage.
+//! LSM rowstore storage, and data movement operations via [`LocalServerDataMover`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -19,6 +19,9 @@ use htap_catalog::{
 use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
 use htap_common::types::{ColumnDef, Mutation, Row, Value};
+use htap_movement::{
+    CopyOptions, CopyReport, LocalDataMover, MovementJob, TabletCloneOptions, TabletPackageManifest,
+};
 use htap_rowstore::{Engine, EngineOptions, Snapshot};
 use htap_sql::ast::{BoundStatement, CreateTable, DeleteByPrimaryKey, Insert, PointSelect};
 use htap_sql::result::StatementResult;
@@ -31,11 +34,12 @@ use parking_lot::Mutex;
 /// Synchronous local database server.
 ///
 /// Encapsulates catalog metadata management, transactional write logging,
-/// and LSM-based rowstore persistence within a single local directory.
+/// LSM-based rowstore persistence, and data movement within a single local directory.
 pub struct LocalServer {
     catalog: LocalCatalogStore,
     engine: Arc<Engine>,
     txn_manager: TransactionManager,
+    data_mover: LocalDataMover,
     execution_lock: Mutex<()>,
 }
 
@@ -46,6 +50,7 @@ impl LocalServer {
     /// - `root/catalog` - Directory for durable catalog snapshots.
     /// - `root/rowstore` - Directory for rowstore LSM data (WAL, SSTs, manifest).
     /// - `root/txn.journal` - Journal file for 2PC transaction coordination.
+    /// - `root/movement` - Directory for data movement jobs and tablet packages.
     ///
     /// Recovery registers a stable [`RowstoreParticipant`] with ID 1 and
     /// replays committed transactions from the transaction journal.
@@ -75,12 +80,26 @@ impl LocalServer {
 
         txn_manager.recover()?;
 
+        let movement_dir = root.join("movement");
+        let data_mover = LocalDataMover::new(movement_dir)?;
+
         Ok(Self {
             catalog,
             engine,
             txn_manager,
+            data_mover,
             execution_lock: Mutex::new(()),
         })
+    }
+
+    /// Returns a borrowing façade for server-integrated data movement operations.
+    pub fn data_mover(&self) -> LocalServerDataMover<'_> {
+        LocalServerDataMover {
+            mover: &self.data_mover,
+            catalog: &self.catalog,
+            engine: &self.engine,
+            txn_manager: &self.txn_manager,
+        }
     }
 
     /// Synchronously executes a single SQL statement against the local database.
@@ -430,5 +449,204 @@ impl LocalServer {
         };
 
         Ok(StatementResult::query(projected_columns, rows))
+    }
+}
+
+/// Borrowing façade providing server-integrated data movement operations.
+///
+/// Supplies the server-owned [`LocalCatalogStore`], [`Engine`], and [`TransactionManager`]
+/// to [`LocalDataMover`] without exposing internal storage handles directly.
+pub struct LocalServerDataMover<'a> {
+    mover: &'a LocalDataMover,
+    catalog: &'a LocalCatalogStore,
+    engine: &'a Arc<Engine>,
+    txn_manager: &'a TransactionManager,
+}
+
+impl<'a> LocalServerDataMover<'a> {
+    /// Imports records from a generic CSV [`std::io::Read`] stream.
+    ///
+    /// Records are parsed according to table schema and committed in batches using
+    /// the server's transaction manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on catalog lookup failure, schema mismatch, or storage error.
+    pub fn copy_from_csv_reader<R: std::io::Read>(
+        &self,
+        options: &CopyOptions,
+        reader: R,
+    ) -> Result<CopyReport> {
+        self.mover
+            .copy_from_csv_reader(options, self.catalog, self.txn_manager, reader)
+    }
+
+    /// Imports records from a generic JSONLines [`std::io::Read`] stream.
+    ///
+    /// Records are parsed according to table schema and committed in batches using
+    /// the server's transaction manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on catalog lookup failure, schema mismatch, or storage error.
+    pub fn copy_from_jsonl_reader<R: std::io::Read>(
+        &self,
+        options: &CopyOptions,
+        reader: R,
+    ) -> Result<CopyReport> {
+        self.mover
+            .copy_from_jsonl_reader(options, self.catalog, self.txn_manager, reader)
+    }
+
+    /// Imports records from a CSV file specified in `options.path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on file read failure, parse error, or transaction commit error.
+    pub fn copy_from_csv(&self, options: &CopyOptions) -> Result<CopyReport> {
+        self.mover
+            .copy_from_csv(options, self.catalog, self.txn_manager)
+    }
+
+    /// Imports records from a JSONLines file specified in `options.path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on file read failure, parse error, or transaction commit error.
+    pub fn copy_from_jsonl(&self, options: &CopyOptions) -> Result<CopyReport> {
+        self.mover
+            .copy_from_jsonl(options, self.catalog, self.txn_manager)
+    }
+
+    /// Imports records from the file specified in `options.path` according to `options.format`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on file read failure, parse error, or transaction commit error.
+    pub fn import(&self, options: &CopyOptions) -> Result<CopyReport> {
+        self.mover.import(options, self.catalog, self.txn_manager)
+    }
+
+    /// Exports partition records to a generic CSV [`std::io::Write`] stream.
+    ///
+    /// Pins the engine snapshot, collapses MVCC/tombstones, and outputs rows in
+    /// deterministic primary-key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on catalog lookup failure, snapshot read failure, or stream write error.
+    pub fn copy_to_csv_writer<W: std::io::Write>(
+        &self,
+        options: &CopyOptions,
+        writer: W,
+    ) -> Result<CopyReport> {
+        self.mover
+            .copy_to_csv_writer(options, self.catalog, self.engine.as_ref(), writer)
+    }
+
+    /// Exports partition records to a generic JSONLines [`std::io::Write`] stream.
+    ///
+    /// Pins the engine snapshot, collapses MVCC/tombstones, and outputs rows in
+    /// deterministic primary-key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on catalog lookup failure, snapshot read failure, or stream write error.
+    pub fn copy_to_jsonl_writer<W: std::io::Write>(
+        &self,
+        options: &CopyOptions,
+        writer: W,
+    ) -> Result<CopyReport> {
+        self.mover
+            .copy_to_jsonl_writer(options, self.catalog, self.engine.as_ref(), writer)
+    }
+
+    /// Exports partition records to a CSV file at `options.path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on snapshot read failure, encoding error, or file write failure.
+    pub fn copy_to_csv(&self, options: &CopyOptions) -> Result<CopyReport> {
+        self.mover
+            .copy_to_csv(options, self.catalog, self.engine.as_ref())
+    }
+
+    /// Exports partition records to a JSONLines file at `options.path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on snapshot read failure, encoding error, or file write failure.
+    pub fn copy_to_jsonl(&self, options: &CopyOptions) -> Result<CopyReport> {
+        self.mover
+            .copy_to_jsonl(options, self.catalog, self.engine.as_ref())
+    }
+
+    /// Exports partition records to the file specified in `options.path` according to `options.format`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on snapshot read failure, encoding error, or file write failure.
+    pub fn export(&self, options: &CopyOptions) -> Result<CopyReport> {
+        self.mover
+            .export(options, self.catalog, self.engine.as_ref())
+    }
+
+    /// Clones a source tablet partition snapshot into a durable logical package.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on catalog lookup error or package write failure.
+    pub fn clone_tablet(&self, options: &TabletCloneOptions) -> Result<TabletPackageManifest> {
+        self.mover
+            .clone_tablet(options, self.catalog, self.engine.as_ref())
+    }
+
+    /// Verifies the integrity and consistency of a tablet clone package.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] if package manifest is corrupt or artifacts fail validation.
+    pub fn verify_package(&self, options: &TabletCloneOptions) -> Result<TabletPackageManifest> {
+        self.mover.verify_package(options, self.catalog)
+    }
+
+    /// Reconciles and repairs an unhealthy replica by validating the clone package and CAS-updating its health status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] if validation fails or replica CAS update fails.
+    pub fn repair_tablet(&self, options: &TabletCloneOptions) -> Result<ReplicaDescriptor> {
+        self.mover.repair_tablet(options, self.catalog)
+    }
+
+    /// Returns the underlying [`LocalDataMover`] reference.
+    pub fn mover(&self) -> &LocalDataMover {
+        self.mover
+    }
+
+    /// Loads an existing movement job by `job_id` if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] if reading or decoding the job file fails.
+    pub fn load_job(&self, job_id: &str) -> Result<Option<MovementJob>> {
+        self.mover.load_job(job_id)
+    }
+
+    /// Resumes an existing movement job by `job_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError::NotFound`] if the job does not exist, or [`HtapError`] on I/O error.
+    pub fn resume_job(&self, job_id: &str) -> Result<MovementJob> {
+        self.mover.resume_job(job_id)
+    }
+}
+
+impl<'a> std::ops::Deref for LocalServerDataMover<'a> {
+    type Target = LocalDataMover;
+
+    fn deref(&self) -> &Self::Target {
+        self.mover
     }
 }
