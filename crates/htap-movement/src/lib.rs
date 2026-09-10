@@ -21,6 +21,7 @@ pub mod codec;
 pub mod export;
 pub mod import;
 pub mod job;
+pub mod tablet;
 
 pub use codec::{
     decode_csv_record, decode_hex, decode_json_line, decode_record, encode_csv_header,
@@ -41,4 +42,9 @@ pub use job::{
     JobCounters, LocalDataMover, MovementJob, MovementJobKind, MovementJobPhase,
     MovementJobRequest, MovementJobState, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, JOB_FILE_NAME,
     JOB_TMP_FILE_NAME, MAX_JOB_PAYLOAD_BYTES,
+};
+pub use tablet::{
+    clone_tablet, decode_manifest, encode_manifest, repair_tablet, verify_package,
+    TabletCloneOptions, TabletPackageManifest, MANIFEST_FORMAT_VERSION, MANIFEST_HEADER_LEN,
+    MANIFEST_HEADER_MAGIC, MAX_MANIFEST_PAYLOAD_BYTES,
 };

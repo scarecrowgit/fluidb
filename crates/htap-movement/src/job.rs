@@ -715,6 +715,7 @@ impl LocalDataMover {
         let root_dir = root_dir.into();
         fs::create_dir_all(&root_dir)?;
         fs::create_dir_all(root_dir.join("jobs"))?;
+        fs::create_dir_all(root_dir.join("tablets"))?;
 
         Ok(Self {
             root_dir,
@@ -747,6 +748,50 @@ impl LocalDataMover {
     /// Return the temporary envelope file path: `<movement_root>/jobs/<job-id>/JOB.tmp`.
     pub fn job_tmp_file_path(&self, job_id: &str) -> PathBuf {
         self.job_dir(job_id).join(JOB_TMP_FILE_NAME)
+    }
+
+    /// Return the tablet packages directory `<movement_root>/tablets`.
+    #[inline]
+    pub fn tablets_dir(&self) -> PathBuf {
+        self.root_dir.join("tablets")
+    }
+
+    /// Return the package directory for a specific tablet clone:
+    /// `<movement_root>/tablets/<source_tablet_id>/<target_replica_id>/<job_id>`.
+    pub fn tablet_package_dir(
+        &self,
+        source_tablet_id: TabletId,
+        target_replica_id: htap_catalog::ReplicaId,
+        job_id: &str,
+    ) -> PathBuf {
+        self.tablets_dir()
+            .join(source_tablet_id.0.to_string())
+            .join(target_replica_id.0.to_string())
+            .join(job_id)
+    }
+
+    /// Return the package manifest path:
+    /// `<movement_root>/tablets/<source_tablet_id>/<target_replica_id>/<job_id>/MANIFEST`.
+    pub fn tablet_manifest_path(
+        &self,
+        source_tablet_id: TabletId,
+        target_replica_id: htap_catalog::ReplicaId,
+        job_id: &str,
+    ) -> PathBuf {
+        self.tablet_package_dir(source_tablet_id, target_replica_id, job_id)
+            .join("MANIFEST")
+    }
+
+    /// Return the package data artifact path:
+    /// `<movement_root>/tablets/<source_tablet_id>/<target_replica_id>/<job_id>/DATA`.
+    pub fn tablet_data_path(
+        &self,
+        source_tablet_id: TabletId,
+        target_replica_id: htap_catalog::ReplicaId,
+        job_id: &str,
+    ) -> PathBuf {
+        self.tablet_package_dir(source_tablet_id, target_replica_id, job_id)
+            .join("DATA")
     }
 
     /// Start a new movement job, or idempotently return the existing job if already registered.
@@ -1072,6 +1117,34 @@ impl LocalDataMover {
         Err(HtapError::Unsupported(
             "schema-less encode is unsupported; use encode_record_with_schema".into(),
         ))
+    }
+
+    /// Clone a source tablet partition snapshot into a durable logical package.
+    pub fn clone_tablet(
+        &self,
+        options: &crate::tablet::TabletCloneOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        engine: &htap_rowstore::Engine,
+    ) -> Result<crate::tablet::TabletPackageManifest> {
+        crate::tablet::clone_tablet(self, options, catalog, engine)
+    }
+
+    /// Verify the integrity and consistency of a tablet clone package.
+    pub fn verify_package(
+        &self,
+        options: &crate::tablet::TabletCloneOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+    ) -> Result<crate::tablet::TabletPackageManifest> {
+        crate::tablet::verify_package(self, options, catalog)
+    }
+
+    /// Reconcile and repair an unhealthy replica by validating the clone package and CAS-updating its health status.
+    pub fn repair_tablet(
+        &self,
+        options: &crate::tablet::TabletCloneOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+    ) -> Result<htap_catalog::ReplicaDescriptor> {
+        crate::tablet::repair_tablet(self, options, catalog)
     }
 
     fn read_job_file_locked(&self, job_id: &str) -> Result<Option<MovementJob>> {
