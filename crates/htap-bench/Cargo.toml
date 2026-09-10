@@ -1,0 +1,22 @@
+[package]
+name = "htap-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+htap-catalog = { path = "../htap-catalog" }
+htap-colstore = { path = "../htap-colstore" }
+htap-common = { path = "../htap-common" }
+htap-convert = { path = "../htap-convert" }
+htap-coord = { path = "../htap-coord" }
+htap-movement = { path = "../htap-movement" }
+htap-rowstore = { path = "../htap-rowstore" }
+htap-txn = { path = "../htap-txn" }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "local_mvp"
+harness = false

@@ -27,13 +27,19 @@ strictly monotonic fencing tokens (`FencingToken`), coordinator-fenced catalog C
 (`fenced_catalog_compare_and_set`), deterministic placement planner (`plan_placement`), and coordinator-fenced
 local replica staging and activation simulation (`stage_placement_addition`, `activate_placement_addition`,
 `activate_placement_plan`).
+Phase 7 has a completed local evidence MVP: Criterion microbenchmarks (`htap-bench`, `benches/local_mvp.rs`)
+evaluating rowstore point get, colstore zone map scans, row-to-column conversion, CSV movement import,
+coordinator placement planning, and coordinator leadership fenced CAS; and synchronous in-process embedded
+client (`htap-client`, `EmbeddedClient`) providing an ergonomic SQL execution interface over `LocalServer`
+with full test coverage in `crates/htap-client/tests/embedded_client.rs`. Root `README.md`, `docs/BENCHMARKS.md`,
+and `docs/OPERATIONS.md` define the operational model, and `ci.sh` runs `cargo bench --workspace --no-run`.
 Later components described below remain `planned` or `in progress` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, cross-process exclusion,
 remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
 reverse `Column -> Row` conversion, delete vectors, physical rowstore reclamation, compaction,
 SQL analytical scans, multi-partition routing, MySQL wire protocol/`htapd` daemon,
-sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`, and broad MySQL compatibility).
+sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`, Docker image/Compose deployment, and broad MySQL compatibility).
 See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
@@ -42,11 +48,12 @@ See [`PROGRESS.md`](./PROGRESS.md).
 
 ```text
                         +---------------------------+
-                        |   client (MySQL wire)     |
+                        |   client (EmbeddedClient  |
+                        |   façade; wire planned)   |
                         +-------------+-------------+
                                       |
 ====================================  |  ==================================
- htapd  --role frontend | backend | both      (single binary, htap-server; LocalServer in progress)
+ htapd / LocalServer (LocalServer implemented in htap-server; daemon planned)
 ======================================================================
                                       |
                         +-------------v-------------+
@@ -107,9 +114,9 @@ See [`PROGRESS.md`](./PROGRESS.md).
 
 ## Process and role model
 
-**Status: `in progress`** (synchronous `LocalServer` façade implemented for the narrow local slice; `htapd` daemon and MySQL wire protocol are planned).
+**Status: `in progress`** (synchronous `LocalServer` façade and `EmbeddedClient` implemented for the narrow local slice; `htapd` daemon, network listeners, and MySQL wire protocol are planned).
 
-The system ships as a **single binary, `htapd`** (planned), which can be run as:
+The system architecture envisions a future **single binary, `htapd`** (planned), which can be run as:
 
 - the **frontend role** — SQL surface, catalog, planner, transaction
   coordinator;
@@ -117,8 +124,8 @@ The system ships as a **single binary, `htapd`** (planned), which can be run as:
 - **both roles in one process**, which is the mode used for single-node
   development and for the README demo.
 
-For the completed Phase 3 narrow local slice, `htap-server` provides `LocalServer`,
-a synchronous in-process façade composing the durable catalog (`LocalCatalogStore`),
+For the completed narrow local slice, `htap-server` provides `LocalServer` and `htap-client` provides `EmbeddedClient`,
+synchronous in-process façades composing the durable catalog (`LocalCatalogStore`),
 `htap-txn` transaction manager, and `htap-rowstore` LSM engine. It directly executes
 `CREATE TABLE` (deterministic one-partition row topology), literal `INSERT`, PK `DELETE`,
 and complete-PK `SELECT` with reopen recovery, without networking or wire protocol overhead.

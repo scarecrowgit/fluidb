@@ -13,22 +13,22 @@ semantics, watches and the client wire protocol, and for running a real
 ZooKeeper ensemble in integration tests. **That directory was not present.**
 The provided `examples/` directory contained only `starrocks/`.
 
-### Impact and mitigation
+### Impact and status
 
-ZooKeeper protocol semantics were derived from the public ZooKeeper 3.9
-documentation and the `zookeeper-async` Rust client crate rather than from
-source. Integration tests for the ZooKeeper coordination backend run against
-the official `zookeeper:3.9` Docker image.
+In addition to `examples/zookeeper` being absent, no ZooKeeper backend,
+`zookeeper-async` dependency, Docker configuration, or real ensemble integration
+test exists in the repository. Coordination is implemented exclusively as a
+single-node local coordinator (`htap-coord::LocalCoordinator`) persisting state to
+`COORDINATOR` binary envelopes (`HTAPCRD1`).
 
-This preserves the more important property: session expiry, ephemeral node
-loss and watch re-registration are exercised against a real server rather than
-a mock, which is where a mock would most likely be wrong.
+An external ZooKeeper coordination backend, watches, session heartbeats, and
+Docker-based ensemble testing remain deferred as future work.
 
 ### Completion plan
 
-If the source tree is supplied, re-verify the session-expiry and
-watch-re-registration code paths against the actual server implementation and
-record any divergence here.
+If distributed multi-node coordination is implemented in the future, provide an
+adapter implementing the `Coordinator` trait backed by ZooKeeper (or Raft), along
+with an optional containerized ensemble test environment.
 
 Cross-reference: ADR-006 in [`DECISIONS.md`](./DECISIONS.md).
 
@@ -79,8 +79,8 @@ cases.
 To close this gap, either (a) run the crash child inside a VM or container
 whose storage is dropped without flushing, (b) interpose a FUSE or
 device-mapper layer that discards non-fsynced writes on fault injection, or
-(c) use a filesystem fault-injection tool such as `dm-flakey` in the chaos
-suite planned for Phase 7.
+(c) use a filesystem fault-injection tool such as `dm-flakey` in a future
+storage chaos test harness (deferred from Phase 7 local MVP).
 
 Until one of these is in place, the fsync path is verified by code inspection
 only.
@@ -220,7 +220,7 @@ The Phase 6 implementation delivers an incrementally verified local coordination
 | Phase 4 — HTAP conversion | `Complete (local MVP)` | Completed local single-tablet Row-to-Column conversion MVP (`htap-convert`). Explicitly deferred: reverse `Column -> Row` conversion, delete vectors, physical rowstore reclamation, compaction, SQL analytical scans, and distributed partition/table conversion semantics. |
 | Phase 5 — Data movement | `Complete (local MVP)` | Single-node tablet clone, verify, repair, CSV/JSONL import/export, durable job tracking, and LocalServer façade implemented. Deferred: SQL COPY syntax, MySQL wire protocol streaming, distributed multi-node coordinated migrations, background replication stream, and cross-partition movement. |
 | Phase 6 — Distribution and coordination | `Complete (local MVP)` | LocalCoordinator (`HTAPCRD1`), monotonic fencing tokens, coordinator-fenced catalog CAS, deterministic placement planner, and local activation simulation implemented. Deferred: Raft/openraft, ZooKeeper backend, watches/locks/KV semantics, distributed consensus, cross-process exclusion, remote physical movement, leader handoff, ongoing replication, capacity/rack placement, and live rebalance; direct CatalogStore CAS and older movement repair APIs bypass coordinator fence. |
-| Phase 7 — Hardening, benchmarks, chaos | `Not started` | — |
+| Phase 7 — Hardening, benchmarks, local MVP | `Complete (local evidence MVP)` | Built Criterion microbenchmarks (`htap-bench`, `local_mvp`), maintained synchronous in-process embedded client (`htap-client`), added root `README.md`, `docs/BENCHMARKS.md`, `docs/OPERATIONS.md`, and CI benchmark compile check. Deferred: standalone `htapd` daemon, MySQL wire protocol server, network sockets, Docker container/compose deployment, ZooKeeper/Raft backends, physical power-loss fsync verification, and TPC-C/TPC-H compliance. |
 
 ---
 
@@ -228,7 +228,7 @@ The Phase 6 implementation delivers an incrementally verified local coordination
 
 | Brief requirement | Deviation | Rationale | Where recorded |
 | ----------------- | --------- | --------- | -------------- |
-| ZooKeeper reference source at `examples/zookeeper` (§3 of the brief) | Input absent; ZooKeeper semantics derived from the ZooKeeper 3.9 specification and the `zookeeper-async` crate, and validated against a real ensemble in Docker rather than a mock. | The source was not supplied. A mock would most likely be wrong precisely on session expiry and ephemeral-node loss, which is the behaviour the coordination layer depends on. | ADR-006 in [`DECISIONS.md`](./DECISIONS.md); "Missing input: ZooKeeper reference source" above. |
+| ZooKeeper reference source at `examples/zookeeper` (§3 of the brief) | Input absent; ZooKeeper backend, `zookeeper-async` dependency, and Docker ensemble tests are not implemented in the local MVP. Coordination is implemented locally via `htap-coord::LocalCoordinator`. ZooKeeper backend and containerized testing remain deferred future work. | `examples/zookeeper` was not supplied; cluster coordination was scoped to a single-node local coordinator MVP. | ADR-006 in [`DECISIONS.md`](./DECISIONS.md); "Missing input: ZooKeeper reference source" above. |
 
 > **This table must remain exhaustive.** Anything omitted or changed relative
 > to the brief is recorded here or in an ADR, never silently dropped.

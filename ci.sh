@@ -22,5 +22,10 @@ echo "========================================="
 cargo test --workspace
 
 echo "========================================="
+echo "Running: cargo bench --workspace --no-run"
+echo "========================================="
+cargo bench --workspace --no-run
+
+echo "========================================="
 echo "CI checks completed successfully!"
 echo "========================================="

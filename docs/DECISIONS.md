@@ -183,37 +183,40 @@ Write a hand-written parser.
 
 ---
 
-## ADR-006: ZooKeeper reference source not provided; derive from specification and validate against a real ensemble
+## ADR-006: ZooKeeper reference source not provided; defer ZooKeeper backend and Docker testing to future work, proceed with local coordinator MVP
 
-`Status: Accepted`
-`Date: 2026-09-07`
+`Status: Superseded by ADR-009`
+`Date: 2026-09-07 (Updated: 2026-09-10)`
 
 ### Context
 
 The project brief specified a reference source at `examples/zookeeper`, but
-only `examples/starrocks` was present. See
-[`LIMITATIONS.md`](./LIMITATIONS.md).
+only `examples/starrocks` was present. Furthermore, no external ZooKeeper backend,
+`zookeeper-async` client dependency, Docker container configuration, or real ensemble
+test exists in the workspace. See [`LIMITATIONS.md`](./LIMITATIONS.md).
 
 ### Options considered
 
-- **(a)** Build against a mock ZooKeeper.
-- **(b)** Skip the ZooKeeper backend entirely.
-- **(c)** Implement against the documented ZooKeeper 3.9 protocol via
-  `zookeeper-async`, and test against a real ensemble in Docker.
+- **(a)** Build against an in-memory mock ZooKeeper without persistence.
+- **(b)** Require external Docker daemon and ZooKeeper runtime for tests.
+- **(c)** Implement a clean synchronous `Coordinator` trait with a local durable coordinator implementation (`LocalCoordinator`), deferring external ZooKeeper/Raft backends and Docker-based testing to future distributed work.
 
 ### Decision
 
-Option **(c)** — because session expiry and ephemeral-node loss are exactly
-the behaviours a mock gets wrong, and they are the behaviours the coordination
-layer depends on for correctness.
+Option **(c)** — superseded by ADR-009. The local MVP coordinates cluster state,
+membership, scoped leadership, and monotonic fencing via `htap-coord::LocalCoordinator`
+persisting to `COORDINATOR` binary envelopes (`HTAPCRD1`). Distributed backends (ZooKeeper
+or Raft) and containerized ensemble testing are deferred to future work.
 
 ### Consequences
 
-- ZooKeeper tests require Docker and are gated behind a feature flag in CI.
+- No external ZooKeeper service, daemon, or Docker environment is required to build, test, or benchmark the repository.
+- Coordination guarantees are verified locally and synchronously in single-node integration tests.
+- Pluggable `Coordinator` trait allows future integration of a real ZooKeeper backend when multi-node distribution is implemented.
 
 ### How to reverse it
 
-None needed.
+Implement a ZooKeeper-backed adapter struct implementing `Coordinator` using an async runtime or client library and add optional containerized integration tests.
 
 ---
 
@@ -239,7 +242,7 @@ Option **(a)**.
 
 ### Consequences
 
-- Simpler demo and `docker-compose` setup.
+- Future demo can expose unified frontend/backend roles. Note: `htapd` daemon binary, network listeners, and Docker/Compose deployments are deferred future work; current MVP provides in-process `LocalServer` and `EmbeddedClient`.
 - The module boundary must be **policed by crate dependencies**, so that
   splitting into separate processes remains possible.
 
@@ -355,3 +358,44 @@ Option **(c)**.
 ### How to reverse it
 
 Implement distributed `openraft` or ZooKeeper coordination backends conforming to the `Coordinator` trait and replace `LocalCoordinator` in the cluster topology runtime.
+
+---
+
+## ADR-010: Local microbenchmark suite and synchronous embedded client façade for Phase 7 local evidence MVP
+
+`Status: Accepted`
+`Date: 2026-09-10`
+
+### Context
+
+Phase 7 requires performance and operational hardening, benchmark validation, and operational documentation. A production HTAP system typically requires distributed TPC-C/TPC-H benchmarks, daemon processes (`htapd`), network wire protocols, and container packaging. Per the autonomy contract, the local MVP prioritizes correctness, runnable verified vertical slices, and explicit boundaries over stubbed production claims.
+
+### Options considered
+
+- **(a)** Attempt partial TPC-C/TPC-H harness scripts requiring distributed transactions, SQL analytical query engines, and background daemons.
+- **(b)** Deliver an in-process Criterion microbenchmark suite (`htap-bench`) covering the six core engine layers (rowstore point lookups, columnar zone-map scans, partition conversion, CSV movement, placement planning, and fenced CAS) with deterministic correctness assertions, accompanied by a synchronous in-process embedded client (`htap-client`, `EmbeddedClient`), while keeping CI benchmark verification compile-only.
+
+### Decision
+
+Option **(b)**.
+
+1. **Criterion microbenchmark harness (`crates/htap-bench/benches/local_mvp.rs`):**
+   - Implements isolated microbenchmarks: `rowstore/point_get_stable_snapshot`, `colstore/equality_zone_map_scan` (validating 99% block skip), `convert/local_converter_row_to_column`, `movement/fixed_csv_import`, `coord/placement_planning`, and `coord/leadership_fenced_cas`.
+   - Each benchmark verifies deterministic functional correctness before entering the timing loop.
+   - Modest execution settings (sample size 10, measurement 1s, warmup 500ms).
+2. **Compile-only CI benchmark stage:**
+   - Modified `ci.sh` to run `cargo bench --workspace --no-run` as a fifth stage following formatting, clippy, build, and test. Timings are never executed in CI, avoiding non-deterministic hardware timing failures in virtualized environments.
+3. **Embedded client façade (`htap-client`):**
+   - Synchronous, direct in-process façade (`EmbeddedClient`) over `LocalServer` executing single-partition `CREATE TABLE`, literal `INSERT`, PK `DELETE`, and complete-PK `SELECT` with structured error mapping and recovery across reopen.
+4. **Operational documentation:**
+   - Created root `README.md`, `docs/BENCHMARKS.md`, and `docs/OPERATIONS.md` documenting filesystem layouts (`catalog`, `rowstore`, `txn.journal`, `movement`, `COORDINATOR`), recovery boundaries, and explicit non-features (no daemon, no MySQL wire protocol, no network sockets, no Docker/Compose, no TPC-C/TPC-H compliance).
+
+### Consequences
+
+- All benchmark targets and client tests compile cleanly and pass verification locally.
+- Explicit non-features prevent scope creep and false claims of production DBMS completeness.
+- Clean separation between storage/server crates, benchmark harness, and embedded client.
+
+### How to reverse it
+
+Extend the benchmark harness into multi-process client/server benchmarks when network transports and analytical SQL engines are implemented.
