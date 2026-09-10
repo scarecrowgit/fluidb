@@ -878,3 +878,75 @@ fn test_subprocess_exclusive_lock_contention_and_symlink() {
         .expect("statement should succeed");
     assert!(matches!(res, StatementResult::Command(_)));
 }
+
+#[test]
+fn test_wal_gc_recovery_with_transaction_manager() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // 1. Open LocalServer, create table and insert rows
+    {
+        let server = LocalServer::open(root).unwrap();
+        server
+            .execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, name VARCHAR, balance INT);")
+            .unwrap();
+        server
+            .execute("INSERT INTO accounts (id, name, balance) VALUES (1, 'Alice', 100);")
+            .unwrap();
+        server
+            .execute("INSERT INTO accounts (id, name, balance) VALUES (2, 'Bob', 200);")
+            .unwrap();
+    }
+
+    // 2. Open underlying rowstore Engine directly (since server was dropped and lock released),
+    // and force a flush which writes an SST with the manifest ledger and executes WAL checkpoint & GC.
+    {
+        let rowstore_dir = root.join("rowstore");
+        let engine =
+            htap_rowstore::Engine::open(htap_rowstore::EngineOptions::new(rowstore_dir)).unwrap();
+        engine.flush().unwrap();
+    }
+
+    // 3. Reopen LocalServer.
+    // During LocalServer::open(), txn_manager.recover() replays txn.journal and calls
+    // RowstoreParticipant::apply for all durable committed transactions in txn.journal.
+    // With the manifest ledger, rowstore accepts idempotent reapply cleanly even though
+    // its active memtable was flushed and WAL checkpointed.
+    let server2 =
+        LocalServer::open(root).expect("LocalServer reopen with GC recovery must succeed");
+
+    // 4. Verify data is intact and queries return expected results
+    let res = server2
+        .execute("SELECT name, balance FROM accounts WHERE id = 1;")
+        .unwrap();
+    match res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0), Some(&Value::String("Alice".to_string())));
+            assert_eq!(row.get(1), Some(&Value::Int32(100)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // 5. Subsequent transactions succeed normally
+    let insert_res = server2
+        .execute("INSERT INTO accounts (id, name, balance) VALUES (3, 'Charlie', 300);")
+        .unwrap();
+    assert!(matches!(
+        insert_res,
+        StatementResult::Command(CommandResult::Dml { affected: 1, .. })
+    ));
+
+    let res_all = server2
+        .execute("SELECT balance FROM accounts WHERE id = 3;")
+        .unwrap();
+    match res_all {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0), Some(&Value::Int32(300)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}

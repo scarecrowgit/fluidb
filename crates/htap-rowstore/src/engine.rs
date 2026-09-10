@@ -47,7 +47,8 @@ pub use htap_common::Mutation;
 use htap_common::{HtapError, Result, Row, Version};
 use parking_lot::{Mutex, RwLock};
 
-use crate::manifest::{sync_dir, Manifest, ManifestSstEntry};
+pub use crate::manifest::MAX_APPLIED_EXTERNAL_TXNS;
+use crate::manifest::{sync_dir, Manifest, ManifestLedgerEntry, ManifestSstEntry};
 use crate::memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
 use crate::sst::{SstOptions, SstReader, SstWriter};
 use crate::wal::{Wal, WalOptions, WalRecord};
@@ -353,8 +354,46 @@ impl Engine {
             }
         }
 
+        // Seed applied_txns from manifest ledger and merge retained nonzero WAL commit mappings
+        let mut applied_txns = HashMap::new();
+        for entry in &manifest.applied_txns {
+            if entry.txn_id == 0 {
+                return Err(HtapError::Corruption(
+                    "manifest ledger contains zero txn_id".into(),
+                ));
+            }
+            if applied_txns.insert(entry.txn_id, entry.version).is_some() {
+                return Err(HtapError::Corruption(format!(
+                    "duplicate transaction id {} in manifest ledger",
+                    entry.txn_id
+                )));
+            }
+        }
+
+        for (&txn_id, &version) in &commit_versions {
+            if txn_id != 0 {
+                if let Some(&manifest_v) = applied_txns.get(&txn_id) {
+                    if manifest_v != version {
+                        return Err(HtapError::Corruption(format!(
+                            "conflicting commit versions between manifest ledger ({manifest_v}) and WAL ({version}) for transaction {txn_id}"
+                        )));
+                    }
+                } else {
+                    applied_txns.insert(txn_id, version);
+                }
+            }
+        }
+
+        if applied_txns.len() > MAX_APPLIED_EXTERNAL_TXNS {
+            return Err(HtapError::Corruption(format!(
+                "applied external transactions count {} exceeds maximum {MAX_APPLIED_EXTERNAL_TXNS}",
+                applied_txns.len()
+            )));
+        }
+
         // 7. visible_version from VISIBLE marker (defaults to INITIAL if absent);
         //    committed_version = max(SST max_versions, replayed commit versions)
+        //    Note: committed_version is NOT inferred solely from the manifest ledger.
         let mut recovered_version = Version::INITIAL;
         for sst_meta in &manifest.ssts {
             if let Some(v) = sst_meta.max_version {
@@ -376,7 +415,7 @@ impl Engine {
             wal,
             next_sst_id,
             manifest,
-            applied_txns: commit_versions,
+            applied_txns,
         };
 
         let read_state = ReadState {
@@ -538,6 +577,14 @@ impl Engine {
                     prepared.txn_id
                 )));
             }
+
+            // Reject new external transaction when ledger cap is full BEFORE any mutation
+            if commit_guard.applied_txns.len() >= MAX_APPLIED_EXTERNAL_TXNS {
+                return Err(HtapError::InvalidArgument(format!(
+                    "applied external transactions cap reached: {} >= {MAX_APPLIED_EXTERNAL_TXNS}",
+                    commit_guard.applied_txns.len()
+                )));
+            }
         }
 
         // 1. Version continuity check
@@ -663,6 +710,14 @@ impl Engine {
                 }
                 return Err(HtapError::Conflict(format!(
                     "transaction {txn_id} was already applied at version {existing_version}, cannot reapply at {version}"
+                )));
+            }
+
+            // Reject new external transaction when ledger cap is full BEFORE prepare or any mutation
+            if commit_guard.applied_txns.len() >= MAX_APPLIED_EXTERNAL_TXNS {
+                return Err(HtapError::InvalidArgument(format!(
+                    "applied external transactions cap reached: {} >= {MAX_APPLIED_EXTERNAL_TXNS}",
+                    commit_guard.applied_txns.len()
                 )));
             }
         }
@@ -910,6 +965,13 @@ impl Engine {
         // 5. Write and fsync MANIFEST
         let mut new_manifest = commit_guard.manifest.clone();
         new_manifest.prepend(ManifestSstEntry::from(&meta));
+        let mut ledger_entries: Vec<ManifestLedgerEntry> = commit_guard
+            .applied_txns
+            .iter()
+            .map(|(&txn_id, &version)| ManifestLedgerEntry::new(txn_id, version))
+            .collect();
+        ledger_entries.sort_unstable_by_key(|e| e.txn_id);
+        new_manifest.applied_txns = ledger_entries;
         Manifest::atomic_publish(&self.options.dir, &new_manifest)?;
         commit_guard.manifest = new_manifest;
 

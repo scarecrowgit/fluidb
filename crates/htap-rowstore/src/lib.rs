@@ -39,7 +39,10 @@ pub mod wal;
 pub use engine::{
     Engine, EngineOptions, Mutation, PreparedTransaction, Snapshot, DEFAULT_MEMTABLE_BYTES,
 };
-pub use manifest::{Manifest, ManifestSstEntry};
+pub use manifest::{
+    Manifest, ManifestLedgerEntry, ManifestSstEntry, FORMAT_VERSION, FORMAT_VERSION_V1,
+    FORMAT_VERSION_V2, MAX_APPLIED_EXTERNAL_TXNS, MAX_MANIFEST_PAYLOAD_BYTES, MAX_SST_COUNT,
+};
 pub use memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
 pub use sst::{SstMetadata, SstOptions, SstReader, SstWriter, DEFAULT_SST_BLOCK_BYTES};
 pub use wal::{Lsn, Wal, WalOptions, WalRecord, WalReplay};
