@@ -2,7 +2,7 @@ use htap_common::error::HtapError;
 use htap_sql::parse_one;
 use sqlparser::ast::{
     BinaryOperator, Expr, Ident, ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins, Value,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, Value,
 };
 
 fn object_name_to_ident(name: &ObjectName) -> &Ident {
@@ -462,5 +462,798 @@ fn test_multi_statement_sql_returns_invalid_argument() {
                 "expected statement count error message for {case:?}, got: {msg}"
             );
         }
+    }
+}
+
+use htap_catalog::{CatalogSnapshot, TableDescriptor, TableId};
+use htap_common::types::{
+    ColumnDef as CommonColumnDef, DataType as CommonDataType, Row, Schema, Value as CommonValue,
+};
+use htap_sql::{bind, BoundStatement};
+
+fn make_test_catalog() -> CatalogSnapshot {
+    let users_schema = Schema::new(vec![
+        CommonColumnDef {
+            name: "id".to_string(),
+            data_type: CommonDataType::Int32,
+            nullable: false,
+            primary_key: true,
+        },
+        CommonColumnDef {
+            name: "name".to_string(),
+            data_type: CommonDataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "age".to_string(),
+            data_type: CommonDataType::Int32,
+            nullable: true,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "bio".to_string(),
+            data_type: CommonDataType::String,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+    let users_table = TableDescriptor::new(TableId(1), "users", users_schema, vec![0], vec![], 1);
+
+    let orders_schema = Schema::new(vec![
+        CommonColumnDef {
+            name: "tenant_id".to_string(),
+            data_type: CommonDataType::Int32,
+            nullable: false,
+            primary_key: true,
+        },
+        CommonColumnDef {
+            name: "order_id".to_string(),
+            data_type: CommonDataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        CommonColumnDef {
+            name: "amount".to_string(),
+            data_type: CommonDataType::Float64,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "created_at".to_string(),
+            data_type: CommonDataType::Timestamp,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+    let orders_table =
+        TableDescriptor::new(TableId(2), "orders", orders_schema, vec![0, 1], vec![], 1);
+
+    let bytes_schema = Schema::new(vec![
+        CommonColumnDef {
+            name: "id".to_string(),
+            data_type: CommonDataType::Int32,
+            nullable: false,
+            primary_key: true,
+        },
+        CommonColumnDef {
+            name: "data".to_string(),
+            data_type: CommonDataType::Bytes,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+    let bytes_table =
+        TableDescriptor::new(TableId(3), "bytes_table", bytes_schema, vec![0], vec![], 1);
+
+    let all_types_schema = Schema::new(vec![
+        CommonColumnDef {
+            name: "c_bool".to_string(),
+            data_type: CommonDataType::Bool,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "c_int".to_string(),
+            data_type: CommonDataType::Int32,
+            nullable: false,
+            primary_key: true,
+        },
+        CommonColumnDef {
+            name: "c_bigint".to_string(),
+            data_type: CommonDataType::Int64,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "c_double".to_string(),
+            data_type: CommonDataType::Float64,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "c_varchar".to_string(),
+            data_type: CommonDataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "c_text".to_string(),
+            data_type: CommonDataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "c_varbinary".to_string(),
+            data_type: CommonDataType::Bytes,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "c_blob".to_string(),
+            data_type: CommonDataType::Bytes,
+            nullable: false,
+            primary_key: false,
+        },
+        CommonColumnDef {
+            name: "c_timestamp".to_string(),
+            data_type: CommonDataType::Timestamp,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+    let all_types_table = TableDescriptor::new(
+        TableId(4),
+        "all_types",
+        all_types_schema,
+        vec![1],
+        vec![],
+        1,
+    );
+
+    CatalogSnapshot::new(
+        1,
+        vec![users_table, orders_table, bytes_table, all_types_table],
+        vec![],
+        vec![],
+        vec![],
+    )
+}
+
+fn parse_and_bind(sql: &str, catalog: &CatalogSnapshot) -> htap_common::Result<BoundStatement> {
+    let stmt = parse_one(sql)?;
+    bind(&stmt, catalog)
+}
+
+#[test]
+fn test_bind_create_table_valid() {
+    let catalog = CatalogSnapshot::empty();
+
+    // 1. Quoted backtick CREATE TABLE
+    let sql = "CREATE TABLE `accounts` (`acc_id` INT PRIMARY KEY, `balance` DOUBLE NOT NULL)";
+    let bound = parse_and_bind(sql, &catalog).expect("valid quoted CREATE TABLE");
+    match bound {
+        BoundStatement::CreateTable(create) => {
+            assert_eq!(create.name, "accounts");
+            assert_eq!(create.primary_key, vec![0]);
+            assert_eq!(create.schema.len(), 2);
+            assert_eq!(create.schema.column(0).unwrap().name, "acc_id");
+            assert_eq!(
+                create.schema.column(0).unwrap().data_type,
+                CommonDataType::Int32
+            );
+            assert!(!create.schema.column(0).unwrap().nullable);
+            assert!(create.schema.column(0).unwrap().primary_key);
+
+            assert_eq!(create.schema.column(1).unwrap().name, "balance");
+            assert_eq!(
+                create.schema.column(1).unwrap().data_type,
+                CommonDataType::Float64
+            );
+            assert!(!create.schema.column(1).unwrap().nullable);
+            assert!(!create.schema.column(1).unwrap().primary_key);
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+
+    // 2. All scalar types mapped to htap_common DataType
+    let sql = "CREATE TABLE all_types (\
+        c_bool BOOL, \
+        c_int INT, \
+        c_bigint BIGINT, \
+        c_double DOUBLE, \
+        c_varchar VARCHAR(255), \
+        c_text TEXT, \
+        c_varbinary VARBINARY(16), \
+        c_blob BLOB, \
+        c_timestamp TIMESTAMP, \
+        PRIMARY KEY (c_int)\
+    )";
+    let bound = parse_and_bind(sql, &catalog).expect("valid CREATE TABLE with all scalar types");
+    match bound {
+        BoundStatement::CreateTable(create) => {
+            assert_eq!(create.name, "all_types");
+            assert_eq!(create.primary_key, vec![1]);
+            let types: Vec<_> = create
+                .schema
+                .columns()
+                .iter()
+                .map(|c| c.data_type)
+                .collect();
+            assert_eq!(
+                types,
+                vec![
+                    CommonDataType::Bool,
+                    CommonDataType::Int32,
+                    CommonDataType::Int64,
+                    CommonDataType::Float64,
+                    CommonDataType::String,
+                    CommonDataType::String,
+                    CommonDataType::Bytes,
+                    CommonDataType::Bytes,
+                    CommonDataType::Timestamp,
+                ]
+            );
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+
+    // 3. Column PK
+    let sql = "CREATE TABLE t1 (id BIGINT PRIMARY KEY, name VARCHAR(255))";
+    let bound = parse_and_bind(sql, &catalog).expect("valid column PK");
+    match bound {
+        BoundStatement::CreateTable(create) => {
+            assert_eq!(create.primary_key, vec![0]);
+            assert!(!create.schema.column(0).unwrap().nullable);
+            assert!(create.schema.column(0).unwrap().primary_key);
+            assert!(create.schema.column(1).unwrap().nullable);
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+
+    // 4. Table composite PK
+    let sql = "CREATE TABLE t2 (tenant_id INT, user_id BIGINT, name TEXT, PRIMARY KEY (tenant_id, user_id))";
+    let bound = parse_and_bind(sql, &catalog).expect("valid table composite PK");
+    match bound {
+        BoundStatement::CreateTable(create) => {
+            assert_eq!(create.primary_key, vec![0, 1]);
+            assert!(create.schema.column(0).unwrap().primary_key);
+            assert!(!create.schema.column(0).unwrap().nullable);
+            assert!(create.schema.column(1).unwrap().primary_key);
+            assert!(!create.schema.column(1).unwrap().nullable);
+            assert!(!create.schema.column(2).unwrap().primary_key);
+            assert!(create.schema.column(2).unwrap().nullable);
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+
+    // 5. Table composite PK (exact requirement: CREATE TABLE t (a INT, b BIGINT, PRIMARY KEY (a,b)))
+    let sql = "CREATE TABLE t (a INT, b BIGINT, PRIMARY KEY (a,b))";
+    let bound = parse_and_bind(sql, &catalog).expect("valid table composite PK");
+    match bound {
+        BoundStatement::CreateTable(create) => {
+            assert_eq!(create.name, "t");
+            assert_eq!(create.primary_key, vec![0, 1]);
+            assert!(create.schema.column(0).unwrap().primary_key);
+            assert!(!create.schema.column(0).unwrap().nullable);
+            assert!(create.schema.column(1).unwrap().primary_key);
+            assert!(!create.schema.column(1).unwrap().nullable);
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_bind_insert_valid() {
+    let catalog = make_test_catalog();
+
+    // 1. Multi-row reordered INSERT with nullable NULL
+    let sql = "INSERT INTO users (bio, age, name, id) VALUES ('first bio', 30, 'alice', 1), ('second bio', NULL, 'bob', 2)";
+    let bound = parse_and_bind(sql, &catalog).expect("valid multi-row reordered INSERT");
+    match bound {
+        BoundStatement::Insert(insert) => {
+            assert_eq!(insert.table, "users");
+            assert_eq!(insert.rows.len(), 2);
+            assert_eq!(
+                insert.rows[0],
+                Row::new(vec![
+                    CommonValue::Int32(1),
+                    CommonValue::String("alice".into()),
+                    CommonValue::Int32(30),
+                    CommonValue::String("first bio".into()),
+                ])
+            );
+            assert_eq!(
+                insert.rows[1],
+                Row::new(vec![
+                    CommonValue::Int32(2),
+                    CommonValue::String("bob".into()),
+                    CommonValue::Null,
+                    CommonValue::String("second bio".into()),
+                ])
+            );
+        }
+        other => panic!("expected Insert, got {other:?}"),
+    }
+
+    // 2. All supported literal values
+    let sql = "INSERT INTO all_types (\
+        c_bool, c_int, c_bigint, c_double, c_varchar, c_text, c_varbinary, c_blob, c_timestamp\
+    ) VALUES (\
+        true, -42, 9223372036854775807, 3.25, 'quoted_str', \"double_quoted\", X'01020304', 0xabcd, 1700000000\
+    )";
+    let bound = parse_and_bind(sql, &catalog).expect("valid literals INSERT");
+    match bound {
+        BoundStatement::Insert(insert) => {
+            assert_eq!(insert.table, "all_types");
+            assert_eq!(insert.rows.len(), 1);
+            assert_eq!(
+                insert.rows[0],
+                Row::new(vec![
+                    CommonValue::Bool(true),
+                    CommonValue::Int32(-42),
+                    CommonValue::Int64(9223372036854775807),
+                    CommonValue::Float64(3.25),
+                    CommonValue::String("quoted_str".into()),
+                    CommonValue::String("double_quoted".into()),
+                    CommonValue::Bytes(vec![1, 2, 3, 4]),
+                    CommonValue::Bytes(vec![0xab, 0xcd]),
+                    CommonValue::Timestamp(1700000000),
+                ])
+            );
+        }
+        other => panic!("expected Insert, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_bind_select_valid() {
+    let catalog = make_test_catalog();
+
+    // 1. SELECT *
+    let sql = "SELECT * FROM users WHERE id = 1";
+    let bound = parse_and_bind(sql, &catalog).expect("valid SELECT *");
+    match bound {
+        BoundStatement::Select(select) => {
+            assert_eq!(select.table, "users");
+            assert_eq!(select.projection, vec![0, 1, 2, 3]);
+            assert_eq!(select.key, vec![CommonValue::Int32(1)]);
+        }
+        other => panic!("expected PointSelect, got {other:?}"),
+    }
+
+    // 2. Specific projection order preserved
+    let sql = "SELECT bio, id, name FROM users WHERE id = 10";
+    let bound = parse_and_bind(sql, &catalog).expect("valid projection order SELECT");
+    match bound {
+        BoundStatement::Select(select) => {
+            assert_eq!(select.table, "users");
+            assert_eq!(select.projection, vec![3, 0, 1]);
+            assert_eq!(select.key, vec![CommonValue::Int32(10)]);
+        }
+        other => panic!("expected PointSelect, got {other:?}"),
+    }
+
+    // 3. Composite PK predicate in reverse order: key emitted in catalog primary_key order
+    let sql = "SELECT amount, order_id FROM orders WHERE order_id = 1000 AND tenant_id = 42";
+    let bound = parse_and_bind(sql, &catalog).expect("valid composite PK reverse order SELECT");
+    match bound {
+        BoundStatement::Select(select) => {
+            assert_eq!(select.table, "orders");
+            assert_eq!(select.projection, vec![2, 1]);
+            assert_eq!(
+                select.key,
+                vec![CommonValue::Int32(42), CommonValue::Int64(1000)]
+            );
+        }
+        other => panic!("expected PointSelect, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_bind_delete_valid() {
+    let catalog = make_test_catalog();
+
+    // 1. Single-column PK DELETE
+    let sql = "DELETE FROM users WHERE id = 99";
+    let bound = parse_and_bind(sql, &catalog).expect("valid single PK DELETE");
+    match bound {
+        BoundStatement::Delete(delete) => {
+            assert_eq!(delete.table, "users");
+            assert_eq!(delete.key, vec![CommonValue::Int32(99)]);
+        }
+        other => panic!("expected DeleteByPrimaryKey, got {other:?}"),
+    }
+
+    // 2. Composite PK DELETE with reverse predicate order: emits in catalog primary_key order
+    let sql = "DELETE FROM orders WHERE order_id = 500 AND tenant_id = 12";
+    let bound = parse_and_bind(sql, &catalog).expect("valid composite PK DELETE");
+    match bound {
+        BoundStatement::Delete(delete) => {
+            assert_eq!(delete.table, "orders");
+            assert_eq!(
+                delete.key,
+                vec![CommonValue::Int32(12), CommonValue::Int64(500)]
+            );
+        }
+        other => panic!("expected DeleteByPrimaryKey, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_negative_create_table() {
+    let catalog = CatalogSnapshot::empty();
+
+    let invalid_arg_cases = [
+        // No PK
+        "CREATE TABLE t (id INT, val TEXT)",
+        // Duplicate column in composite PK
+        "CREATE TABLE t (id INT, val TEXT, PRIMARY KEY (id, id))",
+        // Multiple PK declarations (multiple column PKs)
+        "CREATE TABLE t (id1 INT PRIMARY KEY, id2 INT PRIMARY KEY)",
+        // Multiple PK declarations (column PK and table PK)
+        "CREATE TABLE t (id INT PRIMARY KEY, val TEXT, PRIMARY KEY (id))",
+        // Unknown column in composite PK
+        "CREATE TABLE t (id INT, PRIMARY KEY (non_existent))",
+        // PK declared NULL
+        "CREATE TABLE t (id INT NULL PRIMARY KEY, val TEXT)",
+        "CREATE TABLE t (id INT NULL, val TEXT, PRIMARY KEY (id))",
+        // Empty columns
+        "CREATE TABLE t ()",
+    ];
+
+    for case in invalid_arg_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected InvalidArgument for {case:?}, got {res:?}"
+        );
+    }
+
+    let unsupported_cases = [
+        // IF NOT EXISTS
+        "CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)",
+        // TEMPORARY
+        "CREATE TEMPORARY TABLE t (id INT PRIMARY KEY)",
+        // CTAS
+        "CREATE TABLE t AS SELECT 1",
+        // Engine / table options
+        "CREATE TABLE t (id INT PRIMARY KEY) ENGINE=InnoDB",
+        // Default clause
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT DEFAULT 0)",
+        // Unique clause
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT UNIQUE)",
+        // Check clause
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT CHECK (val > 0))",
+        // Foreign key
+        "CREATE TABLE t (id INT PRIMARY KEY, fid INT REFERENCES other(id))",
+        // Unsupported types
+        "CREATE TABLE t (id INT PRIMARY KEY, d DATE)",
+        "CREATE TABLE t (id INT PRIMARY KEY, g GEOMETRY)",
+        "CREATE TABLE t (id INT PRIMARY KEY, dec DECIMAL(10, 2))",
+        // Qualified table name
+        "CREATE TABLE db.t (id INT PRIMARY KEY)",
+        // Table PK USING index type
+        "CREATE TABLE t (id INT, PRIMARY KEY (id) USING BTREE)",
+    ];
+
+    for case in unsupported_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::Unsupported(_))),
+            "expected Unsupported for {case:?}, got {res:?}"
+        );
+    }
+
+    // Test partition_by rejection directly in binder
+    let mut stmt = match parse_one("CREATE TABLE t (id INT PRIMARY KEY)").unwrap() {
+        Statement::CreateTable(ct) => ct,
+        _ => unreachable!(),
+    };
+    stmt.partition_by = Some(Box::new(Expr::Identifier(Ident::new("id"))));
+    let res = bind(&Statement::CreateTable(stmt), &catalog);
+    assert!(matches!(res, Err(HtapError::Unsupported(_))));
+
+    // Test table PK with index_type rejection directly in binder
+    let mut stmt = match parse_one("CREATE TABLE t (id INT, PRIMARY KEY (id))").unwrap() {
+        Statement::CreateTable(ct) => ct,
+        _ => unreachable!(),
+    };
+    if let TableConstraint::PrimaryKey(ref mut pk) = stmt.constraints[0] {
+        pk.index_type = Some(sqlparser::ast::IndexType::BTree);
+    }
+    let res = bind(&Statement::CreateTable(stmt), &catalog);
+    assert!(matches!(res, Err(HtapError::Unsupported(_))));
+}
+
+#[test]
+fn test_bind_create_table_primary_key_field() {
+    let catalog = CatalogSnapshot::empty();
+
+    // 1. Positive: Statement::CreateTable with stmt.primary_key set (e.g. AST)
+    let mut stmt = match parse_one("CREATE TABLE t (a INT, b BIGINT)").unwrap() {
+        Statement::CreateTable(ct) => ct,
+        other => panic!("expected CreateTable, got {other:?}"),
+    };
+    stmt.primary_key = Some(Box::new(Expr::Tuple(vec![
+        Expr::Identifier(Ident::new("a")),
+        Expr::Identifier(Ident::new("b")),
+    ])));
+    let bound =
+        bind(&Statement::CreateTable(stmt), &catalog).expect("valid table PK via stmt.primary_key");
+    match bound {
+        BoundStatement::CreateTable(create) => {
+            assert_eq!(create.name, "t");
+            assert_eq!(create.primary_key, vec![0, 1]);
+            assert!(create.schema.column(0).unwrap().primary_key);
+            assert!(!create.schema.column(0).unwrap().nullable);
+            assert!(create.schema.column(1).unwrap().primary_key);
+            assert!(!create.schema.column(1).unwrap().nullable);
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+
+    // 2. Negative: multiple PK declarations (column PK + stmt.primary_key)
+    let mut stmt = match parse_one("CREATE TABLE t (a INT PRIMARY KEY, b BIGINT)").unwrap() {
+        Statement::CreateTable(ct) => ct,
+        other => panic!("expected CreateTable, got {other:?}"),
+    };
+    stmt.primary_key = Some(Box::new(Expr::Identifier(Ident::new("b"))));
+    let res = bind(&Statement::CreateTable(stmt), &catalog);
+    assert!(matches!(res, Err(HtapError::InvalidArgument(_))));
+
+    // 3. Negative: multiple PK declarations (table constraint PK + stmt.primary_key)
+    let mut stmt = match parse_one("CREATE TABLE t (a INT, b BIGINT, PRIMARY KEY (a))").unwrap() {
+        Statement::CreateTable(ct) => ct,
+        other => panic!("expected CreateTable, got {other:?}"),
+    };
+    stmt.primary_key = Some(Box::new(Expr::Identifier(Ident::new("b"))));
+    let res = bind(&Statement::CreateTable(stmt), &catalog);
+    assert!(matches!(res, Err(HtapError::InvalidArgument(_))));
+
+    // 4. Negative: duplicate column in stmt.primary_key
+    let mut stmt = match parse_one("CREATE TABLE t (a INT, b BIGINT)").unwrap() {
+        Statement::CreateTable(ct) => ct,
+        other => panic!("expected CreateTable, got {other:?}"),
+    };
+    stmt.primary_key = Some(Box::new(Expr::Tuple(vec![
+        Expr::Identifier(Ident::new("a")),
+        Expr::Identifier(Ident::new("a")),
+    ])));
+    let res = bind(&Statement::CreateTable(stmt), &catalog);
+    assert!(matches!(res, Err(HtapError::InvalidArgument(_))));
+
+    // 5. Negative: unknown column in stmt.primary_key
+    let mut stmt = match parse_one("CREATE TABLE t (a INT, b BIGINT)").unwrap() {
+        Statement::CreateTable(ct) => ct,
+        other => panic!("expected CreateTable, got {other:?}"),
+    };
+    stmt.primary_key = Some(Box::new(Expr::Identifier(Ident::new("non_existent"))));
+    let res = bind(&Statement::CreateTable(stmt), &catalog);
+    assert!(matches!(res, Err(HtapError::InvalidArgument(_))));
+
+    // 6. Negative: invalid non-identifier expression in stmt.primary_key
+    let mut stmt = match parse_one("CREATE TABLE t (a INT, b BIGINT)").unwrap() {
+        Statement::CreateTable(ct) => ct,
+        other => panic!("expected CreateTable, got {other:?}"),
+    };
+    stmt.primary_key = Some(Box::new(Expr::BinaryOp {
+        left: Box::new(Expr::Identifier(Ident::new("a"))),
+        op: BinaryOperator::Plus,
+        right: Box::new(Expr::Identifier(Ident::new("b"))),
+    }));
+    let res = bind(&Statement::CreateTable(stmt), &catalog);
+    assert!(matches!(res, Err(HtapError::InvalidArgument(_))));
+}
+
+#[test]
+fn test_negative_insert() {
+    let catalog = make_test_catalog();
+
+    // Missing table lookup -> NotFound
+    let res = parse_and_bind(
+        "INSERT INTO missing_table (id, name) VALUES (1, 'alice')",
+        &catalog,
+    );
+    assert!(
+        matches!(res, Err(HtapError::NotFound(_))),
+        "expected NotFound, got {res:?}"
+    );
+
+    let invalid_arg_cases = [
+        // Column not in table schema
+        "INSERT INTO users (id, name, age, bio, non_existent) VALUES (1, 'a', 20, 'b', 'c')",
+        // Omitted columns (must provide all schema columns)
+        "INSERT INTO users (id, name) VALUES (1, 'alice')",
+        // Duplicate column in column list
+        "INSERT INTO users (id, id, name, age) VALUES (1, 2, 'alice', 20)",
+        // Missing explicit column list
+        "INSERT INTO users VALUES (1, 'alice', 20, 'b')",
+        // Arity mismatch: fewer values than columns
+        "INSERT INTO users (id, name, age, bio) VALUES (1, 'alice', 20)",
+        // Arity mismatch: more values than columns
+        "INSERT INTO users (id, name, age, bio) VALUES (1, 'alice', 20, 'bio', 'extra')",
+        // Multi-row arity mismatch on second row
+        "INSERT INTO users (id, name, age, bio) VALUES (1, 'alice', 20, 'b'), (2, 'bob')",
+        // Expressions in VALUES
+        "INSERT INTO users (id, name, age, bio) VALUES (1 + 1, 'alice', 20, 'b')",
+        "INSERT INTO users (id, name, age, bio) VALUES (1, LOWER('alice'), 20, 'b')",
+        // Placeholders in VALUES
+        "INSERT INTO users (id, name, age, bio) VALUES (?, 'alice', 20, 'b')",
+        // Type mismatch: string to int
+        "INSERT INTO users (id, name, age, bio) VALUES ('not_an_int', 'alice', 20, 'b')",
+        // Type mismatch: number to string
+        "INSERT INTO users (id, name, age, bio) VALUES (1, 12345, 20, 'b')",
+        // Fractional to integer
+        "INSERT INTO users (id, name, age, bio) VALUES (1.5, 'alice', 20, 'b')",
+        // Exponent to integer
+        "INSERT INTO users (id, name, age, bio) VALUES (1e3, 'alice', 20, 'b')",
+        // Integer with suffix
+        "INSERT INTO users (id, name, age, bio) VALUES (1L, 'alice', 20, 'b')",
+        // Integer overflow for INT32
+        "INSERT INTO users (id, name, age, bio) VALUES (3000000000, 'alice', 20, 'b')",
+        // NULL in primary key
+        "INSERT INTO users (id, name, age, bio) VALUES (NULL, 'alice', 20, 'b')",
+        // NULL in non-nullable column (name is NOT NULL)
+        "INSERT INTO users (id, name, age, bio) VALUES (1, NULL, 20, 'b')",
+        // Odd length hex bytes
+        "INSERT INTO bytes_table (id, data) VALUES (1, X'123')",
+        // Invalid hex character
+        "INSERT INTO bytes_table (id, data) VALUES (1, X'12ZZ')",
+    ];
+
+    for case in invalid_arg_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected InvalidArgument for {case:?}, got {res:?}"
+        );
+    }
+
+    let unsupported_cases = [
+        // INSERT SELECT
+        "INSERT INTO users (id, name, age, bio) SELECT 1, 'a', 20, 'b'",
+        // INSERT SET
+        "INSERT INTO users SET id = 1, name = 'a', age = 20, bio = 'b'",
+        // INSERT IGNORE
+        "INSERT IGNORE INTO users (id, name, age, bio) VALUES (1, 'a', 20, 'b')",
+        // REPLACE INTO
+        "REPLACE INTO users (id, name, age, bio) VALUES (1, 'a', 20, 'b')",
+        // RETURNING
+        "INSERT INTO users (id, name, age, bio) VALUES (1, 'a', 20, 'b') RETURNING id",
+        // Qualified table name
+        "INSERT INTO db.users (id, name, age, bio) VALUES (1, 'a', 20, 'b')",
+    ];
+
+    for case in unsupported_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::Unsupported(_))),
+            "expected Unsupported for {case:?}, got {res:?}"
+        );
+    }
+
+    // Test table alias rejection directly in binder
+    let mut stmt =
+        match parse_one("INSERT INTO users (id, name, age, bio) VALUES (1, 'a', 20, 'b')").unwrap()
+        {
+            Statement::Insert(ins) => ins,
+            _ => unreachable!(),
+        };
+    stmt.table_alias = Some(sqlparser::ast::TableAliasWithoutColumns {
+        explicit: true,
+        alias: Ident::new("u"),
+    });
+    let res = bind(&Statement::Insert(stmt), &catalog);
+    assert!(matches!(res, Err(HtapError::Unsupported(_))));
+}
+
+#[test]
+fn test_negative_select_and_delete() {
+    let catalog = make_test_catalog();
+
+    // Missing table lookup -> NotFound
+    let res = parse_and_bind("SELECT * FROM missing WHERE id = 1", &catalog);
+    assert!(
+        matches!(res, Err(HtapError::NotFound(_))),
+        "expected NotFound, got {res:?}"
+    );
+    let res = parse_and_bind("DELETE FROM missing WHERE id = 1", &catalog);
+    assert!(
+        matches!(res, Err(HtapError::NotFound(_))),
+        "expected NotFound, got {res:?}"
+    );
+
+    let invalid_arg_cases = [
+        // Unknown column in projection
+        "SELECT nonexistent FROM users WHERE id = 1",
+        // Unknown column in WHERE
+        "SELECT * FROM users WHERE nonexistent = 1",
+        // Predicate on non-PK column
+        "SELECT * FROM users WHERE name = 'alice'",
+        // Non-PK column combined with PK in WHERE
+        "SELECT * FROM users WHERE id = 1 AND name = 'alice'",
+        // Partial PK predicate on composite PK table
+        "SELECT * FROM orders WHERE tenant_id = 1",
+        // Duplicate PK predicate
+        "SELECT * FROM users WHERE id = 1 AND id = 2",
+        // OR in WHERE predicate
+        "SELECT * FROM users WHERE id = 1 OR id = 2",
+        // Non-equality operators
+        "SELECT * FROM users WHERE id > 1",
+        "SELECT * FROM users WHERE id != 1",
+        "SELECT * FROM users WHERE id IS NULL",
+        // NULL literal in WHERE
+        "SELECT * FROM users WHERE id = NULL",
+        // Reversed operands (value = col)
+        "SELECT * FROM users WHERE 1 = id",
+        "DELETE FROM users WHERE 1 = id",
+        // Missing WHERE clause
+        "SELECT * FROM users",
+        "DELETE FROM users",
+        // Expression in WHERE value
+        "SELECT * FROM users WHERE id = 1 + 1",
+        // Placeholder in WHERE value
+        "SELECT * FROM users WHERE id = ?",
+        // Type mismatch in WHERE value
+        "SELECT * FROM users WHERE id = 'not_an_int'",
+        // Fractional to integer in WHERE value
+        "SELECT * FROM users WHERE id = 1.5",
+        // Wildcard combined with column
+        "SELECT *, id FROM users WHERE id = 1",
+    ];
+
+    for case in invalid_arg_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected InvalidArgument for {case:?}, got {res:?}"
+        );
+    }
+
+    let unsupported_cases = [
+        // Joins
+        "SELECT * FROM users JOIN orders ON users.id = orders.tenant_id WHERE users.id = 1",
+        "SELECT * FROM users, orders WHERE users.id = 1",
+        // Aliases
+        "SELECT * FROM users u WHERE id = 1",
+        "SELECT * FROM users AS u WHERE id = 1",
+        "DELETE FROM users u WHERE id = 1",
+        "DELETE FROM users AS u WHERE id = 1",
+        "SELECT id AS my_id FROM users WHERE id = 1",
+        // Qualified names
+        "SELECT * FROM db.users WHERE id = 1",
+        "DELETE FROM db.users WHERE id = 1",
+        "SELECT users.id FROM users WHERE id = 1",
+        "SELECT * FROM users WHERE users.id = 1",
+        // ORDER BY
+        "SELECT * FROM users WHERE id = 1 ORDER BY id",
+        "DELETE FROM users WHERE id = 1 ORDER BY id",
+        // LIMIT
+        "SELECT * FROM users WHERE id = 1 LIMIT 1",
+        "DELETE FROM users WHERE id = 1 LIMIT 1",
+        // GROUP BY / HAVING / DISTINCT
+        "SELECT * FROM users WHERE id = 1 GROUP BY id",
+        "SELECT * FROM users WHERE id = 1 HAVING id = 1",
+        "SELECT DISTINCT id FROM users WHERE id = 1",
+        // CTEs / Set ops
+        "WITH cte AS (SELECT 1) SELECT * FROM users WHERE id = 1",
+        "SELECT * FROM users WHERE id = 1 UNION SELECT * FROM users WHERE id = 2",
+        // Unsupported statement types
+        "UPDATE users SET name = 'bob' WHERE id = 1",
+        "DROP TABLE users",
+        "ALTER TABLE users ADD COLUMN foo INT",
+    ];
+
+    for case in unsupported_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::Unsupported(_))),
+            "expected Unsupported for {case:?}, got {res:?}"
+        );
     }
 }

@@ -4,7 +4,9 @@
 #![warn(missing_docs)]
 
 pub mod ast;
+pub mod binder;
 pub mod result;
 
 pub use ast::{parse_one, BoundStatement, CreateTable, DeleteByPrimaryKey, Insert, PointSelect};
+pub use binder::bind;
 pub use result::{CommandResult, QueryResult, StatementResult};
