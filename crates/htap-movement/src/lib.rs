@@ -17,8 +17,25 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod codec;
+pub mod export;
+pub mod import;
 pub mod job;
 
+pub use codec::{
+    decode_csv_record, decode_hex, decode_json_line, decode_record, encode_csv_header,
+    encode_csv_record, encode_hex, encode_json_line, encode_record, format_csv_field,
+    format_json_value, parse_csv_field, parse_json_value, CsvHeaderMap, MAX_FIELD_BYTES,
+    MAX_LINE_BYTES,
+};
+pub use export::{
+    collapse_entries_to_rows, copy_to_csv, copy_to_csv_writer, copy_to_jsonl, copy_to_jsonl_writer,
+    export,
+};
+pub use import::{
+    copy_from_csv, copy_from_csv_reader, copy_from_jsonl, copy_from_jsonl_reader, import,
+    resolve_table_topology, ResolvedTopology,
+};
 pub use job::{
     decode_job, encode_job, sync_dir, validate_job_id, CopyOptions, CopyReport, DataFormat,
     JobCounters, LocalDataMover, MovementJob, MovementJobKind, MovementJobPhase,

@@ -165,7 +165,12 @@ pub struct CopyOptions {
     pub max_errors: usize,
     /// Delimiter byte for CSV format (default `,`).
     pub delimiter: u8,
-    /// Whether the file includes a header line (CSV default `true`).
+    /// Whether the CSV file includes a header line (default `true`).
+    ///
+    /// When `true`, the first row of CSV input is interpreted as column headers and matched
+    /// against schema column names (allowing columns to appear in any order).
+    /// When `false`, the first row is treated as data; fields are interpreted strictly in
+    /// schema declaration order, requiring exactly `schema.len()` fields per record.
     pub has_header: bool,
     /// Optional MVCC snapshot version to pin during export or clone.
     pub pinned_version: Option<Version>,
@@ -223,6 +228,11 @@ impl CopyOptions {
     }
 
     /// Configure whether CSV input/output has a header line.
+    ///
+    /// For CSV import:
+    /// - `true` (default): first row is parsed as column headers and mapped against schema names.
+    /// - `false`: first row is treated as data, interpreted in schema declaration order,
+    ///   requiring exactly `schema.len()` fields per record.
     #[inline]
     pub fn with_has_header(mut self, has_header: bool) -> Self {
         self.has_header = has_header;
@@ -896,37 +906,171 @@ impl LocalDataMover {
         Ok(job)
     }
 
-    /// Import execution stub (deferred to subsequent tasks).
-    pub fn import(&self, options: impl std::borrow::Borrow<CopyOptions>) -> Result<CopyReport> {
-        let options = options.borrow();
-        options.validate()?;
-        Err(HtapError::Unsupported(
-            "import execution not yet implemented; scheduled for subsequent task".into(),
-        ))
+    /// Import records from a generic CSV [`std::io::Read`] stream.
+    ///
+    /// # Consistency & Crash Recovery
+    /// Mutations are batched and committed via [`htap_txn::TransactionManager::commit_request`]
+    /// with participant ID 1 before job progress counters are checkpointed. If a crash
+    /// occurs after the transaction commits but before the job counter checkpoint is written,
+    /// a commit-before-checkpoint replay window exists. On recovery/resume, uncheckpointed
+    /// records are replayed. Because rows are upserted by primary key (`Mutation::Put`),
+    /// replay is idempotent, but exactly-once execution across crashes is not claimed.
+    ///
+    /// # Resume
+    /// Resuming an in-flight job using a non-seekable stream returns [`HtapError::Unsupported`].
+    pub fn copy_from_csv_reader<R: std::io::Read>(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        txn_manager: &htap_txn::TransactionManager,
+        reader: R,
+    ) -> Result<CopyReport> {
+        crate::import::copy_from_csv_reader(self, options, catalog, txn_manager, reader)
     }
 
-    /// Export execution stub (deferred to subsequent tasks).
-    pub fn export(&self, options: impl std::borrow::Borrow<CopyOptions>) -> Result<CopyReport> {
-        let options = options.borrow();
-        options.validate()?;
-        Err(HtapError::Unsupported(
-            "export execution not yet implemented; scheduled for subsequent task".into(),
-        ))
+    /// Import records from a generic JSONLines [`std::io::Read`] stream.
+    ///
+    /// # Resume
+    /// Resuming an in-flight job using a non-seekable stream returns [`HtapError::Unsupported`].
+    pub fn copy_from_jsonl_reader<R: std::io::Read>(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        txn_manager: &htap_txn::TransactionManager,
+        reader: R,
+    ) -> Result<CopyReport> {
+        crate::import::copy_from_jsonl_reader(self, options, catalog, txn_manager, reader)
     }
 
-    /// Codec decode stub (deferred to subsequent tasks).
+    /// Import records from a CSV file at `options.path`.
+    ///
+    /// On resume, reopens the source file and discards exactly the checkpointed logical records.
+    pub fn copy_from_csv(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        txn_manager: &htap_txn::TransactionManager,
+    ) -> Result<CopyReport> {
+        crate::import::copy_from_csv(self, options, catalog, txn_manager)
+    }
+
+    /// Import records from a JSONLines file at `options.path`.
+    ///
+    /// On resume, reopens the source file and discards exactly the checkpointed logical records.
+    pub fn copy_from_jsonl(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        txn_manager: &htap_txn::TransactionManager,
+    ) -> Result<CopyReport> {
+        crate::import::copy_from_jsonl(self, options, catalog, txn_manager)
+    }
+
+    /// Import records from the file specified in `options.path` according to `options.format`.
+    pub fn import(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        txn_manager: &htap_txn::TransactionManager,
+    ) -> Result<CopyReport> {
+        crate::import::import(self, options, catalog, txn_manager)
+    }
+
+    /// Export partition records to a generic CSV [`std::io::Write`] stream.
+    ///
+    /// Pins the engine snapshot once, collapses MVCC/tombstones, and outputs rows in
+    /// deterministic encoded-PK order.
+    pub fn copy_to_csv_writer<W: std::io::Write>(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        engine: &htap_rowstore::Engine,
+        writer: W,
+    ) -> Result<CopyReport> {
+        crate::export::copy_to_csv_writer(self, options, catalog, engine, writer)
+    }
+
+    /// Export partition records to a generic JSONLines [`std::io::Write`] stream.
+    ///
+    /// Pins the engine snapshot once, collapses MVCC/tombstones, and outputs rows in
+    /// deterministic encoded-PK order.
+    pub fn copy_to_jsonl_writer<W: std::io::Write>(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        engine: &htap_rowstore::Engine,
+        writer: W,
+    ) -> Result<CopyReport> {
+        crate::export::copy_to_jsonl_writer(self, options, catalog, engine, writer)
+    }
+
+    /// Export partition records to a CSV file at `options.path`.
+    ///
+    /// Output file is written atomically via temporary file, fsync, and rename.
+    pub fn copy_to_csv(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        engine: &htap_rowstore::Engine,
+    ) -> Result<CopyReport> {
+        crate::export::copy_to_csv(self, options, catalog, engine)
+    }
+
+    /// Export partition records to a JSONLines file at `options.path`.
+    ///
+    /// Output file is written atomically via temporary file, fsync, and rename.
+    pub fn copy_to_jsonl(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        engine: &htap_rowstore::Engine,
+    ) -> Result<CopyReport> {
+        crate::export::copy_to_jsonl(self, options, catalog, engine)
+    }
+
+    /// Export partition records to the file specified in `options.path` according to `options.format`.
+    pub fn export(
+        &self,
+        options: &CopyOptions,
+        catalog: &dyn htap_catalog::store::CatalogStore,
+        engine: &htap_rowstore::Engine,
+    ) -> Result<CopyReport> {
+        crate::export::export(self, options, catalog, engine)
+    }
+
+    /// Decode a raw data record using a table schema.
+    pub fn decode_record_with_schema(
+        &self,
+        schema: &htap_common::Schema,
+        format: DataFormat,
+        data: &[u8],
+    ) -> Result<Row> {
+        crate::codec::decode_record(schema, format, data)
+    }
+
+    /// Encode a row into raw bytes using a table schema.
+    pub fn encode_record_with_schema(
+        &self,
+        schema: &htap_common::Schema,
+        format: DataFormat,
+        row: &Row,
+    ) -> Result<Vec<u8>> {
+        crate::codec::encode_record(schema, format, row)
+    }
+
+    /// Codec decode stub (use [`LocalDataMover::decode_record_with_schema`] for schema-aware decoding).
     pub fn decode_record(&self, format: DataFormat, data: &[u8]) -> Result<Row> {
         let _ = (format, data);
         Err(HtapError::Unsupported(
-            "record decoding not yet implemented; scheduled for subsequent task".into(),
+            "schema-less decode is unsupported; use decode_record_with_schema".into(),
         ))
     }
 
-    /// Codec encode stub (deferred to subsequent tasks).
+    /// Codec encode stub (use [`LocalDataMover::encode_record_with_schema`] for schema-aware encoding).
     pub fn encode_record(&self, format: DataFormat, row: &Row) -> Result<Vec<u8>> {
         let _ = (format, row);
         Err(HtapError::Unsupported(
-            "record encoding not yet implemented; scheduled for subsequent task".into(),
+            "schema-less encode is unsupported; use encode_record_with_schema".into(),
         ))
     }
 
