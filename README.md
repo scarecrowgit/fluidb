@@ -143,14 +143,17 @@ The SQL engine and embedded client execute an explicit, synchronous single-parti
   - Filters: AND-only typed comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) with SQL three-valued logic.
   - Aggregates: `COUNT(*)`, `COUNT(column)`, `SUM(column)` (for `Int32`, `Int64`, `Float64`), `MIN(column)`, `MAX(column)`. Empty global aggregates return 1 row with `COUNT = 0` and other aggregates `NULL`.
   - Grouping: deterministic `GROUP BY` with SQL `NULL` grouping semantics.
+  - Base scan pushdown optimization: For materialized `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads unioning primary key and requested columns, safely pushing down at most one eligible predicate leaf (`=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) directly into `SegmentReader::scan`. Stale base rows are suppressed via newest post-base rowstore deltas, mutations (`Put`/`Delete`) are overlaid, and rows are ordered by primary key deterministically before complete residual SQL filter, aggregate, and group evaluation. `ScanStats`/pruning is tracked internally as execution evidence, but SQL evaluation operates on materialized logical rows (vectorized aggregation is not implemented).
+  - Point read isolation: Complete-PK `Route::RowstorePointRead` queries remain strictly isolated, separate, and unchanged.
 
 ### Unsupported & Deferred SQL Features
-The following features are explicitly deferred:
+Direct `SegmentReader` pushdown optimization is now implemented for the compact base path (single leaf pushdown). The following features are explicitly deferred:
+- Compound `AND` pushdown beyond one leaf, and `!=` pushdown (evaluated as residual SQL filters).
+- Vectorized aggregation and vectorized operator execution pipelines.
 - Joins and multiple tables in `FROM`, table aliases, CTEs (`WITH`), window functions (`OVER`), subqueries.
 - Query modifiers/clauses: `ORDER BY`, `LIMIT`, `HAVING`.
 - Predicate expressions: `OR`, `NOT`, arithmetic, explicit type casts.
 - Aggregates: `AVG`, `DISTINCT` aggregates (`COUNT(DISTINCT ...)`).
-- Direct `SegmentReader` pushdown from SQL, vectorized SQL execution.
 - Multi-tablet or distributed scans, resource quotas, disk spilling, query cancellation.
 - DataFusion and Apache Arrow integration.
 - Full MySQL dialect breadth, sessions, and transaction controls (`BEGIN`, `COMMIT`, `ROLLBACK`).

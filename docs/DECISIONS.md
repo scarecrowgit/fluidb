@@ -38,11 +38,20 @@ accidentally acquire analytical overhead.
 **Implementation note:** In the current local MVP, DataFusion is not integrated
 or implemented. Instead, `htap-sql` binds narrow single-table analytical queries
 to `AnalyticSelect` (`Route::OlapScan`) and `LocalServer` executes them via a hand-written
-evaluator (`htap-server::olap`) over logical rowstore and base-plus-delta rows
-(using `<root>/colstore` for materialized `Column`/`Converting` partitions).
-Complete-PK point queries strictly take the hand-written transactional fast path
-(`Route::RowstorePointRead`), structurally bypassing the analytical evaluator and converter.
-DataFusion/Arrow analytical integration remains deferred future work.
+evaluator (`htap-server::olap`). For materialized `Column` and `Converting` partitions
+(using `<root>/colstore`), `LocalServer` uses projection-aware compact reads
+(`read_column_partition_compact_core`) unioning primary-key and requested columns,
+pushes down at most one safe predicate leaf directly into columnar `SegmentReader::scan`,
+suppresses stale base rows using post-base rowstore deltas, overlays delta puts and deletes,
+and sorts into deterministic primary-key order before full residual SQL filter, aggregate,
+and group evaluation. Columnar `ScanStats` and block pruning are available internally as
+execution evidence, but SQL evaluation still operates on materialized logical rows;
+vectorized aggregation is not implemented. Complete-PK point queries strictly take the
+hand-written transactional fast path (`Route::RowstorePointRead`), structurally bypassing
+the analytical evaluator and converter, remaining separate and unchanged. Compound `AND`
+pushdown beyond one leaf, `!=` pushdown, joins, CTEs, windows, ORDER BY, LIMIT, HAVING, OR,
+expressions, AVG, DISTINCT, multi-tablet/distributed scans, quotas, spill, cancellation,
+and DataFusion/Arrow analytical integration remain deferred future work.
 
 ### Consequences
 
@@ -318,13 +327,18 @@ Option **(c)**.
 - **Authoritative rowstore base-plus-delta overlay:** The rowstore remains the authoritative
   truth for point operations (`Route::RowstoreWrite` and `Route::RowstorePointRead`), executing
   without interruption across `Row`, `Converting`, and `Column` states. Materialized scans
-  via converter API `read_column_partition` (verified in `crates/htap-convert/tests/materialization.rs`)
+  via converter APIs (`read_column_partition` and projection-aware compact reads
+  `read_column_partition_compact_core`, verified in `crates/htap-convert/tests/materialization.rs`)
   and `LocalServer` analytical scans (`Route::OlapScan` using `<root>/colstore`) scan columnar base
-  segments up to `V` and overlay post-`V` rowstore puts and deletes.
-- **Scope boundaries:** Reverse `Column -> Row` conversion is not implemented and not claimed.
-  Columnar bitmap delete vectors, physical rowstore reclamation, delta-to-base background compaction,
-  direct `SegmentReader` pushdown from SQL, vectorized SQL execution, joins/CTEs/windows, and distributed
-  multi-tablet conversion are explicitly deferred.
+  segments up to `V` and overlay post-`V` rowstore puts and deletes. For `Column` and `Converting`
+  partitions, `LocalServer` analytical scans execute projection-aware compact reads (PK + requested
+  column union), safely push down one eligible predicate leaf into `SegmentReader::scan`, suppress
+  stale base rows using rowstore deltas, and evaluate residual SQL logic.
+- **Scope boundaries:** Direct SegmentReader pushdown optimization is now implemented for the compact
+  base path. Compound `AND` pushdown remains limited to one leaf, and `!=` remains residual.
+  Reverse `Column -> Row` conversion is not implemented and not claimed. Columnar bitmap delete vectors,
+  physical rowstore reclamation, delta-to-base background compaction, vectorized aggregation, vectorized
+  operator pipelines, joins/CTEs/windows, and distributed multi-tablet conversion are explicitly deferred.
 
 ### Consequences
 
