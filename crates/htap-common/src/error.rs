@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::version::Version;
+
 /// Common error types across the HTAP storage engine.
 #[derive(Debug, Error)]
 pub enum HtapError {
@@ -23,11 +25,28 @@ pub enum HtapError {
     #[error("Fenced: expected token >= {expected}, got {got}")]
     Fenced { expected: u64, got: u64 },
 
+    /// Transaction commit was fsynced and is durable, but post-commit
+    /// execution (apply or publish) failed. Transaction cannot be rolled back;
+    /// recovery/completion is required.
+    #[error("durable commit pending completion for txn {txn_id} at version {version}: {reason}; recovery required")]
+    DurablePending {
+        txn_id: u64,
+        version: Version,
+        reason: String,
+    },
+
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+impl HtapError {
+    /// Returns true if this error is [`HtapError::DurablePending`].
+    pub fn is_durable_pending(&self) -> bool {
+        matches!(self, Self::DurablePending { .. })
+    }
 }
 
 /// HTAP common Result type alias.
@@ -62,6 +81,18 @@ mod tests {
             got: 3,
         };
         assert_eq!(err_fence.to_string(), "Fenced: expected token >= 5, got 3");
+
+        let err_dp = HtapError::DurablePending {
+            txn_id: 42,
+            version: Version::new(5),
+            reason: "apply failed on participant 1".into(),
+        };
+        assert_eq!(
+            err_dp.to_string(),
+            "durable commit pending completion for txn 42 at version v5: apply failed on participant 1; recovery required"
+        );
+        assert!(err_dp.is_durable_pending());
+        assert!(!err_fence.is_durable_pending());
 
         let err_unsupp = HtapError::Unsupported("feature X".into());
         assert_eq!(err_unsupp.to_string(), "Unsupported: feature X");

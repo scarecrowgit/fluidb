@@ -448,6 +448,20 @@ impl Journal {
         Ok(())
     }
 
+    /// Append a [`JournalRecord`] without fsyncing.
+    ///
+    /// Writes the framed record to disk and updates `valid_end`. Durability requires
+    /// calling [`Journal::sync`].
+    pub fn append_nosync(&mut self, record: &JournalRecord) -> Result<u64> {
+        let frame = encode_frame(record, self.opts.max_frame_size)?;
+        let write_offset = self.valid_end;
+
+        self.file.seek(SeekFrom::Start(write_offset))?;
+        self.file.write_all(&frame)?;
+        self.valid_end = write_offset + frame.len() as u64;
+        Ok(write_offset)
+    }
+
     /// Append a [`JournalRecord`] to the journal.
     ///
     /// Synchronously writes the frame to disk. If `sync_on_write` is enabled (the default),
@@ -482,9 +496,48 @@ impl Journal {
         Ok(scan.records.into_iter().map(|(_, rec)| rec).collect())
     }
 
+    /// Recovers valid records from the journal according to torn-tail and corruption options.
+    ///
+    /// If torn final records are present and `auto_repair_torn_final` is true, the torn tail is
+    /// repaired/truncated and an explanation is returned. If `auto_repair_torn_final` is false,
+    /// torn records produce an error. Middle corruption produces an error regardless of options.
+    pub fn recover_records(&mut self) -> Result<(Vec<JournalRecord>, Option<String>)> {
+        let scan = self.scan()?;
+        if let Some((offset, reason)) = scan.middle_corrupt {
+            return Err(HtapError::Corruption(format!(
+                "journal middle corruption at offset {offset}: {reason}"
+            )));
+        }
+
+        let mut torn_explanation = None;
+        if let Some((offset, reason)) = scan.torn_final {
+            if self.opts.auto_repair_torn_final {
+                let bytes_truncated = self.repair_torn_final()?;
+                torn_explanation = Some(format!(
+                    "torn final record at offset {offset} ({bytes_truncated} bytes truncated): {reason}"
+                ));
+            } else {
+                return Err(HtapError::Corruption(format!(
+                    "journal torn final record at offset {offset}: {reason}"
+                )));
+            }
+        } else {
+            self.valid_end = scan.valid_end;
+            self.file.seek(SeekFrom::Start(self.valid_end))?;
+        }
+
+        let records = scan.records.into_iter().map(|(_, rec)| rec).collect();
+        Ok((records, torn_explanation))
+    }
+
     /// Return the byte length of the valid portion of the journal.
     pub fn valid_bytes(&self) -> u64 {
         self.valid_end
+    }
+
+    /// Return the configured options of this journal.
+    pub fn options(&self) -> &JournalOptions {
+        &self.opts
     }
 
     /// Return the configured path of this journal.

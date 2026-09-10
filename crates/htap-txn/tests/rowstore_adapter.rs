@@ -379,3 +379,95 @@ fn test_malformed_payload_handling() {
         );
     }
 }
+
+#[test]
+fn test_concurrent_commits_serializes_decisions_and_maintains_rowstore_ordering() {
+    let journal_dir = tempfile::tempdir().unwrap();
+    let rowstore_dir = tempfile::tempdir().unwrap();
+
+    let journal_path = journal_dir.path().join("txn.journal");
+    let manager = Arc::new(TransactionManager::open(&journal_path).unwrap());
+
+    let engine = Arc::new(Engine::open(EngineOptions::new(rowstore_dir.path())).unwrap());
+    let participant_id = ParticipantId::new(1);
+    let participant = Arc::new(RowstoreParticipant::new(
+        participant_id,
+        Arc::clone(&engine),
+    ));
+    manager.register_participant(participant);
+
+    let num_threads = 6;
+    let commits_per_thread = 10;
+    let mut handles = Vec::new();
+
+    for t in 0..num_threads {
+        let mgr = Arc::clone(&manager);
+        handles.push(std::thread::spawn(move || {
+            let mut committed_versions = Vec::new();
+            for i in 0..commits_per_thread {
+                let key = format!("t{t}_k{i}").into_bytes();
+                let val = (t * 1000 + i) as i64;
+                let mutations = vec![Mutation::Put {
+                    partition_id: 0,
+                    key,
+                    row: make_row(val),
+                }];
+                let payload = RowstoreParticipant::encode_payload(&mutations).unwrap();
+                let mut txn = mgr.begin().unwrap();
+                txn.add_participant(participant_id, payload);
+                let committed = mgr.commit(&mut txn).unwrap();
+                committed_versions.push((t, i, val, committed.version));
+            }
+            committed_versions
+        }));
+    }
+
+    let mut all_commits = Vec::new();
+    for h in handles {
+        let thread_commits = h.join().unwrap();
+        all_commits.extend(thread_commits);
+    }
+
+    let total_commits = num_threads * commits_per_thread;
+    assert_eq!(all_commits.len(), total_commits);
+
+    // Verify all committed versions are contiguous with no gaps
+    let mut versions: Vec<Version> = all_commits.iter().map(|(_, _, _, v)| *v).collect();
+    versions.sort();
+    assert_eq!(versions.len(), total_commits);
+
+    for (idx, v) in versions.iter().enumerate() {
+        let expected_version = Version::new(2 + idx as u64);
+        assert_eq!(
+            *v, expected_version,
+            "version at index {idx} should be contiguous"
+        );
+    }
+
+    // Manager visible version and rowstore visible version must match the final version
+    let expected_final_version = Version::new(1 + total_commits as u64);
+    assert_eq!(manager.visible_version(), expected_final_version);
+    assert_eq!(engine.visible_version(), expected_final_version);
+
+    // Check that reading at the latest snapshot returns all rows correctly
+    let final_snapshot = engine.snapshot();
+    for (t, i, expected_val, _) in &all_commits {
+        let key = format!("t{t}_k{i}").into_bytes();
+        let row = engine.get(0, &key, final_snapshot).unwrap();
+        assert_eq!(row, Some(make_row(*expected_val)));
+    }
+
+    // Verify snapshot isolation: earlier snapshot taken at version V sees only writes with version <= V
+    let mid_version = Version::new(2 + (total_commits / 2) as u64);
+    let mid_snapshot = Snapshot::new(mid_version);
+
+    for (t, i, expected_val, version) in &all_commits {
+        let key = format!("t{t}_k{i}").into_bytes();
+        let row = engine.get(0, &key, mid_snapshot).unwrap();
+        if *version <= mid_version {
+            assert_eq!(row, Some(make_row(*expected_val)));
+        } else {
+            assert_eq!(row, None);
+        }
+    }
+}

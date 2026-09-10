@@ -20,12 +20,28 @@ use crate::participant::{
 pub enum TxnState {
     /// Transaction is currently active and can register participants or mutate data.
     Active,
-    /// Transaction prepared and commit record is durable in journal.
+    /// Transaction prepared and staged across participants.
     Prepared,
+    /// Transaction commit record is durable in journal; apply/publish pending completion.
+    DurablyCommitted,
     /// Transaction has fully committed, applied, and published.
     Committed,
     /// Transaction aborted; staged participant state has been rolled back.
     Aborted,
+}
+
+impl TxnState {
+    /// Alternate alias for [`TxnState::DurablyCommitted`].
+    #[allow(non_upper_case_globals)]
+    pub const CompletionPending: Self = Self::DurablyCommitted;
+
+    /// Upper-case constant alias for [`TxnState::DurablyCommitted`].
+    pub const COMPLETION_PENDING: Self = Self::DurablyCommitted;
+
+    /// Returns true if the transaction has reached durable commit.
+    pub fn is_durably_committed(&self) -> bool {
+        matches!(self, Self::DurablyCommitted | Self::Committed)
+    }
 }
 
 /// A transaction handle managed by [`TransactionManager`].
@@ -110,17 +126,27 @@ pub struct RecoveryReport {
     pub committed_txns: Vec<TransactionId>,
     /// Explicitly aborted transactions observed in journal.
     pub aborted_txns: Vec<TransactionId>,
+    /// Transactions left unresolved during recovery (e.g. intents missing commit/abort or safely discarded torn tails).
+    pub unresolved_txns: Vec<TransactionId>,
+    /// Detailed reasons for transactions left unresolved.
+    pub unresolved_reasons: BTreeMap<TransactionId, String>,
     /// Highest assigned MVCC version found during journal replay.
     pub max_version: Version,
     /// Re-established visible MVCC version.
     pub visible_version: Version,
 }
 
+/// Type alias for deterministic journal decision boundary test hooks.
+pub type JournalHook = Box<dyn FnOnce(&mut Journal) -> Result<()> + Send>;
+
 /// Synchronous local transaction manager.
 ///
 /// Orchestrates 2PC across local participants using deterministic ID ordering
 /// to prevent deadlocks and guarantees durability via CRC32C journal logging.
 pub struct TransactionManager {
+    decision_lock: Mutex<()>,
+    commit_append_hook: Mutex<Option<JournalHook>>,
+    commit_sync_hook: Mutex<Option<JournalHook>>,
     journal: Mutex<Journal>,
     participants: RwLock<BTreeMap<ParticipantId, Arc<dyn TxnParticipant>>>,
     next_txn_id: AtomicU64,
@@ -132,6 +158,9 @@ impl TransactionManager {
     /// Create a new transaction manager using the provided [`Journal`].
     pub fn new(journal: Journal) -> Self {
         Self {
+            decision_lock: Mutex::new(()),
+            commit_append_hook: Mutex::new(None),
+            commit_sync_hook: Mutex::new(None),
             journal: Mutex::new(journal),
             participants: RwLock::new(BTreeMap::new()),
             next_txn_id: AtomicU64::new(1),
@@ -167,6 +196,22 @@ impl TransactionManager {
     /// Retrieve a registered participant by ID.
     pub fn get_participant(&self, id: ParticipantId) -> Option<Arc<dyn TxnParticipant>> {
         self.participants.read().get(&id).cloned()
+    }
+
+    /// Sets a one-shot deterministic test hook invoked right before commit record append.
+    pub fn set_commit_append_hook<F>(&self, hook: F)
+    where
+        F: FnOnce(&mut Journal) -> Result<()> + Send + 'static,
+    {
+        *self.commit_append_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Sets a one-shot deterministic test hook invoked right before commit record sync.
+    pub fn set_commit_sync_hook<F>(&self, hook: F)
+    where
+        F: FnOnce(&mut Journal) -> Result<()> + Send + 'static,
+    {
+        *self.commit_sync_hook.lock() = Some(Box::new(hook));
     }
 
     /// Allocate a new monotonic transaction ID.
@@ -216,6 +261,8 @@ impl TransactionManager {
     /// 6. Applies mutations and publishes visibility in deterministic ascending ID order.
     /// 7. Advances visible version only after all participants succeed.
     pub fn commit(&self, txn: &mut Transaction) -> Result<CommittedTransaction> {
+        let _decision_guard = self.decision_lock.lock();
+
         if txn.state != TxnState::Active {
             return Err(HtapError::Conflict(format!(
                 "transaction {} cannot commit in state {:?}",
@@ -231,10 +278,10 @@ impl TransactionManager {
         let mut sorted_works = request.participants;
         sorted_works.sort_by_key(|w| w.participant_id);
 
-        // Resolve participants from registry
-        let mut resolved: Vec<Arc<dyn TxnParticipant>> = Vec::with_capacity(sorted_works.len());
-        {
+        // Resolve participants from registry; keep registry lock out of participant method calls
+        let resolved: Vec<Arc<dyn TxnParticipant>> = {
             let registry = self.participants.read();
+            let mut list = Vec::with_capacity(sorted_works.len());
             for work in &sorted_works {
                 let p = registry.get(&work.participant_id).ok_or_else(|| {
                     HtapError::NotFound(format!(
@@ -242,9 +289,10 @@ impl TransactionManager {
                         work.participant_id
                     ))
                 })?;
-                resolved.push(Arc::clone(p));
+                list.push(Arc::clone(p));
             }
-        }
+            list
+        };
 
         // 2. Prepare Phase in deterministic sorted order
         let mut prepared: Vec<Arc<dyn TxnParticipant>> = Vec::with_capacity(resolved.len());
@@ -260,6 +308,8 @@ impl TransactionManager {
             prepared.push(Arc::clone(p));
         }
 
+        txn.state = TxnState::Prepared;
+
         // 3. Fsync Intent record
         let intent_record = JournalRecord::Intent {
             txn_id: txn.id,
@@ -268,35 +318,98 @@ impl TransactionManager {
         };
         {
             let mut journal = self.journal.lock();
-            journal.append(&intent_record)?;
-            journal.sync()?;
+            if let Err(err) = journal.append(&intent_record).and_then(|_| journal.sync()) {
+                for prep in prepared.iter().rev() {
+                    let _ = prep.abort(txn.id);
+                }
+                txn.state = TxnState::Aborted;
+                return Err(err);
+            }
         }
 
         // 4. Assign monotonic commit version
         let version = self.allocate_version();
         txn.commit_version = Some(version);
 
-        // 5. Fsync Commit record (linearization point)
+        // Linearization point boundary entered: once Commit frame append begins,
+        // transaction state transitions to DurablyCommitted / CompletionPending.
+        // It cannot be rolled back or aborted.
+        txn.state = TxnState::DurablyCommitted;
+
         let commit_record = JournalRecord::Commit {
             txn_id: txn.id,
             version,
         };
+
+        // 5. Append and Sync Commit record at the decision boundary
         {
             let mut journal = self.journal.lock();
-            journal.append(&commit_record)?;
-            journal.sync()?;
-        }
 
-        txn.state = TxnState::Prepared;
+            // Hook for deterministic fault injection at commit append
+            if let Some(hook) = self.commit_append_hook.lock().take() {
+                if let Err(err) = hook(&mut journal) {
+                    return Err(HtapError::DurablePending {
+                        txn_id: txn.id.as_u64(),
+                        version,
+                        reason: format!("commit append failed at decision boundary: {err}"),
+                    });
+                }
+            }
+
+            // 5a. Append Commit frame (without sync)
+            if let Err(err) = journal.append_nosync(&commit_record) {
+                return Err(HtapError::DurablePending {
+                    txn_id: txn.id.as_u64(),
+                    version,
+                    reason: format!(
+                        "commit append failed: {err}; commit status ambiguous, recovery required"
+                    ),
+                });
+            }
+
+            // Hook for deterministic fault injection at commit sync
+            if let Some(hook) = self.commit_sync_hook.lock().take() {
+                if let Err(err) = hook(&mut journal) {
+                    return Err(HtapError::DurablePending {
+                        txn_id: txn.id.as_u64(),
+                        version,
+                        reason: format!("commit sync failed at decision boundary: {err}"),
+                    });
+                }
+            }
+
+            // 5b. Sync Commit frame
+            if let Err(err) = journal.sync() {
+                return Err(HtapError::DurablePending {
+                    txn_id: txn.id.as_u64(),
+                    version,
+                    reason: format!(
+                        "commit sync failed: {err}; commit status ambiguous, recovery required"
+                    ),
+                });
+            }
+        }
 
         // 6. Apply participants in deterministic sorted order
         for (work, p) in sorted_works.iter().zip(&resolved) {
-            p.apply(txn.id, version, &work.payload)?;
+            if let Err(err) = p.apply(txn.id, version, &work.payload) {
+                return Err(HtapError::DurablePending {
+                    txn_id: txn.id.as_u64(),
+                    version,
+                    reason: format!("participant {} apply failed: {err}", work.participant_id),
+                });
+            }
         }
 
         // 7. Publish visibility in deterministic sorted order
         for p in &resolved {
-            p.publish(txn.id, version)?;
+            if let Err(err) = p.publish(txn.id, version) {
+                return Err(HtapError::DurablePending {
+                    txn_id: txn.id.as_u64(),
+                    version,
+                    reason: format!("participant {} publish failed: {err}", p.id()),
+                });
+            }
         }
 
         // 8. Advance visible version only after all succeed
@@ -319,9 +432,11 @@ impl TransactionManager {
 
     /// Abort an active transaction, rolling back participants and writing an Abort journal entry.
     pub fn abort(&self, txn: &mut Transaction) -> Result<()> {
-        if txn.state == TxnState::Committed {
+        let _decision_guard = self.decision_lock.lock();
+
+        if txn.state == TxnState::Committed || txn.state == TxnState::DurablyCommitted {
             return Err(HtapError::Conflict(format!(
-                "transaction {} has already committed and cannot be aborted",
+                "transaction {} has already durably committed and cannot be aborted",
                 txn.id
             )));
         }
@@ -330,13 +445,20 @@ impl TransactionManager {
             return Ok(());
         }
 
-        {
+        // Keep participant registry lock out of participant method calls by cloning sorted Arcs first
+        let participants_to_abort: Vec<Arc<dyn TxnParticipant>> = {
             let registry = self.participants.read();
-            for work in &txn.participants {
-                if let Some(p) = registry.get(&work.participant_id) {
-                    let _ = p.abort(txn.id);
-                }
-            }
+            txn.participants
+                .iter()
+                .filter_map(|work| registry.get(&work.participant_id).cloned())
+                .collect()
+        };
+        let mut sorted_participants = participants_to_abort;
+        sorted_participants.sort_by_key(|p| p.id());
+        sorted_participants.dedup_by_key(|p| p.id());
+
+        for p in &sorted_participants {
+            let _ = p.abort(txn.id);
         }
 
         {
@@ -355,7 +477,9 @@ impl TransactionManager {
     /// commit marker using exact stored payloads, ignores uncommitted intents,
     /// requires registered participants, and restores monotonic counters.
     pub fn recover(&self) -> Result<RecoveryReport> {
-        let records = self.journal.lock().read_all()?;
+        let _decision_guard = self.decision_lock.lock();
+
+        let (records, torn_detail) = self.journal.lock().recover_records()?;
 
         let mut intents: BTreeMap<TransactionId, (Version, Vec<ParticipantWork>)> = BTreeMap::new();
         let mut commits: BTreeMap<TransactionId, Version> = BTreeMap::new();
@@ -387,7 +511,17 @@ impl TransactionManager {
             }
         }
 
-        let registry = self.participants.read();
+        // Recovery must reject Commit+Abort for the same txn as corruption; Abort only valid before durable Commit.
+        for txn_id in commits.keys() {
+            if aborts.contains(txn_id) {
+                return Err(HtapError::Corruption(format!(
+                    "malformed journal: transaction {txn_id} contains both commit and abort records"
+                )));
+            }
+        }
+
+        // Keep participant registry lock out of participant method calls by cloning first
+        let registry_snapshot = self.participants.read().clone();
         let mut committed_txns = Vec::new();
 
         // Sort commits by assigned version to replay in exact linear order
@@ -395,10 +529,6 @@ impl TransactionManager {
         commit_list.sort_by_key(|(_, v)| *v);
 
         for (txn_id, commit_version) in commit_list {
-            if aborts.contains(&txn_id) {
-                continue;
-            }
-
             let (_snapshot, mut works) = intents.remove(&txn_id).ok_or_else(|| {
                 HtapError::Corruption(format!(
                     "committed transaction {txn_id} missing corresponding intent in journal"
@@ -408,19 +538,20 @@ impl TransactionManager {
             // Sort participants deterministically by ID
             works.sort_by_key(|w| w.participant_id);
 
-            // Recovery requires registered participants
+            // Recovery requires registered participants; resolve sorted Arcs first
+            let mut resolved: Vec<Arc<dyn TxnParticipant>> = Vec::with_capacity(works.len());
             for work in &works {
-                if !registry.contains_key(&work.participant_id) {
-                    return Err(HtapError::NotFound(format!(
+                let p = registry_snapshot.get(&work.participant_id).ok_or_else(|| {
+                    HtapError::NotFound(format!(
                         "participant {} required for recovery of txn {txn_id} is not registered",
                         work.participant_id
-                    )));
-                }
+                    ))
+                })?;
+                resolved.push(Arc::clone(p));
             }
 
-            // Apply exact participant payloads in sorted order
-            for work in &works {
-                let p = registry.get(&work.participant_id).unwrap();
+            // Apply exact participant payloads in sorted order (no registry lock held)
+            for (work, p) in works.iter().zip(&resolved) {
                 p.apply(txn_id, commit_version, &work.payload)
                     .map_err(|err| match err {
                         HtapError::InvalidArgument(msg) => HtapError::Corruption(format!(
@@ -431,17 +562,46 @@ impl TransactionManager {
                     })?;
             }
 
-            // Publish in sorted order
-            for work in &works {
-                let p = registry.get(&work.participant_id).unwrap();
+            // Publish in sorted order (no registry lock held)
+            for p in &resolved {
                 p.publish(txn_id, commit_version)?;
+            }
+
+            // Advance visible version under manager state lock
+            {
+                let mut vis = self.visible_version.lock();
+                if commit_version > *vis {
+                    *vis = commit_version;
+                }
             }
 
             committed_txns.push(txn_id);
         }
 
-        // Intent-only transactions are ignored completely (no apply/abort, not committed).
+        // Remove aborted transactions from intents map
+        for aborted_id in &aborts {
+            intents.remove(aborted_id);
+        }
         let aborted_txns: Vec<TransactionId> = aborts.into_iter().collect();
+
+        // Any remaining intents had neither commit nor abort: left unresolved
+        let mut unresolved_txns = Vec::new();
+        let mut unresolved_reasons = BTreeMap::new();
+
+        for (unresolved_id, (snap, _)) in intents {
+            unresolved_txns.push(unresolved_id);
+            let reason = if let Some(ref torn) = torn_detail {
+                format!(
+                    "transaction {unresolved_id} left unresolved: intent logged at snapshot {snap}, but commit record was torn and safely discarded ({torn})"
+                )
+            } else {
+                format!(
+                    "transaction {unresolved_id} left unresolved: intent logged at snapshot {snap}, but no commit or abort record found in journal"
+                )
+            };
+            tracing::warn!(txn_id = %unresolved_id, %reason, "unresolved transaction during recovery");
+            unresolved_reasons.insert(unresolved_id, reason);
+        }
 
         self.next_txn_id.store(max_txn_id + 1, Ordering::SeqCst);
         *self.next_version.lock() = max_version.next();
@@ -450,6 +610,8 @@ impl TransactionManager {
         Ok(RecoveryReport {
             committed_txns,
             aborted_txns,
+            unresolved_txns,
+            unresolved_reasons,
             max_version,
             visible_version: max_version,
         })
