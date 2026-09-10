@@ -126,9 +126,9 @@ flowchart TD
         Lock --> SQL["htap_sql::parse_one(sql)<br/>htap_catalog::LocalCatalogStore.load()<br/>htap_sql::bind(stmt, snapshot)"]
         SQL --> Route["htap_sql::classify_route(bound, storage)"]
 
-        Route -->|Route::CatalogDdl<br/>(CREATE TABLE)| DDL["DDL Catalog CAS<br/>LocalCatalogStore.compare_and_set"]
-        Route -->|Route::RowstoreWrite<br/>(INSERT / DELETE)| DML["TransactionManager.commit_request<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
-        Route -->|Route::RowstorePointRead<br/>(complete-PK SELECT)| PointRead["Snapshot(visible_version)<br/>htap_rowstore::Engine.get(key)"]
+        Route -->|"Route::CatalogDdl<br/>(CREATE TABLE)"| DDL["DDL Catalog CAS<br/>LocalCatalogStore.compare_and_set"]
+        Route -->|"Route::RowstoreWrite<br/>(INSERT / DELETE)"| DML["TransactionManager.commit_request<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
+        Route -->|"Route::RowstorePointRead<br/>(complete-PK SELECT)"| PointRead["Snapshot(visible_version)<br/>htap_rowstore::Engine.get(key)"]
     end
 
     subgraph PlannedDeferred ["Planned / Deferred Components (Not in Direct SQL Path)"]
