@@ -188,7 +188,15 @@ dependencies = [
 name = "htap-server"
 version = "0.1.0"
 dependencies = [
+ "htap-catalog",
  "htap-common",
+ "htap-rowstore",
+ "htap-sql",
+ "htap-txn",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

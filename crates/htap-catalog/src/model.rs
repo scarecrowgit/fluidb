@@ -390,7 +390,15 @@ impl CatalogSnapshot {
                 }
             }
 
-            // Primary key validation: indices must be within bounds and unique
+            // Primary key validation: non-empty, indices within bounds and unique,
+            // PK indices reference columns marked primary_key, and all columns marked primary_key are in PK.
+            if table.primary_key.is_empty() {
+                return Err(HtapError::InvalidArgument(format!(
+                    "table '{}' has an empty primary key",
+                    table.name
+                )));
+            }
+
             let schema_len = table.schema.len();
             let mut seen_pk_indices = HashSet::with_capacity(table.primary_key.len());
             for &idx in &table.primary_key {
@@ -404,6 +412,21 @@ impl CatalogSnapshot {
                     return Err(HtapError::InvalidArgument(format!(
                         "table '{}' has duplicate primary key index {}",
                         table.name, idx
+                    )));
+                }
+                if !table.schema.columns()[idx].primary_key {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "primary key index {} in table '{}' refers to column '{}' which is not marked as primary key",
+                        idx, table.name, table.schema.columns()[idx].name
+                    )));
+                }
+            }
+
+            for (col_idx, col) in table.schema.columns().iter().enumerate() {
+                if col.primary_key && !seen_pk_indices.contains(&col_idx) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "column '{}' (index {}) in table '{}' is marked as primary key but absent from primary key list",
+                        col.name, col_idx, table.name
                     )));
                 }
             }

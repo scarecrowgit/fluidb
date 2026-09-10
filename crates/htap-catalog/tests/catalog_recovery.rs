@@ -277,7 +277,43 @@ fn test_invalid_pk_and_schema() {
     assert!(matches!(err, HtapError::InvalidArgument(_)));
     assert!(err.to_string().contains("duplicate primary key index"));
 
-    // 3. Schema with empty column name
+    // 3. Empty primary key
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].primary_key = vec![];
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("empty primary key"));
+
+    // 4. PK index referencing column not marked as primary key
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].primary_key = vec![1]; // col 1 is 'val' with primary_key: false
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("not marked as primary key"));
+
+    // 5. Schema column marked primary key but missing from table primary_key list
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".to_string(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: true,
+        },
+    ])
+    .unwrap();
+    snap.tables[0].primary_key = vec![0]; // only lists index 0, missing index 1
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("absent from primary key list"));
+
+    // 6. Schema with empty column name
     let mut snap = make_valid_snapshot(1);
     snap.tables[0].schema = Schema::new(vec![ColumnDef {
         name: "  ".to_string(),
@@ -290,7 +326,7 @@ fn test_invalid_pk_and_schema() {
     assert!(matches!(err, HtapError::InvalidArgument(_)));
     assert!(err.to_string().contains("empty name"));
 
-    // 4. Converting storage descriptor roundtrip
+    // 7. Converting storage descriptor roundtrip
     let mut snap_converting = make_valid_snapshot(1);
     snap_converting.partitions[0].storage = StorageDescriptor::Converting {
         from: StorageFormat::Row,
