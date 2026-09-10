@@ -510,8 +510,8 @@ fn test_atomic_temp_behavior() {
     let req = sample_request("job-atomic");
     mover.start_job(req).expect("start job");
 
-    let job_file = mover.job_file_path("job-atomic");
-    let tmp_file = mover.job_tmp_file_path("job-atomic");
+    let job_file = mover.job_file_path("job-atomic").unwrap();
+    let tmp_file = mover.job_tmp_file_path("job-atomic").unwrap();
 
     // JOB file must exist, JOB.tmp must NOT exist after atomic publish
     assert!(job_file.exists(), "JOB file must exist");
@@ -555,4 +555,69 @@ fn test_atomic_temp_behavior() {
         .expect("load job")
         .expect("job exists");
     assert_eq!(updated.counters.records_committed, 50);
+}
+
+#[test]
+fn test_job_file_bounds_and_path_validation() {
+    let dir = tempdir().expect("create temp dir");
+    let mover = LocalDataMover::new(dir.path()).expect("create mover");
+
+    // Path validation on job_dir and job_file_path
+    assert!(mover.job_dir("..").is_err());
+    assert!(mover.job_dir("../escape").is_err());
+    assert!(mover.job_dir("a/b").is_err());
+    assert!(mover.job_file_path("..").is_err());
+    assert!(mover.job_file_path("job/../bad").is_err());
+    assert!(mover.job_tmp_file_path("-start-dash").is_err());
+
+    // Tablet package IDs validation
+    assert!(mover
+        .tablet_package_dir(
+            TabletId::new(0),
+            htap_catalog::ReplicaId::new(1),
+            "valid-job"
+        )
+        .is_err());
+    assert!(mover
+        .tablet_package_dir(
+            TabletId::new(1),
+            htap_catalog::ReplicaId::new(0),
+            "valid-job"
+        )
+        .is_err());
+    assert!(mover
+        .tablet_package_dir(TabletId::new(1), htap_catalog::ReplicaId::new(1), "../bad")
+        .is_err());
+    assert!(mover
+        .tablet_manifest_path(
+            TabletId::new(0),
+            htap_catalog::ReplicaId::new(1),
+            "valid-job"
+        )
+        .is_err());
+    assert!(mover
+        .tablet_data_path(
+            TabletId::new(1),
+            htap_catalog::ReplicaId::new(0),
+            "valid-job"
+        )
+        .is_err());
+
+    // Oversized physical JOB file rejected before allocation
+    let req = sample_request("job-oversized");
+    mover.start_job(req).expect("start job");
+    let job_file = mover.job_file_path("job-oversized").unwrap();
+    let file = fs::File::create(&job_file).unwrap();
+    let oversized_len = (HEADER_LEN as u64) + (MAX_JOB_PAYLOAD_BYTES as u64) + 1;
+    file.set_len(oversized_len).unwrap();
+    drop(file);
+
+    let err = mover.load_job("job-oversized").unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("exceeds maximum allowed bound"));
+
+    // Short JOB file (< HEADER_LEN)
+    fs::write(&job_file, b"SHORT").unwrap();
+    let err = mover.load_job("job-oversized").unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
 }

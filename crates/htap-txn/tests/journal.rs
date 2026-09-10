@@ -356,6 +356,229 @@ fn test_journal_corruption_checks_middle() {
 }
 
 #[test]
+fn test_journal_normal_multi_frame_offsets_and_append_cursor() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    let mut journal = Journal::open(&path).unwrap();
+    let off1 = journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(10),
+            version: Version::new(100),
+        })
+        .unwrap();
+    assert_eq!(off1, 0);
+
+    let off2 = journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(20),
+            version: Version::new(200),
+        })
+        .unwrap();
+    assert!(off2 > off1);
+
+    let off3 = journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(30),
+            version: Version::new(300),
+        })
+        .unwrap();
+    assert!(off3 > off2);
+
+    let scan = journal.scan().unwrap();
+    assert_eq!(scan.records.len(), 3);
+    assert_eq!(scan.records[0].0, off1);
+    assert_eq!(scan.records[1].0, off2);
+    assert_eq!(scan.records[2].0, off3);
+    assert_eq!(scan.valid_end, journal.valid_bytes());
+
+    // Close and reopen: append cursor matches valid_end
+    drop(journal);
+    let mut reopened = Journal::open(&path).unwrap();
+    assert_eq!(reopened.valid_bytes(), scan.valid_end);
+
+    let off4 = reopened
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(40),
+            version: Version::new(400),
+        })
+        .unwrap();
+    assert_eq!(off4, scan.valid_end);
+    assert_eq!(reopened.read_all().unwrap().len(), 4);
+}
+
+#[test]
+fn test_journal_middle_corruption_with_valid_frame_ahead() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    let mut journal = Journal::open(&path).unwrap();
+    journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(1),
+            version: Version::new(10),
+        })
+        .unwrap();
+    let offset_rec2 = journal.valid_bytes();
+    journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(2),
+            version: Version::new(20),
+        })
+        .unwrap();
+    journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(3),
+            version: Version::new(30),
+        })
+        .unwrap();
+    drop(journal);
+
+    // Corrupt record 2's declared payload length to exceed remaining file size,
+    // but record 3 remains intact further ahead
+    let mut bytes = std::fs::read(&path).unwrap();
+    let claimed_len = (bytes.len() as u32) + 500;
+    bytes[offset_rec2 as usize..offset_rec2 as usize + 4]
+        .copy_from_slice(&claimed_len.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let res = Journal::open(&path);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("subsequent valid frames exist"));
+}
+
+#[test]
+fn test_journal_oversized_declared_frame_rejected() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    let mut journal =
+        Journal::open_with_options(JournalOptions::new(&path).with_max_frame_size(64)).unwrap();
+    journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(1),
+            version: Version::new(10),
+        })
+        .unwrap();
+    let offset_rec2 = journal.valid_bytes();
+    journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(2),
+            version: Version::new(20),
+        })
+        .unwrap();
+    drop(journal);
+
+    // Inject payload_len = 100 (> max_frame_size 64) for rec2
+    let mut bytes = std::fs::read(&path).unwrap();
+    let oversize_len: u32 = 100;
+    bytes[offset_rec2 as usize..offset_rec2 as usize + 4]
+        .copy_from_slice(&oversize_len.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let res = Journal::open_with_options(JournalOptions::new(&path).with_max_frame_size(64));
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+}
+
+#[test]
+fn test_journal_total_size_rejection() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    // Set physical file length larger than max_journal_size
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(1024).unwrap();
+    drop(file);
+
+    let opts = JournalOptions::new(&path).with_max_journal_size(512);
+    let err = Journal::open_with_options(opts).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("exceeds maximum allowed size"));
+}
+
+#[test]
+fn test_journal_streaming_probe_bounds_and_cursor_restoration() {
+    use htap_txn::encode_frame;
+
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    // 1. Write initial valid record
+    let opts = JournalOptions::new(&path)
+        .with_max_frame_size(256 * 1024)
+        .with_auto_repair(true);
+    let mut journal = Journal::open_with_options(opts.clone()).unwrap();
+    let _off1 = journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(1),
+            version: Version::new(10),
+        })
+        .unwrap();
+    let valid_end = journal.valid_bytes();
+    drop(journal);
+
+    // 2. Append a truncated frame header claiming 150 KiB payload, but file only has 50 KiB
+    {
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        let payload_len: u32 = 150 * 1024; // 150 KiB (<= max_frame_size 256 KiB)
+        let dummy_crc: u32 = 0x12345678;
+        file.write_all(&payload_len.to_le_bytes()).unwrap();
+        file.write_all(&dummy_crc.to_le_bytes()).unwrap();
+        // File only has 50 KiB payload remaining, so remaining < expected_frame_len
+        file.write_all(&vec![0x55; 50 * 1024]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    // Reopen: streaming probe scans the remaining journal without unbounded allocation.
+    // Since there are no valid frames ahead, it must classify as torn_final and auto-repair.
+    let mut journal = Journal::open_with_options(opts.clone()).unwrap();
+    assert_eq!(journal.valid_bytes(), valid_end);
+    let recs = journal.read_all().unwrap();
+    assert_eq!(recs.len(), 1);
+
+    // Cursor restoration: verify new append starts at valid_end
+    let off2 = journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(2),
+            version: Version::new(20),
+        })
+        .unwrap();
+    assert_eq!(off2, valid_end);
+    drop(journal);
+
+    // 3. Now test middle-corruption across the 50 KiB probe:
+    // Append a truncated header claiming 150 KiB, but only 50 KiB padding, then a VALID frame ahead
+    {
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        let payload_len: u32 = 150 * 1024;
+        let dummy_crc: u32 = 0x87654321;
+        file.write_all(&payload_len.to_le_bytes()).unwrap();
+        file.write_all(&dummy_crc.to_le_bytes()).unwrap();
+        file.write_all(&vec![0xaa; 50 * 1024]).unwrap(); // 50 KiB gap (< 150 KiB payload_len)
+
+        // Append a valid frame at the end of the file
+        let valid_rec = JournalRecord::Commit {
+            txn_id: TransactionId::new(3),
+            version: Version::new(30),
+        };
+        let frame = encode_frame(&valid_rec, 256 * 1024).unwrap();
+        file.write_all(&frame).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    // Reopening must detect subsequent valid frame ahead and report middle corruption (not torn_final)
+    let res = Journal::open_with_options(opts);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("subsequent valid frames exist"));
+}
+
+#[test]
 fn test_deterministic_ordering_and_mock_execution() {
     let temp = NamedTempFile::new().unwrap();
     let tm = TransactionManager::open(temp.path()).unwrap();

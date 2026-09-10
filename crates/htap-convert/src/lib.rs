@@ -21,7 +21,9 @@ pub use htap_catalog::{MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS};
 use htap_colstore::{
     validate_segment_schema, ScanRequest, SegmentOptions, SegmentReader, SegmentWriter,
 };
-use htap_common::{encode_key, HtapError, Result, Row, Schema, Value, Version};
+use htap_common::{
+    encode_key, read_file_exact_bounded, HtapError, Result, Row, Schema, Value, Version,
+};
 use htap_rowstore::{Engine, MemtableEntry, Snapshot, ValueKind};
 use serde::{Deserialize, Serialize};
 
@@ -179,17 +181,44 @@ pub fn manifest_path(root_dir: &Path, tablet_id: TabletId) -> PathBuf {
 }
 
 /// Resolves an on-disk filesystem path for a segment entry.
-pub fn resolve_segment_path(root_dir: &Path, tablet_id: TabletId, rel_path: &str) -> PathBuf {
+pub fn resolve_segment_path(
+    root_dir: &Path,
+    tablet_id: TabletId,
+    rel_path: &str,
+) -> Result<PathBuf> {
+    validate_segment_path(rel_path)?;
+    let p = Path::new(rel_path);
+    for comp in p.components() {
+        match comp {
+            std::path::Component::Normal(os_str) => {
+                let s = os_str.to_str().ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "segment path '{rel_path}' contains invalid UTF-8"
+                    ))
+                })?;
+                if s.contains('\0') || s == "." || s == ".." || s.contains("..") {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "segment path '{rel_path}' contains forbidden component '{s}'"
+                    )));
+                }
+            }
+            _ => {
+                return Err(HtapError::InvalidArgument(format!(
+                    "segment path '{rel_path}' contains non-normal component"
+                )));
+            }
+        }
+    }
     let t_dir = tablet_dir(root_dir, tablet_id);
     let tab_candidate = t_dir.join(rel_path);
     if tab_candidate.exists() {
-        return tab_candidate;
+        return Ok(tab_candidate);
     }
     let root_candidate = root_dir.join(rel_path);
     if root_candidate.exists() {
-        return root_candidate;
+        return Ok(root_candidate);
     }
-    tab_candidate
+    Ok(tab_candidate)
 }
 
 /// Authoritative manifest of columnar segments belonging to a tablet.
@@ -484,7 +513,8 @@ pub fn open(root_dir: &Path, tablet_id: TabletId) -> Result<TabletColumnManifest
         )));
     };
 
-    let bytes = std::fs::read(&path)?;
+    let max_bytes = HEADER_LEN + MAX_MANIFEST_PAYLOAD_BYTES as usize;
+    let bytes = read_file_exact_bounded(&path, max_bytes)?;
     let manifest = TabletColumnManifest::decode(&bytes)?;
 
     if manifest.tablet_id != tablet_id {
@@ -497,7 +527,7 @@ pub fn open(root_dir: &Path, tablet_id: TabletId) -> Result<TabletColumnManifest
     // Validate that all registered segments exist and are readable by SegmentReader.
     // Directory enumeration is intentionally avoided; only manifest-registered segments are live.
     for entry in &manifest.segments {
-        let seg_path = resolve_segment_path(root_dir, tablet_id, &entry.path);
+        let seg_path = resolve_segment_path(root_dir, tablet_id, &entry.path)?;
         let reader = SegmentReader::open(&seg_path)?;
         if reader.metadata().row_count != entry.row_count {
             return Err(HtapError::Corruption(format!(
@@ -520,7 +550,8 @@ pub fn open(root_dir: &Path, tablet_id: TabletId) -> Result<TabletColumnManifest
 
 /// Read and decode a manifest directly from a file path without opening registered segment files.
 pub fn read_manifest_envelope(path: &Path) -> Result<TabletColumnManifest> {
-    let bytes = std::fs::read(path)?;
+    let max_bytes = HEADER_LEN + MAX_MANIFEST_PAYLOAD_BYTES as usize;
+    let bytes = read_file_exact_bounded(path, max_bytes)?;
     TabletColumnManifest::decode(&bytes)
 }
 
@@ -548,9 +579,15 @@ pub fn write_segment(
             "segment_name cannot be empty".into(),
         ));
     }
-    if segment_name.contains('/') || segment_name.contains('\\') || segment_name == ".." {
+    if segment_name.contains('/')
+        || segment_name.contains('\\')
+        || segment_name.contains('\0')
+        || segment_name == "."
+        || segment_name == ".."
+        || segment_name.contains("..")
+    {
         return Err(HtapError::InvalidArgument(format!(
-            "invalid segment_name '{segment_name}': must be a simple file name"
+            "invalid segment_name '{segment_name}': must be a safe simple file name"
         )));
     }
 
@@ -1161,7 +1198,7 @@ pub fn read_column_partition(
     // 1. Read base rows from columnar segments into map keyed by encoded PK.
     let mut map: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
     for entry in &manifest.segments {
-        let seg_path = resolve_segment_path(colstore_root, tablet_id, &entry.path);
+        let seg_path = resolve_segment_path(colstore_root, tablet_id, &entry.path)?;
         let reader = SegmentReader::open(&seg_path)?;
         let req = ScanRequest::new((0..schema.len()).collect(), None);
         let scan_res = reader.scan(&req)?;

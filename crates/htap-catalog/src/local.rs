@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use htap_common::{HtapError, Result};
+use htap_common::{read_file_exact_bounded, HtapError, Result};
 
 use crate::model::CatalogSnapshot;
 use crate::store::CatalogStore;
@@ -57,10 +57,11 @@ impl LocalCatalogStore {
 
     fn read_catalog_file(&self) -> Result<Option<CatalogSnapshot>> {
         let path = self.dir.join(CATALOG_FILE_NAME);
-        let bytes = match fs::read(&path) {
+        let max_bytes = HEADER_LEN + MAX_CATALOG_PAYLOAD_BYTES as usize;
+        let bytes = match read_file_exact_bounded(&path, max_bytes) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(HtapError::Io(e)),
+            Err(HtapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
         };
         let snapshot = decode_snapshot(&bytes)?;
         Ok(Some(snapshot))

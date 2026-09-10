@@ -728,3 +728,19 @@ fn test_engine_scan_partition_ordering_and_tombstones() {
     assert_eq!(entries[0].key.user_key, b"a");
     assert_eq!(entries[1].key.user_key, b"b");
 }
+
+#[test]
+fn test_engine_visible_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let visible_path = dir.path().join("VISIBLE");
+
+    // Oversized VISIBLE file (> 16 bytes)
+    std::fs::write(&visible_path, [0u8; 32]).unwrap();
+    let err = Engine::open(EngineOptions::new(dir.path())).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+
+    // Short VISIBLE file (< 16 bytes)
+    std::fs::write(&visible_path, b"SHORT").unwrap();
+    let err = Engine::open(EngineOptions::new(dir.path())).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+}

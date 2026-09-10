@@ -37,7 +37,7 @@ use std::time::Instant;
 
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{PartitionId, ReplicaDescriptor, ReplicaId, TableDescriptor, TableId, TabletId};
-use htap_common::{HtapError, Result, Row, Schema, Version};
+use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Schema, Version};
 use htap_rowstore::{Engine, Snapshot};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,8 @@ pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 pub const MANIFEST_HEADER_LEN: usize = 18;
 /// Maximum allowed manifest JSON payload size (16 MiB).
 pub const MAX_MANIFEST_PAYLOAD_BYTES: u32 = 16 * 1024 * 1024;
+/// Maximum allowed tablet package data payload size (64 MiB).
+pub const MAX_PACKAGE_DATA_BYTES: u64 = 64 * 1024 * 1024;
 
 /// User options for cloning a source tablet snapshot to a target replica.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +137,13 @@ pub struct TabletPackageManifest {
 
 /// Encode a [`TabletPackageManifest`] into a versioned, CRC32C-checked binary envelope.
 pub fn encode_manifest(manifest: &TabletPackageManifest) -> Result<Vec<u8>> {
+    if manifest.payload_bytes > MAX_PACKAGE_DATA_BYTES {
+        return Err(HtapError::InvalidArgument(format!(
+            "manifest payload_bytes {} exceeds maximum allowed {}",
+            manifest.payload_bytes, MAX_PACKAGE_DATA_BYTES
+        )));
+    }
+
     let payload = serde_json::to_vec(manifest)
         .map_err(|e| HtapError::Internal(format!("failed to serialize tablet manifest: {e}")))?;
 
@@ -218,6 +227,13 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<TabletPackageManifest> {
 
     let manifest: TabletPackageManifest = serde_json::from_slice(payload)
         .map_err(|e| HtapError::Corruption(format!("failed to deserialize manifest JSON: {e}")))?;
+
+    if manifest.payload_bytes > MAX_PACKAGE_DATA_BYTES {
+        return Err(HtapError::Corruption(format!(
+            "manifest payload_bytes {} exceeds maximum limit {}",
+            manifest.payload_bytes, MAX_PACKAGE_DATA_BYTES
+        )));
+    }
 
     Ok(manifest)
 }
@@ -387,7 +403,7 @@ pub fn clone_tablet(
         options.source_tablet_id,
         options.target_replica_id,
         &options.job_id,
-    );
+    )?;
 
     // Idempotent retry: if package manifest already exists, validate completed package
     if manifest_path.exists() {
@@ -460,7 +476,7 @@ pub fn clone_tablet(
         options.source_tablet_id,
         options.target_replica_id,
         &options.job_id,
-    );
+    )?;
     fs::create_dir_all(&package_dir)?;
 
     let data_tmp_path = package_dir.join("DATA.tmp");
@@ -468,7 +484,7 @@ pub fn clone_tablet(
         options.source_tablet_id,
         options.target_replica_id,
         &options.job_id,
-    );
+    )?;
     let manifest_tmp_path = package_dir.join("MANIFEST.tmp");
 
     // 1. Write DATA.tmp and fsync
@@ -556,28 +572,25 @@ pub fn verify_package(
         options.source_tablet_id,
         options.target_replica_id,
         &options.job_id,
-    );
+    )?;
     let data_path = mover.tablet_data_path(
         options.source_tablet_id,
         options.target_replica_id,
         &options.job_id,
-    );
-
-    if !manifest_path.exists() {
-        return Err(HtapError::NotFound(format!(
-            "manifest file not found at {}",
-            manifest_path.display()
-        )));
-    }
-    if !data_path.exists() {
-        return Err(HtapError::NotFound(format!(
-            "data artifact file not found at {}",
-            data_path.display()
-        )));
-    }
+    )?;
 
     // 1. Read and decode manifest envelope
-    let manifest_bytes = fs::read(&manifest_path)?;
+    let manifest_max_bytes = MANIFEST_HEADER_LEN + MAX_MANIFEST_PAYLOAD_BYTES as usize;
+    let manifest_bytes = match read_file_exact_bounded(&manifest_path, manifest_max_bytes) {
+        Ok(b) => b,
+        Err(HtapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(HtapError::NotFound(format!(
+                "manifest file not found at {}",
+                manifest_path.display()
+            )));
+        }
+        Err(e) => return Err(e),
+    };
     let manifest = decode_manifest(&manifest_bytes)?;
 
     // 2. ID checks
@@ -681,7 +694,24 @@ pub fn verify_package(
     }
 
     // 5. Data artifact checks
-    let data_bytes = fs::read(&data_path)?;
+    if manifest.payload_bytes > MAX_PACKAGE_DATA_BYTES {
+        return Err(HtapError::Corruption(format!(
+            "payload byte size {} exceeds maximum allowed {}",
+            manifest.payload_bytes, MAX_PACKAGE_DATA_BYTES
+        )));
+    }
+    let data_max_bytes = usize::try_from(manifest.payload_bytes)
+        .map_err(|_| HtapError::Corruption("payload bytes exceed memory address space".into()))?;
+    let data_bytes = match read_file_exact_bounded(&data_path, data_max_bytes) {
+        Ok(b) => b,
+        Err(HtapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(HtapError::NotFound(format!(
+                "data artifact file not found at {}",
+                data_path.display()
+            )));
+        }
+        Err(e) => return Err(e),
+    };
     if data_bytes.len() as u64 != manifest.payload_bytes {
         return Err(HtapError::Corruption(format!(
             "payload byte size mismatch: manifest says {}, found {}",

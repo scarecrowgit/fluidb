@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use htap_common::Mutation;
-use htap_common::{HtapError, Result, Row, Version};
+use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Version};
 use parking_lot::{Mutex, RwLock};
 
 pub use crate::manifest::MAX_APPLIED_EXTERNAL_TXNS;
@@ -235,10 +235,12 @@ fn write_visible_version(
 /// Read visible version marker file from disk, if present.
 fn read_visible_version(dir: &Path) -> Result<Option<Version>> {
     let visible_path = dir.join("VISIBLE");
-    if !visible_path.exists() {
-        return Ok(None);
-    }
-    let data = std::fs::read(&visible_path)?;
+    let max_bytes = 16;
+    let data = match read_file_exact_bounded(&visible_path, max_bytes) {
+        Ok(d) => d,
+        Err(HtapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     if data.len() != 16 || &data[..8] != VISIBLE_MAGIC {
         return Err(HtapError::Corruption(
             "corrupted VISIBLE marker file".into(),

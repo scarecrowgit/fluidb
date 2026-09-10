@@ -341,7 +341,8 @@ fn test_manifest_references_only_readable_durable_segments() {
         &options,
     )
     .unwrap();
-    let corrupt_path = resolve_segment_path(dir.path(), tablet_id, &corrupt_seg_entry.path);
+    let corrupt_path =
+        resolve_segment_path(dir.path(), tablet_id, &corrupt_seg_entry.path).unwrap();
     // Corrupt the header magic of the segment file
     let mut seg_bytes = fs::read(&corrupt_path).unwrap();
     seg_bytes[0] = b'X';
@@ -400,4 +401,36 @@ fn test_atomic_publication_cleans_tmp() {
         !tmp_path.exists(),
         "MANIFEST.tmp must not remain after publish"
     );
+}
+
+#[test]
+fn test_conversion_manifest_bounds_and_resolver_validation() {
+    use htap_convert::{HEADER_LEN, MAX_MANIFEST_PAYLOAD_BYTES};
+
+    let dir = tempfile::tempdir().unwrap();
+    let tablet_id = TabletId::new(401);
+    let t_dir = tablet_dir(dir.path(), tablet_id);
+    fs::create_dir_all(&t_dir).unwrap();
+    let m_path = t_dir.join("MANIFEST");
+
+    // Oversized manifest file rejected before allocation
+    let file = fs::File::create(&m_path).unwrap();
+    let oversized_len = (HEADER_LEN as u64) + (MAX_MANIFEST_PAYLOAD_BYTES as u64) + 1;
+    file.set_len(oversized_len).unwrap();
+    drop(file);
+
+    let err = open(dir.path(), tablet_id).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("exceeds maximum allowed bound"));
+
+    // Short manifest file (< HEADER_LEN)
+    fs::write(&m_path, b"SHORT").unwrap();
+    let err = open(dir.path(), tablet_id).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+
+    // Resolver path validation
+    assert!(resolve_segment_path(dir.path(), tablet_id, "../escaped.col").is_err());
+    assert!(resolve_segment_path(dir.path(), tablet_id, "gen-1/../escaped.col").is_err());
+    assert!(resolve_segment_path(dir.path(), tablet_id, "/absolute/seg.col").is_err());
+    assert!(resolve_segment_path(dir.path(), tablet_id, "gen-1/seg-0.col").is_ok());
 }

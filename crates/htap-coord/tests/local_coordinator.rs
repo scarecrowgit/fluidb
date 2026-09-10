@@ -547,3 +547,26 @@ fn test_subprocess_exclusive_lock_contention_and_symlink() {
         .expect("register should succeed");
     assert_eq!(coord.list_nodes().unwrap(), vec![NodeId::new(42)]);
 }
+
+#[test]
+fn test_coordinator_bounds_oversized_and_short() {
+    use htap_coord::{COORDINATOR_FILE_NAME, HEADER_LEN, MAX_COORDINATOR_PAYLOAD_BYTES};
+
+    let tmp = TempDir::new().unwrap();
+    let coord_path = tmp.path().join(COORDINATOR_FILE_NAME);
+
+    // Oversized physical file rejected before allocation
+    let file = fs::File::create(&coord_path).unwrap();
+    let oversized_len = (HEADER_LEN as u64) + (MAX_COORDINATOR_PAYLOAD_BYTES as u64) + 1;
+    file.set_len(oversized_len).unwrap();
+    drop(file);
+
+    let err = LocalCoordinator::open(tmp.path()).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("exceeds maximum allowed bound"));
+
+    // Short header file (< HEADER_LEN) rejected as corruption
+    fs::write(&coord_path, b"SHORT").unwrap();
+    let err = LocalCoordinator::open(tmp.path()).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+}

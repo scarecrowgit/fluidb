@@ -244,12 +244,14 @@ fn test_valid_multi_replica_fixture_and_snapshot_consistency() {
     assert!(manifest.payload_bytes > 0);
 
     // Verify package files exist on disk under movement root
-    let manifest_path =
-        ctx.mover
-            .tablet_manifest_path(ctx.tablet_id, ctx.target_rep_id, "job-clone-1");
+    let manifest_path = ctx
+        .mover
+        .tablet_manifest_path(ctx.tablet_id, ctx.target_rep_id, "job-clone-1")
+        .unwrap();
     let data_path = ctx
         .mover
-        .tablet_data_path(ctx.tablet_id, ctx.target_rep_id, "job-clone-1");
+        .tablet_data_path(ctx.tablet_id, ctx.target_rep_id, "job-clone-1")
+        .unwrap();
     assert!(manifest_path.exists());
     assert!(data_path.exists());
 
@@ -366,7 +368,8 @@ fn test_corrupt_package_blocks_repair_then_regenerate_and_healthy_cas() {
     // Corrupt the DATA artifact file by flipping bytes
     let data_path = ctx
         .mover
-        .tablet_data_path(ctx.tablet_id, ctx.target_rep_id, "job-corrupt-1");
+        .tablet_data_path(ctx.tablet_id, ctx.target_rep_id, "job-corrupt-1")
+        .unwrap();
     let mut data_bytes = fs::read(&data_path).unwrap();
     data_bytes[10] ^= 0xFF; // flip bits
     fs::write(&data_path, &data_bytes).unwrap();
@@ -428,9 +431,10 @@ fn test_corrupt_manifest_blocks_repair() {
         .clone_tablet(&options, ctx.cat_store.as_ref(), &ctx.engine)
         .unwrap();
 
-    let manifest_path =
-        ctx.mover
-            .tablet_manifest_path(ctx.tablet_id, ctx.target_rep_id, "job-corrupt-mnf");
+    let manifest_path = ctx
+        .mover
+        .tablet_manifest_path(ctx.tablet_id, ctx.target_rep_id, "job-corrupt-mnf")
+        .unwrap();
     let mut manifest_bytes = fs::read(&manifest_path).unwrap();
     // Corrupt the header magic
     manifest_bytes[0] ^= 0xFF;
@@ -628,11 +632,10 @@ fn test_mismatch_rejections() {
         .unwrap();
 
     // Tamper with manifest row count in the file and re-encode with valid envelope
-    let manifest_path = ctx2.mover.tablet_manifest_path(
-        ctx2.tablet_id,
-        ctx2.target_rep_id,
-        "job-rowcount-mismatch",
-    );
+    let manifest_path = ctx2
+        .mover
+        .tablet_manifest_path(ctx2.tablet_id, ctx2.target_rep_id, "job-rowcount-mismatch")
+        .unwrap();
     manifest.row_count = 9999;
     let tampered_bytes = encode_manifest(&manifest).unwrap();
     fs::write(&manifest_path, &tampered_bytes).unwrap();
@@ -717,4 +720,58 @@ fn test_free_functions_api() {
     let rep = repair_tablet(&ctx.mover, &options, ctx.cat_store.as_ref()).unwrap();
     assert!(rep.healthy);
     assert_eq!(rep.generation, 2);
+}
+
+#[test]
+fn test_tablet_package_file_bounds_and_caps() {
+    use htap_movement::tablet::{
+        MANIFEST_HEADER_LEN, MAX_MANIFEST_PAYLOAD_BYTES, MAX_PACKAGE_DATA_BYTES,
+    };
+
+    let ctx = create_test_context();
+    let options = TabletCloneOptions::new("job-bounds-test", ctx.tablet_id, ctx.target_rep_id);
+    let mut manifest =
+        clone_tablet(&ctx.mover, &options, ctx.cat_store.as_ref(), &ctx.engine).unwrap();
+
+    let manifest_path = ctx
+        .mover
+        .tablet_manifest_path(ctx.tablet_id, ctx.target_rep_id, "job-bounds-test")
+        .unwrap();
+    let data_path = ctx
+        .mover
+        .tablet_data_path(ctx.tablet_id, ctx.target_rep_id, "job-bounds-test")
+        .unwrap();
+
+    // 1. Oversized physical manifest rejected
+    let f = fs::File::create(&manifest_path).unwrap();
+    let oversized_len = (MANIFEST_HEADER_LEN as u64) + (MAX_MANIFEST_PAYLOAD_BYTES as u64) + 1;
+    f.set_len(oversized_len).unwrap();
+    drop(f);
+    let err = verify_package(&ctx.mover, &options, ctx.cat_store.as_ref()).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("exceeds maximum allowed bound"));
+
+    // 2. Short manifest rejected
+    fs::write(&manifest_path, b"SHORT").unwrap();
+    let err = verify_package(&ctx.mover, &options, ctx.cat_store.as_ref()).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+
+    // 3. Manifest payload_bytes exceeding MAX_PACKAGE_DATA_BYTES
+    manifest.payload_bytes = MAX_PACKAGE_DATA_BYTES + 1;
+    let tampered = encode_manifest(&manifest);
+    assert!(matches!(tampered, Err(HtapError::InvalidArgument(_))));
+
+    // 4. Restore valid manifest, test oversized physical DATA file
+    manifest.payload_bytes = 10;
+    let valid_bytes = encode_manifest(&manifest).unwrap();
+    fs::write(&manifest_path, &valid_bytes).unwrap();
+    // DATA file larger than declared payload_bytes (e.g. 100 bytes)
+    fs::write(&data_path, [0u8; 100]).unwrap();
+    let err = verify_package(&ctx.mover, &options, ctx.cat_store.as_ref()).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+
+    // 5. DATA file shorter than declared payload_bytes
+    fs::write(&data_path, [0u8; 5]).unwrap();
+    let err = verify_package(&ctx.mover, &options, ctx.cat_store.as_ref()).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
 }

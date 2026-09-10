@@ -606,9 +606,10 @@ fn test_corrupt_or_fence_failure_leaves_target_unready() {
     htap_movement::clone_tablet(&ctx.mover, &clone_opts, ctx.cat_store.as_ref(), &ctx.engine)
         .unwrap();
 
-    let data_path =
-        ctx.mover
-            .tablet_data_path(addition.tablet_id, addition.replica_id, "job-corrupt-data");
+    let data_path = ctx
+        .mover
+        .tablet_data_path(addition.tablet_id, addition.replica_id, "job-corrupt-data")
+        .unwrap();
     // Write corrupt bytes into data file
     fs::write(&data_path, b"corrupt-data-payload").unwrap();
 

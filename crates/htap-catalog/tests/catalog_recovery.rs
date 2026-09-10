@@ -542,6 +542,29 @@ fn test_corruption_and_truncation() {
 }
 
 #[test]
+fn test_catalog_file_bounds_oversized_and_short() {
+    use htap_catalog::local::{HEADER_LEN, MAX_CATALOG_PAYLOAD_BYTES};
+
+    let temp = TempDir::new().unwrap();
+    let catalog_path = temp.path().join("CATALOG");
+
+    // Oversized physical file rejected before allocation
+    let file = fs::File::create(&catalog_path).unwrap();
+    let oversized_len = (HEADER_LEN as u64) + (MAX_CATALOG_PAYLOAD_BYTES as u64) + 1;
+    file.set_len(oversized_len).unwrap();
+    drop(file);
+
+    let err = LocalCatalogStore::open(temp.path()).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("exceeds maximum allowed bound"));
+
+    // Short header file (< HEADER_LEN) rejected as corruption
+    fs::write(&catalog_path, b"SHORT").unwrap();
+    let err = LocalCatalogStore::open(temp.path()).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+}
+
+#[test]
 fn test_atomic_replacement_and_failed_cas_no_disk_change() {
     let temp = TempDir::new().unwrap();
     let catalog_path = temp.path().join("CATALOG");

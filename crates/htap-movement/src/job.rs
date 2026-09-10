@@ -21,7 +21,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use htap_catalog::{TableId, TabletId};
-use htap_common::{HtapError, Result, Row, Version};
+use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Version};
 use serde::{Deserialize, Serialize};
 
 /// Catalog file name inside `<movement_root>/jobs/<job-id>/`.
@@ -157,7 +157,10 @@ pub struct CopyOptions {
     pub tablet_id: TabletId,
     /// Data format (CSV or JSONLines).
     pub format: DataFormat,
-    /// Path to source or destination file.
+    /// Path to external source or destination file.
+    ///
+    /// Note: This path is caller-controlled and external to internal storage paths;
+    /// it is not sandboxed.
     pub path: PathBuf,
     /// Maximum rows to commit in a single transaction batch.
     pub batch_rows: usize,
@@ -736,18 +739,19 @@ impl LocalDataMover {
     }
 
     /// Return the directory for a specific job: `<movement_root>/jobs/<job-id>`.
-    pub fn job_dir(&self, job_id: &str) -> PathBuf {
-        self.jobs_dir().join(job_id)
+    pub fn job_dir(&self, job_id: &str) -> Result<PathBuf> {
+        validate_job_id(job_id)?;
+        Ok(self.jobs_dir().join(job_id))
     }
 
     /// Return the persistent envelope file path: `<movement_root>/jobs/<job-id>/JOB`.
-    pub fn job_file_path(&self, job_id: &str) -> PathBuf {
-        self.job_dir(job_id).join(JOB_FILE_NAME)
+    pub fn job_file_path(&self, job_id: &str) -> Result<PathBuf> {
+        Ok(self.job_dir(job_id)?.join(JOB_FILE_NAME))
     }
 
     /// Return the temporary envelope file path: `<movement_root>/jobs/<job-id>/JOB.tmp`.
-    pub fn job_tmp_file_path(&self, job_id: &str) -> PathBuf {
-        self.job_dir(job_id).join(JOB_TMP_FILE_NAME)
+    pub fn job_tmp_file_path(&self, job_id: &str) -> Result<PathBuf> {
+        Ok(self.job_dir(job_id)?.join(JOB_TMP_FILE_NAME))
     }
 
     /// Return the tablet packages directory `<movement_root>/tablets`.
@@ -763,11 +767,23 @@ impl LocalDataMover {
         source_tablet_id: TabletId,
         target_replica_id: htap_catalog::ReplicaId,
         job_id: &str,
-    ) -> PathBuf {
-        self.tablets_dir()
+    ) -> Result<PathBuf> {
+        validate_job_id(job_id)?;
+        if source_tablet_id.as_u64() == 0 {
+            return Err(HtapError::InvalidArgument(
+                "source_tablet_id cannot be zero".into(),
+            ));
+        }
+        if target_replica_id.as_u64() == 0 {
+            return Err(HtapError::InvalidArgument(
+                "target_replica_id cannot be zero".into(),
+            ));
+        }
+        Ok(self
+            .tablets_dir()
             .join(source_tablet_id.0.to_string())
             .join(target_replica_id.0.to_string())
-            .join(job_id)
+            .join(job_id))
     }
 
     /// Return the package manifest path:
@@ -777,9 +793,10 @@ impl LocalDataMover {
         source_tablet_id: TabletId,
         target_replica_id: htap_catalog::ReplicaId,
         job_id: &str,
-    ) -> PathBuf {
-        self.tablet_package_dir(source_tablet_id, target_replica_id, job_id)
-            .join("MANIFEST")
+    ) -> Result<PathBuf> {
+        Ok(self
+            .tablet_package_dir(source_tablet_id, target_replica_id, job_id)?
+            .join("MANIFEST"))
     }
 
     /// Return the package data artifact path:
@@ -789,9 +806,10 @@ impl LocalDataMover {
         source_tablet_id: TabletId,
         target_replica_id: htap_catalog::ReplicaId,
         job_id: &str,
-    ) -> PathBuf {
-        self.tablet_package_dir(source_tablet_id, target_replica_id, job_id)
-            .join("DATA")
+    ) -> Result<PathBuf> {
+        Ok(self
+            .tablet_package_dir(source_tablet_id, target_replica_id, job_id)?
+            .join("DATA"))
     }
 
     /// Start a new movement job, or idempotently return the existing job if already registered.
@@ -1148,11 +1166,12 @@ impl LocalDataMover {
     }
 
     fn read_job_file_locked(&self, job_id: &str) -> Result<Option<MovementJob>> {
-        let path = self.job_file_path(job_id);
-        let bytes = match fs::read(&path) {
+        let path = self.job_file_path(job_id)?;
+        let max_bytes = HEADER_LEN + MAX_JOB_PAYLOAD_BYTES as usize;
+        let bytes = match read_file_exact_bounded(&path, max_bytes) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(HtapError::Io(e)),
+            Err(HtapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
         };
 
         let job = decode_job(&bytes)?;
@@ -1167,11 +1186,11 @@ impl LocalDataMover {
     }
 
     fn persist_job_locked(&self, job: &MovementJob) -> Result<()> {
-        let job_dir = self.job_dir(&job.request.job_id);
+        let job_dir = self.job_dir(&job.request.job_id)?;
         fs::create_dir_all(&job_dir)?;
 
-        let tmp_path = self.job_tmp_file_path(&job.request.job_id);
-        let final_path = self.job_file_path(&job.request.job_id);
+        let tmp_path = self.job_tmp_file_path(&job.request.job_id)?;
+        let final_path = self.job_file_path(&job.request.job_id)?;
 
         let encoded = encode_job(job)?;
 

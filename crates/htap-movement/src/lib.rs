@@ -46,5 +46,5 @@ pub use job::{
 pub use tablet::{
     clone_tablet, decode_manifest, encode_manifest, repair_tablet, verify_package,
     TabletCloneOptions, TabletPackageManifest, MANIFEST_FORMAT_VERSION, MANIFEST_HEADER_LEN,
-    MANIFEST_HEADER_MAGIC, MAX_MANIFEST_PAYLOAD_BYTES,
+    MANIFEST_HEADER_MAGIC, MAX_MANIFEST_PAYLOAD_BYTES, MAX_PACKAGE_DATA_BYTES,
 };

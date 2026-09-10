@@ -32,12 +32,14 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod fs;
 pub mod keycodec;
 pub mod lock;
 pub mod types;
 pub mod version;
 
 pub use error::{HtapError, Result};
+pub use fs::read_file_exact_bounded;
 pub use keycodec::{encode_key, encode_key_prefix};
 pub use lock::{ProcessLock, LOCK_FILE_NAME};
 pub use types::{ColumnDef, DataType, Mutation, Row, Schema, Value};

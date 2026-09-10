@@ -17,6 +17,9 @@ pub const HEADER_SIZE: usize = 8;
 /// if corrupted length headers are encountered.
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Default maximum total journal size (64 MiB) to reject oversized journals before allocation.
+pub const DEFAULT_MAX_JOURNAL_SIZE: u64 = 64 * 1024 * 1024;
+
 /// Entries logged in the transaction journal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalRecord {
@@ -78,6 +81,9 @@ pub struct JournalOptions {
     pub path: PathBuf,
     /// Upper bound for an individual frame's payload size in bytes.
     pub max_frame_size: usize,
+    /// Upper bound for total journal file size in bytes before rejecting as oversized corruption.
+    /// Default is 64 MiB ([`DEFAULT_MAX_JOURNAL_SIZE`]).
+    pub max_journal_size: u64,
     /// Whether appends fsync immediately. Default is true for synchronous durability.
     pub sync_on_write: bool,
     /// Automatically truncate torn partial frames at EOF upon opening.
@@ -90,6 +96,7 @@ impl JournalOptions {
         Self {
             path: path.into(),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            max_journal_size: DEFAULT_MAX_JOURNAL_SIZE,
             sync_on_write: true,
             auto_repair_torn_final: true,
         }
@@ -99,6 +106,13 @@ impl JournalOptions {
     #[must_use]
     pub fn with_max_frame_size(mut self, size: usize) -> Self {
         self.max_frame_size = size;
+        self
+    }
+
+    /// Override the maximum allowed total journal size in bytes.
+    #[must_use]
+    pub fn with_max_journal_size(mut self, size: u64) -> Self {
+        self.max_journal_size = size;
         self
     }
 
@@ -343,6 +357,15 @@ impl Journal {
             .truncate(false)
             .open(&opts.path)?;
 
+        let metadata = file.metadata()?;
+        let file_len = metadata.len();
+        if file_len > opts.max_journal_size {
+            return Err(HtapError::Corruption(format!(
+                "journal file size {file_len} exceeds maximum allowed size {}",
+                opts.max_journal_size
+            )));
+        }
+
         let mut journal = Self {
             opts,
             file,
@@ -365,34 +388,136 @@ impl Journal {
 
     /// Scans the entire journal, validating CRC32C checksums and frame bounds.
     pub fn scan(&mut self) -> Result<JournalScan> {
+        let file_len = self.file.metadata()?.len();
+        if file_len > self.opts.max_journal_size {
+            return Err(HtapError::Corruption(format!(
+                "journal file size {file_len} exceeds maximum allowed size {}",
+                self.opts.max_journal_size
+            )));
+        }
+
         self.file.seek(SeekFrom::Start(0))?;
-        let mut buffer = Vec::new();
-        self.file.read_to_end(&mut buffer)?;
-        let file_len = buffer.len() as u64;
 
         let mut records = Vec::new();
         let mut pos: u64 = 0;
         let mut torn_final = None;
         let mut middle_corrupt = None;
 
-        while (pos as usize) < buffer.len() {
-            let slice = &buffer[pos as usize..];
-            match decode_frame_slice(slice, pos, file_len, self.opts.max_frame_size) {
-                FrameStatus::CleanEof => break,
-                FrameStatus::Valid { record, frame_len } => {
+        while pos < file_len {
+            let remaining = file_len - pos;
+            if remaining < HEADER_SIZE as u64 {
+                torn_final = Some((
+                    pos,
+                    format!(
+                        "incomplete header: only {remaining} bytes remaining, expected {HEADER_SIZE}"
+                    ),
+                ));
+                break;
+            }
+
+            let mut header = [0u8; HEADER_SIZE];
+            self.file.read_exact(&mut header)?;
+
+            let payload_len =
+                u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            let expected_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+
+            if payload_len == 0 {
+                if pos + HEADER_SIZE as u64 == file_len {
+                    torn_final = Some((pos, "zero payload length at end of file".into()));
+                } else {
+                    middle_corrupt = Some((pos, "zero payload length inside journal".into()));
+                }
+                break;
+            }
+
+            if payload_len > self.opts.max_frame_size {
+                if pos + HEADER_SIZE as u64 == file_len {
+                    torn_final = Some((
+                        pos,
+                        format!("unbounded payload length {payload_len} at EOF"),
+                    ));
+                } else {
+                    middle_corrupt = Some((
+                        pos,
+                        format!(
+                            "frame payload length {payload_len} exceeds bounded max {}",
+                            self.opts.max_frame_size
+                        ),
+                    ));
+                }
+                break;
+            }
+
+            let expected_frame_len = (HEADER_SIZE + payload_len) as u64;
+            if remaining < expected_frame_len {
+                let probe_res = self.has_valid_frame_ahead_stream(pos + 1, file_len);
+                let _ = self.file.seek(SeekFrom::Start(self.valid_end));
+                let has_ahead = probe_res?;
+
+                if has_ahead {
+                    middle_corrupt = Some((
+                        pos,
+                        format!(
+                            "corrupted frame at offset {pos}: claimed length {payload_len} exceeds remaining bytes, but subsequent valid frames exist"
+                        ),
+                    ));
+                } else {
+                    torn_final = Some((
+                        pos,
+                        format!(
+                            "truncated frame payload: need {payload_len} bytes, only {} remaining",
+                            remaining - HEADER_SIZE as u64
+                        ),
+                    ));
+                }
+                break;
+            }
+
+            let mut payload = vec![0u8; payload_len];
+            self.file.read_exact(&mut payload)?;
+
+            let actual_crc = crc32c::crc32c(&payload);
+            let is_eof_record = pos + expected_frame_len == file_len;
+
+            if actual_crc != expected_crc {
+                if is_eof_record {
+                    torn_final = Some((
+                        pos,
+                        format!(
+                            "CRC32C mismatch at final record: expected {expected_crc:#010x}, calculated {actual_crc:#010x}"
+                        ),
+                    ));
+                } else {
+                    middle_corrupt = Some((
+                        pos,
+                        format!(
+                            "CRC32C mismatch in journal: expected {expected_crc:#010x}, calculated {actual_crc:#010x}"
+                        ),
+                    ));
+                }
+                break;
+            }
+
+            match serde_json::from_slice::<JournalRecord>(&payload) {
+                Ok(record) => {
                     records.push((pos, record));
-                    pos += frame_len as u64;
+                    pos += expected_frame_len;
                 }
-                FrameStatus::TornFinal { offset, reason } => {
-                    torn_final = Some((offset, reason));
-                    break;
-                }
-                FrameStatus::Corrupt { offset, reason } => {
-                    middle_corrupt = Some((offset, reason));
+                Err(e) => {
+                    if is_eof_record {
+                        torn_final =
+                            Some((pos, format!("deserialization failure at final record: {e}")));
+                    } else {
+                        middle_corrupt =
+                            Some((pos, format!("deserialization failure at offset {pos}: {e}")));
+                    }
                     break;
                 }
             }
         }
+
+        let _ = self.file.seek(SeekFrom::Start(self.valid_end));
 
         Ok(JournalScan {
             records,
@@ -401,6 +526,67 @@ impl Journal {
             torn_final,
             middle_corrupt,
         })
+    }
+
+    /// Streaming probe starting at `start_pos` up to `file_len` to determine if a valid
+    /// frame exists ahead in the journal, using fixed-size header and payload allocations
+    /// bounded by `max_frame_size`, without allocating proportional to remaining journal size.
+    fn has_valid_frame_ahead_stream(&mut self, start_pos: u64, file_len: u64) -> Result<bool> {
+        const CHUNK_SIZE: usize = 8192;
+        let mut chunk = [0u8; CHUNK_SIZE];
+        let mut chunk_start = start_pos;
+        let mut chunk_len = 0usize;
+
+        let mut payload_buf = Vec::new();
+        let mut probe_pos = start_pos;
+
+        while probe_pos + (HEADER_SIZE as u64) <= file_len {
+            if probe_pos < chunk_start
+                || probe_pos + (HEADER_SIZE as u64) > chunk_start + (chunk_len as u64)
+            {
+                self.file.seek(SeekFrom::Start(probe_pos))?;
+                let to_read = (file_len - probe_pos).min(CHUNK_SIZE as u64) as usize;
+                self.file.read_exact(&mut chunk[..to_read])?;
+                chunk_start = probe_pos;
+                chunk_len = to_read;
+            }
+
+            let offset_in_chunk = (probe_pos - chunk_start) as usize;
+            let header = &chunk[offset_in_chunk..offset_in_chunk + HEADER_SIZE];
+            let payload_len =
+                u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            let expected_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+
+            if payload_len > 0
+                && payload_len <= self.opts.max_frame_size
+                && probe_pos + (HEADER_SIZE + payload_len) as u64 <= file_len
+            {
+                let payload_start = probe_pos + HEADER_SIZE as u64;
+                let payload_end = payload_start + payload_len as u64;
+
+                let valid = if payload_end <= chunk_start + (chunk_len as u64) {
+                    let p_offset = (payload_start - chunk_start) as usize;
+                    let payload = &chunk[p_offset..p_offset + payload_len];
+                    crc32c::crc32c(payload) == expected_crc
+                        && serde_json::from_slice::<JournalRecord>(payload).is_ok()
+                } else {
+                    payload_buf.resize(payload_len, 0);
+                    self.file.seek(SeekFrom::Start(payload_start))?;
+                    self.file.read_exact(&mut payload_buf)?;
+                    chunk_len = 0;
+                    crc32c::crc32c(&payload_buf) == expected_crc
+                        && serde_json::from_slice::<JournalRecord>(&payload_buf).is_ok()
+                };
+
+                if valid {
+                    return Ok(true);
+                }
+            }
+
+            probe_pos += 1;
+        }
+
+        Ok(false)
     }
 
     /// Truncates any torn tail at EOF back to the last valid record boundary.

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{CatalogSnapshot, NodeId};
 use htap_common::lock::ProcessLock;
-use htap_common::{FencingToken, HtapError, Result};
+use htap_common::{read_file_exact_bounded, FencingToken, HtapError, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -233,13 +233,15 @@ impl LocalCoordinator {
         let lock_guard = ProcessLock::acquire(&canonical_root)?;
 
         let coord_path = canonical_root.join(COORDINATOR_FILE_NAME);
-        let state = if coord_path.exists() {
-            let bytes = fs::read(&coord_path)?;
-            decode_state(&bytes)?
-        } else {
-            let initial = CoordinatorState::default();
-            atomic_publish(&canonical_root, &initial)?;
-            initial
+        let max_bytes = HEADER_LEN + MAX_COORDINATOR_PAYLOAD_BYTES as usize;
+        let state = match read_file_exact_bounded(&coord_path, max_bytes) {
+            Ok(bytes) => decode_state(&bytes)?,
+            Err(HtapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                let initial = CoordinatorState::default();
+                atomic_publish(&canonical_root, &initial)?;
+                initial
+            }
+            Err(e) => return Err(e),
         };
 
         Ok(Self {
