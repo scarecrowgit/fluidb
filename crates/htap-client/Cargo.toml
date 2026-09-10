@@ -1,0 +1,13 @@
+[package]
+name = "htap-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+htap-common = { path = "../htap-common" }
+htap-server = { path = "../htap-server" }
+htap-sql = { path = "../htap-sql" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
