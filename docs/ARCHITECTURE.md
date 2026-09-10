@@ -50,72 +50,49 @@ See [`PROGRESS.md`](./PROGRESS.md).
 
 ### Target / Planned Architecture Diagram (Qualified Intended State)
 
-The following ASCII diagram illustrates the planned multi-node target architecture, including the planned `htapd` daemon listener and planned DataFusion OLAP execution engine. These components are explicitly deferred or planned and are not part of the active SQL execution path in the current local MVP.
+The following diagram illustrates the current active local MVP execution paths alongside the planned target architecture:
 
-```text
-                        +---------------------------+
-                        |   client (EmbeddedClient  |
-                        |   façade; wire planned)   |
-                        +-------------+-------------+
-                                      |
-====================================  |  ==================================
- htapd / LocalServer (LocalServer implemented in htap-server; daemon planned)
-======================================================================
-                                      |
-                        +-------------v-------------+
-                        |  htap-sql                 |  implemented (local MVP)
-                        |  parse (sqlparser, MySQL) |  (narrow point subset;
-                        |  bind / catalog resolve   |   breadth planned)
-                        +-------------+-------------+
-                                      |
-                        +-------------v-------------+
-                        |  query router             |  implemented (local MVP)
-                        +------+-------------+------+  (rowstore classifier;
-                    PK point   |             |  everything else
-                    lookup /   |             |         sharded routing planned)
-                    short txn  |             |
-             +-----------------v--+       +--v---------------------+
-             | OLTP fast path     |       | OLAP engine            |
-             | index probe -> row |       | (DataFusion, vectorized|
-             | fetch, no planner  |       |  plan fragments)       |
-             | implemented (MVP)  |       | planned                |
-             +---------+----------+       +-----------+------------+
-                       |                              |
-                       |   (no crate dependency)      |
-                       +--------------+---------------+
-                                      |
-      +-------------------------------v-------------------------------+
-      |  htap-txn : MVCC version domain, rowstore participant (MVP);  |
-      |  shared multi-format WAL planned / deferred                   |
-      +-------------------------------+-------------------------------+
-                                      |
-              +-----------------------+-----------------------+
-              |                                               |
-    +----------v-----------+                       +-----------v----------+
-    | htap-rowstore (OLTP) |                       | htap-colstore (OLAP) |
-    | WAL, memtable,       | rowstore-auth overlay | immutable segments,  |
-    | SSTs, PK index,      |<- base+delta (impl) ->| column chunks,       |
-    | MVCC snapshot engine |    delete vectors     | per-page zone maps   |
-    | IMPLEMENTED          |  (planned/deferred)   | IMPLEMENTED          |
-    +----------+-----------+                       +-----------+----------+
-              |                                               |
-              +-----------------------+-----------------------+
-                                      |
-      +-------------------------------v-------------------------------+
-      | htap-convert : row -> col conversion (R2)  IMPLEMENTED (MVP)   |
-      +---------------------------------------------------------------+
+```mermaid
+flowchart TD
+    subgraph ActiveMVP ["Current Active Local MVP"]
+        client["EmbeddedClient"] --> server["LocalServer"]
+        server --> sql_pb["htap-sql parse/bind"]
+        sql_pb --> catalog_bind["CatalogStore load/bind"]
+        catalog_bind --> route_class["Route classifier"]
 
-   +----------------------+  +----------------------+  +-----------------+
-   | htap-catalog         |  | htap-coord (localMVP)|  | htap-movement   |
-   | durable local store, |  | local | Raft(plan)   |  | placement,      |
-   | topology, recovery   |  | ZK(plan) | fence CAS |  | repair (local)  |
-   | IMPLEMENTED (MVP)    |  | IMPLEMENTED (MVP)    |  | IMPLEMENTED     |
-   +----------------------+  +----------------------+  +-----------------+
+        route_class -->|"Route::CatalogDdl"| ddl_cas["LocalCatalogStore.compare_and_set"]
+        route_class -->|"Route::RowstoreWrite"| txn_mgr["TransactionManager"]
+        txn_mgr --> rowstore_part["RowstoreParticipant (ID 1)"]
+        rowstore_part --> rowstore_engine["htap-rowstore Engine/WAL/Memtable/SST"]
+        route_class -->|"Route::RowstorePointRead"| snap_read["visible snapshot"]
+        snap_read --> engine_get["Engine.get"]
+        route_class -->|"Route::OlapScan"| olap_exec["LocalServer OLAP executor"]
+        olap_exec -->|"materialized Column & manifest-bearing Converting"| compact_read["htap-convert compact read"]
+        compact_read -->|"invokes"| col_scan["htap-colstore SegmentReader.scan"]
+        col_scan -->|"then performs"| delta_merge["htap-convert delta suppression/overlay & deterministic merge"]
+        delta_merge --> logical_rows["logical rows/aggregates"]
+        olap_exec -->|"Row & SnapshotPinned manifest-less Converting fallback"| row_scan["htap-rowstore logical scan / collapse"]
+        row_scan --> logical_rows
+    end
 
-   +---------------------------------------------------------------+
-   | htap-common : Version, FencingToken, error types  IMPLEMENTED |
-   +---------------------------------------------------------------+
+    subgraph PlannedTarget ["Planned / Deferred Target Architecture"]
+        plan_wire["htapd/MySQL wire"]
+        plan_df["DataFusion/Arrow"]
+        plan_coord["distributed Coordinator Raft/ZooKeeper"]
+        plan_remote["multi-tablet/remote serving"]
+        plan_compact["delete vectors/compaction"]
+
+        plan_wire -.->|"planned wire service"| plan_df
+        plan_coord -.->|"planned cluster consensus"| plan_remote
+        plan_df -.->|"planned distributed scan"| plan_remote
+        plan_remote -.->|"planned maintenance"| plan_compact
+    end
+
+    classDef planned stroke-dasharray: 5 5;
+    class plan_wire,plan_df,plan_coord,plan_remote,plan_compact planned;
 ```
+
+The current active path operates entirely in-process within `LocalServer` without network overhead or distributed dependencies: queries submitted via `EmbeddedClient` are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and `SnapshotPinned` manifest-less partitions). In contrast, the planned target architecture—including the `htapd` MySQL wire protocol listener, DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with background compaction—is deferred and strictly separated from active execution paths.
 
 ### Current In-Process Execution Call Flow (Implemented Local Slice)
 
@@ -132,13 +109,22 @@ flowchart TD
         Route -->|"Route::CatalogDdl<br/>(CREATE TABLE)"| DDL["DDL Catalog CAS<br/>LocalCatalogStore.compare_and_set"]
         Route -->|"Route::RowstoreWrite<br/>(INSERT / DELETE)"| DML["TransactionManager.commit_request<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
         Route -->|"Route::RowstorePointRead<br/>(complete-PK SELECT)"| PointRead["Snapshot(visible_version)<br/>htap_rowstore::Engine.get(key)"]
-        Route -->|"Route::OlapScan<br/>(AnalyticSelect)"| OlapScan["execute_analytic_select<br/>Row: scan rowstore<br/>Column/Converting: read_column_partition_compact_core<br/>at &lt;root&gt;/colstore (PK+requested union, 1 leaf pushdown)<br/>suppress/overlay deltas, eval residual SQL"]
+        Route -->|"Route::OlapScan<br/>(AnalyticSelect)"| OlapScan["execute_analytic_select"]
+
+        OlapScan -->|"Row & SnapshotPinned<br/>manifest-less fallback"| RowScan["htap_rowstore logical scan &amp; collapse<br/>(scan_partition + collapse_entries_to_rows)"]
+        OlapScan -->|"materialized Column &amp;<br/>manifest-bearing Converting"| ColCompact["htap-convert read_column_partition_compact_core<br/>at &lt;root&gt;/colstore (PK+requested union, 1 leaf pushdown)"]
+        ColCompact -->|"invokes"| ColEngine["htap-colstore SegmentReader.scan<br/>(vectorized scan primitive with ScanStats)"]
+        ColEngine -->|"then performs"| ConvertOverlay["htap-convert delta suppression/overlay<br/>&amp; deterministic PK merge"]
+        ConvertOverlay --> ResidualEval["Evaluate residual SQL filters,<br/>aggregates &amp; groups (Vec&lt;Row&gt;/BTreeMap)"]
     end
 
-    subgraph PlannedDeferred ["Planned / Deferred Components (Not in Direct SQL Path)"]
-        Daemon["htapd daemon / MySQL wire listener"] -.->|planned| LS
-        DataFusion["DataFusion vectorized scan engine"] -.->|planned| ColEngine["htap-colstore scans"]
+    subgraph PlannedDeferred ["Planned / Deferred Integration (Not in Direct SQL Path)"]
+        Daemon["htapd daemon / MySQL wire listener"] -.->|"planned wire service"| LS
+        DataFusion["DataFusion / Arrow query engine integration<br/>(planned vectorized engine)"] -.->|"planned engine integration"| ColEngine
     end
+
+    classDef planned stroke-dasharray: 5 5;
+    class Daemon,DataFusion planned;
 ```
 
 ### DML Transaction Execution Sequence
@@ -177,7 +163,7 @@ sequenceDiagram
     TxnMgr->>Journal: Append & fsync INTENT frame
     TxnMgr->>Journal: Append & fsync COMMIT frame (irrevocable)
     TxnMgr->>RowstorePart: apply(txn_id, version, payload)
-    RowstorePart->>Engine: apply(mutations) -> write WAL & memtable
+    RowstorePart->>Engine: apply_external(txn_id, version, mutations) -> write WAL & memtable
     Engine-->>RowstorePart: Ok
     RowstorePart-->>TxnMgr: Ok
     TxnMgr->>RowstorePart: publish(txn_id, version)
@@ -195,11 +181,11 @@ sequenceDiagram
 
 ## Subsystem Boundaries: LocalServer, LocalConverter, and LocalCoordinator
 
-It is important to emphasize that `LocalServer::open` does **not** instantiate or supervise `LocalConverter` (`crates/htap-convert`) or `LocalCoordinator` (`crates/htap-coord`):
+It is important to emphasize that `LocalServer::open` does **not** create a persistent converter or instantiate `LocalCoordinator` (`crates/htap-coord`):
 - `LocalServer` integrates only `LocalCatalogStore`, `htap_rowstore::Engine`, `TransactionManager` (with a single registered `RowstoreParticipant`), and `LocalDataMover`.
-- `LocalConverter` is a partition-scoped conversion state machine that runs independently to transcode rowstore data into columnar segments (`htap-colstore`) and advance catalog metadata via CAS.
+- `LocalServer::open` does not create a persistent converter; instead, `LocalServer::convert_table` creates a `LocalConverter` on demand under the server's `execution_lock` to execute partition conversion.
 - `LocalCoordinator` is an independent cluster coordination and placement engine persisting its own state envelope at `<coord_root>/COORDINATOR` (`HTAPCRD1`).
-Neither converter background workers nor coordinator lease managers are created or managed by `LocalServer` or `EmbeddedClient`. They are standalone crate capabilities used directly in migration or coordination tasks.
+Neither persistent converter background workers nor coordinator lease managers are created or managed by `LocalServer::open` or `EmbeddedClient`. They are standalone crate capabilities used directly in migration or coordination tasks.
 
 ---
 
@@ -300,11 +286,128 @@ A router inspects the **bound** statement and the partition's **storage descript
 - **Explicitly Deferred OLAP & SQL Capabilities:** Direct SegmentReader pushdown optimization is implemented for the compact base path (single leaf pushdown). Joins, CTEs (`WITH`), window functions (`OVER`), `ORDER BY`, `LIMIT`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates, compound AND pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, multi-tablet or distributed partition scans, resource quotas/spill/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth remain deferred.
 
 This separation is enforced **by construction, not by a runtime heuristic**:
-the OLTP fast path lives in a crate that has no dependency on the analytical
-execution crate. It is therefore not possible for a point lookup to
-accidentally acquire analytical-engine overhead through a mis-tuned cost
-threshold — the code to do so is not linked into that path. See
-[ADR-001](./DECISIONS.md).
+the route code path for point lookups (`Route::RowstorePointRead`) directly
+invokes `Engine::get` on a visible snapshot and does not invoke OLAP or converter
+functions, build plan fragments, or execute operator pipelines. While the server crate
+(`htap-server`) links both transactional and analytical dependencies (`htap-rowstore`,
+`htap-convert`, `htap-colstore`), the point-lookup execution path itself is strictly
+isolated from analytical evaluation logic by structural route classification and match routing.
+It is therefore impossible for a point lookup to accidentally acquire analytical-engine
+overhead through a mis-tuned cost threshold. See [ADR-001](./DECISIONS.md).
+
+---
+
+## OLTP rowstore execution path
+
+**Status: `implemented`** (`htap-rowstore`, `htap-txn`, `htap-sql`, and `htap-server`).
+
+The transactional rowstore path provides ACID point operations, durable MVCC versioning, and crash-safe logging:
+
+### Subsystem architecture and durability layers
+
+`htap_rowstore::Engine` coordinates write-ahead logging, memory buffering, and immutable disk structures:
+- **Write-ahead log (`Wal`):** Mutations are sequentially appended to WAL segment files (`{first_lsn:020}.wal`) at `<root>/rowstore/wal/`. Commits append a `WalRecord::Commit { txn_id, version }` and fsync to disk before acknowledgement.
+- **Active and immutable memtables (`MemTable`):** Mutations land in an active in-memory memtable. When flushed or frozen, active memtables transition to immutable memtables (`Vec<Arc<MemTable>>`) pending disk serialization.
+- **Immutable SST readers and manifest (`SstReader`, `Manifest`):** Frozen memtables are written to disk as immutable SST runs (`{sst_id}.sst`) with typed block indices, CRC32C checksums, and bloom filters. SST registrations are committed to `MANIFEST` at `<root>/rowstore/MANIFEST` via atomic temporary file replacement (`MANIFEST.tmp` write -> fsync -> rename -> directory fsync) bounded by `MAX_MANIFEST_PAYLOAD_BYTES`.
+- **Durable visibility marker (`VISIBLE`):** Published transaction versions advance an external watermark persisted at `<root>/rowstore/VISIBLE` using the `HTAPVIS1` binary envelope (16-byte fixed format: 8-byte magic `b"HTAPVIS1"` + 8-byte little-endian visible version). Visibility writes execute atomically via `VISIBLE.tmp` write -> fsync -> rename -> directory fsync on every commit publish.
+
+### Point read execution path (`PointSelect -> Route::RowstorePointRead -> Engine::get`)
+
+1. **SQL parsing and binding:** `htap_sql::parse_one(sql)` parses MySQL dialect SQL. `htap_sql::bind(stmt, &catalog)` verifies column definitions and schema constraints. When a `SELECT` statement specifies a complete primary key via equality predicates (`WHERE pk_col = val`) without unhandled clauses, it binds to typed `BoundStatement::Select(PointSelect)`.
+2. **Structural route classification:** `htap_sql::classify_route` inspects the bound statement and maps `PointSelect` to `Route::RowstorePointRead { key }` across all storage formats (`StorageDescriptor::Row`, `StorageDescriptor::Column`, `StorageDescriptor::Converting`), bypassing analytical planning and converter logic entirely.
+3. **Snapshot acquisition:** `LocalServer::execute_select` acquires the server's current visible watermark: `snapshot = Snapshot::new(self.txn_manager.visible_version())`.
+4. **Layered probe in `Engine::get`:** `LocalServer` invokes `self.engine.get(partition_id.as_u64(), &key, snapshot)`. Inside `Engine::get`, an engine read lock is acquired, and the effective version is computed as `effective_version = snapshot.version.min(read_guard.visible_version)`. `Engine::get` then searches layers in newest-to-oldest order:
+   - Active memtable (`read_guard.active.get(...)`)
+   - Immutable memtables in newest-to-oldest order (`read_guard.immutables`)
+   - SST readers in newest-to-oldest order (`read_guard.ssts`)
+5. **MVCC and tombstone semantics:**
+   - If a layer returns `ValueKind::Put(row)`, that row is immediately returned.
+   - If a layer returns `ValueKind::Delete` (a tombstone), `Engine::get` immediately returns `Ok(None)` without checking older layers or SSTs.
+   - This strict early termination guarantees **no resurrection**: a deleted key can never expose an older historical value. If no layer yields a match, `Engine::get` returns `Ok(None)`.
+
+### Transactional write execution path (`INSERT` / `DELETE` -> 2PC -> `RowstoreParticipant`)
+
+1. **Binding and routing:** Literal `INSERT` and PK `DELETE` bind to `BoundStatement::Insert` or `BoundStatement::Delete` and classify as `Route::RowstoreWrite` across all partition storage descriptors (`Row`, `Column`, `Converting`).
+2. **Transaction manager coordination:** `LocalServer::execute_insert` and `execute_delete` construct a `TransactionRequest` containing mutations (`Mutation::Put` or `Mutation::Delete`) and invoke `TransactionManager::commit_request`.
+3. **Two-phase commit sequence:** Under the transaction manager's internal lock, mutations coordinate across registered participants. `LocalServer` registers a single participant: `RowstoreParticipant` with ID 1 (`ROWSTORE_PARTICIPANT_ID = 1`):
+   - **Prepare:** `RowstoreParticipant::prepare` validates the mutation batch (non-empty, no duplicate keys).
+   - **Intent logging:** `TransactionManager` appends and fsyncs an `INTENT` frame to `<root>/txn.journal`.
+   - **Commit decision:** `TransactionManager` appends and fsyncs a `COMMIT` frame to `<root>/txn.journal`. Once fsynced, the transaction is irrevocably committed.
+   - **Apply:** `RowstoreParticipant::apply` calls `Engine::apply_external`, writing mutations to the rowstore WAL and inserting them into the active memtable.
+   - **Publish:** `RowstoreParticipant::publish` invokes `Engine::publish(version)`, persisting the new visible version to `VISIBLE` (`HTAPVIS1`) and advancing in-memory visibility.
+   - **Watermark advance:** `TransactionManager` advances its internal `visible_version` watermark and returns `CommittedTransaction`.
+
+### Concurrency, topology, and process lock boundaries
+
+- **Single execution lock:** `LocalServer` serializes all SQL execution (`execute`) and table conversion (`convert_table`) via an internal `execution_lock` (`parking_lot::Mutex<()>`).
+- **Single partition/tablet/leader topology:** `LocalServer` requires tables to have exactly one partition (`partitions.len() == 1`), exactly one tablet (`partition.tablets.len() == 1`), and exactly one healthy leader replica (`is_leader == true`, `healthy == true`). Any topology violation returns `HtapError::Unsupported`.
+- **ProcessLock isolation:** `LocalServer::open` acquires an exclusive, non-blocking OS advisory `ProcessLock` (`<root>/LOCK` via `flock`). Low-level APIs in `htap-rowstore` (`Engine`, `Wal`, `MemTable`, `SstReader`), `htap-txn` (`TransactionManager`, `Journal`), and `htap-catalog` do **not** take the server's `ProcessLock` or `execution_lock`; their concurrency is governed by internal read-write locks and mutexes, enabling isolated unit testing and direct library embedding.
+
+### Verification and test coverage
+
+The OLTP rowstore execution path is verified by the following test suites:
+- Point lookups, layered memtable/SST search, and tombstone masking: `crates/htap-rowstore/tests/engine.rs`.
+- MVCC snapshot isolation, version visibility, and no-resurrection tombstone semantics: `crates/htap-rowstore/tests/mvcc_properties.rs`.
+- Write-ahead log replay, torn-write truncation, and crash recovery: `crates/htap-rowstore/tests/wal_recovery.rs` and `crates/htap-rowstore/tests/wal_crash.rs`.
+- SST block index, bloom filters, and CRC32C integrity: `crates/htap-rowstore/tests/sst.rs`.
+- Durable `VISIBLE` watermark marker (`HTAPVIS1`) recovery across restarts: `crates/htap-rowstore/tests/external_visibility.rs`.
+- 2PC protocol, journal `INTENT`/`COMMIT` framing, and `RowstoreParticipant` (ID 1) lifecycle: `crates/htap-txn/tests/rowstore_adapter.rs` and `crates/htap-txn/tests/journal.rs`.
+- Server SQL binding, route classification, single-partition topology enforcement, process lock conflict rejection, and crash/reopen recovery: `crates/htap-server/tests/local_server.rs`.
+- End-to-end client SQL DML and complete-PK point reads: `crates/htap-client/tests/embedded_client.rs`.
+
+---
+
+## OLAP execution paths
+
+**Status: `implemented (local MVP)`** (`htap-sql`, `htap-colstore`, `htap-convert`, and `htap-server`).
+
+Analytical queries execute via `Route::OlapScan` using two primary storage execution paths depending on the partition's storage format and conversion status:
+
+### Query binding and route classification
+
+Queries on single unaliased tables containing projections, AND-only filters, aggregates (`COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`), or deterministic `GROUP BY` clauses bind to `BoundStatement::AnalyticSelect`. The router (`classify_route`) maps `AnalyticSelect` to `Route::OlapScan` for all three storage descriptors (`Row`, `Column`, `Converting`). `LocalServer::execute_analytic_select` handles execution against the current snapshot (`Snapshot::new(self.txn_manager.visible_version())`).
+
+### Logical Row execution path
+
+When `partition.storage` is `StorageDescriptor::Row`:
+1. **Partition scan:** `LocalServer` calls `self.engine.scan_partition(partition.id.as_u64(), snapshot)`, collecting all MVCC versioned entries from active memtables, immutable memtables, and SSTs up to `snapshot.version`.
+2. **Version collapse:** `htap_convert::collapse_entries_to_rows(&entries)` collapses version chains per primary key, retaining the newest visible version `<= snapshot.version`, filtering out tombstones (`ValueKind::Delete`), and producing logical `Row` records.
+3. **Analytical evaluation:** `olap::execute_analytic_select(&select, rows)` evaluates where-clause filters, builds `BTreeMap` grouping buckets for `GROUP BY`, and computes aggregates in memory.
+
+### Materialized Column and manifest-bearing Converting compact execution path
+
+When `partition.storage` is `StorageDescriptor::Column` (or manifest-bearing `StorageDescriptor::Converting`):
+1. **Manifest verification:** `LocalServer` verifies that the tablet's catalog manifest ref matches the on-disk manifest generation: `disk_manifest.generation == cat_manifest.generation`.
+2. **Source-column planning:** `olap::plan_source_columns(&select)` inspects projected columns, filter leaves, and GROUP BY keys to produce the minimal subset of requested source column indices and an output projection mapping.
+3. **Predicate pushdown selection:** `olap::select_pushdown_predicate(select.filter.as_ref())` inspects the AND-tree filter leaves and selects at most one eligible predicate leaf (`=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) for pushdown into columnar block evaluation.
+4. **Compact scan core (`htap_convert::read_column_partition_compact_core`):**
+   - **Scan projection:** Unions requested source columns with table primary-key indices (`scan_projection`), ensuring primary keys are available for delta reconciliation even if omitted from the SQL projection.
+   - **Columnar primitive scan:** Invokes `htap_colstore::SegmentReader::scan` on each segment listed in the tablet manifest using `scan_projection` and the pushed-down predicate leaf. Typed zone maps skip non-matching blocks, and block-skipping metrics are recorded in `ScanStats`.
+   - **Rowstore post-base delta scan:** Scans `self.engine.scan_partition` at `snapshot`, identifying all mutations committed after the columnar base version (`entry.key.version > base_version`). The newest post-base mutation per user key is recorded into `post_base_puts` or `post_base_deletes`.
+   - **Delta suppression and overlay (`htap-convert`):** Base rows decoded from columnar segments whose primary keys match `post_base_deletes` or `post_base_puts` are suppressed. Surviving base rows are placed into a `BTreeMap<Vec<u8>, Row>` keyed by encoded primary key. Post-base puts are projected to the requested columns and overlaid into the map.
+   - **Deterministic row ordering:** Extracting values from the `BTreeMap` yields deterministically ordered compact rows by primary key along with execution `ScanStats`.
+5. **Residual SQL evaluation:** `olap::execute_analytic_select_compact(&select, compact_res.rows, &mapping)` evaluates all residual SQL filter leaves not pushed down, evaluates groups via `BTreeMap`, and computes aggregate values (`COUNT`, `SUM`, `MIN`, `MAX`).
+
+### Vectorized scan primitive vs. non-vectorized SQL aggregation
+
+A critical architectural distinction exists between storage scanning and SQL execution:
+- **`htap-colstore::SegmentReader` is a vectorized scan primitive:** It decodes compressed columnar blocks into columnar batches (`RecordBatch`) and uses typed zone maps for block-level pruning, returning `ScanStats` (candidate blocks, skipped blocks, decoded blocks, returned rows).
+- **SQL layer materializes logical rows:** `htap-server::olap` converts columnar batches into row-oriented `Vec<Row>` and evaluates grouping and aggregation using standard Rust collection structures (`BTreeMap`). Vectorized aggregation, SIMD operator pipelines, and DataFusion integration are planned/deferred.
+
+### Fallback behavior and defensive branches
+
+- **Row format fallback:** Partitions with `StorageDescriptor::Row` always execute the rowstore scan and collapse path.
+- **SnapshotPinned manifest-less fallback:** For partitions in `StorageDescriptor::Converting` without a published manifest, if the phase is `ConversionPhase::SnapshotPinned`, `LocalServer` falls back to the rowstore scan and collapse path. If in any later phase without a manifest, `LocalServer` rejects the query with `HtapError::InvalidArgument`.
+- **Pre-base historical query fallback:** In `read_column_partition_compact_core` (and `read_column_partition`), if `target_snapshot.version < base_version`, the converter core directly falls back to scanning the rowstore and collapsing rows, because columnar segments only represent state at and after `base_version`.
+- **Manifest-bearing Converting defensive branch:** In normal operation, the conversion process publishes the tablet manifest to the catalog only upon final cutover to `StorageDescriptor::Column`. However, if a converting partition in the catalog already references a valid manifest, `LocalServer` contains a defensive branch executing the compact columnar path.
+
+### Verification and test coverage
+
+The OLAP execution paths are verified by:
+- Projection-aware compact reads, zone-map multiblock pruning, mutation overlay sequence, deterministic PK ordering, and pre-base equivalence: `crates/htap-convert/tests/materialization.rs`.
+- Analytical queries on row and column formats, base-plus-delta equivalence, and predicate pushdown pruning stats: `crates/htap-server/tests/local_server.rs`.
+- `AnalyticSelect` parsing, binding, and route classification: `crates/htap-sql/tests/parse_bind.rs` and `crates/htap-sql/tests/route.rs`.
+- Columnar segment scan decoding and zone-map skipping: `crates/htap-colstore/tests/scan.rs` and `crates/htap-colstore/tests/zone_map_skip.rs`.
 
 ---
 
@@ -398,6 +501,85 @@ StorageDescriptor::Column
 
 ---
 
+## Conversion and transaction boundaries
+
+**Status: `implemented (local MVP)`** (`htap-convert`, `htap-txn`, `htap-catalog`, and `htap-server`).
+
+Storage format conversion transitions tables from rowstore format to immutable columnar segments while preserving online transactional availability:
+
+### Converter inputs and administrative invocation
+
+`htap_convert::LocalConverter::new` takes four dependencies:
+- `catalog: Arc<dyn CatalogStore>` for loading snapshots and advancing metadata via compare-and-set.
+- `engine: Arc<Engine>` for rowstore scanning, version collapsing, and visible version inspection.
+- `colstore_root: &Path` pointing to `<server_root>/colstore` where columnar segments and manifests reside.
+- `options: SegmentOptions` defining block sizes, compression algorithms (zstd), and dictionary thresholds.
+
+In `LocalServer`, table conversion is triggered on demand via `LocalServer::convert_table(table_name)`. The call acquires `execution_lock`, verifies that the table has a single partition and tablet, instantiates `LocalConverter`, and calls `converter.convert_partition(partition_id)`.
+
+### Four-phase conversion state machine
+
+Conversion executes a four-phase crash-resumable state machine:
+
+```text
+StorageDescriptor::Row
+        │
+        ▼ 1. Pin snapshot V, allocate generation g+1, catalog CAS
+StorageDescriptor::Converting { phase: SnapshotPinned }
+        │
+        ▼ 2. Transcode rowstore at V to columnar segments, atomic MANIFEST
+StorageDescriptor::Converting { phase: SegmentsWritten }
+        │
+        ▼ 3. Catalog CAS advance with incremented generation
+StorageDescriptor::Converting { phase: ReadyToPublish }
+        │
+        ▼ 4. Final catalog CAS cutover with column_manifest registered
+StorageDescriptor::Column
+```
+
+1. **`SnapshotPinned`:** The converter checks partition single-tablet topology, pins the conversion base version `V = engine.visible_version()` (or `Version(1)` if unwritten), and allocates a new catalog generation. It updates the catalog via CAS to `StorageDescriptor::Converting { from: Row, to: Column }` with `ConversionPhase::SnapshotPinned`. If resuming after a crash, existing pinned metadata is reused without creating a new snapshot.
+2. **`SegmentsWritten`:** Scans the rowstore at pinned snapshot `V`, collapses MVCC versions into rows, and encodes immutable columnar segments (`htap-colstore`) in `<colstore_root>/tablets/{tablet_id}/`. It writes the tablet manifest (`HTAPTBM1` envelope with CRC32C checksum) to `MANIFEST.tmp`, fsyncs, and renames to `MANIFEST`. Catalog state advances via CAS to `ConversionPhase::SegmentsWritten`.
+3. **`ReadyToPublish`:** Advances catalog CAS to `ConversionPhase::ReadyToPublish` with an incremented catalog generation, ensuring all segments and the manifest are durably discoverable before cutover.
+4. **`Column`:** Advances catalog CAS to `StorageDescriptor::Column`, registering `column_manifest = Some(manifest_ref)` and clearing the conversion descriptor in a single atomic metadata update.
+
+### Manifest and catalog CAS vs. rowstore WAL separation
+
+Columnar manifests (`HTAPTBM1`) and catalog metadata CAS transitions are completely isolated from the rowstore WAL and the transaction journal (`txn.journal`):
+- **No shared cross-format WAL:** There is no unified write-ahead log that writes across both formats. All transactional commits mutate the rowstore exclusively through `TransactionManager` and `RowstoreParticipant (ID 1)`.
+- **Manifest publication:** Columnar segment durability is established by writing `MANIFEST` with format `HTAPTBM1`. The catalog references this manifest via `ColumnManifestRef { generation, path }`.
+
+### Rowstore authority and delta freshness
+
+The rowstore remains the single authority for all writes and point reads:
+- rowstore remains authoritative and no dual-write is introduced;
+- underlying storage semantics support online post-conversion writes via overlay;
+- however, the synchronous LocalServer API serializes `convert_table` with execute calls while conversion runs, so no concurrent server-call guarantee is claimed.
+- Columnar queries read base segments up to version `V` and merge rowstore deltas committed after `V`.
+
+### Explicitly deferred conversion capabilities
+
+- **No atomic cross-format transactions:** Transactions never mutate rowstore and columnstore simultaneously.
+- **No reverse conversion:** Reverse `Column -> Row` conversion is unsupported; attempting it returns `HtapError::Unsupported`.
+- **No delete vectors:** Column segments have no bitmap delete vectors; deletions post-base are tracked as rowstore tombstones in the delta overlay.
+- **No rowstore reclamation or compaction:** Converted rows are not purged from the rowstore, and deltas are not merged back into base columnar files via background compaction.
+
+### Transaction boundary, 2PC journal, and crash recovery
+
+- **Irrevocable commit boundary:** In `htap-txn`, the commit boundary is the fsync of the `COMMIT` record to `txn.journal`. Prior to this fsync, only an `INTENT` record exists; if the system crashes, uncommitted intents are rolled back.
+- **Participant apply and publish:** Once `COMMIT` is fsynced, mutations are irrevocable. `RowstoreParticipant::apply` calls `Engine::apply_external` to write mutations to the rowstore WAL and memtable, and `RowstoreParticipant::publish` persists the new version to `VISIBLE` (`HTAPVIS1`).
+- **Crash recovery:** On system restart, `TransactionManager::recover` inspects `txn.journal`. Committed transactions missing from participant state are reapplied, ensuring atomic durability across restarts.
+
+### Verification and test coverage
+
+Conversion and transaction boundaries are verified by:
+- Tablet manifest envelope `HTAPTBM1` encoding, CRC32C validation, and generation tracking: `crates/htap-convert/tests/tablet_manifest.rs`.
+- Conversion lifecycle, online mutation overlays, and snapshot isolation: `crates/htap-convert/tests/materialization.rs`.
+- Catalog conversion state persistence, metadata roundtrips, and stale CAS rejection: `crates/htap-catalog/tests/catalog_recovery.rs`.
+- Transaction journal INTENT/COMMIT frame recovery and `RowstoreParticipant` 2PC: `crates/htap-txn/tests/journal.rs` and `crates/htap-txn/tests/rowstore_adapter.rs`.
+- Online writes during table conversion and post-reopen execution: `crates/htap-server/tests/local_server.rs`.
+
+---
+
 ## Coordination
 
 **Status: `implemented (local MVP)`** (`htap-coord` implements local durable coordination, membership, fencing, and fenced catalog CAS; distributed consensus backends like Raft/ZooKeeper are planned/deferred).
@@ -444,7 +626,7 @@ Key operational guarantees:
 
 ### Architectural boundaries and explicitly deferred capabilities
 
-- **Direct CatalogStore CAS and movement repair bypass fence:** Direct calls to `CatalogStore::compare_and_set` and older movement repair APIs (`htap_movement::repair_replica`) operate directly against catalog storage without coordinator fence validation. Fencing is strictly enforced when mutations route through `fenced_catalog_compare_and_set` or `activate_placement_addition`.
+- **Direct CatalogStore CAS and movement repair bypass fence:** Direct calls to `CatalogStore::compare_and_set` and older movement repair APIs (`htap_movement::repair_tablet`, not `repair_replica`) operate directly against catalog storage without coordinator fence validation. Fencing is strictly enforced when mutations route through `fenced_catalog_compare_and_set` or `activate_placement_addition`.
 - **One-owner OS advisory ProcessLock:** `LocalCoordinator`'s root has a one-owner OS advisory `ProcessLock` (`<root>/LOCK` via `flock`), rejecting concurrent process opens with `HtapError::Conflict`; distributed consensus and concurrent multi-node coordination remain unsupported.
 - **No distributed consensus:** Neither Raft (`openraft`) nor ZooKeeper backends are implemented. Coordination is single-node local only.
 - **No watches, distributed locks, or KV store semantics:** The `Coordinator` trait focuses on membership, scoped leadership, and catalog CAS gating. General-purpose KV storage, ephemeral path watches, and lock lease expirations are deferred.
@@ -479,11 +661,11 @@ The placement planner computes pure, deterministic, colocation-free replica plac
 
 ### Coordinator-mediated local replica activation
 
-Replica activation proceeds through coordinator-fenced phases:
-1. **Staging (`stage_placement_addition`):** Under coordinator fence validation for the tablet scope, registers target `ReplicaDescriptor` in the catalog with `is_leader = false` and `healthy = false` via `fenced_catalog_compare_and_set`.
-2. **Logical clone & package verification:** Generates a snapshot clone package via `htap_movement::clone_tablet` and verifies package checksums and metadata via `htap_movement::verify_package` (`HTAPMNF1`).
-3. **Activation (`activate_placement_addition`):** Transitions the target replica to `healthy = true` via `fenced_catalog_compare_and_set`. If cloning, verification, or fencing fails at any step, the target replica remains unready (`healthy = false`) in the catalog.
-4. **Batch activation (`activate_placement_plan`):** Sequentially stages, clones, verifies, and activates all additions in a `PlacementPlan`.
+Replica activation (`activate_placement_addition`, `activate_placement_plan`) proceeds through coordinator-fenced phases using a caller-supplied scope:
+1. **Staging (`stage_placement_addition`):** Under coordinator fence validation for the caller-supplied scope, registers target `ReplicaDescriptor` in the catalog with `is_leader = false` and `healthy = false` via `fenced_catalog_compare_and_set`.
+2. **Logical clone & package verification:** Generates a logical snapshot clone package (an `HTAPMNF1` `MANIFEST` plus one `DATA` payload/checksum, never copying WAL/SST) via `htap_movement::clone_tablet` and verifies package checksums and metadata via `htap_movement::verify_package`.
+3. **Activation (`activate_placement_addition`):** Transitions the target replica to `healthy = true` via `fenced_catalog_compare_and_set` under the caller-supplied scope. If cloning, verification, or fencing fails at any step, the target replica remains unready (`healthy = false`) in the catalog.
+4. **Batch activation (`activate_placement_plan`):** Sequentially stages, clones, verifies, and activates all additions in a `PlacementPlan` using the caller-supplied scope.
 
 ### Hash bucketing contract
 
@@ -492,3 +674,66 @@ The hash bucketing contract is fixed explicitly and versioned: the bucket is
 modulus is the actual tablet count of that index in that partition. The
 per-type byte encoding is a versioned contract rather than an implementation
 detail — see finding 11 in [`RESEARCH.md`](./RESEARCH.md).
+
+---
+
+## Movement and coordinator boundaries
+
+**Status: `implemented (local MVP)`** (`htap-movement`, `htap-coord`, `htap-catalog`, and `htap-server`).
+
+Data movement and cluster coordination operate as independent subsystems that interact with catalog metadata, rowstore snapshots, and placement planning:
+
+### Data movement and job lifecycle (`htap-movement`)
+
+`htap_movement::LocalDataMover` manages batch data ingress, egress, and tablet snapshot cloning:
+- **Durable jobs (`HTAPJOB1`):** Job states are tracked under `<movement_dir>/jobs/` using the `HTAPJOB1` binary envelope format with CRC32C checksums and atomic file staging (`.tmp` -> fsync -> rename).
+- **Semantic idempotency (no exactly-once crash claim):** Mutations are batched and committed via `TransactionManager` before job progress counters are checkpointed. If a crash occurs between commit and checkpoint, uncheckpointed records will be replayed on resume. Because imports apply primary-key upserts (`Mutation::Put`), replay is semantically idempotent at the rowstore level, but no exactly-once execution across crashes is claimed. Identical job requests or already-completed jobs are safely skipped.
+- **Streaming batch imports (CSV / JSONL):** Reads CSV or JSONLines sources in configurable batch sizes, parses records against table schema, and commits batches via `TransactionManager`.
+- **Materialized partition exports:** Movement export APIs (`export`, `copy_to_csv*`, `copy_to_jsonl*`, not `export_partition`) materialize the entire logical partition into memory before streaming to disk, guaranteeing consistent snapshot isolation during export.
+- **Tablet snapshot clone packages (`HTAPMNF1`):** `clone_tablet` creates a logical clone package consisting of an `HTAPMNF1` `MANIFEST` envelope plus a single serialized `DATA` payload with a CRC32C checksum (by scanning partition entries and collapsing MVCC versions and tombstones into logical rows). It **never copies rowstore WAL or SST files**. `verify_package` validates manifest envelope integrity, payload CRC32C, row count, and schema before activation.
+
+### Server borrowing façade (`LocalServerDataMover`)
+
+`LocalServer` integrates data movement via a non-owning borrowing façade:
+- Calling `server.data_mover()` returns a `LocalServerDataMover<'_>` borrowing `&self.data_mover`, `&self.catalog`, `&self.txn_manager`, and `&self.engine`.
+- Exposes high-level helper methods (`import`, `export`, `copy_to_csv*`, `copy_to_jsonl*`, `clone_tablet`, `verify_package`, `repair_tablet`) while keeping ownership and process locking under `LocalServer`.
+
+### Local coordinator implementation (`htap-coord`)
+
+`htap_coord::LocalCoordinator` provides local single-node cluster coordination and fencing:
+- **State persistence (`HTAPCRD1`):** Coordinator state is stored at `<coord_root>/COORDINATOR` using the `HTAPCRD1` binary format (`HEADER_MAGIC = b"HTAPCRD1"`, CRC32C checksum, atomic temporary file replacement).
+- **OS advisory ProcessLock:** Coordinator root directory is protected by an exclusive advisory `ProcessLock` (`<coord_root>/LOCK` via `flock`). Concurrent coordinator initialization on the same path returns `HtapError::Conflict`.
+- **Sorted deterministic membership:** `list_nodes` returns registered `NodeId` values sorted in deterministic ascending order.
+- **Monotonic fencing tokens (`FencingToken`):** Every leadership acquisition (`acquire_leadership`) or replacement (`replace_leadership`) issues a strictly monotonic fencing token. Next token IDs are persisted durably to ensure tokens never repeat across restarts.
+- **Coordinator-fenced catalog CAS:** `fenced_catalog_compare_and_set` executes under coordinator lock, verifying that the caller's `FencingToken` matches current active leadership for the given scope before calling `CatalogStore::compare_and_set`. Stale tokens are rejected with `HtapError::Fenced`.
+
+### Placement planning and local activation simulation
+
+- **Pure deterministic placement planner (`plan_placement`):** Given an immutable `CatalogSnapshot`, a list of candidate `NodeId`s, and a replication factor, `plan_placement` computes a deterministic, colocation-free replica placement plan without side effects.
+- **Coordinator-fenced staged activation simulation:**
+  1. **Staging (`stage_placement_addition`):** Under coordinator fencing for the caller-supplied scope, adds a new replica descriptor to the catalog marked `is_leader = false` and `healthy = false` via `fenced_catalog_compare_and_set`.
+  2. **Cloning & verification:** Generates an `HTAPMNF1` logical clone package (envelope `MANIFEST` plus one `DATA` payload/checksum, never copying WAL/SST) via `htap_movement::clone_tablet` and validates checksums via `htap_movement::verify_package`.
+  3. **Activation (`activate_placement_addition`):** Updates the replica to `healthy = true` via `fenced_catalog_compare_and_set` under the caller-supplied scope.
+  4. **Batch activation (`activate_placement_plan`):** Sequentially stages, clones, verifies, and activates all additions in a plan under the caller-supplied scope.
+- **Simulation scope:** Placement planning and activation are metadata and local filesystem simulations. Physical sharded SQL routing across multiple nodes is not implemented.
+
+### Direct catalog and legacy repair fence bypass
+
+- Direct calls to `CatalogStore::compare_and_set` and older movement repair APIs (`htap_movement::repair_tablet` / `LocalServerDataMover::repair_tablet`, not `repair_replica`) bypass coordinator fence validation. Coordinator fencing is enforced only when mutations route through `fenced_catalog_compare_and_set` or `activate_placement_addition`.
+
+### Explicitly deferred distributed capabilities
+
+- **No distributed consensus:** Neither Raft (`openraft`) nor ZooKeeper backends are implemented.
+- **No remote physical movement:** Movement and cloning operate solely on local filesystem paths without network transport.
+- **No live peer replication:** Replication uses static snapshot clone packages rather than continuous log replication.
+- **No leader handoff, rebalancing, or rack awareness:** Dynamic cluster rebalancing, capacity/rack-aware placement, and graceful leadership handoff protocols are deferred.
+
+### Verification and test coverage
+
+Movement and coordinator boundaries are verified by:
+- Durable job lifecycle, crash resumption, and semantic idempotency: `crates/htap-movement/tests/jobs.rs`.
+- CSV/JSONLines streaming imports and materialized exports: `crates/htap-movement/tests/import_export.rs`.
+- Tablet snapshot clone package (`HTAPMNF1`) creation, verification, and repair: `crates/htap-movement/tests/tablet_simulation.rs`.
+- Coordinator state persistence (`HTAPCRD1`), token monotonicity, and fenced catalog CAS: `crates/htap-coord/tests/local_coordinator.rs`.
+- Pure placement planning, staged replica activation simulation, and stale fence rejection: `crates/htap-coord/tests/placement_movement.rs`.
+- Server data mover façade integration and clone/verify/repair execution: `crates/htap-server/tests/local_server.rs`.
