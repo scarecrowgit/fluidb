@@ -17,6 +17,13 @@ use htap_common::{FencingToken, HtapError, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+pub mod placement;
+
+pub use placement::{
+    activate_placement_addition, activate_placement_plan, plan_placement, stage_placement_addition,
+    PlacementAddition, PlacementPlan, TabletPlacement,
+};
+
 /// Coordinator persistent state file name.
 pub const COORDINATOR_FILE_NAME: &str = "COORDINATOR";
 

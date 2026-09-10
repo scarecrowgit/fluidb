@@ -191,6 +191,8 @@ dependencies = [
  "crc32c",
  "htap-catalog",
  "htap-common",
+ "htap-movement",
+ "htap-rowstore",
  "parking_lot",
  "serde",
  "serde_json",

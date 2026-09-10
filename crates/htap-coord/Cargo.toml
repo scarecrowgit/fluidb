@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 htap-common = { path = "../htap-common" }
 htap-catalog = { path = "../htap-catalog" }
+htap-movement = { path = "../htap-movement" }
+htap-rowstore = { path = "../htap-rowstore" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 crc32c = { workspace = true }
