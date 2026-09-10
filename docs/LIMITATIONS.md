@@ -124,6 +124,40 @@ The Phase 3 implementation delivers a verified, crash-safe narrow local SQL slic
 
 ---
 
+## HTAP conversion local MVP scope and deferred features
+
+The Phase 4 implementation delivers an incrementally verified local single-tablet Row-to-Column storage conversion engine (`htap-convert`), integrating with `htap-catalog`, `htap-rowstore`, `htap-colstore`, `htap-sql`, and `htap-server`. It implements a crash-resumable cutover state machine, durable tablet columnar manifest envelopes with CRC32C validation, atomic manifest and catalog publication, rowstore-authoritative base-plus-delta overlay scans, and online point mutations and point reads during and after conversion.
+
+### Completed local MVP
+
+- **Four-phase cutover state machine:** Deterministic state machine governing partition conversion:
+  `SnapshotPinned -> SegmentsWritten -> ReadyToPublish -> Column`.
+  - In `SnapshotPinned`, validates local partition topology (requiring exactly one tablet with one healthy leader replica), pins the rowstore visible version (or `Version(1)` if unwritten), allocates a catalog generation, and advances catalog storage to `StorageDescriptor::Converting { from: Row, to: Column }` via CAS.
+  - In `SegmentsWritten`, reads rowstore rows at the pinned snapshot version, collapses versions and tombstones, writes encoded/compressed columnar segments, writes the tablet manifest, and records completion via catalog CAS.
+  - In `ReadyToPublish`, bumps catalog generation and verifies manifest durability prior to cutover.
+  - In `Column`, executes final catalog CAS cutover, clearing conversion descriptors and recording the tablet's `ColumnManifestRef`.
+- **Atomic per-tablet manifest and catalog publication:** Manifest files use the `HTAPTBM1` binary envelope format with format versioning and payload CRC32C checksums (`HEADER_MAGIC = b"HTAPTBM1"`, `HEADER_LEN = 18`). Publication uses atomic staging (`MANIFEST.tmp` replaced to `MANIFEST`) followed by generation-checked catalog CAS updates. The manifest guarantees that only durable, readable segments are referenced, preventing partially written or orphaned segment exposure.
+- **Rowstore authoritative base-plus-delta overlay:** `read_materialized_partition` executes base-plus-delta queries by reading columnar segments up to the conversion snapshot version and overlaying rowstore mutations (`Put` and `Delete`) committed after that base version up to the target snapshot. Historical reads for versions before the conversion base version are served directly from rowstore.
+- **Online point writes and reads:** Storage descriptors (`Row`, `Converting`, `Column`) route point mutations (`INSERT`, `DELETE`) to `Route::RowstoreWrite` and complete-primary-key reads to `Route::RowstorePointRead`. Writers and point readers operate against the authoritative rowstore without interruption during or after conversion.
+- **Crash resumption and idempotency:** If interrupted, conversion safely resumes: `SnapshotPinned` reuses the persisted pinned version and generation without re-snapshotting; `SegmentsWritten` and `ReadyToPublish` verify disk manifests without overwriting existing files or corrupting state.
+- **Verified by test suite:**
+  - Manifest envelope roundtrips, corruption, truncation, path traversal checks, and atomic tmp replacement: `crates/htap-convert/tests/tablet_manifest.rs`.
+  - End-to-end conversion, post-conversion put/delete overlays, historical snapshot queries, empty partition handling, and phase CAS crash-resumption boundaries: `tests/materialization.rs` (`crates/htap-convert/tests/materialization.rs`).
+  - Storage descriptor routing for Row, Converting, and Column: `crates/htap-sql/tests/route.rs`.
+  - Online point mutations and point reads during Converting and Column storage: `crates/htap-server/tests/local_server.rs`.
+  - Catalog conversion descriptor roundtrips, state validation, manifest path validation, and stale CAS rejection: `crates/htap-catalog/tests/catalog_recovery.rs` (`test_conversion_metadata_and_manifest_roundtrip_and_reopen`, `test_invalid_conversion_combinations`, `test_invalid_column_manifest_and_paths`, `test_conversion_stale_cas`).
+
+### Explicitly deferred features
+
+- **Reverse `Column -> Row` conversion:** Reverse conversion (`Column -> Row`) is not implemented and is explicitly rejected with `HtapError::Unsupported`. It is not claimed.
+- **Columnar delete vectors:** Per-segment bitmap delete vectors on columnar files are deferred. Deletion semantics are handled via tombstones in the rowstore base-plus-delta overlay.
+- **Physical rowstore reclamation:** Converted rows are not purged or garbage-collected from rowstore SSTs/WAL. Rowstore remains authoritative and retains all history.
+- **Delta-to-base background compaction:** No automatic compaction folds accumulated rowstore deltas into new columnar segments.
+- **SQL analytical scans:** Full table scans and analytical vectorized query execution over columnar or converting tables via SQL (`LocalServer`) are deferred (non-point queries return `InvalidArgument` or `Unsupported`).
+- **Full partition and table conversion semantics:** Conversions across multi-tablet sharded partitions, range/list partition boundaries, and distributed multi-node coordinated cutovers are deferred to Phase 5 and Phase 6.
+
+---
+
 ## Scope
 
 - The brief describes a production HTAP database engine: an LSM row store, a
@@ -148,7 +182,7 @@ The Phase 3 implementation delivers a verified, crash-safe narrow local SQL slic
 | Phase 1 — Row store | `Complete` | fsync durability unverified — see above: SIGKILL tests prove restart/replay integrity across abrupt process death, not physical power-loss durability. |
 | Phase 2 — Columnar store | `Complete` | Standalone columnar segments, zone-map pruning, and vectorized scans implemented. Deferred to later phases: delta/delete vectors, MVCC visibility, conversion/catalog integration, richer predicates/joins/aggregates, Arrow/DataFusion, and atomic publication/manifest integration. |
 | Phase 3 — SQL layer | `In progress` | Narrow local slice completed (sqlparser MySQL dialect, strict binder, structural rowstore route classifier, durable catalog with reopen recovery, synchronous `LocalServer` for `CREATE TABLE`, literal `INSERT`, PK `DELETE`, complete-PK `SELECT`). Deferred: MySQL wire protocol/`htapd` daemon, sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`, scans/aggregates/joins/CTEs/windows/subqueries, columnstore SQL execution, multi-partition routing, and broad MySQL compatibility. |
-| Phase 4 — HTAP conversion | `Not started` | — |
+| Phase 4 — HTAP conversion | `Complete (local MVP)` | Completed local single-tablet Row-to-Column conversion MVP (`htap-convert`). Explicitly deferred: reverse `Column -> Row` conversion, delete vectors, physical rowstore reclamation, compaction, SQL analytical scans, and distributed partition/table conversion semantics. |
 | Phase 5 — Data movement | `Not started` | — |
 | Phase 6 — Distribution and coordination | `Not started` | — |
 | Phase 7 — Hardening, benchmarks, chaos | `Not started` | — |

@@ -14,10 +14,15 @@ are `implemented`. Phase 3 has a completed narrow local slice: sqlparser MySQL d
 strict binder, structural rowstore route classifier (`htap-sql`), durable catalog with reopen recovery
 (`htap-catalog`), and synchronous `LocalServer` (`htap-server`) supporting `CREATE TABLE`, literal
 `INSERT`, PK `DELETE`, and complete-PK `SELECT` with reopen recovery.
+Phase 4 has a completed local conversion MVP: partition-scoped row-to-column conversion (`htap-convert`)
+with durable tablet columnar manifest envelopes, a four-phase state machine
+(`SnapshotPinned -> SegmentsWritten -> ReadyToPublish -> Column`), atomic per-tablet manifest and
+catalog publication, rowstore-authoritative base-plus-delta overlay, and online point writes/reads on
+converting and columnar storage partitions.
 Later components described below remain `planned` or `in progress` (explicitly deferred:
-MySQL protocol/`htapd` daemon, sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`,
-scans/aggregates/joins/CTEs/windows/subqueries, columnstore SQL execution, multi-partition routing,
-and broad MySQL compatibility).
+reverse `Column -> Row` conversion, delete vectors, physical rowstore reclamation, compaction,
+SQL analytical scans, multi-partition routing, MySQL wire protocol/`htapd` daemon,
+sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`, and broad MySQL compatibility).
 See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
@@ -72,7 +77,7 @@ See [`PROGRESS.md`](./PROGRESS.md).
               +-----------------------+-----------------------+
                                       |
       +-------------------------------v-------------------------------+
-      | htap-convert : row <-> column format conversion (R2)  planned |
+      | htap-convert : row -> col conversion (R2)  IMPLEMENTED (MVP)   |
       +---------------------------------------------------------------+
 
    +----------------------+  +----------------------+  +-----------------+
@@ -115,7 +120,7 @@ therefore a **deployment choice, not a rewrite**.
 
 ## Dual-format storage
 
-**Status: `in progress`** (`htap-rowstore` and `htap-colstore` are `implemented`; integration, delta store, and conversion are `planned`).
+**Status: `in progress`** (`htap-rowstore`, `htap-colstore`, and local row-to-column conversion via `htap-convert` are `implemented`; reverse conversion, delta compaction, and distributed conversion are `planned`).
 
 | Format | Crate | Structure | Status |
 | ------ | ----- | --------- | ------ |
@@ -126,8 +131,9 @@ The `htap-colstore` implementation delivers the standalone columnar engine MVP:
 durable binary segment files, plain and dictionary column encodings, optional zstd compression,
 per-block CRC32C integrity checksums, typed zone maps (min, max, and nullability flags),
 and vectorized scan execution with conservative pushdown pruning and selective column decoding.
-At this stage, `htap-colstore` does not integrate with the SQL query engine, transactional MVCC
-version visibility, online conversion state machines, or rowstore query routing.
+Phase 4 integrates `htap-colstore` segments into partition-scoped conversion (`htap-convert`),
+registering columnar segments in durable tablet manifests while keeping the rowstore authoritative
+for online point mutations and post-conversion base-plus-delta queries.
 
 Both formats share **one MVCC version domain** (`htap-common::Version`, which
 is `implemented`) and **one WAL**, so a single transaction can touch both
@@ -144,17 +150,15 @@ both formats would need two-phase commit against itself. See
 
 ## Freshness: delta store and merge-on-read
 
-**Status: `planned`.**
+**Status: `in progress`** (authoritative rowstore base-plus-delta overlay implemented for local conversion; delete vectors and background base compaction are planned).
 
-A partition held in column format still accepts writes. Those writes land in a
-**row-format delta** plus a **delete vector** over the columnar base.
+A partition converted to or held in column format still accepts writes. In the Phase 4 local MVP,
+those writes land directly in the authoritative **row store**, which acts as the live delta store:
 
-- Reads merge the base (minus its delete vector) with the delta.
-- Background compaction folds the delta into a new base.
-
-This keeps freshly written rows visible to analytical queries without imposing
-a per-row merge cost on scans: the base is subtracted by a single bitmap
-ANDNOT, and only the (small) delta is merged.
+- Historical reads prior to the conversion base version read directly from the rowstore.
+- Materialized partition scans (`htap_convert::read_materialized_partition`) scan the columnar base segments up to the conversion snapshot version and overlay rowstore mutations (`Put` and `Delete`) committed after that base version up to the target snapshot.
+- Online transactional writes (`INSERT`, `DELETE`) and point reads (`SELECT` by primary key) execute directly against the row store (`Route::RowstoreWrite` and `Route::RowstorePointRead`), ensuring zero read or write interruption during and after conversion.
+- Bitmap delete vectors directly on columnar segments, physical rowstore reclamation, and background compaction folding deltas into new columnar segments are explicitly deferred.
 
 ---
 
@@ -194,24 +198,82 @@ therefore cannot starve concurrent point queries of either CPU or memory.
 
 ## Storage-format conversion (R2)
 
-**Status: `planned`** (the `htap-convert` crate exists as a skeleton).
+**Status: `implemented (local MVP)`** (`htap-convert`).
 
-Conversion is a **partition-scoped state machine**:
+Conversion operates as a partition-scoped, crash-resumable state machine for local single-tablet partitions:
 
-1. Snapshot the partition at version `V`.
-2. Transcode rows to columnar segments.
-3. Apply the delta accumulated since `V`.
-4. Atomically swap the partition's storage descriptor in a metadata
-   transaction.
-5. Garbage-collect the old data after a grace period.
+```text
+StorageDescriptor::Row
+        │
+        ▼ (pin visible version V, allocate conversion generation)
+ConversionPhase::SnapshotPinned
+        │
+        ▼ (write columnar segments, atomically persist MANIFEST)
+ConversionPhase::SegmentsWritten
+        │
+        ▼ (advance catalog CAS with incremented generation)
+ConversionPhase::ReadyToPublish
+        │
+        ▼ (final catalog CAS cutover to Column, clear conversion metadata)
+StorageDescriptor::Column
+```
 
-Properties:
+### Conversion execution steps
 
-- The state is **persisted at each transition**, so conversion is
-  crash-resumable rather than restart-from-scratch.
-- The swap is a **single metadata record**, so a reader observes either the old
-  format or the new one, never a mix.
-- The **same machinery runs in reverse** for column → row conversion.
+1. **Topology validation and snapshot pinning (`SnapshotPinned`):**
+   The converter validates that the partition contains exactly one tablet with one healthy leader replica.
+   If in `StorageDescriptor::Row`, it pins snapshot version `V` from the rowstore's current visible version
+   (or `Version(1)` if unwritten), allocates a new catalog generation, and updates the partition via catalog
+   compare-and-set (CAS) to `StorageDescriptor::Converting { from: Row, to: Column }` with phase
+   `ConversionPhase::SnapshotPinned`. If resuming an existing conversion, the persisted pinned snapshot
+   version and generation are reused without taking a new snapshot.
+
+2. **Columnar transcoding and atomic manifest write (`SegmentsWritten`):**
+   The converter scans the rowstore at pinned snapshot version `V`, collapses MVCC versions and tombstones
+   into logical rows, and encodes durable columnar segments (`htap-colstore`) into the tablet directory.
+   It writes the tablet columnar manifest (`HTAPTBM1` binary envelope with CRC32C integrity checksum)
+   atomically via temporary file replacement (`MANIFEST.tmp` -> `MANIFEST`).
+   The catalog is then advanced via CAS to `ConversionPhase::SegmentsWritten`.
+
+3. **Publication gating (`ReadyToPublish`):**
+   The converter advances the catalog via CAS to `ConversionPhase::ReadyToPublish` with an incremented catalog
+   generation, ensuring all segment and manifest writes are durably observable before final cutover.
+
+4. **Atomic cutover (`Column`):**
+   The final catalog CAS transitions the partition from `StorageDescriptor::Converting` in `ReadyToPublish`
+   phase to `StorageDescriptor::Column`. The conversion descriptor is cleared and the tablet's
+   `ColumnManifestRef` is registered in the catalog in a single atomic metadata update.
+
+### System invariants during and after conversion
+
+- **Atomic per-tablet publication:** Columnar segments and the tablet manifest are written to disk with
+  checksum verification and atomic file renaming before catalog cutover. The manifest only ever references
+  readable, durable segments, preventing orphaned or partially written files from becoming visible.
+- **Rowstore authoritative base-plus-delta overlay:** The rowstore remains the authoritative source of truth.
+  Queries reading full partitions (`read_materialized_partition`) read base rows from columnar segments
+  up to the conversion base version `V`, and overlay rowstore mutations (`Put` and `Delete`) committed after
+  version `V` up to the target snapshot. Historical reads for versions earlier than `V` are served directly
+  from the rowstore.
+- **Online point writes and reads:** Primary-key point lookups (`SELECT` by PK) and mutations (`INSERT`,
+  `DELETE`) continue to execute online without interruption through `LocalServer` and `htap-sql` query routing
+  (`Route::RowstoreWrite` and `Route::RowstorePointRead`), which operate directly on the rowstore regardless
+  of whether the partition is `Row`, `Converting`, or `Column`.
+- **Reverse conversion:** Reverse `Column -> Row` conversion is **not implemented** and is not claimed.
+  Attempting conversion in any direction other than `Row -> Column` returns `HtapError::Unsupported`.
+
+### Explicitly deferred features
+
+- **Delete vectors:** Per-segment bitmap delete vectors on columnar segments are deferred; deletions are
+  tracked via rowstore tombstones in the base-plus-delta overlay.
+- **Physical rowstore reclamation:** Converted rows remain in the rowstore SSTs and WAL; physical space
+  reclamation / truncation of converted rowstore history is deferred.
+- **Compaction:** Background merge-on-read compaction folding accumulated rowstore deltas into new columnar
+  segments is deferred.
+- **SQL analytical scans:** Vectorized SQL query scans over columnar or converting tables via `LocalServer`
+  are deferred (non-point queries return `InvalidArgument` or `Unsupported`).
+- **Full partition and table conversion semantics:** Conversions across multi-tablet sharded partitions,
+  range/list partition boundaries, and distributed multi-node coordinated cutovers are deferred to Phase 5
+  and Phase 6.
 
 ---
 

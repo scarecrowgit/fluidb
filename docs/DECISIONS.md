@@ -246,3 +246,68 @@ Option **(a)**.
 ### How to reverse it
 
 Add two thin binary crates over the same libraries.
+
+---
+
+## ADR-008: Partition-scoped four-phase conversion state machine with authoritative rowstore overlay
+
+`Status: Accepted`
+`Date: 2026-09-10`
+
+### Context
+
+Storage-format conversion (R2) converts partitions from row-oriented storage (`htap-rowstore`)
+to columnar storage (`htap-colstore`). The conversion process must not interrupt concurrent
+OLTP transactions, must not expose incomplete or unchecksummed columnar data to readers,
+and must survive abrupt process crashes at any intermediate step without corrupting catalog
+or storage state.
+
+### Options considered
+
+- **(a)** Stop-the-world offline migration: block incoming writes and reads, transcode data,
+  and update catalog format in a single pause.
+- **(b)** Synchronous dual-writing during conversion: transcode background data while active
+  writers simultaneously mirror incoming writes to both rowstore and columnar segments.
+- **(c)** Partition-scoped four-phase state machine (`SnapshotPinned -> SegmentsWritten -> ReadyToPublish -> Column`)
+  with atomic manifest and catalog publication and authoritative rowstore base-plus-delta overlay.
+
+### Decision
+
+Option **(c)**.
+
+- **Four-phase state machine:**
+  1. `SnapshotPinned`: pins rowstore visible version `V`, allocates a new catalog generation,
+     and transitions the partition to `StorageDescriptor::Converting { from: Row, to: Column }`
+     via catalog CAS. Resuming an existing conversion reuses the persisted pinned snapshot version
+     and generation.
+  2. `SegmentsWritten`: transcodes rowstore entries at snapshot `V` into columnar segments,
+     writes the durable tablet manifest envelope (`HTAPTBM1` with CRC32C checksum) atomically
+     via temporary file replacement (`MANIFEST.tmp` -> `MANIFEST`), and records the phase in the
+     catalog via CAS.
+  3. `ReadyToPublish`: advances the catalog generation and phase via CAS, verifying manifest
+     durability before cutover.
+  4. `Column`: executes the final catalog CAS cutover to `StorageDescriptor::Column`, clearing
+     conversion descriptors and binding the tablet's `ColumnManifestRef`.
+- **Authoritative rowstore base-plus-delta overlay:** The rowstore remains the authoritative
+  truth for point operations (`Route::RowstoreWrite` and `Route::RowstorePointRead`), executing
+  without interruption across `Row`, `Converting`, and `Column` states. Materialized scans
+  (`read_materialized_partition`) scan columnar base segments up to `V` and overlay post-`V`
+  rowstore puts and deletes.
+- **Scope boundaries:** Reverse `Column -> Row` conversion is not implemented and not claimed.
+  Columnar bitmap delete vectors, physical rowstore reclamation, delta-to-base background compaction,
+  vectorized SQL query execution over columnar tables, and distributed multi-tablet conversion
+  are explicitly deferred.
+
+### Consequences
+
+- Zero downtime or blocking for online point reads and writes throughout conversion.
+- Crash-safe and resumable: any crash during conversion resumes from the persisted phase and
+  pinned snapshot without duplicate manifest generation or orphaned segment leaks.
+- Storage footprint temporarily retains rowstore data post-conversion because physical rowstore
+  reclamation is deferred.
+- Reverse conversion is unsupported and returns `HtapError::Unsupported`.
+
+### How to reverse it
+
+Replace the online state machine and rowstore overlay with an offline transcode and catalog swap
+utility.
