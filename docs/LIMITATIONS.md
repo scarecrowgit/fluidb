@@ -100,6 +100,30 @@ The Phase 2 `htap-colstore` implementation delivers the core columnar segment st
 
 ---
 
+## SQL layer narrow local slice scope and deferred features
+
+The Phase 3 implementation delivers a verified, crash-safe narrow local SQL slice integrating parsing, catalog binding, route classification, transactional DML execution, and point reads. It does not implement full SQL breadth, analytical query execution, or client network protocols.
+
+### Completed narrow local slice
+
+- **sqlparser MySQL dialect:** Strict single-statement parsing using `sqlparser::dialect::MySqlDialect`, accepting valid backtick identifiers and MySQL escape semantics while rejecting empty input, malformed SQL, and multi-statement input with stable `InvalidArgument` errors. Verified in `crates/htap-sql/tests/parse_bind.rs`.
+- **Strict catalog binder:** Schema-validated binding for `CREATE TABLE` (scalar types and primary keys), literal schema-ordered `INSERT`, complete-primary-key `DELETE`, and complete-primary-key `SELECT`. Strictly rejects unsupported data types, composite key mismatches, expression evaluations, implicit coercions, and unhandled clauses. Verified in `crates/htap-sql/tests/parse_bind.rs`.
+- **Structural rowstore route classifier:** Inspects bound statements and storage descriptors, classifying complete-PK queries as `Route::RowstorePointLookup` and single-partition mutations as `Route::RowstoreWrite`, while explicitly rejecting unsupported columnar/converting descriptors. Verified in `tests/route.rs` (`crates/htap-sql/tests/route.rs`).
+- **Durable catalog with reopen recovery:** `LocalCatalogStore` persists catalog snapshots with atomic file replacement, generation tracking, and crash validation. Verified by catalog recovery tests in `crates/htap-catalog/tests/catalog_recovery.rs`.
+- **Synchronous `LocalServer` execution façade:** Direct in-process engine façade binding the catalog, `htap-txn` transaction manager, and `htap-rowstore` LSM engine. Supports `CREATE TABLE` (with deterministic one-partition row topology), literal `INSERT`, primary-key `DELETE`, and complete-PK `SELECT` with recovery and version progression across reopen. Verified in `crates/htap-server/tests/local_server.rs`.
+
+### Explicitly deferred features
+
+- **MySQL wire protocol and `htapd` daemon:** No MySQL wire protocol server, handshake, packet serialization, or daemon network listener is implemented. All interaction is via the synchronous in-process `LocalServer` API. MySQL wire compatibility is not claimed.
+- **Sessions and explicit transaction control:** No interactive session management or multi-statement transactions (`BEGIN`, `COMMIT`, `ROLLBACK`). Every statement is executed as an autonomous synchronous operation.
+- **Extended DML and DDL:** Non-PK mutations and schema alterations (`UPDATE`, `ALTER TABLE`, `DROP TABLE`) are deferred.
+- **Analytical queries and SQL breadth (R4):** Full SQL breadth is not complete. Table scans, vectorized filter pushdown from SQL, aggregations (`GROUP BY`, `COUNT`, `SUM`), hash joins, common table expressions (`WITH` / CTEs), window functions (`OVER`), subqueries, and cost-based query optimization are deferred.
+- **Columnstore SQL execution:** `htap-colstore` vectorized scans are not yet wired to the SQL execution layer; queries targeting columnstore or converting tables are rejected at route classification.
+- **Multi-partition and distributed routing:** LocalServer supports only the local single-partition row topology. Partition pruning, distributed fanout, cross-node coordination, and scatter-gather execution are deferred to Phase 5 and Phase 6.
+- **Broad MySQL compatibility:** Broad MySQL syntax, built-in functions, variable setting, system tables, and loose type coercions are deliberately unsupported.
+
+---
+
 ## Scope
 
 - The brief describes a production HTAP database engine: an LSM row store, a
@@ -123,7 +147,7 @@ The Phase 2 `htap-colstore` implementation delivers the core columnar segment st
 | Phase 0 — Research and workspace bootstrap | `Complete` | None. |
 | Phase 1 — Row store | `Complete` | fsync durability unverified — see above: SIGKILL tests prove restart/replay integrity across abrupt process death, not physical power-loss durability. |
 | Phase 2 — Columnar store | `Complete` | Standalone columnar segments, zone-map pruning, and vectorized scans implemented. Deferred to later phases: delta/delete vectors, MVCC visibility, conversion/catalog integration, richer predicates/joins/aggregates, Arrow/DataFusion, and atomic publication/manifest integration. |
-| Phase 3 — SQL layer | `Not started` | — |
+| Phase 3 — SQL layer | `In progress` | Narrow local slice completed (sqlparser MySQL dialect, strict binder, structural rowstore route classifier, durable catalog with reopen recovery, synchronous `LocalServer` for `CREATE TABLE`, literal `INSERT`, PK `DELETE`, complete-PK `SELECT`). Deferred: MySQL wire protocol/`htapd` daemon, sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`, scans/aggregates/joins/CTEs/windows/subqueries, columnstore SQL execution, multi-partition routing, and broad MySQL compatibility. |
 | Phase 4 — HTAP conversion | `Not started` | — |
 | Phase 5 — Data movement | `Not started` | — |
 | Phase 6 — Distribution and coordination | `Not started` | — |

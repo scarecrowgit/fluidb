@@ -10,8 +10,14 @@ This document describes the intended system. Every component carries a status:
 (the `Version` MVCC domain, `FencingToken`, and shared error types),
 `htap-rowstore` (WAL, memtable, SST writer/reader, and LSM row-store engine), and
 `htap-colstore` (immutable encoded/compressed segments, typed zone maps, and vectorized scans)
-are `implemented`. Later components described below remain `planned` (including SQL binding,
-transactional MVCC integration, conversion state machines, and rowstore routing).
+are `implemented`. Phase 3 has a completed narrow local slice: sqlparser MySQL dialect,
+strict binder, structural rowstore route classifier (`htap-sql`), durable catalog with reopen recovery
+(`htap-catalog`), and synchronous `LocalServer` (`htap-server`) supporting `CREATE TABLE`, literal
+`INSERT`, PK `DELETE`, and complete-PK `SELECT` with reopen recovery.
+Later components described below remain `planned` or `in progress` (explicitly deferred:
+MySQL protocol/`htapd` daemon, sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`,
+scans/aggregates/joins/CTEs/windows/subqueries, columnstore SQL execution, multi-partition routing,
+and broad MySQL compatibility).
 See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
@@ -24,17 +30,17 @@ See [`PROGRESS.md`](./PROGRESS.md).
                         +-------------+-------------+
                                       |
 ====================================  |  ==================================
- htapd  --role frontend | backend | both      (single binary, htap-server)
+ htapd  --role frontend | backend | both      (single binary, htap-server; LocalServer in progress)
 ======================================================================
                                       |
                         +-------------v-------------+
-                        |  htap-sql                 |  planned
+                        |  htap-sql                 |  in progress (narrow slice)
                         |  parse (sqlparser, MySQL) |
                         |  bind / catalog resolve   |
                         +-------------+-------------+
                                       |
                         +-------------v-------------+
-                        |  query router             |  planned
+                        |  query router             |  in progress (rowstore classifier)
                         +------+-------------+------+
                     PK point   |             |  everything else
                     lookup /   |             |
@@ -70,9 +76,10 @@ See [`PROGRESS.md`](./PROGRESS.md).
       +---------------------------------------------------------------+
 
    +----------------------+  +----------------------+  +-----------------+
-   | htap-catalog planned |  | htap-coord   planned |  | htap-movement   |
-   | Table/Partition/     |  | local | Raft | ZK    |  | placement,      |
-   | Tablet/Replica       |  | fencing tokens       |  | repair  planned |
+   | htap-catalog         |  | htap-coord   planned |  | htap-movement   |
+   | durable local store, |  | local | Raft | ZK    |  | placement,      |
+   | topology, recovery   |  | fencing tokens       |  | repair  planned |
+   | in progress          |  |                      |  |                 |
    +----------------------+  +----------------------+  +-----------------+
 
    +---------------------------------------------------------------+
@@ -84,15 +91,21 @@ See [`PROGRESS.md`](./PROGRESS.md).
 
 ## Process and role model
 
-**Status: `planned`** (the `htap-server` crate exists as a skeleton).
+**Status: `in progress`** (synchronous `LocalServer` façade implemented for the narrow local slice; `htapd` daemon and MySQL wire protocol are planned).
 
-The system ships as a **single binary, `htapd`**, which can be run as:
+The system ships as a **single binary, `htapd`** (planned), which can be run as:
 
 - the **frontend role** — SQL surface, catalog, planner, transaction
   coordinator;
 - the **backend role** — storage, execution, compaction;
 - **both roles in one process**, which is the mode used for single-node
   development and for the README demo.
+
+For the completed Phase 3 narrow local slice, `htap-server` provides `LocalServer`,
+a synchronous in-process façade composing the durable catalog (`LocalCatalogStore`),
+`htap-txn` transaction manager, and `htap-rowstore` LSM engine. It directly executes
+`CREATE TABLE` (deterministic one-partition row topology), literal `INSERT`, PK `DELETE`,
+and complete-PK `SELECT` with reopen recovery, without networking or wire protocol overhead.
 
 The frontend/backend boundary is preserved as an internal module boundary,
 policed by crate dependencies. Splitting the two into separate processes is
@@ -147,14 +160,18 @@ ANDNOT, and only the (small) delta is merged.
 
 ## Query routing — the R5 guarantee, structurally enforced
 
-**Status: `planned`.**
+**Status: `in progress`** (structural rowstore route classifier implemented for point lookups and DDL/DML; analytical execution and multi-partition routing are planned).
 
 A router inspects the **bound** statement:
 
 - **Point lookups and short transactions that resolve fully against a primary
   key** take a dedicated fast path: index probe → row fetch. There is no
-  plan-fragment construction and no vectorized operator pipeline.
-- **Everything else** goes to the vectorized analytical engine.
+  plan-fragment construction and no vectorized operator pipeline. In the completed
+  Phase 3 local slice, `htap_sql::classify_route` inspects the bound AST and catalog
+  storage descriptor, routing complete-PK point reads strictly to `Route::RowstorePointLookup`
+  and literal mutations to `Route::RowstoreWrite` (verified in `tests/route.rs` / `crates/htap-sql/tests/route.rs`
+  and `crates/htap-server/tests/local_server.rs`).
+- **Everything else** is destined for the vectorized analytical engine (deferred).
 
 This separation is enforced **by construction, not by a runtime heuristic**:
 the OLTP fast path lives in a crate that has no dependency on the analytical
