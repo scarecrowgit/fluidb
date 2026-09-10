@@ -139,9 +139,38 @@ The Phase 3 implementation delivers a verified, crash-safe narrow local SQL slic
 
 - **sqlparser MySQL dialect:** Strict single-statement parsing using `sqlparser::dialect::MySqlDialect`, accepting valid backtick identifiers and MySQL escape semantics while rejecting empty input, malformed SQL, and multi-statement input with stable `InvalidArgument` errors. Verified in `crates/htap-sql/tests/parse_bind.rs`.
 - **Strict catalog binder:** Schema-validated binding for `CREATE TABLE` (scalar types and primary keys), literal schema-ordered `INSERT`, complete-primary-key `DELETE`, and complete-primary-key `SELECT`. Strictly rejects unsupported data types, composite key mismatches, expression evaluations, implicit coercions, and unhandled clauses. Verified in `crates/htap-sql/tests/parse_bind.rs`.
-- **Structural rowstore route classifier:** Inspects bound statements and storage descriptors, classifying complete-PK queries as `Route::RowstorePointLookup` and single-partition mutations as `Route::RowstoreWrite`, while explicitly rejecting unsupported columnar/converting descriptors. Verified in `crates/htap-sql/tests/route.rs`.
+- **Structural rowstore route classifier:** Inspects bound statements and storage descriptors, classifying complete-PK queries as `Route::RowstorePointRead` and single-partition mutations as `Route::RowstoreWrite` across `Row`, `Column`, and `Converting` descriptors, keeping the rowstore authoritative across all conversion states. Verified in `crates/htap-sql/tests/route.rs` and `crates/htap-server/tests/local_server.rs`.
 - **Durable catalog with reopen recovery:** `LocalCatalogStore` persists catalog snapshots with atomic file replacement, generation tracking, and crash validation. Verified by catalog recovery tests in `crates/htap-catalog/tests/catalog_recovery.rs`.
 - **Synchronous `LocalServer` execution façade:** Direct in-process engine façade binding the catalog, `htap-txn` transaction manager, and `htap-rowstore` LSM engine. Supports `CREATE TABLE` (with deterministic one-partition row topology), literal `INSERT`, primary-key `DELETE`, and complete-PK `SELECT` with recovery and version progression across reopen. Verified in `crates/htap-server/tests/local_server.rs`.
+
+### Client / Server Boundary and Error Categorization
+
+`EmbeddedClient` (`htap-client`) wraps `LocalServer` (`htap-server`) synchronously within the host process, with no intermediate RPC, serialization, or daemon layer. Execution maps strictly to stable `HtapError` categories verified by integration tests (`crates/htap-client/tests/embedded_client.rs`):
+
+| Failure / Execution Scenario | Example Statement | Error Category / Result |
+| ---------------------------- | ----------------- | ----------------------- |
+| Syntax parse error | `NOT A VALID SQL STATEMENT;` | `HtapError::InvalidArgument` |
+| Empty or whitespace SQL | `   ;  ` | `HtapError::InvalidArgument` |
+| Duplicate table creation | `CREATE TABLE products (id BIGINT PRIMARY KEY, name VARCHAR, price INT);` | `HtapError::Conflict` |
+| Missing / nonexistent table | `SELECT * FROM nonexistent_table WHERE id = 1;` | `HtapError::NotFound` |
+| Full table scan without complete PK | `SELECT * FROM products;` | `HtapError::InvalidArgument` |
+| Unsupported DML operation | `UPDATE products SET price = 99 WHERE id = 1;` | `HtapError::Unsupported` |
+| Unsupported query modifiers | `SELECT name FROM products WHERE id = 1 ORDER BY price;` | `HtapError::Unsupported` |
+| Unsupported query clauses | `SELECT name FROM products WHERE id = 1 GROUP BY name;` | `HtapError::Unsupported` |
+| Concurrent process root access | Opening an already locked storage root or symlink alias | `HtapError::Conflict` |
+| Absent primary key lookup | `SELECT name, age FROM users WHERE id = 9999;` | Returns empty `QueryResult` (`qr.is_empty() == true`, `qr.num_rows() == 0`, column metadata preserved) |
+
+### Subsystem Decoupling: Converter and Coordinator Not Created by LocalServer or EmbeddedClient
+
+Neither `LocalServer::open` nor `EmbeddedClient::open` creates, configures, or supervises `LocalConverter` (`crates/htap-convert`) or `LocalCoordinator` (`crates/htap-coord`):
+- `LocalServer` initializes only the local catalog store (`LocalCatalogStore`), rowstore engine (`htap_rowstore::Engine`), transaction manager (`TransactionManager`), and data mover (`LocalDataMover`).
+- `LocalConverter` is a standalone partition-scoped conversion engine used for transcoding rowstore tables into columnar segments and advancing catalog cutover state machines.
+- `LocalCoordinator` is an independent cluster coordination and placement engine managing node registration, leadership leases, and monotonic fencing tokens at `<coord_root>/COORDINATOR`.
+Workflows requiring format conversion or coordinator-fenced catalog CAS instantiate `LocalConverter` or `LocalCoordinator` explicitly outside the server façade.
+
+### Documentation Mermaid Convention
+
+All architectural call flows, DML transaction sequences, and initialization state machines in documentation follow standard GitHub-compatible Mermaid `flowchart` and `sequenceDiagram` syntax without unsupported extensions.
 
 ### Explicitly deferred features (No network/MySQL daemon/auth/security boundary/full SQL analytics)
 
@@ -150,7 +179,7 @@ The Phase 3 implementation delivers a verified, crash-safe narrow local SQL slic
 - **Sessions and explicit transaction control:** No interactive session management or multi-statement transactions (`BEGIN`, `COMMIT`, `ROLLBACK`). Every statement is executed as an autonomous synchronous operation.
 - **Extended DML and DDL:** Non-PK mutations and schema alterations (`UPDATE`, `ALTER TABLE`, `DROP TABLE`) are deferred.
 - **Analytical queries and SQL breadth (R4):** Full SQL breadth is not complete. Table scans, vectorized filter pushdown from SQL, aggregations (`GROUP BY`, `COUNT`, `SUM`), hash joins, common table expressions (`WITH` / CTEs), window functions (`OVER`), subqueries, and cost-based query optimization are deferred.
-- **Columnstore SQL execution:** `htap-colstore` vectorized scans are not yet wired to the SQL execution layer; queries targeting columnstore or converting tables are rejected at route classification.
+- **Columnstore SQL execution:** `htap-colstore` vectorized scans are not yet wired to the SQL execution layer; queries attempting full table scans or analytical scans targeting any table (Row, Column, or Converting) are rejected at semantic binding or route classification with `InvalidArgument` or `Unsupported`.
 - **Multi-partition and distributed routing:** LocalServer supports only the local single-partition row topology. Partition pruning, distributed fanout, cross-node coordination, and scatter-gather execution are deferred.
 - **Broad MySQL compatibility:** Broad MySQL syntax, built-in functions, variable setting, system tables, and loose type coercions are deliberately unsupported.
 
@@ -185,7 +214,7 @@ The Phase 4 implementation delivers an incrementally verified local single-table
 
 The Phase 5 implementation delivers single-node tablet clone, verify, repair, CSV/JSONL import/export, durable job tracking, and `LocalServer` integration. Hardening unit H5/M2 (`b7ff200`) added strict persistence boundaries:
 
-- **H5/M2 fixed (`b7ff200`):** Shared bounded exact-file reader (`read_exact_bounded`) enforces size limits on all owned state files (`CATALOG`, `COORDINATOR`, `jobs.json`, tablet manifests, `MANIFEST`, `VISIBLE`, `txn.journal`). Internal movement job IDs, package IDs, and conversion segment paths are strictly validated against traversal and injection attacks.
+- **H5/M2 fixed (`b7ff200`):** Shared bounded exact-file reader (`read_exact_bounded`) enforces size limits on all owned state files (`CATALOG`, `COORDINATOR`, `movement/jobs/<job-id>/JOB`, tablet manifests, `MANIFEST`, `VISIBLE`, `txn.journal`). Internal movement job IDs, tablet paths, and conversion segment paths are strictly validated against traversal and injection attacks.
 - **External CopyOptions paths remain caller-controlled by design:** While internal persistence files and paths are bounded and validated, external filesystem paths supplied via `CopyOptions` (e.g. CSV/JSONL import sources and export destinations) are caller-controlled by design.
 - **Whole-dataset materialization in export and clone:** CSV/JSONL export and tablet snapshot cloning materialize whole datasets in intermediate buffers/files rather than streaming records.
 - **Deferred features:** Distributed multi-node coordinated migrations, background replication streams, and cross-partition movement remain deferred.

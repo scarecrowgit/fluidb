@@ -76,7 +76,7 @@ The following critical and high-severity architectural issues have been verified
   - `crates/htap-rowstore/src/manifest.rs`, `crates/htap-rowstore/src/engine.rs`
   - `crates/htap-txn/src/journal.rs`
 - **Scenario:**
-  Persistence envelopes (`CATALOG`, `COORDINATOR`, `jobs.json`, tablet manifests, `MANIFEST`, `VISIBLE`, `txn.journal`) used unbounded file reads, exposing the engine to memory exhaustion attacks from maliciously enlarged or corrupted files. Internal movement job IDs, package IDs, and conversion segment paths lacked strict validation.
+  Persistence envelopes (`CATALOG`, `COORDINATOR`, `jobs.json` (historical pre-hardening finding; current layout uses `movement/jobs/<job-id>/JOB`), tablet manifests, `MANIFEST`, `VISIBLE`, `txn.journal`) used unbounded file reads, exposing the engine to memory exhaustion attacks from maliciously enlarged or corrupted files. Internal movement job IDs, package IDs, and conversion segment paths lacked strict validation.
 - **Resolution:**
   Added a shared metadata-bounded exact-file reader (`read_exact_bounded`) enforcing explicit size caps on all owned persistence envelopes before memory allocation, rejecting oversized, truncated, trailing, or growth-raced files. Bounded the transaction journal total size and stream frame validation with fixed probe buffers. Validated internal movement job/package IDs and conversion segment relative paths. (External `CopyOptions` paths remain caller-controlled by design.)
 

@@ -20,8 +20,75 @@ This project is delivered as a verified in-process local library and test suite.
 - **No MySQL wire server or client compatibility:** There is no MySQL binary wire protocol listener, packet framing, handshake protocol, authentication layer, or compatibility with standard MySQL client libraries.
 - **No Docker image or Docker Compose deployment:** No `Dockerfile`, `docker-compose.yml`, or container images are provided or required. All execution is local and filesystem-based.
 - **No network endpoint:** There are no network listeners, TCP/IP sockets, Unix domain sockets, or HTTP/gRPC endpoints.
+- **No interactive sessions or session state:** Each statement executes independently without connection-level state, session variables, or transaction handles.
+- **No prepared statements:** Statements are parsed, validated, and planned synchronously on every execution call without prepared statement handles or binary parameter binding.
 - **No TPC-C or TPC-H compliance:** The system does not implement the TPC-C or TPC-H benchmark specifications, relational transaction models, or analytical query profiles. Microbenchmarks evaluate isolated internal subsystem performance only.
 - **Exclusive Process Ownership (No Concurrent Multiprocess Operation):** `LocalServer` and `LocalCoordinator` enforce exclusive ownership of their root directory using an OS-level advisory lock (`<root>/LOCK` via `flock`). Concurrent access or duplicate opens by multiple processes against the same root directory (or its symlink aliases) are strictly rejected with `HtapError::Conflict`. This is single-process exclusive ownership, not concurrent shared-root operation; concurrent multiprocess writers are not supported. Low-level standalone subsystem instances (`htap_rowstore::Engine::open`, `htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) do not acquire this lock and remain unsafe for concurrent shared-root use.
+
+---
+
+## Embedded Client API & Usage
+
+The `htap-client` crate provides [`EmbeddedClient`], an ergonomic synchronous in-process façade over `LocalServer`:
+
+- **`EmbeddedClient::open(root)`:** Opens or recovers the local database rooted at `root`, acquiring `<root>/LOCK`, loading catalog metadata, recovering committed rowstore transactions, and initializing data movement.
+- **`client.execute(sql)`:** Synchronously executes a single SQL statement against the embedded engine, returning a [`StatementResult`].
+- **Re-exported Result Types:**
+  - [`StatementResult`]: `StatementResult::Command(CommandResult)` or `StatementResult::Query(QueryResult)`.
+  - [`CommandResult`]: `CommandResult::Ddl { affected }` for schema changes, or `CommandResult::Dml { affected, version }` with the optional committed MVCC [`Version`] (`Option<Version>`).
+  - [`QueryResult`]: Tabular point lookup result providing column definitions via `qr.columns()` and data rows via `qr.rows()`, `qr.num_rows()`, and `qr.is_empty()`.
+
+### Rust Usage Example
+
+The following example demonstrates the complete embedded workflow without any external daemon or network dependency:
+
+```rust
+use htap_client::{CommandResult, EmbeddedClient, QueryResult, StatementResult};
+use htap_common::Result;
+
+fn main() -> Result<()> {
+    // 1. Open or recover the embedded engine at a local filesystem directory
+    let client = EmbeddedClient::open("/tmp/htap_demo")?;
+
+    // 2. CREATE TABLE (DDL)
+    let ddl_res = client.execute(
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, age INT);"
+    )?;
+    assert_eq!(ddl_res, StatementResult::Command(CommandResult::Ddl { affected: 1 }));
+
+    // 3. Literal INSERT (DML) - single or multi-row
+    let insert_res = client.execute(
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30), (2, 'Bob', 25);"
+    )?;
+    match insert_res {
+        StatementResult::Command(CommandResult::Dml { affected, version }) => {
+            println!("Inserted {affected} rows at MVCC version {version:?}");
+        }
+        _ => unreachable!(),
+    }
+
+    // 4. Complete-PK SELECT (Point Query)
+    let select_res = client.execute(
+        "SELECT name, age FROM users WHERE id = 1;"
+    )?;
+    if let StatementResult::Query(qr) = select_res {
+        println!("Found {} row(s):", qr.num_rows());
+        for row in qr.rows() {
+            println!("  name = {:?}, age = {:?}", row.get(0), row.get(1));
+        }
+    }
+
+    // 5. Complete-PK DELETE (Point DML)
+    let delete_res = client.execute(
+        "DELETE FROM users WHERE id = 1;"
+    )?;
+    if let StatementResult::Command(cmd) = delete_res {
+        println!("Deleted {} row(s) at version {:?}", cmd.affected(), cmd.version());
+    }
+
+    Ok(())
+}
+```
 
 ---
 

@@ -39,44 +39,73 @@ The following operational facilities and production features are **explicitly no
 
 ---
 
-## 3. LocalServer Filesystem Layout
+## 3. LocalServer Filesystem Layout & Initialization Flow
 
-When a `LocalServer` is opened at a specified `root` directory (`LocalServer::open(root)`), it manages four dedicated sub-paths and an advisory lock:
+### Initialization Flow (`LocalServer::open`)
+
+When opening or recovering a database instance at a given `root` path, `LocalServer::open(root)` executes an ordered, crash-safe sequence:
+
+```mermaid
+flowchart TD
+    Start["LocalServer::open(root)"] --> Mkdir["Create root directory if missing<br/>std::fs::create_dir_all(&amp;root)"]
+    Mkdir --> Canon["Canonicalize root path<br/>root.canonicalize()"]
+    Canon --> Lock["Acquire ProcessLock on &lt;canonical_root&gt;/LOCK<br/>(OS flock exclusive, non-blocking)"]
+    Lock --> Catalog["Open LocalCatalogStore at &lt;canonical_root&gt;/catalog<br/>catalog/{CATALOG, CATALOG.tmp}"]
+    Catalog --> Rowstore["Open Rowstore Engine at &lt;canonical_root&gt;/rowstore<br/>wal/{20-digit}.wal, sst/{id}.sst, MANIFEST, VISIBLE"]
+    Rowstore --> TxnJourn["Open TransactionManager at &lt;canonical_root&gt;/txn.journal"]
+    TxnJourn --> Part1["Register RowstoreParticipant<br/>(ParticipantId(1) wrapping Engine)"]
+    Part1 --> Recov["Recover TransactionManager<br/>txn_manager.recover() (replay journal & complete commits)"]
+    Recov --> Move["Initialize LocalDataMover at &lt;canonical_root&gt;/movement<br/>movement/jobs, movement/tablets"]
+    Move --> Ready["Return ready LocalServer instance"]
+```
+
+### Filesystem Layout
+
+`LocalServer` manages four dedicated sub-paths and an advisory lock file under the canonical root directory:
 
 ```text
 <root>/
-├── LOCK                    # Exclusive process advisory lock and diagnostic PID/start-time (1083fbd)
+├── LOCK                                      # Exclusive process advisory lock and diagnostic PID/start-time (1083fbd)
 ├── catalog/
-│   ├── CATALOG             # Durable catalog snapshot state (bounded envelope b7ff200)
-│   └── CATALOG.tmp         # Staging file for atomic replacement
+│   ├── CATALOG                               # Durable catalog snapshot state (bounded envelope b7ff200)
+│   └── CATALOG.tmp                           # Staging file for atomic replacement
 ├── rowstore/
-│   ├── wal-*.log           # Framed write-ahead log segments (CRC32C protected)
-│   ├── sst-*.sst           # Immutable Sorted String Tables (blocks, bloom filter, CRC32C)
-│   ├── MANIFEST            # MANIFEST v2 with external apply ledger (f7a4975, b7ff200)
-│   └── VISIBLE             # Monotonically increasing visible version watermark (b7ff200)
-├── txn.journal             # 2PC transaction manager write-ahead log (irrevocable 88cc314, bounded b7ff200)
+│   ├── wal/
+│   │   └── {20-digit}.wal                    # Framed write-ahead log segments (e.g. 00000000000000000001.wal, CRC32C)
+│   ├── sst/
+│   │   └── {id}.sst                          # Immutable Sorted String Tables (blocks, bloom filter, CRC32C)
+│   ├── MANIFEST                              # MANIFEST v2 with external apply ledger (f7a4975, b7ff200)
+│   └── VISIBLE                               # Monotonically increasing visible version watermark (b7ff200)
+├── txn.journal                               # 2PC transaction manager write-ahead log (irrevocable 88cc314, bounded b7ff200)
 └── movement/
-    ├── jobs.json           # Durable job tracking file (HTAPJOB1 envelope, bounded b7ff200)
-    └── packages/           # Transient staging and tablet package clone archives (HTAPMNF1)
+    ├── jobs/
+    │   └── <job-id>/
+    │       ├── JOB                           # Durable movement job envelope (HTAPJOB1, bounded b7ff200)
+    │       └── JOB.tmp                       # Staging file for atomic job envelope replacement
+    └── tablets/
+        └── <source>/<target>/<job>/
+            ├── MANIFEST                      # Tablet package manifest envelope (HTAPMNF1, CRC32C)
+            └── DATA                          # Tablet snapshot rowstore data
 ```
 
 ### Component Details
 
 0. **`LOCK` (`ProcessLock` — `1083fbd`):**
-   - Non-blocking exclusive advisory lock (`flock`) acquired during `LocalServer::open(root)`.
-   - Protects the server root against concurrent access from multiple processes or symlink aliases.
-   - Bounded to one-owner multiprocess-exclusive mode; does not permit concurrent shared-root writers.
+   - **Lock Lifetime:** Acquired during `LocalServer::open(root)` (and `LocalCoordinator::open`) and held continuously by the `ProcessLock` instance for the lifetime of the server. Dropping the server instance releases the OS-level file lock (`flock unlock`).
+   - **Contention Behavior:** The lock is acquired non-blockingly (`try_lock_exclusive`). If another process or thread holds an exclusive lock on the file, `open` fails immediately with `HtapError::Conflict`. The error message includes diagnostic metadata read from `<root>/LOCK` (`pid=<pid>;start_time=<epoch_secs>`).
+   - **Symlink Aliases:** `ProcessLock::acquire` operates on the canonicalized root path (`root.canonicalize()`). Accessing the same root via symlink aliases resolves to the exact same physical lock file, preventing multi-process lock bypass.
+   - **Low-Level Subsystem APIs Do Not Lock:** Standalone subsystem instances (`htap_rowstore::Engine::open`, `htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) do **not** acquire `<root>/LOCK`. They remain unsafe for direct concurrent shared-root use.
 
 1. **`catalog/` (`LocalCatalogStore` — `b7ff200`):**
    - Tracks table definitions, schema, partition descriptors, tablets, and replica topologies.
    - Enforces optimistic concurrency control using integer generations (`compare_and_set`).
-   - Mutations stage to `CATALOG.tmp`, call `sync_all()`, and atomically rename to `CATALOG`, followed by directory `sync_all()`. Read via bounded exact reader.
+   - Mutations stage to `catalog/CATALOG.tmp`, call `sync_all()`, and atomically rename to `catalog/CATALOG`, followed by directory `sync_all()`. Read via bounded exact reader.
 
 2. **`rowstore/` (`htap_rowstore::Engine` — `f7a4975`, `c5ee281`, `b7ff200`):**
-   - **`wal-*.log`:** Write-ahead log files recording transactional row mutations (`Put` and `Delete`). Each entry is framed with magic, length, sequence, payload, and CRC32C checksum.
-   - **`sst-*.sst`:** Immutable SST files containing ordered key-value pairs organized into indexed blocks with Bloom filters.
-   - **`MANIFEST`:** Manifest v2 format storing active SST sets and an external transaction apply ledger (`f7a4975`). Bounded read protects against allocation attacks (`b7ff200`). Prevents identity replay across WAL GC. Note: hard cap of 16,384 entries without compaction.
-   - **`VISIBLE`:** Tracks the monotonically advanced `visible_version`. Records applied but uncommitted/unpublished remain invisible across crashes until published. Post-WAL failures surface as `DurablePending` (`c5ee281`).
+   - **`rowstore/wal/{20-digit}.wal`:** Framed write-ahead log files recording transactional row mutations (`Put` and `Delete`). Files are named using 20-digit zero-padded sequence numbers (e.g. `00000000000000000001.wal`). Each entry is framed with magic, length, sequence, payload, and CRC32C checksum.
+   - **`rowstore/sst/{id}.sst`:** Immutable SST files containing ordered key-value pairs organized into indexed blocks with Bloom filters.
+   - **`rowstore/MANIFEST`:** Manifest v2 format storing active SST sets and an external transaction apply ledger (`f7a4975`). Bounded read protects against allocation attacks (`b7ff200`). Prevents identity replay across WAL GC. Note: hard cap of 16,384 entries without compaction.
+   - **`rowstore/VISIBLE`:** Tracks the monotonically advanced `visible_version`. Records applied but uncommitted/unpublished remain invisible across crashes until published. Post-WAL failures surface as `DurablePending` (`c5ee281`).
 
 3. **`txn.journal` (`htap_txn::TransactionManager` — `88cc314`, `b7ff200`):**
    - 2-Phase Commit (2PC) coordination journal tracking transaction lifecycle: `Prepare`, `Commit`, `Abort`.
@@ -87,8 +116,9 @@ When a `LocalServer` is opened at a specified `root` directory (`LocalServer::op
 
 4. **`movement/` (`htap_movement::LocalDataMover` — `b7ff200`):**
    - Tracks data movement jobs (CSV/JSONL import/export, tablet snapshot migrations).
-   - Job metadata is stored under `jobs.json` protected by the `HTAPJOB1` envelope with bounded reading.
-   - Internal job IDs and package IDs are strictly validated (`b7ff200`). External `CopyOptions` paths remain caller-controlled.
+   - **`movement/jobs/<job-id>/{JOB, JOB.tmp}`:** Individual job metadata envelopes protected by the `HTAPJOB1` envelope with bounded reading and CRC32C verification. Updates use atomic staging (`JOB.tmp` -> `JOB`).
+   - **`movement/tablets/<source>/<target>/<job>/{MANIFEST, DATA}`:** Tablet snapshot clone packages containing manifest envelope (`HTAPMNF1`) and data dump.
+   - Internal job IDs and package paths are strictly validated (`b7ff200`). External `CopyOptions` paths remain caller-controlled.
 
 ---
 
@@ -125,7 +155,7 @@ Because `LocalServer` writes across multiple internal components (`catalog`, `ro
    - Once all locks are released and file handles closed, take a filesystem-level copy (e.g., `tar`, `cp -a`, or filesystem snapshot) of the entire root directory.
 
 2. **Online / Running Backup:**
-   - **Do not** perform arbitrary file-by-file copies of an active server root. Doing so risks capturing torn states between `txn.journal`, `wal-*.log`, and `MANIFEST`.
+   - **Do not** perform arbitrary file-by-file copies of an active server root. Doing so risks capturing torn states between `txn.journal`, `rowstore/wal/{20-digit}.wal`, and `MANIFEST`.
    - If online backup is necessary, rely on filesystem-level point-in-time snapshots (such as ZFS or LVM snapshots) that provide crash-consistent atomic snapshots across the storage volume.
 
 ### Reopen Recovery Guarantees

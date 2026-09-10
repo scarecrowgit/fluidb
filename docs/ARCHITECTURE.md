@@ -35,7 +35,7 @@ with full test coverage in `crates/htap-client/tests/embedded_client.rs`. Root `
 and `docs/OPERATIONS.md` define the operational model, and `ci.sh` runs `cargo bench --workspace --no-run`.
 Later components described below remain `planned` or `in progress` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
-ZooKeeper backend, watches/locks/KV semantics, distributed consensus, cross-process exclusion,
+ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
 remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
 reverse `Column -> Row` conversion, delete vectors, physical rowstore reclamation, compaction,
 SQL analytical scans, multi-partition routing, MySQL wire protocol/`htapd` daemon,
@@ -45,6 +45,10 @@ See [`PROGRESS.md`](./PROGRESS.md).
 ---
 
 ## Component diagram
+
+### Target / Planned Architecture Diagram (Qualified Intended State)
+
+The following ASCII diagram illustrates the planned multi-node target architecture, including the planned `htapd` daemon listener and planned DataFusion OLAP execution engine. These components are explicitly deferred or planned and are not part of the active SQL execution path in the current local MVP.
 
 ```text
                         +---------------------------+
@@ -110,6 +114,89 @@ See [`PROGRESS.md`](./PROGRESS.md).
    +---------------------------------------------------------------+
 ```
 
+### Current In-Process Execution Call Flow (Implemented Local Slice)
+
+In the implemented local slice, all SQL execution is synchronous and in-process. `EmbeddedClient` forwards calls directly to `LocalServer`, which acquires its execution lock, parses and binds the statement against the durable catalog, classifies the route, and delegates directly to the appropriate storage or transaction subsystem:
+
+```mermaid
+flowchart TD
+    subgraph CurrentDirectCalls ["Direct Current In-Process Execution"]
+        EC["EmbeddedClient.execute(sql)"] --> LS["LocalServer.execute(sql)"]
+        LS --> Lock["Acquire execution_lock<br/>(parking_lot::Mutex)"]
+        Lock --> SQL["htap_sql::parse_one(sql)<br/>htap_catalog::LocalCatalogStore.load()<br/>htap_sql::bind(stmt, snapshot)"]
+        SQL --> Route["htap_sql::classify_route(bound, storage)"]
+
+        Route -->|Route::CatalogDdl<br/>(CREATE TABLE)| DDL["DDL Catalog CAS<br/>LocalCatalogStore.compare_and_set"]
+        Route -->|Route::RowstoreWrite<br/>(INSERT / DELETE)| DML["TransactionManager.commit_request<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
+        Route -->|Route::RowstorePointRead<br/>(complete-PK SELECT)| PointRead["Snapshot(visible_version)<br/>htap_rowstore::Engine.get(key)"]
+    end
+
+    subgraph PlannedDeferred ["Planned / Deferred Components (Not in Direct SQL Path)"]
+        Daemon["htapd daemon / MySQL wire listener"] -.->|planned| LS
+        DataFusion["DataFusion vectorized scan engine"] -.->|planned| ColEngine["htap-colstore scans"]
+    end
+```
+
+### DML Transaction Execution Sequence
+
+Transactional mutations (`INSERT` and `DELETE`) execute through `LocalServer`'s single execution lock, 2PC `TransactionManager` logging, and rowstore participant application, returning the assigned monotonic MVCC version:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Caller as Caller / Host Application
+    participant Client as EmbeddedClient
+    participant Server as LocalServer
+    participant Parser as htap-sql (parse & bind)
+    participant Catalog as LocalCatalogStore
+    participant TxnMgr as TransactionManager
+    participant Journal as txn.journal
+    participant Participant as RowstoreParticipant (ID 1)
+    participant Engine as Rowstore Engine
+
+    Caller->>Client: execute(sql) [INSERT or DELETE]
+    Client->>Server: execute(sql)
+    Note over Server: Acquire execution_lock (Mutex)
+    Server->>Parser: parse_one(sql)
+    Parser-->>Server: AST
+    Server->>Catalog: load()
+    Catalog-->>Server: CatalogSnapshot
+    Server->>Parser: bind(AST, CatalogSnapshot)
+    Parser-->>Server: BoundStatement (Insert / Delete)
+    Server->>Parser: classify_route(BoundStatement, partition.storage)
+    Parser-->>Server: Route::RowstoreWrite
+
+    Server->>TxnMgr: commit_request(TransactionRequest)
+    Note over TxnMgr: Acquire manager lock (serializes commit decision)
+    TxnMgr->>Participant: prepare(snapshot, payload)
+    Participant-->>TxnMgr: Ok
+    TxnMgr->>Journal: Append & fsync INTENT frame
+    TxnMgr->>Journal: Append & fsync COMMIT frame (irrevocable)
+    TxnMgr->>Participant: apply(txn_id, version, payload)
+    Participant->>Engine: apply(mutations) -> write WAL & memtable
+    Engine-->>Participant: Ok
+    Participant-->>TxnMgr: Ok
+    TxnMgr->>Participant: publish(txn_id, version)
+    Participant->>Engine: publish(version)
+    Engine-->>Participant: Ok
+    Participant-->>TxnMgr: Ok
+    TxnMgr->>TxnMgr: Advance visible_version watermark
+    TxnMgr-->>Server: CommittedTransaction { version, ... }
+    Note over Server: Release execution_lock
+    Server-->>Client: StatementResult::dml(affected, Some(version))
+    Client-->>Caller: StatementResult::Command(CommandResult::Dml { affected, version })
+```
+
+---
+
+## Subsystem Boundaries: LocalServer, LocalConverter, and LocalCoordinator
+
+It is important to emphasize that `LocalServer::open` does **not** instantiate or supervise `LocalConverter` (`crates/htap-convert`) or `LocalCoordinator` (`crates/htap-coord`):
+- `LocalServer` integrates only `LocalCatalogStore`, `htap_rowstore::Engine`, `TransactionManager` (with a single registered `RowstoreParticipant`), and `LocalDataMover`.
+- `LocalConverter` is a partition-scoped conversion state machine that runs independently to transcode rowstore data into columnar segments (`htap-colstore`) and advance catalog metadata via CAS.
+- `LocalCoordinator` is an independent cluster coordination and placement engine persisting its own state envelope at `<coord_root>/COORDINATOR` (`HTAPCRD1`).
+Neither converter background workers nor coordinator lease managers are created or managed by `LocalServer` or `EmbeddedClient`. They are standalone crate capabilities used directly in migration or coordination tasks.
+
 ---
 
 ## Process and role model
@@ -121,12 +208,12 @@ The system architecture envisions a future **single binary, `htapd`** (planned),
 - the **frontend role** — SQL surface, catalog, planner, transaction
   coordinator;
 - the **backend role** — storage, execution, compaction;
-- **both roles in one process**, which is the mode used for single-node
-  development and for the README demo.
+- **both roles in one process**, planned for single-node development and deployments.
 
 For the completed narrow local slice, `htap-server` provides `LocalServer` and `htap-client` provides `EmbeddedClient`,
 synchronous in-process façades composing the durable catalog (`LocalCatalogStore`),
-`htap-txn` transaction manager, and `htap-rowstore` LSM engine. It directly executes
+`htap-txn` transaction manager, and `htap-rowstore` LSM engine. The current README demo uses the
+`EmbeddedClient -> LocalServer` in-process façade to directly execute
 `CREATE TABLE` (deterministic one-partition row topology), literal `INSERT`, PK `DELETE`,
 and complete-PK `SELECT` with reopen recovery, without networking or wire protocol overhead.
 
@@ -184,16 +271,15 @@ those writes land directly in the authoritative **row store**, which acts as the
 
 **Status: `in progress`** (structural rowstore route classifier implemented for point lookups and DDL/DML; analytical execution and multi-partition routing are planned).
 
-A router inspects the **bound** statement:
+A router inspects the **bound** statement and the partition's **storage descriptor**:
 
-- **Point lookups and short transactions that resolve fully against a primary
-  key** take a dedicated fast path: index probe → row fetch. There is no
-  plan-fragment construction and no vectorized operator pipeline. In the completed
-  Phase 3 local slice, `htap_sql::classify_route` inspects the bound AST and catalog
-  storage descriptor, routing complete-PK point reads strictly to `Route::RowstorePointLookup`
-  and literal mutations to `Route::RowstoreWrite` (verified in `tests/route.rs` / `crates/htap-sql/tests/route.rs`
-  and `crates/htap-server/tests/local_server.rs`).
-- **Everything else** is destined for the vectorized analytical engine (deferred).
+- **Point lookups and short transactions that resolve fully against a primary key** take a dedicated fast path: index probe → row fetch. There is no plan-fragment construction and no vectorized operator pipeline. In the completed Phase 3 local slice, `htap_sql::classify_route` inspects the bound AST and catalog storage descriptor, routing complete-PK point reads strictly to `Route::RowstorePointRead { key }` and literal mutations to `Route::RowstoreWrite` (verified in `tests/route.rs` and `crates/htap-server/tests/local_server.rs`).
+- **Route Acceptance across Storage Formats:** `classify_route` accepts `StorageDescriptor::Row`, `StorageDescriptor::Column`, and `StorageDescriptor::Converting`:
+  - `CREATE TABLE` routes to `Route::CatalogDdl`.
+  - Literal `INSERT` and PK `DELETE` route to `Route::RowstoreWrite` regardless of whether the partition is `Row`, `Column`, or `Converting`, preserving rowstore write-authority and zero mutation downtime.
+  - Complete-PK `SELECT` routes to `Route::RowstorePointRead { key }` across all three storage formats (`Row`, `Column`, `Converting`), serving point reads directly from the authoritative rowstore.
+- **Current SQL-Created Row Topology:** While `classify_route` accepts all three descriptors, tables created via SQL DDL (`CREATE TABLE`) in `LocalServer` are currently initialized exclusively with a single-partition `StorageDescriptor::Row` topology. Setting a partition to `Column` or `Converting` occurs via catalog updates or `LocalConverter` workflows.
+- **No SQL Analytic Scans:** Analytical scans (vectorized column scans over `htap-colstore` segments or planned DataFusion execution) are not linked to the SQL execution façade. Statements requiring full table scans without complete PK equality predicates or specifying unsupported clauses (`ORDER BY`, `GROUP BY`, joins, aggregations, CTEs) are rejected with `HtapError::InvalidArgument` or `HtapError::Unsupported`.
 
 This separation is enforced **by construction, not by a runtime heuristic**:
 the OLTP fast path lives in a crate that has no dependency on the analytical
@@ -335,15 +421,15 @@ Key operational guarantees:
 
 | Backend | Status | Purpose |
 | ------- | ------ | ------- |
-| Local single-node (`LocalCoordinator`) | `implemented (local MVP)` | Single-node durable coordinator with `HTAPCRD1` envelopes, intra-process mutex serialization, and fenced catalog CAS. |
+| Local single-node (`LocalCoordinator`) | `implemented (local MVP)` | Single-node durable coordinator with `HTAPCRD1` envelopes, one-owner OS advisory `ProcessLock`, and fenced catalog CAS. |
 | Embedded Raft (`openraft`) | `planned` | Distributed consensus default for multi-node deployments. |
 | ZooKeeper | `planned` | Integration with existing external ensembles. |
 
 ### Architectural boundaries and explicitly deferred capabilities
 
 - **Direct CatalogStore CAS and movement repair bypass fence:** Direct calls to `CatalogStore::compare_and_set` and older movement repair APIs (`htap_movement::repair_replica`) operate directly against catalog storage without coordinator fence validation. Fencing is strictly enforced when mutations route through `fenced_catalog_compare_and_set` or `activate_placement_addition`.
-- **No cross-process concurrency exclusion:** `LocalCoordinator` serializes state internally with an intra-process mutex (`parking_lot::Mutex`). Multi-process concurrent access to the same coordinator root directory is unsupported and lacks OS-level or distributed locking.
-- **No distributed consensus:** Neither Raft (`openraft`) nor ZooKeeper backends are implemented. Consensus is single-node local only.
+- **One-owner OS advisory ProcessLock:** `LocalCoordinator`'s root has a one-owner OS advisory `ProcessLock` (`<root>/LOCK` via `flock`), rejecting concurrent process opens with `HtapError::Conflict`; distributed consensus and concurrent multi-node coordination remain unsupported.
+- **No distributed consensus:** Neither Raft (`openraft`) nor ZooKeeper backends are implemented. Coordination is single-node local only.
 - **No watches, distributed locks, or KV store semantics:** The `Coordinator` trait focuses on membership, scoped leadership, and catalog CAS gating. General-purpose KV storage, ephemeral path watches, and lock lease expirations are deferred.
 - **No remote physical movement or network transport:** Tablet movement and placement activation execute locally using `htap_movement::LocalDataMover`, local filesystem paths, and local rowstore engine snapshots.
 - **No leader handoff, ongoing replication, capacity/rack placement, or live rebalance:** Leadership turnover immediately revokes previous tokens but executes no consensus handoff protocol; replication uses static snapshot clone packages rather than ongoing log replication; dynamic placement does not rebalance live clusters or consider rack topology or storage capacity.
