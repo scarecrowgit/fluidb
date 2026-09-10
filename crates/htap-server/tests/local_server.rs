@@ -2,7 +2,7 @@
 
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
-use htap_catalog::{StorageDescriptor, StorageFormat};
+use htap_catalog::{ConversionDescriptor, ConversionPhase, StorageDescriptor, StorageFormat};
 use htap_common::types::{DataType, Value};
 use htap_common::version::Version;
 use htap_common::HtapError;
@@ -396,7 +396,7 @@ fn test_reopen_data_and_next_version() {
 }
 
 #[test]
-fn test_unsupported_storage_descriptors() {
+fn test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point() {
     let dir = TempDir::new().unwrap();
     let server = LocalServer::open(dir.path()).unwrap();
 
@@ -411,46 +411,106 @@ fn test_unsupported_storage_descriptors() {
     snap.generation += 1;
     catalog_store.compare_and_set(1, snap).unwrap();
 
-    // INSERT against Column partition must return Unsupported
-    let err = server
+    // INSERT against Column partition succeeds (rowstore authoritative)
+    let ins1 = server
         .execute("INSERT INTO c_table (id, val) VALUES (1, 'a');")
-        .unwrap_err();
-    assert!(matches!(err, HtapError::Unsupported(_)));
+        .unwrap();
+    assert_eq!(ins1, StatementResult::dml(1, Some(Version::new(2))));
 
-    // SELECT against Column partition must return Unsupported
-    let err = server
+    // SELECT point read against Column partition succeeds
+    let sel1 = server
         .execute("SELECT val FROM c_table WHERE id = 1;")
-        .unwrap_err();
-    assert!(matches!(err, HtapError::Unsupported(_)));
+        .unwrap();
+    match sel1 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("a".into())));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
 
-    // DELETE against Column partition must return Unsupported
-    let err = server
-        .execute("DELETE FROM c_table WHERE id = 1;")
-        .unwrap_err();
-    assert!(matches!(err, HtapError::Unsupported(_)));
+    // DELETE against Column partition succeeds
+    let del1 = server.execute("DELETE FROM c_table WHERE id = 1;").unwrap();
+    assert_eq!(del1, StatementResult::dml(1, Some(Version::new(3))));
 
-    // Modify to Converting storage
+    // Verify deleted
+    let absent1 = server
+        .execute("SELECT val FROM c_table WHERE id = 1;")
+        .unwrap();
+    match absent1 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 0);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // Unsupported non-point statements remain rejected under Column
+    let err_scan = server.execute("SELECT val FROM c_table;").unwrap_err();
+    assert!(matches!(err_scan, HtapError::InvalidArgument(_)));
+
+    let err_unsupported = server
+        .execute("SELECT val FROM c_table WHERE id = 1 ORDER BY val;")
+        .unwrap_err();
+    assert!(matches!(err_unsupported, HtapError::Unsupported(_)));
+
+    // Modify to Converting storage with valid conversion metadata
     let mut snap2 = catalog_store.load().unwrap().unwrap();
+    let conv_gen = snap2.generation + 1;
+    snap2.generation = conv_gen;
+    snap2.partitions[0].generation = conv_gen;
     snap2.partitions[0].storage = StorageDescriptor::Converting {
         from: StorageFormat::Row,
         to: StorageFormat::Column,
-        generation: snap2.generation + 1,
+        generation: conv_gen,
     };
-    snap2.generation += 1;
+    snap2.partitions[0].conversion = Some(ConversionDescriptor::new(
+        conv_gen,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(3),
+        ConversionPhase::SnapshotPinned,
+    ));
     catalog_store.compare_and_set(2, snap2).unwrap();
 
-    let err = server
+    // INSERT against Converting partition succeeds (rowstore authoritative)
+    let ins2 = server
         .execute("INSERT INTO c_table (id, val) VALUES (2, 'b');")
-        .unwrap_err();
-    assert!(matches!(err, HtapError::Unsupported(_)));
+        .unwrap();
+    assert_eq!(ins2, StatementResult::dml(1, Some(Version::new(4))));
 
-    let err = server
+    // SELECT point read against Converting partition succeeds
+    let sel2 = server
         .execute("SELECT val FROM c_table WHERE id = 2;")
-        .unwrap_err();
-    assert!(matches!(err, HtapError::Unsupported(_)));
+        .unwrap();
+    match sel2 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("b".into())));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
 
-    let err = server
-        .execute("DELETE FROM c_table WHERE id = 2;")
+    // DELETE against Converting partition succeeds
+    let del2 = server.execute("DELETE FROM c_table WHERE id = 2;").unwrap();
+    assert_eq!(del2, StatementResult::dml(1, Some(Version::new(5))));
+
+    // Verify deleted
+    let absent2 = server
+        .execute("SELECT val FROM c_table WHERE id = 2;")
+        .unwrap();
+    match absent2 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 0);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // Unsupported non-point statements remain rejected under Converting
+    let err_scan2 = server.execute("SELECT val FROM c_table;").unwrap_err();
+    assert!(matches!(err_scan2, HtapError::InvalidArgument(_)));
+
+    let err_unsupported2 = server
+        .execute("SELECT val FROM c_table WHERE id = 2 ORDER BY val;")
         .unwrap_err();
-    assert!(matches!(err, HtapError::Unsupported(_)));
+    assert!(matches!(err_unsupported2, HtapError::Unsupported(_)));
 }
