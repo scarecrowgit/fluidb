@@ -1,187 +1,153 @@
 # Production Architecture & Hardening Review
 
 **Date:** 2026-09-10  
-**Status:** Approved Architectural Review & Hardening Record  
+**Status:** Audit & Hardening Record  
 **Target:** Local HTAP Database Engine (`LocalServer` / `LocalCoordinator`)
 
 ---
 
-## 1. Executive Summary & Root Ownership Model
+## 1. Current Status: Hardened Local Embedded MVP
 
-This document records the production review findings (**C1/C2/H1–H5**), verified code paths, failure scenarios, architectural impacts, positive observations, and prioritized engineering roadmap for the HTAP storage engine.
+**This project is a hardened local embedded MVP, not a production-ready database system.**
 
-### Strict Process-Exclusive Root Ownership
+The storage, transaction, and coordination components have undergone focused hardening against concurrency hazards, crash recovery boundaries, transaction commit irrevocability, and persistence bounds. However, **production readiness is not claimed**. The system operates strictly as an in-process embedded library without daemon lifecycle management, client networking, distributed consensus, or power-loss fault verification.
 
-**Only one owner process may open a server or coordinator root.**
+---
 
-The hardening unit implemented on 2026-09-10 enforces **strict single-process exclusive root ownership**:
+## 2. Root Ownership Model
+
+### Exclusive Root Ownership (`1083fbd`)
+
 - `LocalServer::open(root)` and `LocalCoordinator::open(root)` canonicalize the target directory path and acquire an OS-level non-blocking exclusive advisory lock (`flock`) on `<root>/LOCK`.
 - Any subsequent attempt by another operating system process (or redundant instance within the same process) to open the same root directory—or any symlink alias resolving to it—is immediately rejected with `HtapError::Conflict`.
 - Contention errors include diagnostic metadata (lock-holding PID and start timestamp), but the held OS file lock is the authoritative source of ownership.
-- **Scope Boundary:** This mechanism provides **exclusive process ownership**, *not* concurrent shared-root operation. Concurrent multiprocess writers or readers against a shared directory root remain strictly unsupported and unsafe. Low-level standalone subsystem instances (`Engine`, `CatalogStore`, `LocalDataMover`) opened directly outside `LocalServer` do not acquire the root lock and must not be used concurrently on shared storage roots.
+- **Scope Boundary:** This mechanism provides **one-owner multiprocess-exclusive mode, not concurrent shared-root writers**. Concurrent multiprocess writers or readers against a shared directory root remain strictly unsupported and unsafe. Low-level standalone subsystem instances (`Engine`, `CatalogStore`, `LocalDataMover`) opened directly outside `LocalServer` do not acquire the root lock and must not be used concurrently on shared storage roots.
 
 ---
 
-## 2. Positive Observations & Architectural Strengths
+## 3. Completed Hardening Units (Fixed Findings)
 
-A thorough audit of the codebase revealed key architectural strengths and resilient implementations:
+The following critical and high-severity architectural issues have been verified and resolved:
 
-1. **Strict Memory Safety:** All workspace crates enforce `#![forbid(unsafe_code)]`. Advisory locking via `fs2` is encapsulated entirely within safe Rust abstractions (`ProcessLock`).
-2. **Crash-Resilient Atomic Envelope Staging:** Persistent state files (`CATALOG`, `COORDINATOR`, `jobs.json`, tablet columnar manifests) use an atomic two-phase write protocol:
-   $$\text{write to } .tmp \longrightarrow \text{fsync file} \longrightarrow \text{atomic rename} \longrightarrow \text{fsync parent directory}$$
-3. **Framed Envelopes with CRC32C Integrity:** Binary envelopes (`HTAPCRD1`, `HTAPJOB1`, `HTAPMNF1`) enforce fixed magic headers, version checks, strict payload length bounds (guarding against unbounded memory allocations), and CRC32C payload checksum validation.
-4. **WAL Torn-Tail Truncation:** The LSM write-ahead log cleanly identifies and truncates uncommitted torn tails at power-loss boundaries without corrupting previously committed transaction frames.
-5. **Two-Phase Commit Recovery:** The transaction manager (`htap-txn`) coordinates multi-participant 2PC with durable intent and commit markers, verifying participant reconciliation and crash recovery replay.
-6. **Deterministic Query Pruning:** The columnar scan engine (`htap-colstore`) utilizes typed zone-map metadata (min/max/nullability) to prune non-matching data blocks with $\ge 90\%$ skip efficiency.
+### C1 — WAL-GC Transaction Identity Replay (Fixed: `f7a4975`)
+- **Verified Code Paths:**
+  - `crates/htap-rowstore/src/manifest.rs` (`ManifestCodec`, `ExternalLedgerEntry`)
+  - `crates/htap-rowstore/src/engine.rs` (`Engine::open`, `apply_prepared_locked`)
+  - `crates/htap-rowstore/tests/external_ledger.rs`
+- **Scenario:**
+  WAL prefix garbage collection pruned older WAL segments that recorded external transaction identities. Upon restart or retry, the engine could not determine if an external transaction ID had already been applied, risking duplicate execution or conflicting identity reuse.
+- **Resolution:**
+  Upgraded rowstore `MANIFEST` to v2, introducing a bounded, no-eviction external apply ledger mapping external transaction IDs to applied versions while preserving backward decode compatibility for v1 manifests. The ledger is restored prior to WAL replay, rejects conflicting identities, and ensures exact external replays remain idempotent across WAL GC prefix pruning. Manifest updates publish atomically alongside SST updates before checkpoint advance.
 
----
+### C2 — Durable Commit Reversibility (Fixed: `88cc314`)
+- **Verified Code Paths:**
+  - `crates/htap-txn/src/manager.rs` (`TransactionManager::commit`, `recover`)
+  - `crates/htap-txn/src/journal.rs` (`Journal::append_commit`)
+  - `crates/htap-txn/tests/journal.rs`, `crates/htap-txn/tests/rowstore_adapter.rs`
+- **Scenario:**
+  A failure occurring after a transaction commit record was durably written and fsynced to `txn.journal` (such as during post-decision participant apply, publication, or secondary sync) could cause the transaction manager to return an error resembling an abort or leave uncommitted state, violating commit durability and irrevocability.
+- **Resolution:**
+  Transaction decisions are strictly irrevocable once the commit record is synced to `txn.journal`. Abort requests for committed transactions are rejected; journal logs containing commit followed by abort are treated as corruption. Post-decision failures return a structured `DurablePending` outcome rather than rolling back, and recovery deterministically drives durable commits to completion.
 
-## 3. Production Review Findings
+### H1 — Manager Decision Serialization (Fixed: `88cc314`)
+- **Verified Code Paths:**
+  - `crates/htap-txn/src/manager.rs` (`TransactionManager`)
+  - `crates/htap-txn/tests/journal.rs`, `crates/htap-txn/tests/rowstore_adapter.rs`
+- **Scenario:**
+  Concurrent transaction requests could race through prepare, intent logging, version assignment, commit logging, participant application, and publication, creating interleaved states or out-of-order publication.
+- **Resolution:**
+  Enforced manager-wide decision serialization using a unified lock across prepare, intent, version allocation, commit sync, participant apply, publication, and recovery replay.
 
-### C1 — Uncoordinated Concurrent Multi-Process Root Access (Critical)
+### H2 — Engine Post-WAL Failures Surface as DurablePending with Retry/Recovery (Fixed: `c5ee281`)
+- **Verified Code Paths:**
+  - `crates/htap-rowstore/src/engine.rs` (`Engine::apply_prepared_locked`, `Engine::flush_frozen_memtable`)
+  - `crates/htap-rowstore/tests/durable_completion.rs`
+  - `crates/htap-txn/tests/rowstore_adapter.rs`
+- **Scenario:**
+  When `Engine::apply_prepared` succeeded in appending and syncing a WAL commit but failed during subsequent active memtable insertion, automatic SST flush, or visible marker update, the engine surfaced errors that risked discarding committed data or stalling the flush pipeline.
+- **Resolution:**
+  Once the WAL commit boundary is reached, post-WAL errors return `DurablePending`. The engine retains committed and applied state, retries failed immutable memtable flushes before admitting new active data, preserves SST/manifest/checkpoint ordering, and allows retry or reopen recovery to complete publication exactly once semantically.
 
+### H5/M2 — Owned Persistence Bounds and Internal Path Validation (Fixed: `b7ff200`)
+- **Verified Code Paths:**
+  - `crates/htap-common/src/fs.rs` (`read_exact_bounded`)
+  - `crates/htap-catalog/src/local.rs`, `crates/htap-coord/src/lib.rs`
+  - `crates/htap-convert/src/lib.rs`, `crates/htap-movement/src/job.rs`, `crates/htap-movement/src/tablet.rs`
+  - `crates/htap-rowstore/src/manifest.rs`, `crates/htap-rowstore/src/engine.rs`
+  - `crates/htap-txn/src/journal.rs`
+- **Scenario:**
+  Persistence envelopes (`CATALOG`, `COORDINATOR`, `jobs.json`, tablet manifests, `MANIFEST`, `VISIBLE`, `txn.journal`) used unbounded file reads, exposing the engine to memory exhaustion attacks from maliciously enlarged or corrupted files. Internal movement job IDs, package IDs, and conversion segment paths lacked strict validation.
+- **Resolution:**
+  Added a shared metadata-bounded exact-file reader (`read_exact_bounded`) enforcing explicit size caps on all owned persistence envelopes before memory allocation, rejecting oversized, truncated, trailing, or growth-raced files. Bounded the transaction journal total size and stream frame validation with fixed probe buffers. Validated internal movement job/package IDs and conversion segment relative paths. (External `CopyOptions` paths remain caller-controlled by design.)
+
+### Exclusive Root Ownership (Fixed: `1083fbd`)
 - **Verified Code Paths:**
   - `crates/htap-server/src/lib.rs` (`LocalServer::open`)
   - `crates/htap-coord/src/lib.rs` (`LocalCoordinator::open`)
-  - `crates/htap-common/src/lock.rs` (`ProcessLock::acquire`)
+  - `crates/htap-common/src/lock.rs` (`ProcessLock`)
 - **Scenario:**
-  Two or more operating system processes attempt to open the same database or coordinator storage root simultaneously, or through symlink aliases pointing to the same directory.
-- **Failure Mode & Impact:**
-  Without exclusive OS-level locking, concurrent processes execute independent WAL appends (`wal-*.log`), generate conflicting SSTable generation IDs in `MANIFEST`, overwrite 2PC journal entries (`txn.journal`), or race on atomic file replacement (`CATALOG`, `COORDINATOR`). This causes silent metadata desynchronization, split-brain corruption, and irrecoverable data loss upon restart.
-- **Hardening Delivered (2026-09-10):**
-  `LocalServer::open` and `LocalCoordinator::open` now canonicalize `root` and acquire an exclusive non-blocking advisory lock on `<root>/LOCK` before opening any subcomponents. Contending processes fail immediately with `HtapError::Conflict`.
-- **Remaining Boundary:**
-  Concurrent multiprocess operation on a shared root is **not** supported; exclusive root ownership is enforced.
+  Two or more OS processes attempted to open the same database or coordinator storage root simultaneously or via symlink aliases.
+- **Resolution:**
+  `LocalServer::open` and `LocalCoordinator::open` canonicalize paths and acquire an OS-level non-blocking exclusive advisory lock (`<root>/LOCK`). Contending processes immediately fail with `HtapError::Conflict`. Operates in one-owner multiprocess-exclusive mode (not concurrent shared-root writers).
 
 ---
 
-### C2 — Direct Unfenced Catalog Mutations and Coordinator Bypass (Critical)
+## 4. Remaining Open Issues & Architectural Boundaries
 
-- **Verified Code Paths:**
-  - `crates/htap-catalog/src/store.rs` (`CatalogStore::compare_and_set`)
-  - `crates/htap-catalog/src/local.rs` (`LocalCatalogStore::compare_and_set`)
-  - `crates/htap-movement/src/tablet.rs` (`repair_replica`)
-- **Scenario:**
-  Application code or internal migration routines invoke `CatalogStore::compare_and_set` directly rather than routing updates through `Coordinator::fenced_catalog_compare_and_set`.
-- **Failure Mode & Impact:**
-  Direct invocation bypasses active coordinator leadership and fencing token (`FencingToken`) validation. If a partitioned or demoted leader process executes a direct catalog update, it can overwrite schema descriptors, partition mappings, or tablet replica states, causing split-brain metadata divergence despite active fencing tokens.
-- **Current Status:**
-  Fencing validation is strictly opt-in. Full mandatory fencing across all catalog mutation points is tracked in the P1 roadmap.
+The following limitations and architectural boundaries remain explicitly open:
 
----
+1. **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks New External Applies:**
+   Neither the transaction journal (`txn.journal`) nor the rowstore `MANIFEST` v2 external apply ledger implements compaction, pruning, or coordinated retention. The external ledger enforces a hard cap (`MAX_EXTERNAL_LEDGER_ENTRIES = 16,384`). Once this cap is saturated, subsequent new external transaction applies are rejected with `CapacityExceeded`. Coordinated journal and ledger retention tied to participant checkpoints remains future work.
 
-### H1 — Rowstore Single-Scalar Visible Watermark & Contiguous Version Constraint (High)
+2. **Possible Later Flush-Boundary Duplicate SST Publication After Crash:**
+   If a crash occurs immediately after an SST file is published to disk but before reader registration, manifest update, or checkpoint advance, a subsequent reopen/flush cycle may republish duplicate SST data. Full resolution requires a future staged flush recovery mechanism.
 
-- **Verified Code Paths:**
-  - `crates/htap-rowstore/src/engine.rs` (`Engine::publish`, `apply_prepared_locked`)
-  - `crates/htap-txn/src/manager.rs` (`TransactionManager::commit`)
-- **Scenario:**
-  A multi-participant transaction involves only a subset of storage partitions, or an intermediate distributed transaction is aborted after version allocation, creating a gap in monotonically sequential version IDs on a given participant.
-- **Failure Mode & Impact:**
-  The rowstore LSM engine enforces strict sequential publication: `version == visible_version.next()`. If a version number is skipped due to a multi-partition version gap, `Engine::publish` rejects the call with `HtapError::InvalidArgument`, halting the publication pipeline. Consequently, transactions must strictly proceed as dense contiguous single-participant sequences.
-- **Current Status:**
-  Documented in `LIMITATIONS.md`. Addressing sparse global version watermarks or bitmap tracking is tracked in the P1 roadmap.
+3. **No Power-Loss Proof:**
+   Integration crash tests verify process `SIGKILL` termination, torn-tail truncation, and log reassembly across process death. They do not prove durability against true physical power outages, operating system kernel panics, or un-flushed disk controller write caches (no `dm-flakey` or FUSE power-cut testing).
+
+4. **No Distributed Consensus, Remote Replica Serving, or Real HA:**
+   Coordination is strictly single-node via local filesystem binary envelopes (`HTAPCRD1`). No Raft consensus (`openraft`), ZooKeeper ensemble backend, network session heartbeats, ephemeral watches, remote RPC replica streaming, or active HA failover exists.
+
+5. **Whole-Dataset Materialization in Conversion, Export, and Clone:**
+   HTAP row-to-column conversion (`htap-convert`), data import/export (`htap-movement`), and tablet snapshot cloning materialize entire datasets in memory or intermediate staging directories rather than utilizing streaming, chunked pipelines.
+
+6. **No Network, MySQL Daemon, Authentication, Security Boundary, or Full SQL Analytics:**
+   Interaction is limited to synchronous in-process calls to `LocalServer`. No MySQL wire protocol listener, network server daemon (`htapd`), client authentication, TLS encryption, or role-based access control (RBAC) exists. SQL execution supports only a narrow OLTP slice (PK lookups, single-partition literal mutations); analytical scans, vectorized joins, and aggregations are unsupported.
+
+7. **External CopyOptions Paths Remain Caller-Controlled by Design:**
+   While internal persistence bounds and internal paths (job IDs, package IDs, segment filenames) are strictly validated, external filesystem paths provided in `CopyOptions` for CSV/JSONL import and export are caller-controlled by design.
 
 ---
 
-### H2 — Standalone Low-Level Subsystem Opens Lack Process Locking (High)
-
-- **Verified Code Paths:**
-  - `crates/htap-rowstore/src/engine.rs` (`Engine::open`)
-  - `crates/htap-catalog/src/local.rs` (`LocalCatalogStore::open`)
-  - `crates/htap-movement/src/lib.rs` (`LocalDataMover::new`)
-- **Scenario:**
-  Low-level engine, catalog, or data mover instances are initialized directly via their standalone constructors against a path that is currently managed by an active `LocalServer` or another process.
-- **Failure Mode & Impact:**
-  Standalone constructors do not acquire `<root>/LOCK`. Concurrent access by standalone components bypasses the server-level exclusive lock, leading to file access races, torn WAL writes, and catalog corruption.
-- **Current Status:**
-  Documented in `OPERATIONS.md`, `README.md`, and `LIMITATIONS.md` as an unsafe operational boundary. Adding protective lock guards to standalone components is tracked in the P1 roadmap.
-
----
-
-### H3 — Physical Storage Power-Loss Durability Gap (High)
-
-- **Verified Code Paths:**
-  - `crates/htap-rowstore/src/wal.rs` (`append_commit`, `sync`)
-  - `crates/htap-txn/src/journal.rs` (`append_intent`, `append_commit`)
-  - `crates/htap-rowstore/tests/wal_crash.rs`, `crates/htap-rowstore/tests/engine_crash.rs`
-- **Scenario:**
-  An abrupt hardware power outage, host kernel panic, or block-device power loss occurs while writes are in flight.
-- **Failure Mode & Impact:**
-  Existing crash tests verify replay integrity against process `SIGKILL` termination. While `SIGKILL` verifies recovery from torn tails and log reassembly across process death, it does not invalidate operating system page caches. Un-flushed disk controller write caches or non-barrier writes can lead to undetected data loss during true physical power cutoffs.
-- **Current Status:**
-  Fsync ordering is validated by inspection and unit tests. Physical fault injection testing (e.g., via `dm-flakey` or FUSE) is tracked in the P2 roadmap.
-
----
-
-### H4 — HTAP Conversion Storage Amplification & Missing Delta Compaction (High)
-
-- **Verified Code Paths:**
-  - `crates/htap-convert/src/lib.rs` (`LocalConverter::convert_partition`, `read_materialized_partition`)
-  - `crates/htap-server/src/lib.rs` (`execute_insert`, `execute_delete`)
-- **Scenario:**
-  A table undergoes row-to-column conversion, followed by prolonged operational point inserts and deletes.
-- **Failure Mode & Impact:**
-  Converted rows are never physically reclaimed or purged from rowstore SSTables and WAL files. All subsequent point writes continue accumulating in the rowstore without an automatic background compaction task to fold rowstore deltas back into columnar segments. Over time, this leads to significant storage amplification and degraded base-plus-delta scan latency.
-- **Current Status:**
-  Documented in `LIMITATIONS.md`. Background delta compaction and physical rowstore space reclamation are tracked in the P2 roadmap.
-
----
-
-### H5 — Coordination Scope Bounded to Single-Node Local Envelope (High)
-
-- **Verified Code Paths:**
-  - `crates/htap-coord/src/lib.rs` (`LocalCoordinator`)
-  - `crates/htap-coord/src/placement.rs` (`plan_placement`)
-- **Scenario:**
-  Multi-node cluster failover, dynamic cluster topology changes, or node membership churn across network partitions.
-- **Failure Mode & Impact:**
-  `LocalCoordinator` persists leadership leases and fencing tokens strictly to a local filesystem envelope (`HTAPCRD1`). It provides no distributed consensus protocol (Raft/ZAB), network session heartbeats, or ephemeral watch semantics. Multi-node coordination cannot execute across machines without external consensus.
-- **Current Status:**
-  Documented in `LIMITATIONS.md` and ADR-006. Distributed consensus integration is tracked in the P2 roadmap.
-
----
-
-## 4. Prioritized Engineering Roadmap
+## 5. Prioritized Engineering Roadmap
 
 ```
 +-----------------------------------------------------------------------------+
-| P0 — Immediate Hardening (Delivered 2026-09-10)                             |
-| - Safe Unix/Linux advisory file lock on <root>/LOCK (fs2)                   |
-| - Path canonicalization resolving symlink aliases                           |
-| - Clear HtapError::Conflict on contention with diagnostic PID/timestamp     |
-| - Subprocess contention tests for LocalServer and LocalCoordinator          |
+| Completed Hardening (Current Local Embedded MVP)                            |
+| - Exclusive root process lock (<root>/LOCK) (1083fbd)                       |
+| - C1: MANIFEST v2 external ledger for WAL-GC identity replay (f7a4975)      |
+| - C2: Irrevocable commit decision + DurablePending (88cc314)                |
+| - H1: Manager decision serialization (88cc314)                              |
+| - H2: Engine post-WAL failure DurablePending & retry/recovery (c5ee281)     |
+| - H5/M2: Owned persistence bounds & internal path validation (b7ff200)      |
 +-----------------------------------------------------------------------------+
                                        |
                                        v
 +-----------------------------------------------------------------------------+
-| P1 — Near-Term Architectural Hardening                                      |
-| - Enforce coordinator fencing across all catalog mutation points (C2)       |
-| - Multi-participant sparse version tracking in rowstore engine (H1)         |
-| - Component-level lock encapsulation for standalone Engine/Catalog/Mover(H2)|
+| P1 — Near-Term Robustness & Lifecycle                                       |
+| - Coordinated journal and MANIFEST v2 ledger retention/compaction           |
+| - Staged flush recovery to eliminate duplicate SST publication risks        |
+| - Standalone subsystem process-lock encapsulation (Engine, Catalog, Mover)  |
+| - Mandatory coordinator fencing across all direct CatalogStore mutations    |
 +-----------------------------------------------------------------------------+
                                        |
                                        v
 +-----------------------------------------------------------------------------+
-| P2 — Long-Term Production Readiness                                         |
-| - Power-loss chaos validation harness (dm-flakey / FUSE) (H3)               |
-| - Background delta compaction & rowstore space reclamation (H4)             |
-| - Distributed consensus backend (Raft / ZooKeeper) & cluster heartbeats(H5) |
+| P2 — Distribution, Analytics & Full Durability                              |
+| - Power-loss chaos validation harness (dm-flakey / FUSE)                    |
+| - Distributed consensus backend (Raft / ZooKeeper) and remote replication   |
+| - Streaming non-materializing conversion, clone, and export pipelines       |
+| - Network server daemon, MySQL wire protocol, and auth security boundary    |
+| - Columnar analytical query execution (aggregations, joins, scans)          |
 +-----------------------------------------------------------------------------+
 ```
-
-### P0 (Completed — 2026-09-10)
-- Enforce single-process exclusive root ownership in `LocalServer::open` and `LocalCoordinator::open`.
-- Reject cross-process contention with `HtapError::Conflict` and informative diagnostic metadata.
-- Validate subprocess contention and symlink resolution in integration test suites.
-- Establish verified production review and operational boundaries documentation.
-
-### P1 (Near-Term Hardening)
-- **Mandatory Catalog Fencing (C2):** Ensure all `CatalogStore` mutation paths mandate a valid `FencingToken` verified by the coordinator.
-- **Sparse Version Progression (H1):** Implement active transaction tracking or multi-watermark bitmaps in `htap-rowstore` to accommodate distributed version gaps.
-- **Standalone Component Locking (H2):** Add advisory root locks to `Engine::open`, `LocalCatalogStore::open`, and `LocalDataMover::new` to prevent direct uncoordinated access.
-
-### P2 (Long-Term Readiness)
-- **Storage Chaos Testing (H3):** Construct automated CI harnesses simulating kernel crashes and power loss using Linux `dm-flakey`.
-- **Conversion Delta Compaction (H4):** Implement background delta-to-base compaction and physical rowstore space reclamation for converted partitions.
-- **Distributed Coordination (H5):** Implement a distributed `Coordinator` backend backed by Raft or Apache ZooKeeper with ephemeral heartbeats and watches.

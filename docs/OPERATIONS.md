@@ -4,82 +4,102 @@ This document describes the on-disk storage layout, crash-recovery boundaries, a
 
 ---
 
-## Important Operational Boundaries & Non-Features
+## 1. Current Status: Hardened Local Embedded MVP
 
-The HTAP local MVP is an embedded, single-process, synchronous storage and execution library. It operates strictly within the calling application process.
+**The HTAP database engine is a hardened local embedded MVP, not a production-ready standalone database.**
 
-The following production operational facilities are **not implemented**:
+The codebase operates strictly as an in-process, synchronous Rust library (`LocalServer` / `LocalCoordinator`). Core storage, transaction, and persistence paths have received critical hardening, but **production readiness is not claimed**.
 
-- **No daemon lifecycle or supervisor management:** No `systemd` service units, init scripts, process supervision, background workers, or signal handling (such as `SIGHUP` reload or graceful shutdown signals).
-- **No network ports or sockets:** No TCP/IP listeners, Unix domain sockets, or remote procedure calls (RPC).
-- **No authentication, TLS, or authorization:** No user credentials, authentication handshakes, TLS encryption certificates, or role-based access control (RBAC).
-- **No observability or monitoring infrastructure:** No Prometheus metrics endpoints, OpenTelemetry exporters, health-check probes, or operational telemetry daemons.
-- **No container or container orchestration:** No Docker images, Containerfile, Docker Compose setups, or Kubernetes manifests.
-- **No High Availability (HA) or multi-node consensus:** No Raft cluster consensus, ZooKeeper cluster integration, or automatic failover.
-- **Single-Process Exclusive Root Ownership:** `LocalServer` and `LocalCoordinator` enforce exclusive ownership of their root directories using an OS-level non-blocking advisory lock (`<root>/LOCK` via `flock`). Canonicalized directory paths and symlink aliases are resolved prior to lock acquisition. Contention from a second process (or redundant instance) immediately fails with `HtapError::Conflict`.
-- **No Concurrent Multi-Process Shared-Root Operation:** Exclusive root ownership guarantees that only one process accesses a server or coordinator root at a time; concurrent multi-process shared-root operations and concurrent writers are strictly unsupported.
-- **Low-Level Standalone Component Hazard:** Standalone subsystem opens (`htap_rowstore::Engine::open`, `htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) do not acquire the root lock when invoked directly outside of `LocalServer`; concurrent direct opens of these low-level components against a shared root remain **unsafe**.
+### Completed Hardening Units
+
+- **C1 — WAL-GC Transaction Identity Replay (Fixed: `f7a4975`):** Rowstore `MANIFEST` v2 records an external apply ledger of external transaction IDs and applied versions. Even after WAL prefix pruning, exact re-applies remain idempotent and conflicting identity reuse is rejected.
+- **C2 — Durable Commit Reversibility (Fixed: `88cc314`):** Transaction decisions are irrevocable once the commit record is synced to `txn.journal`. Post-decision failures return `DurablePending` rather than rolling back or reporting aborts.
+- **H1 — Manager Decision Serialization (Fixed: `88cc314`):** Transaction manager operations are serialized under a single lock across prepare, intent, version allocation, commit, participant apply, publish, and recovery.
+- **H2 — Engine Post-WAL Failures Surface as DurablePending (Fixed: `c5ee281`):** Once a WAL commit is durable, post-decision memtable, flush, and publication errors return `DurablePending`. Committed state is retained, failed flushes are retried before new data is admitted, and reopen recovery completes visibility.
+- **H5/M2 — Owned Persistence Bounds and Internal Path Validation (Fixed: `b7ff200`):** Shared bounded reader (`read_exact_bounded`) enforces size limits on all owned envelopes before allocation. Internal movement job/package IDs and conversion segment relative paths are strictly validated.
+- **Exclusive Root Ownership (Fixed: `1083fbd`):** Non-blocking advisory file lock (`<root>/LOCK` via `flock`) and path canonicalization enforce single-process root ownership.
 
 ---
 
-## LocalServer Filesystem Layout
+## 2. Important Operational Boundaries & Non-Features
+
+The following operational facilities and production features are **explicitly not implemented or open**:
+
+- **No Daemon Lifecycle or Supervisor Management:** No `systemd` units, init scripts, background daemon processes (`htapd`), or signal-handling shutdown infrastructure.
+- **No Network Ports, Sockets, or MySQL Wire Protocol:** No TCP/IP listeners, Unix domain sockets, or MySQL client wire protocol support. All interaction is via synchronous in-process Rust method calls.
+- **No Authentication, TLS, or Security Boundary:** No user credentials, authentication handshakes, TLS encryption certificates, or role-based access control (RBAC).
+- **No Full SQL Analytics:** Analytical scans over columnar tables, vectorized aggregations (`GROUP BY`, `SUM`, `COUNT`), hash joins, subqueries, and CTEs are unsupported.
+- **No High Availability (HA) or Distributed Consensus:** No Raft (`openraft`), ZooKeeper ensemble backend, network heartbeats, ephemeral sessions, remote RPC replica serving, or active failover exists.
+- **One-Owner Multiprocess-Exclusive Mode (Not Concurrent Shared-Root Writers):** Root locking (`<root>/LOCK`) enforces that only one operating system process may open a server or coordinator root. Concurrent multiprocess shared-root operations and concurrent writers are strictly unsupported. Standalone subsystem opens (`Engine::open`, `LocalCatalogStore::open`, `LocalDataMover::new`) do not acquire this lock and remain unsafe for direct concurrent use.
+- **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks Applies:** Neither `txn.journal` nor the rowstore `MANIFEST` v2 external ledger implements compaction or coordinated retention. The external ledger enforces a hard cap (`MAX_EXTERNAL_LEDGER_ENTRIES = 16,384`). Once full, new external applies fail with `HtapError::CapacityExceeded`.
+- **Possible Later Flush-Boundary Duplicate SST Publication After Crash:** Crashes occurring after an SST is written but before reader registration, manifest update, or checkpoint advance can cause duplicate SST publication on subsequent cycles, requiring future staged flush recovery.
+- **No Power-Loss Proof:** Integration crash tests prove recovery across process `SIGKILL` termination, not physical machine power loss, host kernel panics, or write cache invalidation.
+- **Whole-Dataset Materialization in Conversion, Export, and Clone:** HTAP conversion (`htap-convert`), data import/export (`htap-movement`), and tablet snapshot cloning materialize entire datasets into memory or intermediate files without streaming.
+- **External CopyOptions Paths Remain Caller-Controlled by Design:** While internal persistence files and paths are bounded and validated (`b7ff200`), external import/export paths specified via `CopyOptions` are caller-controlled by design and must be validated by the host application.
+
+---
+
+## 3. LocalServer Filesystem Layout
 
 When a `LocalServer` is opened at a specified `root` directory (`LocalServer::open(root)`), it manages four dedicated sub-paths and an advisory lock:
 
 ```text
 <root>/
-├── LOCK                    # Exclusive process advisory lock and diagnostic PID/start-time
+├── LOCK                    # Exclusive process advisory lock and diagnostic PID/start-time (1083fbd)
 ├── catalog/
-│   ├── CATALOG             # Durable catalog snapshot state
+│   ├── CATALOG             # Durable catalog snapshot state (bounded envelope b7ff200)
 │   └── CATALOG.tmp         # Staging file for atomic replacement
 ├── rowstore/
 │   ├── wal-*.log           # Framed write-ahead log segments (CRC32C protected)
 │   ├── sst-*.sst           # Immutable Sorted String Tables (blocks, bloom filter, CRC32C)
-│   ├── MANIFEST            # Manifest tracking active SSTs and LSM generations
-│   └── VISIBLE             # Monotonically increasing visible version watermark
-├── txn.journal             # 2PC transaction manager write-ahead log
+│   ├── MANIFEST            # MANIFEST v2 with external apply ledger (f7a4975, b7ff200)
+│   └── VISIBLE             # Monotonically increasing visible version watermark (b7ff200)
+├── txn.journal             # 2PC transaction manager write-ahead log (irrevocable 88cc314, bounded b7ff200)
 └── movement/
-    ├── jobs.json           # Durable job tracking file (HTAPJOB1 envelope)
-    └── packages/           # Transient staging and tablet package clone archives
+    ├── jobs.json           # Durable job tracking file (HTAPJOB1 envelope, bounded b7ff200)
+    └── packages/           # Transient staging and tablet package clone archives (HTAPMNF1)
 ```
 
 ### Component Details
 
-0. **`LOCK` (`ProcessLock`):**
+0. **`LOCK` (`ProcessLock` — `1083fbd`):**
    - Non-blocking exclusive advisory lock (`flock`) acquired during `LocalServer::open(root)`.
    - Protects the server root against concurrent access from multiple processes or symlink aliases.
-   - Contains diagnostic metadata (`pid=...;start_time=...`) while the held OS kernel lock serves as the authoritative boundary.
+   - Bounded to one-owner multiprocess-exclusive mode; does not permit concurrent shared-root writers.
 
-1. **`catalog/` (`LocalCatalogStore`):**
+1. **`catalog/` (`LocalCatalogStore` — `b7ff200`):**
    - Tracks table definitions, schema, partition descriptors, tablets, and replica topologies.
    - Enforces optimistic concurrency control using integer generations (`compare_and_set`).
-   - Mutations stage to `CATALOG.tmp`, call `sync_all()`, and atomically rename to `CATALOG`, followed by a directory `sync_all()`.
+   - Mutations stage to `CATALOG.tmp`, call `sync_all()`, and atomically rename to `CATALOG`, followed by directory `sync_all()`. Read via bounded exact reader.
 
-2. **`rowstore/` (`htap_rowstore::Engine`):**
+2. **`rowstore/` (`htap_rowstore::Engine` — `f7a4975`, `c5ee281`, `b7ff200`):**
    - **`wal-*.log`:** Write-ahead log files recording transactional row mutations (`Put` and `Delete`). Each entry is framed with magic, length, sequence, payload, and CRC32C checksum.
    - **`sst-*.sst`:** Immutable SST files containing ordered key-value pairs organized into indexed blocks with Bloom filters.
-   - **`MANIFEST`:** Atomic LSM metadata recording active SST sets and compaction generations.
-   - **`VISIBLE`:** Tracks the monotonically advanced `visible_version`. Records applied but uncommitted/unpublished remain invisible across crashes until published.
+   - **`MANIFEST`:** Manifest v2 format storing active SST sets and an external transaction apply ledger (`f7a4975`). Bounded read protects against allocation attacks (`b7ff200`). Prevents identity replay across WAL GC. Note: hard cap of 16,384 entries without compaction.
+   - **`VISIBLE`:** Tracks the monotonically advanced `visible_version`. Records applied but uncommitted/unpublished remain invisible across crashes until published. Post-WAL failures surface as `DurablePending` (`c5ee281`).
 
-3. **`txn.journal` (`htap_txn::TransactionManager`):**
+3. **`txn.journal` (`htap_txn::TransactionManager` — `88cc314`, `b7ff200`):**
    - 2-Phase Commit (2PC) coordination journal tracking transaction lifecycle: `Prepare`, `Commit`, `Abort`.
-   - On server startup (`open`), the transaction manager recovers the journal and instructs participants (such as `RowstoreParticipant`) to replay or finalize uncommitted/committed state.
+   - Irrevocable commit boundary: once the commit record is fsynced, abort is rejected.
+   - Manager decision serialization: all transitions serialized under one manager lock (`88cc314`).
+   - Post-commit append/sync/apply/publish failures return `DurablePending`.
+   - Read via bounded streaming frame validation with fixed probe buffers (`b7ff200`).
 
-4. **`movement/` (`htap_movement::LocalDataMover`):**
+4. **`movement/` (`htap_movement::LocalDataMover` — `b7ff200`):**
    - Tracks data movement jobs (CSV/JSONL import/export, tablet snapshot migrations).
-   - Job metadata is stored under `jobs.json` protected by the `HTAPJOB1` envelope.
-   - Snapshot clone packages (`HTAPMNF1`) stage logical partitions into directory packages containing manifest checksums.
+   - Job metadata is stored under `jobs.json` protected by the `HTAPJOB1` envelope with bounded reading.
+   - Internal job IDs and package IDs are strictly validated (`b7ff200`). External `CopyOptions` paths remain caller-controlled.
 
 ---
 
-## LocalCoordinator Filesystem Layout
+## 4. LocalCoordinator Filesystem Layout
 
 The `LocalCoordinator` manages cluster membership, scoped leadership leases, and monotonic fencing tokens independently under its own root directory:
 
 ```text
 <coord_root>/
-├── LOCK                    # Exclusive process advisory lock and diagnostic PID/start-time
-├── COORDINATOR             # Durable coordinator state envelope (HTAPCRD1)
+├── LOCK                    # Exclusive process advisory lock and diagnostic PID/start-time (1083fbd)
+├── COORDINATOR             # Durable coordinator state envelope (HTAPCRD1, bounded b7ff200)
 └── COORDINATOR.tmp         # Staging file for atomic publish
 ```
 
@@ -88,19 +108,13 @@ The `LocalCoordinator` manages cluster membership, scoped leadership leases, and
 Coordinator state is stored in a versioned binary envelope:
 - **Header Magic (8 bytes):** `b"HTAPCRD1"`
 - **Format Version (2 bytes):** `0x0001` (big-endian `u16`)
-- **Payload Length (4 bytes):** Big-endian `u32` (limited to 64 MiB)
+- **Payload Length (4 bytes):** Big-endian `u32` (capped at 64 MiB by bounded reader `b7ff200`)
 - **Checksum (4 bytes):** CRC32C over the payload bytes
-- **Payload:** JSON/Bincode serialized state tracking:
-  - Registered cluster nodes (`BTreeSet<NodeId>`).
-  - Active leadership leases (`scope -> (holder, FencingToken)`).
-  - High-water mark issued fencing tokens per scope and globally.
-
-All state transitions follow a two-phase atomic write protocol:
-`COORDINATOR.tmp` write -> `sync_all()` -> `rename` over `COORDINATOR` -> parent directory `sync_all()`.
+- **Payload:** JSON/Bincode serialized state tracking registered cluster nodes, active leases, and high-water mark issued fencing tokens.
 
 ---
 
-## Backup & Recovery Boundaries
+## 5. Backup & Recovery Boundaries
 
 ### Safe Local Backup Boundaries
 
@@ -111,13 +125,19 @@ Because `LocalServer` writes across multiple internal components (`catalog`, `ro
    - Once all locks are released and file handles closed, take a filesystem-level copy (e.g., `tar`, `cp -a`, or filesystem snapshot) of the entire root directory.
 
 2. **Online / Running Backup:**
-   - **Do not** perform arbitrary file-by-file copies of an active server root. Doing so risks capturing torn states between the `txn.journal` and rowstore `wal-*.log` / `MANIFEST`.
-   - If online backup is necessary, rely on filesystem-level point-in-time snapshots (e.g., ZFS snapshots or LVM snapshots) that provide crash-consistent atomic snapshots across the storage volume.
+   - **Do not** perform arbitrary file-by-file copies of an active server root. Doing so risks capturing torn states between `txn.journal`, `wal-*.log`, and `MANIFEST`.
+   - If online backup is necessary, rely on filesystem-level point-in-time snapshots (such as ZFS or LVM snapshots) that provide crash-consistent atomic snapshots across the storage volume.
 
 ### Reopen Recovery Guarantees
 
 When reopening an existing directory via `LocalServer::open(path)`:
-1. **Catalog Recovery:** Loads `CATALOG`, validates snapshot structure, and initializes optimistic concurrency control at the recorded generation. If a `.tmp` file is present from an interrupted write, it is discarded or ignored in favor of the durable `CATALOG`.
-2. **Rowstore LSM Recovery:** Replays WAL records up to the last clean boundary, repairs torn tails caused by abrupt power loss, reconstructs the active memtable, and reads the `VISIBLE` version watermark.
-3. **Transaction Manager Recovery:** Replays `txn.journal`, matches prepared and committed states, and coordinates with `RowstoreParticipant` to ensure only committed transactions are exposed.
+1. **Catalog Recovery:** Loads `CATALOG` with bounded reader validation (`b7ff200`), validates snapshot structure, and initializes optimistic concurrency control at the recorded generation. Interrupted `.tmp` files are ignored.
+2. **Rowstore LSM Recovery:**
+   - Reads `MANIFEST` v2 and restores the external transaction apply ledger before WAL replay (`f7a4975`).
+   - Replays WAL records up to the last clean boundary, repairs torn tails caused by abrupt process death, reconstructs active memtables, and reads the `VISIBLE` version watermark.
+   - Post-WAL errors returning `DurablePending` are retried and completed during recovery (`c5ee281`).
+3. **Transaction Manager Recovery:**
+   - Replays `txn.journal` using bounded streaming frame inspection (`b7ff200`).
+   - Treats committed records as irrevocable (`88cc314`).
+   - Matches prepared and committed states, re-applies committed operations across participants idempotently via the external ledger (`f7a4975`), and completes unpublished transactions.
 4. **Fencing Token Monotonicity:** On reopening `LocalCoordinator`, persisted high-water tokens are restored, ensuring subsequent leadership acquisitions yield strictly greater fencing tokens than any token issued prior to restart.
