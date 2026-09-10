@@ -153,7 +153,14 @@ dependencies = [
 name = "htap-convert"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
+ "htap-catalog",
+ "htap-colstore",
  "htap-common",
+ "htap-rowstore",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
