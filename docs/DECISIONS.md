@@ -294,8 +294,9 @@ Option **(c)**.
 - **Authoritative rowstore base-plus-delta overlay:** The rowstore remains the authoritative
   truth for point operations (`Route::RowstoreWrite` and `Route::RowstorePointRead`), executing
   without interruption across `Row`, `Converting`, and `Column` states. Materialized scans
-  (`read_materialized_partition`) scan columnar base segments up to `V` and overlay post-`V`
-  rowstore puts and deletes.
+  via converter API `read_column_partition` (explicitly a converter API, not SQL execution;
+  verified in `crates/htap-convert/tests/materialization.rs`) scan columnar base segments up to `V`
+  and overlay post-`V` rowstore puts and deletes.
 - **Scope boundaries:** Reverse `Column -> Row` conversion is not implemented and not claimed.
   Columnar bitmap delete vectors, physical rowstore reclamation, delta-to-base background compaction,
   vectorized SQL query execution over columnar tables, and distributed multi-tablet conversion
