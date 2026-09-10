@@ -78,7 +78,15 @@ fn main() -> Result<()> {
         }
     }
 
-    // 5. Complete-PK DELETE (Point DML)
+    // 5. Analytical SELECT (Narrow OLAP Scan)
+    let olap_res = client.execute(
+        "SELECT count(*), max(age) FROM users WHERE age >= 25;"
+    )?;
+    if let StatementResult::Query(qr) = olap_res {
+        println!("OLAP aggregate count: {}", qr.num_rows());
+    }
+
+    // 6. Complete-PK DELETE (Point DML)
     let delete_res = client.execute(
         "DELETE FROM users WHERE id = 1;"
     )?;
@@ -106,8 +114,8 @@ The workspace consists of modular crates separated by architectural boundaries:
 | `crates/htap-convert` | Partition-scoped row-to-column conversion engine (`LocalConverter`, `HTAPTBM1` manifest envelope, and base-plus-delta overlay). |
 | `crates/htap-movement` | Single-node data movement engine (`LocalDataMover`, `HTAPJOB1` job log, CSV/JSONLines streaming, and tablet snapshot cloning/repair). |
 | `crates/htap-coord` | Local coordination and placement engine (`LocalCoordinator`, `HTAPCRD1` state envelope, monotonic fencing tokens, and deterministic placement planner). |
-| `crates/htap-sql` | SQL front-end using `sqlparser` (MySQL dialect), strict catalog schema binder, and structural rowstore point query router. |
-| `crates/htap-server` | Durable synchronous in-process engine façade (`LocalServer`) integrating catalog, rowstore, transactions, and data movement. |
+| `crates/htap-sql` | SQL front-end using `sqlparser` (MySQL dialect), strict catalog schema binder (typed `PointSelect` and `AnalyticSelect`), and structural query router (`Route::RowstorePointRead`, `Route::OlapScan`). |
+| `crates/htap-server` | Durable synchronous in-process engine façade (`LocalServer`) integrating catalog, rowstore, transactions, data movement, and narrow analytical scan execution (`<root>/colstore`). |
 | `crates/htap-client` | Synchronous in-process embedded client (`EmbeddedClient`) providing an ergonomic SQL execution interface over `LocalServer`. |
 | `crates/htap-bench` | Criterion microbenchmark suite (`benches/local_mvp.rs`) measuring rowstore point lookups, columnar zone-map scans, conversion, CSV import, and coordination. |
 
@@ -126,13 +134,27 @@ The SQL engine and embedded client execute an explicit, synchronous single-parti
   ```sql
   DELETE FROM users WHERE id = 1;
   ```
-- **Complete-PK `SELECT`:** Point lookup projecting specific columns or `*` specifying equality predicates for the complete primary key in the `WHERE` clause:
+- **Complete-PK `SELECT`:** Point lookup projecting specific columns or `*` specifying equality predicates for the complete primary key in the `WHERE` clause (strictly routes to `Route::RowstorePointRead` and bypasses the analytical scan engine and converter):
   ```sql
   SELECT name, age FROM users WHERE id = 2;
   ```
+- **Analytical `SELECT` (OLAP Scans):** Narrow analytical queries over single unaliased tables, routing to `Route::OlapScan` and evaluated across logical rowstore or base-plus-delta columnar partitions (using server-root `<root>/colstore` for materialized `Column`/`Converting` partitions) at the current visible snapshot:
+  - Projections: plain column lists or `*` (with optional aliases).
+  - Filters: AND-only typed comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) with SQL three-valued logic.
+  - Aggregates: `COUNT(*)`, `COUNT(column)`, `SUM(column)` (for `Int32`, `Int64`, `Float64`), `MIN(column)`, `MAX(column)`. Empty global aggregates return 1 row with `COUNT = 0` and other aggregates `NULL`.
+  - Grouping: deterministic `GROUP BY` with SQL `NULL` grouping semantics.
 
-### Unsupported SQL Features
-Transactions (`BEGIN`, `COMMIT`, `ROLLBACK`), `UPDATE`, `ALTER TABLE`, `DROP TABLE`, non-PK filters, table scans, aggregations (`COUNT`, `SUM`, `GROUP BY`), joins, CTEs (`WITH`), window functions (`OVER`), subqueries, and prepared statements are rejected with explicit errors (`HtapError::Unsupported` or `HtapError::InvalidArgument`).
+### Unsupported & Deferred SQL Features
+The following features are explicitly deferred:
+- Joins and multiple tables in `FROM`, table aliases, CTEs (`WITH`), window functions (`OVER`), subqueries.
+- Query modifiers/clauses: `ORDER BY`, `LIMIT`, `HAVING`.
+- Predicate expressions: `OR`, `NOT`, arithmetic, explicit type casts.
+- Aggregates: `AVG`, `DISTINCT` aggregates (`COUNT(DISTINCT ...)`).
+- Direct `SegmentReader` pushdown from SQL, vectorized SQL execution.
+- Multi-tablet or distributed scans, resource quotas, disk spilling, query cancellation.
+- DataFusion and Apache Arrow integration.
+- Full MySQL dialect breadth, sessions, and transaction controls (`BEGIN`, `COMMIT`, `ROLLBACK`).
+- Non-PK DML / DDL (`UPDATE`, `ALTER TABLE`, `DROP TABLE`).
 
 ---
 
@@ -164,14 +186,21 @@ cargo bench --workspace --no-run
 
 ## Focused Component Tests
 
-To run focused integration tests for the primary engine façade and client:
+To run focused integration tests for the primary SQL, server, client, and conversion components:
 
 ```bash
-# Test LocalServer engine integration and recovery
+# Test SQL parsing, binding, and route classification
+cargo test -p htap-sql --test parse_bind
+cargo test -p htap-sql --test route
+
+# Test LocalServer engine integration, recovery, and OLAP scans
 cargo test -p htap-server --test local_server
 
-# Test EmbeddedClient SQL CRUD lifecycle, recovery, and error mapping
+# Test EmbeddedClient SQL CRUD and OLAP lifecycle
 cargo test -p htap-client --test embedded_client
+
+# Test Row-to-Column conversion and base-plus-delta materialization
+cargo test -p htap-convert --test materialization
 ```
 
 ---

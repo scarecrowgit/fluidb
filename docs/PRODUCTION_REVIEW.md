@@ -97,7 +97,7 @@ The following critical and high-severity architectural issues have been verified
 The following limitations and architectural boundaries remain explicitly open:
 
 1. **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks New External Applies:**
-   Neither the transaction journal (`txn.journal`) nor the rowstore `MANIFEST` v2 external apply ledger implements compaction, pruning, or coordinated retention. The external ledger enforces a hard cap (`MAX_EXTERNAL_LEDGER_ENTRIES = 16,384`). Once this cap is saturated, subsequent new external transaction applies are rejected with `CapacityExceeded`. Coordinated journal and ledger retention tied to participant checkpoints remains future work.
+   Neither the transaction journal (`txn.journal`) nor the rowstore `MANIFEST` v2 external apply ledger implements compaction, pruning, or coordinated retention. The external ledger enforces a hard cap (`MAX_APPLIED_EXTERNAL_TXNS = 1_000_000`). Once this cap is saturated, subsequent new external transaction applies are rejected with `CapacityExceeded`. Coordinated journal and ledger retention tied to participant checkpoints remains future work.
 
 2. **Possible Later Flush-Boundary Duplicate SST Publication After Crash:**
    If a crash occurs immediately after an SST file is published to disk but before reader registration, manifest update, or checkpoint advance, a subsequent reopen/flush cycle may republish duplicate SST data. Full resolution requires a future staged flush recovery mechanism.
@@ -109,10 +109,10 @@ The following limitations and architectural boundaries remain explicitly open:
    Coordination is strictly single-node via local filesystem binary envelopes (`HTAPCRD1`). No Raft consensus (`openraft`), ZooKeeper ensemble backend, network session heartbeats, ephemeral watches, remote RPC replica streaming, or active HA failover exists.
 
 5. **Whole-Dataset Materialization in Conversion, Export, and Clone:**
-   HTAP row-to-column conversion (`htap-convert`), data import/export (`htap-movement`), and tablet snapshot cloning materialize entire datasets in memory or intermediate staging directories rather than utilizing streaming, chunked pipelines.
+   HTAP row-to-column conversion (`htap-convert`), data export (`htap-movement`, where exports materialize the full logical partition before writing), and tablet snapshot cloning materialize entire datasets in memory or intermediate staging directories rather than utilizing streaming, chunked pipelines.
 
 6. **No Network, MySQL Daemon, Authentication, Security Boundary, or Full SQL Analytics:**
-   Interaction is limited to synchronous in-process calls to `LocalServer`. No MySQL wire protocol listener, network server daemon (`htapd`), client authentication, TLS encryption, or role-based access control (RBAC) exists. SQL execution supports only a narrow OLTP slice (PK lookups, single-partition literal mutations); analytical scans, vectorized joins, and aggregations are unsupported.
+   Interaction is limited to synchronous in-process calls to `LocalServer`. No MySQL wire protocol listener, network server daemon (`htapd`), client authentication, TLS encryption, or role-based access control (RBAC) exists. SQL execution supports a narrow OLTP slice (PK lookups, single-partition literal mutations) and narrow single-table OLAP scans (plain projections, AND-only filters, `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, deterministic `GROUP BY`); joins, CTEs, windows, `ORDER BY`, `LIMIT`, `HAVING`, direct `SegmentReader` pushdown, vectorized SQL execution, and full SQL analytics remain unsupported.
 
 7. **External CopyOptions Paths Remain Caller-Controlled by Design:**
    While internal persistence bounds and internal paths (job IDs, package IDs, segment filenames) are strictly validated, external filesystem paths provided in `CopyOptions` for CSV/JSONL import and export are caller-controlled by design.
@@ -148,6 +148,6 @@ The following limitations and architectural boundaries remain explicitly open:
 | - Distributed consensus backend (Raft / ZooKeeper) and remote replication   |
 | - Streaming non-materializing conversion, clone, and export pipelines       |
 | - Network server daemon, MySQL wire protocol, and auth security boundary    |
-| - Columnar analytical query execution (aggregations, joins, scans)          |
+| - Full analytical query execution (vectorized pushdown, joins, CTEs, windows)|
 +-----------------------------------------------------------------------------+
 ```

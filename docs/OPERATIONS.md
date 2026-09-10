@@ -28,13 +28,13 @@ The following operational facilities and production features are **explicitly no
 - **No Daemon Lifecycle or Supervisor Management:** No `systemd` units, init scripts, background daemon processes (`htapd`), or signal-handling shutdown infrastructure.
 - **No Network Ports, Sockets, or MySQL Wire Protocol:** No TCP/IP listeners, Unix domain sockets, or MySQL client wire protocol support. All interaction is via synchronous in-process Rust method calls.
 - **No Authentication, TLS, or Security Boundary:** No user credentials, authentication handshakes, TLS encryption certificates, or role-based access control (RBAC).
-- **No Full SQL Analytics:** Analytical scans over columnar tables, vectorized aggregations (`GROUP BY`, `SUM`, `COUNT`), hash joins, subqueries, and CTEs are unsupported.
+- **Narrow OLAP SQL, No Full SQL Analytics:** `LocalServer` executes narrow single-table analytical scans (plain projections, AND-only typed filters, `COUNT(*)`, `COUNT(col)`, `SUM(Int32/Int64/Float64)`, `MIN/MAX`, deterministic `GROUP BY` with SQL NULL grouping) over logical rowstore and base-plus-delta rows using server-root `<root>/colstore` for materialized `Column`/`Converting` partitions. Joins, CTEs, windows, `ORDER BY`, `LIMIT`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, direct `SegmentReader` pushdown from SQL, vectorized SQL execution, multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow, and full MySQL breadth remain unsupported.
 - **No High Availability (HA) or Distributed Consensus:** No Raft (`openraft`), ZooKeeper ensemble backend, network heartbeats, ephemeral sessions, remote RPC replica serving, or active failover exists.
 - **One-Owner Multiprocess-Exclusive Mode (Not Concurrent Shared-Root Writers):** Root locking (`<root>/LOCK`) enforces that only one operating system process may open a server or coordinator root. Concurrent multiprocess shared-root operations and concurrent writers are strictly unsupported. Standalone subsystem opens (`Engine::open`, `LocalCatalogStore::open`, `LocalDataMover::new`) do not acquire this lock and remain unsafe for direct concurrent use.
-- **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks Applies:** Neither `txn.journal` nor the rowstore `MANIFEST` v2 external ledger implements compaction or coordinated retention. The external ledger enforces a hard cap (`MAX_EXTERNAL_LEDGER_ENTRIES = 16,384`). Once full, new external applies fail with `HtapError::CapacityExceeded`.
+- **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks Applies:** Neither `txn.journal` nor the rowstore `MANIFEST` v2 external ledger implements compaction or coordinated retention. The external ledger enforces a hard cap (`MAX_APPLIED_EXTERNAL_TXNS = 1_000_000`). Once full, new external applies fail with `HtapError::CapacityExceeded`.
 - **Possible Later Flush-Boundary Duplicate SST Publication After Crash:** Crashes occurring after an SST is written but before reader registration, manifest update, or checkpoint advance can cause duplicate SST publication on subsequent cycles, requiring future staged flush recovery.
 - **No Power-Loss Proof:** Integration crash tests prove recovery across process `SIGKILL` termination, not physical machine power loss, host kernel panics, or write cache invalidation.
-- **Whole-Dataset Materialization in Conversion, Export, and Clone:** HTAP conversion (`htap-convert`), data import/export (`htap-movement`), and tablet snapshot cloning materialize entire datasets into memory or intermediate files without streaming.
+- **Whole-Dataset Materialization in Conversion, Export, and Clone:** HTAP conversion (`htap-convert`), data export (`htap-movement`, where exports materialize the full logical partition before writing), and tablet snapshot cloning materialize entire datasets into memory or intermediate files without streaming.
 - **External CopyOptions Paths Remain Caller-Controlled by Design:** While internal persistence files and paths are bounded and validated (`b7ff200`), external import/export paths specified via `CopyOptions` are caller-controlled by design and must be validated by the host application.
 
 ---
@@ -56,12 +56,13 @@ flowchart TD
     TxnJourn --> Part1["Register RowstoreParticipant<br/>(ParticipantId(1) wrapping Engine)"]
     Part1 --> Recov["Recover TransactionManager<br/>txn_manager.recover() (replay journal & complete commits)"]
     Recov --> Move["Initialize LocalDataMover at &lt;canonical_root&gt;/movement<br/>movement/jobs, movement/tablets"]
-    Move --> Ready["Return ready LocalServer instance"]
+    Move --> Colstore["Initialize Columnar Storage Root at &lt;canonical_root&gt;/colstore<br/>std::fs::create_dir_all(&amp;colstore_dir)"]
+    Colstore --> Ready["Return ready LocalServer instance"]
 ```
 
 ### Filesystem Layout
 
-`LocalServer` manages four dedicated sub-paths and an advisory lock file under the canonical root directory:
+`LocalServer` manages five dedicated sub-paths and an advisory lock file under the canonical root directory:
 
 ```text
 <root>/
@@ -76,6 +77,10 @@ flowchart TD
 │   │   └── {id}.sst                          # Immutable Sorted String Tables (blocks, bloom filter, CRC32C)
 │   ├── MANIFEST                              # MANIFEST v2 with external apply ledger (f7a4975, b7ff200)
 │   └── VISIBLE                               # Monotonically increasing visible version watermark (b7ff200)
+├── colstore/                                 # Server columnar storage root for materialized partitions (b62c705)
+│   └── <tablet_id>/
+│       ├── MANIFEST                          # Durable columnar tablet manifest envelope (HTAPTBM1)
+│       └── *.seg                             # Columnar segment files
 ├── txn.journal                               # 2PC transaction manager write-ahead log (irrevocable 88cc314, bounded b7ff200)
 └── movement/
     ├── jobs/
@@ -104,7 +109,7 @@ flowchart TD
 2. **`rowstore/` (`htap_rowstore::Engine` — `f7a4975`, `c5ee281`, `b7ff200`):**
    - **`rowstore/wal/{20-digit}.wal`:** Framed write-ahead log files recording transactional row mutations (`Put` and `Delete`). Files are named using 20-digit zero-padded sequence numbers (e.g. `00000000000000000001.wal`). Each entry is framed with magic, length, sequence, payload, and CRC32C checksum.
    - **`rowstore/sst/{id}.sst`:** Immutable SST files containing ordered key-value pairs organized into indexed blocks with Bloom filters.
-   - **`rowstore/MANIFEST`:** Manifest v2 format storing active SST sets and an external transaction apply ledger (`f7a4975`). Bounded read protects against allocation attacks (`b7ff200`). Prevents identity replay across WAL GC. Note: hard cap of 16,384 entries without compaction.
+   - **`rowstore/MANIFEST`:** Manifest v2 format storing active SST sets and an external transaction apply ledger (`f7a4975`). Bounded read protects against allocation attacks (`b7ff200`). Prevents identity replay across WAL GC. Note: hard cap of 1_000_000 entries (`MAX_APPLIED_EXTERNAL_TXNS`) without compaction.
    - **`rowstore/VISIBLE`:** Tracks the monotonically advanced `visible_version`. Records applied but uncommitted/unpublished remain invisible across crashes until published. Post-WAL failures surface as `DurablePending` (`c5ee281`).
 
 3. **`txn.journal` (`htap_txn::TransactionManager` — `88cc314`, `b7ff200`):**
@@ -119,6 +124,11 @@ flowchart TD
    - **`movement/jobs/<job-id>/{JOB, JOB.tmp}`:** Individual job metadata envelopes protected by the `HTAPJOB1` envelope with bounded reading and CRC32C verification. Updates use atomic staging (`JOB.tmp` -> `JOB`).
    - **`movement/tablets/<source>/<target>/<job>/{MANIFEST, DATA}`:** Tablet snapshot clone packages containing manifest envelope (`HTAPMNF1`) and data dump.
    - Internal job IDs and package paths are strictly validated (`b7ff200`). External `CopyOptions` paths remain caller-controlled.
+
+5. **`colstore/` (`<root>/colstore` — `b62c705`):**
+   - Columnar storage root for materialized partitions.
+   - Houses per-tablet directories (`colstore/<tablet_id>/`) containing immutable columnar segments (`*.seg`) and tablet manifests (`MANIFEST` in `HTAPTBM1` envelope format with CRC32C checksums).
+   - Used by `LocalServer::convert_table` and `LocalServer` analytical scans (`Route::OlapScan`) over `Column` and `Converting` partitions. Manifest generation on disk is validated against catalog metadata before execution.
 
 ---
 
@@ -137,10 +147,10 @@ The `LocalCoordinator` manages cluster membership, scoped leadership leases, and
 
 Coordinator state is stored in a versioned binary envelope:
 - **Header Magic (8 bytes):** `b"HTAPCRD1"`
-- **Format Version (2 bytes):** `0x0001` (big-endian `u16`)
-- **Payload Length (4 bytes):** Big-endian `u32` (capped at 64 MiB by bounded reader `b7ff200`)
-- **Checksum (4 bytes):** CRC32C over the payload bytes
-- **Payload:** JSON/Bincode serialized state tracking registered cluster nodes, active leases, and high-water mark issued fencing tokens.
+- **Format Version (2 bytes):** `0x0001` (little-endian `u16`)
+- **Payload Length (4 bytes):** Little-endian `u32` (capped at 64 MiB by bounded reader `b7ff200`)
+- **Checksum (4 bytes):** Little-endian `u32` CRC32C over the payload bytes
+- **Payload:** JSON-serialized state tracking registered cluster nodes, active leases, and high-water mark issued fencing tokens (HTAPCRD1 fields are little-endian JSON).
 
 ---
 

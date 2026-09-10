@@ -11,16 +11,17 @@ This document describes the intended system. Every component carries a status:
 `htap-rowstore` (WAL, memtable, SST writer/reader, and LSM row-store engine), and
 `htap-colstore` (immutable encoded/compressed segments, typed zone maps, and vectorized scans)
 are `implemented`. Phase 3 has a completed narrow local slice: sqlparser MySQL dialect,
-strict binder, structural rowstore route classifier (`htap-sql`), durable catalog with reopen recovery
+strict binder (with typed `PointSelect` and `AnalyticSelect`), structural route classifier (`htap-sql`), durable catalog with reopen recovery
 (`htap-catalog`), and synchronous `LocalServer` (`htap-server`) supporting `CREATE TABLE`, literal
-`INSERT`, PK `DELETE`, and complete-PK `SELECT` with reopen recovery.
+`INSERT`, PK `DELETE`, complete-PK `SELECT`, and narrow analytical scans over logical rowstore
+and base-plus-delta rows using server-root `<root>/colstore` for materialized `Column`/`Converting` partitions with reopen recovery.
 Phase 4 has a completed local conversion MVP: partition-scoped row-to-column conversion (`htap-convert`)
 with durable tablet columnar manifest envelopes, a four-phase state machine
 (`SnapshotPinned -> SegmentsWritten -> ReadyToPublish -> Column`), atomic per-tablet manifest and
 catalog publication, rowstore-authoritative base-plus-delta overlay, and online point writes/reads on
 converting and columnar storage partitions.
 Phase 5 has a completed local movement MVP (`htap-movement`): durable jobs (`HTAPJOB1`), CSV/JSONL
-streaming import/export, and tablet snapshot clone/verify/repair (`HTAPMNF1`).
+streaming import and full logical partition export materialization (exports materialize full logical partition before writing), and tablet snapshot clone/verify/repair (`HTAPMNF1`).
 Phase 6 has a completed local coordination and placement MVP (`htap-coord`): synchronous `Coordinator`
 trait, durable `LocalCoordinator` persisting at `COORDINATOR` (`HTAPCRD1`), deterministic sorted membership,
 strictly monotonic fencing tokens (`FencingToken`), coordinator-fenced catalog CAS
@@ -38,7 +39,8 @@ direct CatalogStore CAS and older movement repair APIs bypass coordinator fence;
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
 remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
 reverse `Column -> Row` conversion, delete vectors, physical rowstore reclamation, compaction,
-SQL analytical scans, multi-partition routing, MySQL wire protocol/`htapd` daemon,
+direct SegmentReader pushdown from SQL, vectorized SQL execution, joins/CTEs/windows/ORDER/LIMIT/HAVING,
+multi-partition routing, MySQL wire protocol/`htapd` daemon,
 sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`, Docker image/Compose deployment, and broad MySQL compatibility).
 See [`PROGRESS.md`](./PROGRESS.md).
 
@@ -130,6 +132,7 @@ flowchart TD
         Route -->|"Route::CatalogDdl<br/>(CREATE TABLE)"| DDL["DDL Catalog CAS<br/>LocalCatalogStore.compare_and_set"]
         Route -->|"Route::RowstoreWrite<br/>(INSERT / DELETE)"| DML["TransactionManager.commit_request<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
         Route -->|"Route::RowstorePointRead<br/>(complete-PK SELECT)"| PointRead["Snapshot(visible_version)<br/>htap_rowstore::Engine.get(key)"]
+        Route -->|"Route::OlapScan<br/>(AnalyticSelect)"| OlapScan["execute_analytic_select<br/>Row: scan rowstore<br/>Column/Converting: read_column_partition_core<br/>at &lt;root&gt;/colstore<br/>evaluate filters &amp; aggregates"]
     end
 
     subgraph PlannedDeferred ["Planned / Deferred Components (Not in Direct SQL Path)"]
@@ -252,7 +255,7 @@ is `implemented`). In the target architecture, a unified WAL across formats is e
 In the current implementation, however, there is **no single shared WAL that atomically mutates
 both row and column formats within a single transaction**: the **rowstore remains authoritative**
 for all writes and commits through `TransactionManager` using `RowstoreParticipant` only
-(`crates/htap-server/src/server.rs`). Columnar storage is created via partition-scoped conversion
+(`crates/htap-server/src/lib.rs`). Columnar storage is created via partition-scoped conversion
 (`htap-convert`), and its durability and visibility are published separately via tablet manifests
 (`HTAPTBM1`) and catalog metadata CAS updates. Current SQL statements touch the rowstore participant
 exclusively; single transactions mutating both row and column representations simultaneously are
@@ -279,17 +282,25 @@ those writes land directly in the authoritative **row store**, which acts as the
 
 ## Query routing — the R5 guarantee, structurally enforced
 
-**Status: `implemented (local MVP)`** (structural rowstore route classifier implemented for point lookups and DDL/DML; analytical execution, full SQL breadth, and multi-partition routing are planned/deferred).
+**Status: `implemented (local MVP)`** (structural route classifier implemented for point lookups, DDL/DML, and narrow OLAP scans; full SQL breadth, direct vectorized pushdown from SQL, and multi-partition routing are planned/deferred).
 
 A router inspects the **bound** statement and the partition's **storage descriptor**:
 
-- **Point lookups and short transactions that resolve fully against a primary key** take a dedicated fast path: index probe → row fetch. There is no plan-fragment construction and no vectorized operator pipeline. In the completed Phase 3 local slice, `htap_sql::classify_route` inspects the bound AST and catalog storage descriptor, routing complete-PK point reads strictly to `Route::RowstorePointRead { key }` and literal mutations to `Route::RowstoreWrite` (verified in `crates/htap-sql/tests/route.rs`, `crates/htap-sql/tests/parse_bind.rs`, and `crates/htap-server/tests/local_server.rs`).
+- **Point lookups and short transactions that resolve fully against a primary key** take a dedicated fast path: index probe → row fetch. There is no plan-fragment construction and no vectorized operator pipeline. In `htap-sql`, complete-PK `SELECT` queries strictly bind to `PointSelect` and route to `Route::RowstorePointRead { key }` across all three storage formats (`Row`, `Column`, `Converting`), serving point reads directly from the authoritative rowstore without invoking OLAP execution or the converter (verified in `crates/htap-sql/tests/route.rs`, `crates/htap-sql/tests/parse_bind.rs`, `crates/htap-server/tests/local_server.rs`, and `crates/htap-client/tests/embedded_client.rs`).
+- **Narrow OLAP Scans (`Route::OlapScan`):** `htap-sql` binds non-PK queries on a single unaliased table into typed `AnalyticSelect` structures routing to `Route::OlapScan`. `LocalServer` executes these narrow analytical scans over logical rowstore rows or the converter's rowstore-authoritative base-plus-delta view using server-root `<root>/colstore` for materialized `Column` and `Converting` partitions (validating catalog vs disk manifest generations). Supported OLAP SQL:
+  - Exactly one unaliased table in `FROM`;
+  - Plain projections (named columns or `*`, with optional aliases);
+  - AND-only typed filters (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) with SQL three-valued logic;
+  - Aggregate functions: `COUNT(*)`, `COUNT(column)`, `SUM(column)` (for `Int32`, `Int64`, and `Float64`), `MIN(column)`, and `MAX(column)`;
+  - Deterministic `GROUP BY` with SQL NULL grouping;
+  - Evaluated against the current visible snapshot (`visible_version`).
 - **Route Acceptance across Storage Formats:** `classify_route` accepts `StorageDescriptor::Row`, `StorageDescriptor::Column`, and `StorageDescriptor::Converting`:
   - `CREATE TABLE` routes to `Route::CatalogDdl`.
   - Literal `INSERT` and PK `DELETE` route to `Route::RowstoreWrite` regardless of whether the partition is `Row`, `Column`, or `Converting`, preserving rowstore write-authority and zero mutation downtime.
-  - Complete-PK `SELECT` routes to `Route::RowstorePointRead { key }` across all three storage formats (`Row`, `Column`, `Converting`), serving point reads directly from the authoritative rowstore.
-- **Current SQL-Created Row Topology:** While `classify_route` accepts all three descriptors, tables created via SQL DDL (`CREATE TABLE`) in `LocalServer` are currently initialized exclusively with a single-partition `StorageDescriptor::Row` topology. Setting a partition to `Column` or `Converting` occurs via catalog updates or `LocalConverter` workflows.
-- **No SQL Analytic Scans:** Analytical scans (vectorized column scans over `htap-colstore` segments or planned DataFusion execution) are not linked to the SQL execution façade. Statements requiring full table scans without complete PK equality predicates or specifying unsupported clauses (`ORDER BY`, `GROUP BY`, joins, aggregations, CTEs) are rejected with `HtapError::InvalidArgument` or `HtapError::Unsupported` (verified in `crates/htap-sql/tests/parse_bind.rs` and `crates/htap-client/tests/embedded_client.rs`).
+  - Complete-PK `SELECT` routes to `Route::RowstorePointRead { key }` across all three storage formats, strictly bypassing analytical execution and the converter.
+  - `AnalyticSelect` routes to `Route::OlapScan` across `Row`, `Column`, and `Converting` formats.
+- **Current SQL-Created Row Topology:** While `classify_route` accepts all three descriptors, tables created via SQL DDL (`CREATE TABLE`) in `LocalServer` are currently initialized exclusively with a single-partition `StorageDescriptor::Row` topology. Setting a partition to `Column` or `Converting` occurs via `LocalServer::convert_table`, catalog updates, or `LocalConverter` workflows.
+- **Explicitly Deferred OLAP & SQL Capabilities:** Joins, CTEs (`WITH`), window functions (`OVER`), `ORDER BY`, `LIMIT`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates, direct `SegmentReader` pushdown from SQL, vectorized SQL execution, multi-tablet or distributed partition scans, resource quotas/spill/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth remain deferred.
 
 This separation is enforced **by construction, not by a runtime heuristic**:
 the OLTP fast path lives in a crate that has no dependency on the analytical
@@ -383,8 +394,7 @@ StorageDescriptor::Column
   reclamation / truncation of converted rowstore history is deferred.
 - **Compaction:** Background merge-on-read compaction folding accumulated rowstore deltas into new columnar
   segments is deferred.
-- **SQL analytical scans:** Vectorized SQL query scans over columnar or converting tables via `LocalServer`
-  are deferred (non-point queries return `InvalidArgument` or `Unsupported`).
+- **Vectorized SQL pushdown and distributed OLAP scans:** Direct `SegmentReader` pushdown from SQL, vectorized SQL execution, joins, CTEs, windows, and multi-tablet/distributed scans remain deferred (narrow single-table analytical scans evaluate over collapsed logical rows in memory via `execute_analytic_select`).
 - **Full partition and table conversion semantics:** Conversions across multi-tablet sharded partitions,
   range/list partition boundaries, and distributed multi-node coordinated cutovers are deferred to Phase 5
   and Phase 6.

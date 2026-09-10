@@ -7,7 +7,7 @@ An architecture decision record (ADR) log. Each entry follows the same shape:
 
 ## ADR-001: DataFusion for the analytical path only; hand-write the transactional fast path
 
-`Status: Accepted`
+`Status: Proposal / Deferred (reference only; not implemented in local MVP)`
 `Date: 2026-09-07`
 
 ### Context
@@ -24,7 +24,7 @@ machinery. These two requirements pull in opposite directions.
 
 ### Decision
 
-Option **(c)**.
+Option **(c)** (architectural proposal / future work).
 
 DataFusion delivers the breadth R4 requires at a fraction of the cost of
 building it. But routing a primary-key point lookup through logical planning,
@@ -35,11 +35,21 @@ Splitting also makes the guarantee **structural** rather than advisory: the
 OLTP crate does not depend on the OLAP crate, so a point lookup cannot
 accidentally acquire analytical overhead.
 
+**Implementation note:** In the current local MVP, DataFusion is not integrated
+or implemented. Instead, `htap-sql` binds narrow single-table analytical queries
+to `AnalyticSelect` (`Route::OlapScan`) and `LocalServer` executes them via a hand-written
+evaluator (`htap-server::olap`) over logical rowstore and base-plus-delta rows
+(using `<root>/colstore` for materialized `Column`/`Converting` partitions).
+Complete-PK point queries strictly take the hand-written transactional fast path
+(`Route::RowstorePointRead`), structurally bypassing the analytical evaluator and converter.
+DataFusion/Arrow analytical integration remains deferred future work.
+
 ### Consequences
 
 - Two execution paths must be kept semantically consistent.
 - A conformance test asserting that both paths return identical results for
   overlapping queries is **required**, not optional.
+- DataFusion analytical integration remains deferred future work.
 
 ### How to reverse it
 
@@ -50,7 +60,7 @@ operator.
 
 ## ADR-002: Adopt the delete-vector / delete-and-insert MVCC model
 
-`Status: Accepted`
+`Status: Proposal / Reference design (reference only; not implemented in local MVP)`
 `Date: 2026-09-07`
 
 ### Context
@@ -66,9 +76,14 @@ on every scan, which directly penalizes the analytical workload.
 
 ### Decision
 
-Option **(b)**. Reads become a UNION of rowsets with each segment's delete
-vector subtracted by a single bitmap ANDNOT — no key comparison, no merge, no
-sort at read time.
+Option **(b)** (architectural proposal / reference design). Reads become a UNION
+of rowsets with each segment's delete vector subtracted by a single bitmap
+ANDNOT — no key comparison, no merge, no sort at read time.
+
+**Implementation note:** Not implemented in the current local MVP. The local
+engine relies on LSM rowstore tombstones and rowstore-authoritative base-plus-delta
+overlays (`read_column_partition`). Columnar bitmap delete vectors remain
+deferred future work.
 
 ### Consequences
 
@@ -77,6 +92,7 @@ sort at read time.
 - Delete vectors must be **version-scoped** and **copy-on-write**, so that
   applying a delete clones the bitmap and bumps its version without disturbing
   existing readers.
+- Implementation deferred to post-MVP columnar updates.
 
 ### How to reverse it
 
@@ -123,7 +139,7 @@ replica.
 
 ## ADR-004: One MVCC version domain and one WAL shared by both storage formats
 
-`Status: Accepted`
+`Status: Proposal / Reference design (reference only; not implemented in local MVP)`
 `Date: 2026-09-07`
 
 ### Context
@@ -138,13 +154,21 @@ a log, or maintain their own.
 
 ### Decision
 
-Option **(a)**. This allows a single transaction to touch a row-format
-partition and a column-format partition atomically, and it makes the R2 format
-swap a single metadata record.
+Option **(a)** (architectural proposal / reference design). This allows a single
+transaction to touch a row-format partition and a column-format partition
+atomically, and it makes the R2 format swap a single metadata record.
+
+**Implementation note:** While a single MVCC version domain (`Version`) is
+implemented across formats, there is no single shared WAL mutating both row
+and column formats atomically in the current codebase. The rowstore maintains
+its own WAL, while columnar storage is written via partition conversion and
+tablet manifest envelopes.
 
 ### Consequences
 
 - The WAL becomes a shared bottleneck and must support **group commit**.
+- Single shared multi-format atomic WAL remains deferred to future unified
+  storage work.
 
 ### How to reverse it
 
@@ -294,13 +318,13 @@ Option **(c)**.
 - **Authoritative rowstore base-plus-delta overlay:** The rowstore remains the authoritative
   truth for point operations (`Route::RowstoreWrite` and `Route::RowstorePointRead`), executing
   without interruption across `Row`, `Converting`, and `Column` states. Materialized scans
-  via converter API `read_column_partition` (explicitly a converter API, not SQL execution;
-  verified in `crates/htap-convert/tests/materialization.rs`) scan columnar base segments up to `V`
-  and overlay post-`V` rowstore puts and deletes.
+  via converter API `read_column_partition` (verified in `crates/htap-convert/tests/materialization.rs`)
+  and `LocalServer` analytical scans (`Route::OlapScan` using `<root>/colstore`) scan columnar base
+  segments up to `V` and overlay post-`V` rowstore puts and deletes.
 - **Scope boundaries:** Reverse `Column -> Row` conversion is not implemented and not claimed.
   Columnar bitmap delete vectors, physical rowstore reclamation, delta-to-base background compaction,
-  vectorized SQL query execution over columnar tables, and distributed multi-tablet conversion
-  are explicitly deferred.
+  direct `SegmentReader` pushdown from SQL, vectorized SQL execution, joins/CTEs/windows, and distributed
+  multi-tablet conversion are explicitly deferred.
 
 ### Consequences
 
@@ -387,7 +411,7 @@ Option **(b)**.
 2. **Compile-only CI benchmark stage:**
    - Modified `ci.sh` to run `cargo bench --workspace --no-run` as a fifth stage following formatting, clippy, build, and test. Timings are never executed in CI, avoiding non-deterministic hardware timing failures in virtualized environments.
 3. **Embedded client façade (`htap-client`):**
-   - Synchronous, direct in-process façade (`EmbeddedClient`) over `LocalServer` executing single-partition `CREATE TABLE`, literal `INSERT`, PK `DELETE`, and complete-PK `SELECT` with structured error mapping and recovery across reopen.
+   - Synchronous, direct in-process façade (`EmbeddedClient`) over `LocalServer` executing single-partition `CREATE TABLE`, literal `INSERT`, PK `DELETE`, complete-PK `SELECT`, and narrow analytical scans (`AnalyticSelect` / `Route::OlapScan`) with structured error mapping and recovery across reopen.
 4. **Operational documentation:**
    - Created root `README.md`, `docs/BENCHMARKS.md`, and `docs/OPERATIONS.md` documenting filesystem layouts (`catalog`, `rowstore`, `txn.journal`, `movement`, `COORDINATOR`), recovery boundaries, and explicit non-features (no daemon, no MySQL wire protocol, no network sockets, no Docker/Compose, no TPC-C/TPC-H compliance).
 

@@ -70,11 +70,12 @@ bounds) traces to **Apache Kudu**, via StarRocks, which credits Kudu for it.
 
 ## Apache ZooKeeper
 
-Apache ZooKeeper (Apache-2.0) is the **protocol specification** that this
-project's ZooKeeper coordination backend targets. The ZooKeeper source was not
-available to this project; see [`docs/LIMITATIONS.md`](./docs/LIMITATIONS.md).
-Its semantics were accessed through the public ZooKeeper 3.9 documentation and
-the `zookeeper-async` client crate.
+Apache ZooKeeper (Apache-2.0) is an architectural **protocol reference**
+for future distributed coordination proposals (reference only / not implemented;
+see [`docs/LIMITATIONS.md`](./docs/LIMITATIONS.md) and ADR-006 in
+[`docs/DECISIONS.md`](./docs/DECISIONS.md)). Neither a ZooKeeper backend nor a
+`zookeeper-async` client crate dependency is implemented in this codebase;
+all coordination is implemented via `htap-coord::LocalCoordinator`.
 
 > Apache ZooKeeper
 > Copyright The Apache Software Foundation
@@ -97,5 +98,7 @@ the `zookeeper-async` client crate.
 
 No StarRocks, Apache Kudu, or Apache ZooKeeper source file was vendored,
 copied, or machine-translated into this repository. All listed design elements
-were re-derived from the described designs and implemented independently in
-Rust.
+were studied as architectural references; only the local MVP subset is
+implemented independently in Rust, while proposals such as delete vectors,
+shared multi-format WAL, openraft, DataFusion, and ZooKeeper coordination
+backends remain reference proposals or deferred future work.
