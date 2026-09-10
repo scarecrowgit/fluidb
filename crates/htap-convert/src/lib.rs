@@ -6,15 +6,23 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use htap_catalog::{ColumnManifestRef, TabletId};
+use htap_catalog::store::CatalogStore;
+use htap_catalog::{
+    ColumnManifestRef, ConversionDescriptor, ConversionPhase, PartitionId, StorageDescriptor,
+    StorageFormat, TabletId,
+};
 pub use htap_catalog::{MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS};
-use htap_colstore::{validate_segment_schema, SegmentOptions, SegmentReader, SegmentWriter};
-use htap_common::{HtapError, Result, Row, Schema, Version};
+use htap_colstore::{
+    validate_segment_schema, ScanRequest, SegmentOptions, SegmentReader, SegmentWriter,
+};
+use htap_common::{encode_key, HtapError, Result, Row, Schema, Value, Version};
+use htap_rowstore::{Engine, MemtableEntry, Snapshot, ValueKind};
 use serde::{Deserialize, Serialize};
 
 /// Header magic bytes for tablet manifest files (`HTAPTBM1`).
@@ -600,6 +608,709 @@ pub fn write_segment(
         row_count: metadata.row_count,
         summary: Some(summary),
     })
+}
+
+/// Collapses raw rowstore MVCC and tombstone entries for a partition into logical visible rows.
+///
+/// Because [`MemtableEntry`] items from `scan_partition` are ordered by user key ascending
+/// and version descending, the first entry encountered for any distinct user key represents
+/// its latest visible MVCC state. If that entry is a [`ValueKind::Put`], its row is retained;
+/// if it is a [`ValueKind::Delete`], the key is tombstoned and omitted. Subsequent older
+/// versions for the same key are discarded.
+pub fn collapse_entries_to_rows(entries: &[MemtableEntry]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut current_user_key: Option<&[u8]> = None;
+    for entry in entries {
+        if current_user_key == Some(entry.key.user_key.as_slice()) {
+            continue;
+        }
+        current_user_key = Some(entry.key.user_key.as_slice());
+        match &entry.value {
+            ValueKind::Put(row) => rows.push(row.clone()),
+            ValueKind::Delete => {}
+        }
+    }
+    rows
+}
+
+/// Perform row-to-column conversion for a given partition.
+///
+/// Coordinates the atomic cutover protocol:
+/// 1. Inspects catalog state and validates partition topology (requires exactly one tablet,
+///    which must have exactly one healthy leader replica).
+/// 2. If partition is in `StorageDescriptor::Row`, pins snapshot version from rowstore visible
+///    version (or Version 1 if empty) and atomically advances catalog to `StorageDescriptor::Converting`
+///    with phase [`ConversionPhase::SnapshotPinned`]. If already in `Converting`, reuses the persisted
+///    pinned snapshot version and generation.
+/// 3. If in `SnapshotPinned`, scans `rowstore` for the partition at the pinned snapshot version,
+///    collapses MVCC versions and tombstones into logical rows, writes columnar segment file(s),
+///    and atomically writes the tablet columnar manifest envelope to disk.
+/// 4. Persists conversion phase transitions via catalog CAS: reloads catalog and advances phase to
+///    [`ConversionPhase::SegmentsWritten`], then [`ConversionPhase::ReadyToPublish`] with a new
+///    catalog generation, preserving `StorageDescriptor::Converting` and pinned snapshot/generation.
+/// 5. Executes the final publish catalog CAS cutover to `StorageDescriptor::Column` requiring phase
+///    [`ConversionPhase::ReadyToPublish`], clearing conversion metadata and registering the tablet
+///    column manifest reference.
+pub fn convert_partition(
+    catalog: &dyn CatalogStore,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    options: &SegmentOptions,
+    partition_id: PartitionId,
+) -> Result<TabletColumnManifest> {
+    let current_cat = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+    let part_desc = current_cat
+        .partition(partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?
+        .clone();
+
+    let table_desc = current_cat
+        .table(part_desc.table_id)
+        .ok_or_else(|| HtapError::NotFound(format!("table {} not found", part_desc.table_id)))?
+        .clone();
+
+    // 1. Validate topology: require exactly 1 tablet, resolve it, require exactly 1 replica,
+    // resolve replica, and require healthy && is_leader.
+    if part_desc.tablets.is_empty() {
+        return Err(HtapError::InvalidArgument(format!(
+            "partition {partition_id} has no tablets"
+        )));
+    }
+    if part_desc.tablets.len() != 1 {
+        return Err(HtapError::Unsupported(format!(
+            "partition {partition_id} has {} tablets; exactly 1 tablet is required for conversion",
+            part_desc.tablets.len()
+        )));
+    }
+    let tablet_id = part_desc.tablets[0];
+    let tablet_desc = current_cat.tablet(tablet_id).ok_or_else(|| {
+        HtapError::Internal(format!(
+            "tablet {tablet_id} referenced by partition {partition_id} not found in catalog"
+        ))
+    })?;
+
+    if tablet_desc.partition_id != part_desc.id {
+        return Err(HtapError::Internal(format!(
+            "tablet {tablet_id} partition_id mismatch: expected {partition_id}, got {}",
+            tablet_desc.partition_id
+        )));
+    }
+
+    if tablet_desc.replicas.is_empty() {
+        return Err(HtapError::InvalidArgument(format!(
+            "tablet {tablet_id} has no replicas"
+        )));
+    }
+    if tablet_desc.replicas.len() != 1 {
+        return Err(HtapError::Unsupported(format!(
+            "tablet {tablet_id} has {} replicas; exactly 1 replica is required for conversion",
+            tablet_desc.replicas.len()
+        )));
+    }
+    let replica_id = tablet_desc.replicas[0];
+    let replica_desc = current_cat.replica(replica_id).ok_or_else(|| {
+        HtapError::Internal(format!(
+            "replica {replica_id} referenced by tablet {tablet_id} not found in catalog"
+        ))
+    })?;
+
+    if replica_desc.tablet_id != tablet_id {
+        return Err(HtapError::Internal(format!(
+            "replica {replica_id} tablet_id mismatch: expected {tablet_id}, got {}",
+            replica_desc.tablet_id
+        )));
+    }
+
+    if !replica_desc.healthy {
+        return Err(HtapError::Internal(format!(
+            "replica {replica_id} for tablet {tablet_id} is not healthy"
+        )));
+    }
+    if !replica_desc.is_leader {
+        return Err(HtapError::Internal(format!(
+            "replica {replica_id} for tablet {tablet_id} is not leader"
+        )));
+    }
+
+    // Determine pinned snapshot version, conversion generation, and whether manifest already exists.
+    let (snapshot_version, conv_generation, manifest_opt) = match &part_desc.storage {
+        StorageDescriptor::Column => {
+            if part_desc.conversion.is_some() {
+                return Err(HtapError::Corruption(format!(
+                    "partition {partition_id} has Column storage but conversion descriptor is present"
+                )));
+            }
+            let manifest = open(colstore_root, tablet_id)?;
+            return Ok(manifest);
+        }
+        StorageDescriptor::Converting {
+            from,
+            to,
+            generation,
+        } => {
+            if *to != StorageFormat::Column || *from != StorageFormat::Row {
+                return Err(HtapError::Unsupported(format!(
+                    "partition {partition_id} converting in unsupported direction: {from:?} -> {to:?}"
+                )));
+            }
+            let conv = part_desc.conversion.as_ref().ok_or_else(|| {
+                HtapError::Corruption(format!(
+                    "partition {partition_id} in Converting state without conversion descriptor"
+                ))
+            })?;
+            if conv.generation != *generation || conv.from != *from || conv.to != *to {
+                return Err(HtapError::Corruption(format!(
+                    "partition {partition_id} conversion descriptor does not match Converting storage"
+                )));
+            }
+
+            match conv.phase {
+                ConversionPhase::SnapshotPinned => {
+                    // On retry when already Converting and phase is SnapshotPinned,
+                    // reuse pinned snapshot & generation, build, then perform phase updates.
+                    (conv.snapshot_version, *generation, None)
+                }
+                ConversionPhase::SegmentsWritten | ConversionPhase::ReadyToPublish => {
+                    // When phase is SegmentsWritten or ReadyToPublish and matching manifest exists,
+                    // do not take a new snapshot or overwrite with a different generation.
+                    let disk_manifest = open(colstore_root, tablet_id).map_err(|e| {
+                        HtapError::Corruption(format!(
+                            "partition {partition_id} in phase {:?} but could not open manifest: {e}",
+                            conv.phase
+                        ))
+                    })?;
+                    if disk_manifest.generation != conv.generation
+                        || disk_manifest.base_version != conv.snapshot_version
+                    {
+                        return Err(HtapError::Corruption(format!(
+                            "partition {partition_id} manifest on disk (gen {}, base_version {}) does not match conversion descriptor (gen {}, base_version {})",
+                            disk_manifest.generation,
+                            disk_manifest.base_version,
+                            conv.generation,
+                            conv.snapshot_version
+                        )));
+                    }
+                    (conv.snapshot_version, *generation, Some(disk_manifest))
+                }
+            }
+        }
+        StorageDescriptor::Row => {
+            if part_desc.conversion.is_some() {
+                return Err(HtapError::InvalidArgument(format!(
+                    "partition {partition_id} has Row storage but conversion descriptor is present"
+                )));
+            }
+            let visible_v = rowstore.visible_version();
+            let pin_v = if visible_v.get() == 0 {
+                Version::new(1)
+            } else {
+                visible_v
+            };
+
+            let next_gen = current_cat.generation + 1;
+            let mut next_cat = current_cat.clone();
+            next_cat.generation = next_gen;
+
+            let p_mut = next_cat
+                .partitions
+                .iter_mut()
+                .find(|p| p.id == partition_id)
+                .ok_or_else(|| {
+                    HtapError::NotFound(format!("partition {partition_id} not found"))
+                })?;
+            p_mut.generation = next_gen;
+            p_mut.storage = StorageDescriptor::Converting {
+                from: StorageFormat::Row,
+                to: StorageFormat::Column,
+                generation: next_gen,
+            };
+            p_mut.conversion = Some(ConversionDescriptor::new(
+                next_gen,
+                StorageFormat::Row,
+                StorageFormat::Column,
+                pin_v,
+                ConversionPhase::SnapshotPinned,
+            ));
+
+            catalog.compare_and_set(current_cat.generation, next_cat)?;
+            (pin_v, next_gen, None)
+        }
+    };
+
+    // Build segments and publish manifest if not already durable
+    let manifest = match manifest_opt {
+        Some(m) => m,
+        None => {
+            let entries =
+                rowstore.scan_partition(partition_id.as_u64(), Snapshot::new(snapshot_version))?;
+            let logical_rows = collapse_entries_to_rows(&entries);
+
+            let mut segments = Vec::new();
+            if !logical_rows.is_empty() {
+                let segment_name = "seg-0.col";
+                let entry = write_segment(
+                    colstore_root,
+                    tablet_id,
+                    conv_generation,
+                    segment_name,
+                    &table_desc.schema,
+                    logical_rows,
+                    options,
+                )?;
+                segments.push(entry);
+            }
+
+            let m = TabletColumnManifest::new(
+                conv_generation,
+                tablet_id,
+                table_desc.schema.clone(),
+                snapshot_version,
+                segments,
+            );
+            write_atomic(colstore_root, &m)?;
+            m
+        }
+    };
+
+    // Transition 1: Update phase to SegmentsWritten
+    let cat1 = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+    let p1 = cat1
+        .partition(partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?;
+
+    if matches!(p1.storage, StorageDescriptor::Column) {
+        return Ok(manifest);
+    }
+
+    if let Some(conv1) = &p1.conversion {
+        if conv1.generation != conv_generation
+            || conv1.from != StorageFormat::Row
+            || conv1.to != StorageFormat::Column
+            || conv1.snapshot_version != snapshot_version
+        {
+            return Err(HtapError::Conflict(format!(
+                "conversion descriptor mismatch during transition to SegmentsWritten: {conv1:?}"
+            )));
+        }
+
+        if conv1.phase == ConversionPhase::SnapshotPinned {
+            let next_gen = cat1.generation + 1;
+            let mut cat_sw = cat1.clone();
+            cat_sw.generation = next_gen;
+
+            let p_mut = cat_sw
+                .partitions
+                .iter_mut()
+                .find(|p| p.id == partition_id)
+                .ok_or_else(|| {
+                    HtapError::NotFound(format!("partition {partition_id} not found"))
+                })?;
+            p_mut.generation = next_gen;
+            p_mut.storage = StorageDescriptor::Converting {
+                from: StorageFormat::Row,
+                to: StorageFormat::Column,
+                generation: conv_generation,
+            };
+            p_mut.conversion = Some(ConversionDescriptor::new(
+                conv_generation,
+                StorageFormat::Row,
+                StorageFormat::Column,
+                snapshot_version,
+                ConversionPhase::SegmentsWritten,
+            ));
+
+            catalog.compare_and_set(cat1.generation, cat_sw)?;
+        }
+    } else {
+        return Err(HtapError::Corruption(format!(
+            "partition {partition_id} missing conversion descriptor during SegmentsWritten update"
+        )));
+    }
+
+    // Transition 2: Update phase to ReadyToPublish
+    let cat2 = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+    let p2 = cat2
+        .partition(partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?;
+
+    if matches!(p2.storage, StorageDescriptor::Column) {
+        return Ok(manifest);
+    }
+
+    if let Some(conv2) = &p2.conversion {
+        if conv2.generation != conv_generation
+            || conv2.from != StorageFormat::Row
+            || conv2.to != StorageFormat::Column
+            || conv2.snapshot_version != snapshot_version
+        {
+            return Err(HtapError::Conflict(format!(
+                "conversion descriptor mismatch during transition to ReadyToPublish: {conv2:?}"
+            )));
+        }
+
+        if conv2.phase == ConversionPhase::SegmentsWritten {
+            let next_gen = cat2.generation + 1;
+            let mut cat_rtp = cat2.clone();
+            cat_rtp.generation = next_gen;
+
+            let p_mut = cat_rtp
+                .partitions
+                .iter_mut()
+                .find(|p| p.id == partition_id)
+                .ok_or_else(|| {
+                    HtapError::NotFound(format!("partition {partition_id} not found"))
+                })?;
+            p_mut.generation = next_gen;
+            p_mut.storage = StorageDescriptor::Converting {
+                from: StorageFormat::Row,
+                to: StorageFormat::Column,
+                generation: conv_generation,
+            };
+            p_mut.conversion = Some(ConversionDescriptor::new(
+                conv_generation,
+                StorageFormat::Row,
+                StorageFormat::Column,
+                snapshot_version,
+                ConversionPhase::ReadyToPublish,
+            ));
+
+            catalog.compare_and_set(cat2.generation, cat_rtp)?;
+        }
+    } else {
+        return Err(HtapError::Corruption(format!(
+            "partition {partition_id} missing conversion descriptor during ReadyToPublish update"
+        )));
+    }
+
+    // Transition 3: Final publish CAS to Column format and register manifest ref
+    let cat3 = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+    let p3 = cat3
+        .partition(partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?;
+
+    if matches!(p3.storage, StorageDescriptor::Column) {
+        return Ok(manifest);
+    }
+
+    match &p3.storage {
+        StorageDescriptor::Converting {
+            from,
+            to,
+            generation,
+        } => {
+            if *from != StorageFormat::Row
+                || *to != StorageFormat::Column
+                || *generation != conv_generation
+            {
+                return Err(HtapError::Conflict(format!(
+                    "final CAS failed: partition storage mismatch (expected Row->Column gen {conv_generation}, found {from:?}->{to:?} gen {generation})"
+                )));
+            }
+        }
+        other => {
+            return Err(HtapError::Conflict(format!(
+                "final CAS failed: partition storage is {other:?}, expected Converting"
+            )));
+        }
+    }
+
+    let conv3 = p3.conversion.as_ref().ok_or_else(|| {
+        HtapError::Conflict(format!(
+            "final CAS failed: partition {partition_id} missing conversion descriptor"
+        ))
+    })?;
+
+    if conv3.generation != conv_generation
+        || conv3.from != StorageFormat::Row
+        || conv3.to != StorageFormat::Column
+        || conv3.snapshot_version != snapshot_version
+        || conv3.phase != ConversionPhase::ReadyToPublish
+    {
+        return Err(HtapError::Conflict(format!(
+            "final CAS failed: persisted conversion descriptor does not match ReadyToPublish state: {conv3:?}"
+        )));
+    }
+
+    let rel_path = format!("tablet-{}/{}", tablet_id.as_u64(), MANIFEST_FILE_NAME);
+    let manifest_ref = manifest.to_manifest_ref(rel_path);
+
+    let final_gen = cat3.generation + 1;
+    let mut final_cat = cat3.clone();
+    final_cat.generation = final_gen;
+
+    let p_mut = final_cat
+        .partitions
+        .iter_mut()
+        .find(|p| p.id == partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?;
+    p_mut.generation = final_gen;
+    p_mut.storage = StorageDescriptor::Column;
+    p_mut.conversion = None;
+
+    let t_mut = final_cat
+        .tablets
+        .iter_mut()
+        .find(|t| t.id == tablet_id)
+        .ok_or_else(|| HtapError::NotFound(format!("tablet {tablet_id} not found")))?;
+    t_mut.generation = final_gen;
+    t_mut.column_manifest = Some(manifest_ref);
+
+    if let Err(err) = catalog.compare_and_set(cat3.generation, final_cat) {
+        if matches!(err, HtapError::Conflict(_)) {
+            // Check if another concurrent or retry operation completed the final publish
+            if let Some(reloaded) = catalog.load()? {
+                if let Some(p) = reloaded.partition(partition_id) {
+                    if p.storage == StorageDescriptor::Column && p.conversion.is_none() {
+                        if let Some(t) = reloaded.tablet(tablet_id) {
+                            if let Some(mref) = &t.column_manifest {
+                                if mref.generation == conv_generation
+                                    && mref.base_version == snapshot_version
+                                {
+                                    return Ok(manifest);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Err(err);
+    }
+
+    Ok(manifest)
+}
+
+/// Read visible rows for a partition, overlaying rowstore mutations on top of columnar data.
+///
+/// Keeps the rowstore authoritative:
+/// - If the partition is in `StorageDescriptor::Row` or has no columnar manifest, reads directly
+///   from rowstore at `snapshot`.
+/// - If the target `snapshot` version is strictly less than the manifest `base_version`, reads
+///   from rowstore historical MVCC data to avoid reading uncommitted future columnar state.
+/// - If `snapshot` version is `>= manifest base_version`, reads base columnar rows from segment
+///   files, then applies all rowstore mutations for this partition committed after `base_version`
+///   up to `snapshot` version (Puts update/insert, Deletes tombstone/remove).
+///
+/// Returns rows sorted by primary key.
+pub fn read_column_partition(
+    catalog: &dyn CatalogStore,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    partition_id: PartitionId,
+    snapshot: impl Into<Snapshot>,
+) -> Result<Vec<Row>> {
+    let cat_snap = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+    let part_desc = cat_snap
+        .partition(partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?;
+
+    let table_desc = cat_snap
+        .table(part_desc.table_id)
+        .ok_or_else(|| HtapError::NotFound(format!("table {} not found", part_desc.table_id)))?;
+
+    let schema = &table_desc.schema;
+    let pk_indices = &table_desc.primary_key;
+    let target_snapshot = snapshot.into();
+
+    if part_desc.tablets.is_empty() {
+        return Err(HtapError::InvalidArgument(format!(
+            "partition {partition_id} has no tablets"
+        )));
+    }
+    if part_desc.tablets.len() != 1 {
+        return Err(HtapError::Unsupported(format!(
+            "partition {partition_id} has {} tablets; exactly 1 tablet is required",
+            part_desc.tablets.len()
+        )));
+    }
+    let tablet_id = part_desc.tablets[0];
+    let tablet = cat_snap
+        .tablet(tablet_id)
+        .ok_or_else(|| HtapError::NotFound(format!("tablet {tablet_id} not found")))?;
+
+    // If there is no column manifest or partition is Row, read directly from rowstore.
+    if tablet.column_manifest.is_none() || matches!(part_desc.storage, StorageDescriptor::Row) {
+        let entries = rowstore.scan_partition(partition_id.as_u64(), target_snapshot)?;
+        return Ok(collapse_entries_to_rows(&entries));
+    }
+
+    let manifest = open(colstore_root, tablet_id)?;
+    let base_version = manifest.base_version;
+
+    // Rowstore is authoritative for historical reads before manifest base_version.
+    if target_snapshot.version < base_version {
+        let entries = rowstore.scan_partition(partition_id.as_u64(), target_snapshot)?;
+        return Ok(collapse_entries_to_rows(&entries));
+    }
+
+    // 1. Read base rows from columnar segments into map keyed by encoded PK.
+    let mut map: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
+    for entry in &manifest.segments {
+        let seg_path = resolve_segment_path(colstore_root, tablet_id, &entry.path);
+        let reader = SegmentReader::open(&seg_path)?;
+        let req = ScanRequest::new((0..schema.len()).collect(), None);
+        let scan_res = reader.scan(&req)?;
+        for batch in scan_res.batches {
+            let n = batch.num_rows();
+            for r in 0..n {
+                let mut values = Vec::with_capacity(schema.len());
+                for col in &batch.columns {
+                    values.push(col.get(r).ok_or_else(|| {
+                        HtapError::Corruption(format!("missing value at row {r} in column vector"))
+                    })?);
+                }
+                let row = Row::new(values);
+                let pk_values: Vec<Value> = pk_indices
+                    .iter()
+                    .map(|&idx| {
+                        row.get(idx).cloned().ok_or_else(|| {
+                            HtapError::InvalidArgument(format!("row missing PK column index {idx}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let key = encode_key(&pk_values)?;
+                map.insert(key, row);
+            }
+        }
+    }
+
+    // 2. Overlay rowstore mutations committed after base_version up to target snapshot.
+    let rowstore_entries = rowstore.scan_partition(partition_id.as_u64(), target_snapshot)?;
+    let mut seen_keys = HashSet::new();
+    for entry in &rowstore_entries {
+        let user_key = &entry.key.user_key;
+        if seen_keys.contains(user_key) {
+            continue;
+        }
+        seen_keys.insert(user_key.clone());
+
+        if entry.key.version > base_version {
+            match &entry.value {
+                ValueKind::Put(row) => {
+                    map.insert(user_key.clone(), row.clone());
+                }
+                ValueKind::Delete => {
+                    map.remove(user_key);
+                }
+            }
+        }
+    }
+
+    Ok(map.into_values().collect())
+}
+
+/// Local single-node row-to-column conversion and columnar materialization engine.
+///
+/// Manages conversions of partitions from row-oriented storage into columnar segments,
+/// tracking catalog transitions and keeping the LSM rowstore authoritative for live mutations.
+#[derive(Clone)]
+pub struct LocalConverter {
+    catalog: Arc<dyn CatalogStore>,
+    rowstore: Arc<Engine>,
+    colstore_root: PathBuf,
+    options: SegmentOptions,
+}
+
+impl std::fmt::Debug for LocalConverter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalConverter")
+            .field("colstore_root", &self.colstore_root)
+            .field("options", &self.options)
+            .finish()
+    }
+}
+
+impl LocalConverter {
+    /// Create a new local converter instance.
+    pub fn new(
+        catalog: Arc<dyn CatalogStore>,
+        rowstore: Arc<Engine>,
+        colstore_root: impl Into<PathBuf>,
+        options: SegmentOptions,
+    ) -> Self {
+        Self {
+            catalog,
+            rowstore,
+            colstore_root: colstore_root.into(),
+            options,
+        }
+    }
+
+    /// Access the underlying catalog store.
+    pub fn catalog(&self) -> &Arc<dyn CatalogStore> {
+        &self.catalog
+    }
+
+    /// Access the underlying rowstore engine.
+    pub fn rowstore(&self) -> &Arc<Engine> {
+        &self.rowstore
+    }
+
+    /// Access the columnar storage root directory.
+    pub fn colstore_root(&self) -> &Path {
+        &self.colstore_root
+    }
+
+    /// Access the segment options.
+    pub fn options(&self) -> &SegmentOptions {
+        &self.options
+    }
+
+    /// Perform row-to-column conversion for a partition.
+    pub fn convert_partition(&self, partition_id: PartitionId) -> Result<TabletColumnManifest> {
+        convert_partition(
+            self.catalog.as_ref(),
+            self.rowstore.as_ref(),
+            &self.colstore_root,
+            &self.options,
+            partition_id,
+        )
+    }
+
+    /// Materialize a partition to columnar format (alias for [`convert_partition`](Self::convert_partition)).
+    pub fn materialize_partition(&self, partition_id: PartitionId) -> Result<TabletColumnManifest> {
+        self.convert_partition(partition_id)
+    }
+
+    /// Convert a partition to columnar format (alias for [`convert_partition`](Self::convert_partition)).
+    pub fn convert(&self, partition_id: PartitionId) -> Result<TabletColumnManifest> {
+        self.convert_partition(partition_id)
+    }
+
+    /// Read visible rows for a partition at `snapshot`, overlaying rowstore mutations on columnar segments.
+    pub fn read_column_partition(
+        &self,
+        partition_id: PartitionId,
+        snapshot: impl Into<Snapshot>,
+    ) -> Result<Vec<Row>> {
+        read_column_partition(
+            self.catalog.as_ref(),
+            self.rowstore.as_ref(),
+            &self.colstore_root,
+            partition_id,
+            snapshot,
+        )
+    }
+
+    /// Read visible rows for a partition at the current visible snapshot of the rowstore.
+    pub fn read_column_partition_current(&self, partition_id: PartitionId) -> Result<Vec<Row>> {
+        self.read_column_partition(partition_id, self.rowstore.snapshot())
+    }
 }
 
 /// Module providing re-exports matching module path conventions.
