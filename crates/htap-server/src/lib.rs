@@ -495,7 +495,7 @@ impl LocalServer {
     fn execute_analytic_select(
         &self,
         select: AnalyticSelect,
-        _table_desc: &TableDescriptor,
+        table_desc: &TableDescriptor,
         partition: &PartitionDescriptor,
         catalog: &CatalogSnapshot,
     ) -> Result<StatementResult> {
@@ -505,12 +505,14 @@ impl LocalServer {
             .tablet(tablet_id)
             .ok_or_else(|| HtapError::Internal(format!("tablet {tablet_id} not found")))?;
 
-        let rows = match &partition.storage {
+        match &partition.storage {
             StorageDescriptor::Row => {
                 let entries = self
                     .engine
                     .scan_partition(partition.id.as_u64(), snapshot)?;
-                htap_convert::collapse_entries_to_rows(&entries)
+                let rows = htap_convert::collapse_entries_to_rows(&entries);
+                let result = olap::execute_analytic_select(&select, rows)?;
+                Ok(StatementResult::Query(result))
             }
             StorageDescriptor::Column => {
                 let cat_manifest = tablet.column_manifest.as_ref().ok_or_else(|| {
@@ -526,30 +528,47 @@ impl LocalServer {
                         disk_manifest.generation, cat_manifest.generation
                     )));
                 }
-                htap_convert::read_column_partition_core(
+                let (source_columns, mapping) = olap::plan_source_columns(&select);
+                let pushdown_predicate = olap::select_pushdown_predicate(select.filter.as_ref());
+                let compact_res = htap_convert::read_column_partition_compact_core(
                     catalog,
                     &self.engine,
                     &self.colstore_dir,
                     partition.id,
                     snapshot,
-                )?
+                    &source_columns,
+                    &table_desc.primary_key,
+                    pushdown_predicate,
+                )?;
+                let result =
+                    olap::execute_analytic_select_compact(&select, compact_res.rows, &mapping)?;
+                Ok(StatementResult::Query(result))
             }
             StorageDescriptor::Converting { .. } => match &tablet.column_manifest {
                 Some(cat_manifest) => {
                     let disk_manifest = htap_convert::open(&self.colstore_dir, tablet_id)?;
                     if disk_manifest.generation != cat_manifest.generation {
                         return Err(HtapError::InvalidArgument(format!(
-                                "column manifest generation mismatch for converting tablet {tablet_id}: disk {} != catalog {}",
-                                disk_manifest.generation, cat_manifest.generation
-                            )));
+                            "column manifest generation mismatch for converting tablet {tablet_id}: disk {} != catalog {}",
+                            disk_manifest.generation, cat_manifest.generation
+                        )));
                     }
-                    htap_convert::read_column_partition_core(
+                    let (source_columns, mapping) = olap::plan_source_columns(&select);
+                    let pushdown_predicate =
+                        olap::select_pushdown_predicate(select.filter.as_ref());
+                    let compact_res = htap_convert::read_column_partition_compact_core(
                         catalog,
                         &self.engine,
                         &self.colstore_dir,
                         partition.id,
                         snapshot,
-                    )?
+                        &source_columns,
+                        &table_desc.primary_key,
+                        pushdown_predicate,
+                    )?;
+                    let result =
+                        olap::execute_analytic_select_compact(&select, compact_res.rows, &mapping)?;
+                    Ok(StatementResult::Query(result))
                 }
                 None => {
                     let is_snapshot_pinned = partition
@@ -561,19 +580,18 @@ impl LocalServer {
                         let entries = self
                             .engine
                             .scan_partition(partition.id.as_u64(), snapshot)?;
-                        htap_convert::collapse_entries_to_rows(&entries)
+                        let rows = htap_convert::collapse_entries_to_rows(&entries);
+                        let result = olap::execute_analytic_select(&select, rows)?;
+                        Ok(StatementResult::Query(result))
                     } else {
-                        return Err(HtapError::InvalidArgument(format!(
-                                "partition {} is converting without manifest but phase is not SnapshotPinned",
-                                partition.id
-                            )));
+                        Err(HtapError::InvalidArgument(format!(
+                            "partition {} is converting without manifest but phase is not SnapshotPinned",
+                            partition.id
+                        )))
                     }
                 }
             },
-        };
-
-        let result = olap::execute_analytic_select(&select, rows)?;
-        Ok(StatementResult::Query(result))
+        }
     }
 
     /// Returns the columnar storage root directory for this local server.

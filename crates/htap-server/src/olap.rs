@@ -8,10 +8,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use htap_common::error::{HtapError, Result};
 use htap_common::types::{ColumnDef, DataType, Row, Value};
+use htap_convert::Predicate;
 use htap_sql::ast::{
     AggregateFunction, AnalyticExpr, AnalyticFilter, AnalyticSelect, ComparisonOp,
 };
@@ -154,6 +155,220 @@ pub fn execute_analytic_select(select: &AnalyticSelect, rows: Vec<Row>) -> Resul
 
         Ok(QueryResult::new(output_columns, output_rows))
     }
+}
+
+/// Plans the required source columns for an [`AnalyticSelect`] by collecting column references
+/// from projection expressions, `GROUP BY` columns, and filter leaf predicates.
+///
+/// Returns a sorted and deduplicated vector of source column indices, along with a mapping
+/// from original source table column index to compact position in that vector.
+pub fn plan_source_columns(select: &AnalyticSelect) -> (Vec<usize>, BTreeMap<usize, usize>) {
+    let mut columns = BTreeSet::new();
+
+    for expr in &select.projection {
+        match expr {
+            AnalyticExpr::Column { index, .. } => {
+                columns.insert(*index);
+            }
+            AnalyticExpr::Aggregate { column_index, .. } => {
+                if let Some(idx) = column_index {
+                    columns.insert(*idx);
+                }
+            }
+        }
+    }
+
+    for &idx in &select.group_by {
+        columns.insert(idx);
+    }
+
+    if let Some(filter) = &select.filter {
+        for leaf in filter.leaves() {
+            match leaf {
+                AnalyticFilter::Comparison { column, .. } => {
+                    columns.insert(*column);
+                }
+                AnalyticFilter::IsNull { column } | AnalyticFilter::IsNotNull { column } => {
+                    columns.insert(*column);
+                }
+                AnalyticFilter::And(_) => {}
+            }
+        }
+    }
+
+    let source_columns: Vec<usize> = columns.into_iter().collect();
+    let mapping: BTreeMap<usize, usize> = source_columns
+        .iter()
+        .enumerate()
+        .map(|(compact_idx, &orig_idx)| (orig_idx, compact_idx))
+        .collect();
+
+    (source_columns, mapping)
+}
+
+/// Selects at most one deterministic pushdown leaf predicate from the filter tree.
+///
+/// Evaluates leaf predicates in deterministic AST order. Eligible pushdown leaves are
+/// `Eq`, `Lt`, `Lte`, `Gt`, `Gte`, `IsNull`, and `IsNotNull`. `NotEq` is never pushed down,
+/// and `AND` trees are never pushed down as a whole.
+pub fn select_pushdown_predicate(filter: Option<&AnalyticFilter>) -> Option<Predicate> {
+    let filter = filter?;
+    for leaf in filter.leaves() {
+        match leaf {
+            AnalyticFilter::Comparison { column, op, value } => {
+                if value.is_null() {
+                    continue;
+                }
+                let pred = match op {
+                    ComparisonOp::Eq => Some(Predicate::Eq {
+                        column: *column,
+                        value: value.clone(),
+                    }),
+                    ComparisonOp::Lt => Some(Predicate::Lt {
+                        column: *column,
+                        value: value.clone(),
+                    }),
+                    ComparisonOp::Lte => Some(Predicate::Lte {
+                        column: *column,
+                        value: value.clone(),
+                    }),
+                    ComparisonOp::Gt => Some(Predicate::Gt {
+                        column: *column,
+                        value: value.clone(),
+                    }),
+                    ComparisonOp::Gte => Some(Predicate::Gte {
+                        column: *column,
+                        value: value.clone(),
+                    }),
+                    ComparisonOp::NotEq => None,
+                };
+                if pred.is_some() {
+                    return pred;
+                }
+            }
+            AnalyticFilter::IsNull { column } => {
+                return Some(Predicate::IsNull { column: *column });
+            }
+            AnalyticFilter::IsNotNull { column } => {
+                return Some(Predicate::IsNotNull { column: *column });
+            }
+            AnalyticFilter::And(_) => {}
+        }
+    }
+    None
+}
+
+/// Remaps original source column indices in an [`AnalyticSelect`] statement to compact positions
+/// according to `mapping`.
+pub fn remap_analytic_select(
+    select: &AnalyticSelect,
+    mapping: &BTreeMap<usize, usize>,
+) -> Result<AnalyticSelect> {
+    let remap_idx = |idx: usize| -> Result<usize> {
+        mapping.get(&idx).copied().ok_or_else(|| {
+            HtapError::Internal(format!("column index {idx} not found in compact mapping"))
+        })
+    };
+
+    let mut new_projection = Vec::with_capacity(select.projection.len());
+    for expr in &select.projection {
+        let new_expr = match expr {
+            AnalyticExpr::Column {
+                index,
+                name,
+                data_type,
+                nullable,
+            } => AnalyticExpr::Column {
+                index: remap_idx(*index)?,
+                name: name.clone(),
+                data_type: *data_type,
+                nullable: *nullable,
+            },
+            AnalyticExpr::Aggregate {
+                function,
+                column_index,
+                name,
+                data_type,
+                nullable,
+            } => AnalyticExpr::Aggregate {
+                function: *function,
+                column_index: match column_index {
+                    Some(idx) => Some(remap_idx(*idx)?),
+                    None => None,
+                },
+                name: name.clone(),
+                data_type: *data_type,
+                nullable: *nullable,
+            },
+        };
+        new_projection.push(new_expr);
+    }
+
+    let new_group_by = select
+        .group_by
+        .iter()
+        .map(|&idx| remap_idx(idx))
+        .collect::<Result<Vec<_>>>()?;
+
+    let new_filter = match &select.filter {
+        Some(filter) => Some(remap_filter(filter, mapping)?),
+        None => None,
+    };
+
+    Ok(AnalyticSelect {
+        table: select.table.clone(),
+        projection: new_projection,
+        filter: new_filter,
+        group_by: new_group_by,
+        output_schema: select.output_schema.clone(),
+    })
+}
+
+fn remap_filter(
+    filter: &AnalyticFilter,
+    mapping: &BTreeMap<usize, usize>,
+) -> Result<AnalyticFilter> {
+    let remap_idx = |idx: usize| -> Result<usize> {
+        mapping.get(&idx).copied().ok_or_else(|| {
+            HtapError::Internal(format!(
+                "filter column index {idx} not found in compact mapping"
+            ))
+        })
+    };
+
+    match filter {
+        AnalyticFilter::IsNull { column } => Ok(AnalyticFilter::IsNull {
+            column: remap_idx(*column)?,
+        }),
+        AnalyticFilter::IsNotNull { column } => Ok(AnalyticFilter::IsNotNull {
+            column: remap_idx(*column)?,
+        }),
+        AnalyticFilter::Comparison { column, op, value } => Ok(AnalyticFilter::Comparison {
+            column: remap_idx(*column)?,
+            op: *op,
+            value: value.clone(),
+        }),
+        AnalyticFilter::And(children) => {
+            let remapped_children = children
+                .iter()
+                .map(|c| remap_filter(c, mapping))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(AnalyticFilter::And(remapped_children))
+        }
+    }
+}
+
+/// Executes an [`AnalyticSelect`] against compact input rows whose columns correspond to `mapping`.
+///
+/// Remaps original column references in `select` to compact column positions, then evaluates
+/// filter, grouping, aggregations, and projections using the existing analytical query semantics.
+pub fn execute_analytic_select_compact(
+    select: &AnalyticSelect,
+    rows: Vec<Row>,
+    mapping: &BTreeMap<usize, usize>,
+) -> Result<QueryResult> {
+    let remapped_select = remap_analytic_select(select, mapping)?;
+    execute_analytic_select(&remapped_select, rows)
 }
 
 fn evaluate_filter(filter: &AnalyticFilter, row: &Row) -> Result<bool> {

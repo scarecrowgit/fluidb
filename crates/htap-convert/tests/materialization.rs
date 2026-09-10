@@ -1151,3 +1151,360 @@ fn test_snapshot_aware_core_read() {
         Some(&Value::String("val_30".to_string()))
     );
 }
+
+#[test]
+fn test_compact_read_multiblock_pruning_and_stats() {
+    use htap_colstore::Predicate;
+    use htap_convert::read_column_partition_compact_core;
+
+    let dir = tempdir().unwrap();
+    let (cat_store, engine, _table_id, part_id, _tablet_id, _schema) = make_test_setup(dir.path());
+    let colstore_dir = dir.path().join("colstore");
+
+    // Commit 10 rows into rowstore
+    for i in 1..=10 {
+        commit_put(&engine, part_id.as_u64(), i, Some(&format!("val_{i}")));
+    }
+
+    // Convert with rows_per_block = 2 (produces 5 blocks)
+    let converter = LocalConverter::new(
+        cat_store.clone(),
+        engine.clone(),
+        &colstore_dir,
+        SegmentOptions::new().with_rows_per_block(2),
+    );
+    converter.convert_partition(part_id).unwrap();
+
+    let cat_snap = cat_store.load().unwrap().unwrap();
+    let snap = engine.snapshot();
+
+    // 1. Scan with projection [1] (only val column, omit id) without predicate
+    let res = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[1],
+        &[0],
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(res.rows.len(), 10);
+    assert_eq!(res.stats.candidate_blocks, 5);
+    assert_eq!(res.stats.skipped_blocks, 0);
+    assert_eq!(res.stats.decoded_blocks, 5);
+    assert_eq!(res.stats.returned_rows, 10);
+    for (i, row) in res.rows.iter().enumerate() {
+        assert_eq!(row.len(), 1);
+        let expected = format!("val_{}", i + 1);
+        assert_eq!(row.get(0), Some(&Value::String(expected)));
+    }
+
+    // 2. Scan with Predicate::Eq matching only 1 row in block 2 (id = 5)
+    let pred_eq = Predicate::Eq {
+        column: 0,
+        value: Value::Int64(5),
+    };
+    let res_eq = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[0, 1],
+        &[0],
+        Some(pred_eq),
+    )
+    .unwrap();
+
+    assert_eq!(res_eq.rows.len(), 1);
+    assert_eq!(res_eq.rows[0].get(0), Some(&Value::Int64(5)));
+    assert_eq!(
+        res_eq.rows[0].get(1),
+        Some(&Value::String("val_5".to_string()))
+    );
+    assert_eq!(res_eq.stats.candidate_blocks, 5);
+    assert_eq!(res_eq.stats.skipped_blocks, 4);
+    assert_eq!(res_eq.stats.decoded_blocks, 1);
+    assert_eq!(res_eq.stats.returned_rows, 1);
+
+    // 3. Scan with Predicate::Lt matching block 0 (id < 3)
+    let pred_lt = Predicate::Lt {
+        column: 0,
+        value: Value::Int64(3),
+    };
+    let res_lt = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[0],
+        &[0],
+        Some(pred_lt),
+    )
+    .unwrap();
+
+    assert_eq!(res_lt.rows.len(), 2);
+    assert_eq!(res_lt.rows[0].get(0), Some(&Value::Int64(1)));
+    assert_eq!(res_lt.rows[1].get(0), Some(&Value::Int64(2)));
+    assert_eq!(res_lt.stats.candidate_blocks, 5);
+    assert_eq!(res_lt.stats.skipped_blocks, 4);
+    assert_eq!(res_lt.stats.decoded_blocks, 1);
+    assert_eq!(res_lt.stats.returned_rows, 2);
+}
+
+#[test]
+fn test_compact_read_mutation_sequence_and_deterministic_order() {
+    use htap_convert::read_column_partition_compact_core;
+
+    let dir = tempdir().unwrap();
+    let (cat_store, engine, _table_id, part_id, _tablet_id, _schema) = make_test_setup(dir.path());
+    let colstore_dir = dir.path().join("colstore");
+
+    // Commit initial rows 10, 20, 30
+    commit_put(&engine, part_id.as_u64(), 10, Some("val_10"));
+    commit_put(&engine, part_id.as_u64(), 20, Some("val_20"));
+    commit_put(&engine, part_id.as_u64(), 30, Some("val_30"));
+
+    // Convert to column
+    let converter = LocalConverter::new(
+        cat_store.clone(),
+        engine.clone(),
+        &colstore_dir,
+        SegmentOptions::new().with_rows_per_block(2),
+    );
+    converter.convert_partition(part_id).unwrap();
+
+    // Post-base mutations:
+    // Update key 20
+    commit_put(&engine, part_id.as_u64(), 20, Some("val_20_v2"));
+    // Delete key 10
+    commit_delete(&engine, part_id.as_u64(), 10);
+    // Insert new key 40
+    commit_put(&engine, part_id.as_u64(), 40, Some("val_40"));
+    // Insert then delete key 50
+    commit_put(&engine, part_id.as_u64(), 50, Some("val_50"));
+    commit_delete(&engine, part_id.as_u64(), 50);
+    // Double update key 30
+    commit_put(&engine, part_id.as_u64(), 30, Some("val_30_v2"));
+    commit_put(&engine, part_id.as_u64(), 30, Some("val_30_v3"));
+
+    let cat_snap = cat_store.load().unwrap().unwrap();
+    let snap = engine.snapshot();
+
+    // Reordered layout [1, 0] (val, id)
+    let res = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[1, 0],
+        &[0],
+        None,
+    )
+    .unwrap();
+
+    // Visible keys: 20, 30, 40 (sorted by PK)
+    assert_eq!(res.rows.len(), 3);
+
+    assert_eq!(
+        res.rows[0].get(0),
+        Some(&Value::String("val_20_v2".to_string()))
+    );
+    assert_eq!(res.rows[0].get(1), Some(&Value::Int64(20)));
+
+    assert_eq!(
+        res.rows[1].get(0),
+        Some(&Value::String("val_30_v3".to_string()))
+    );
+    assert_eq!(res.rows[1].get(1), Some(&Value::Int64(30)));
+
+    assert_eq!(
+        res.rows[2].get(0),
+        Some(&Value::String("val_40".to_string()))
+    );
+    assert_eq!(res.rows[2].get(1), Some(&Value::Int64(40)));
+}
+
+#[test]
+fn test_compact_read_pre_base_and_row_format_equivalence() {
+    use htap_convert::{read_column_partition_compact_core, read_column_partition_core, ScanStats};
+
+    let dir = tempdir().unwrap();
+    let (cat_store, engine, _table_id, part_id, _tablet_id, _schema) = make_test_setup(dir.path());
+    let colstore_dir = dir.path().join("colstore");
+
+    // Commit initial row
+    commit_put(&engine, part_id.as_u64(), 10, Some("val_10"));
+    let snap_v1 = engine.snapshot();
+
+    // Commit second row before conversion
+    commit_put(&engine, part_id.as_u64(), 20, Some("val_20"));
+    let snap_v2 = engine.snapshot();
+
+    let cat_snap1 = cat_store.load().unwrap().unwrap();
+
+    // 1. Compact read in Row format matches full row compacted
+    let compact_row = read_column_partition_compact_core(
+        &cat_snap1,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap_v2,
+        &[1],
+        &[0],
+        None,
+    )
+    .unwrap();
+    assert_eq!(compact_row.rows.len(), 2);
+    assert_eq!(
+        compact_row.rows[0].get(0),
+        Some(&Value::String("val_10".to_string()))
+    );
+    assert_eq!(
+        compact_row.rows[1].get(0),
+        Some(&Value::String("val_20".to_string()))
+    );
+    assert_eq!(compact_row.stats, ScanStats::default());
+
+    // 2. Convert to Column
+    let converter = LocalConverter::new(
+        cat_store.clone(),
+        engine.clone(),
+        &colstore_dir,
+        SegmentOptions::new(),
+    );
+    converter.convert_partition(part_id).unwrap();
+
+    // Commit post-base change
+    commit_put(&engine, part_id.as_u64(), 20, Some("val_20_updated"));
+    let snap_v3 = engine.snapshot();
+
+    let cat_snap2 = cat_store.load().unwrap().unwrap();
+
+    // 3. Read at historical snapshot before base version falls back to rowstore
+    let compact_hist = read_column_partition_compact_core(
+        &cat_snap2,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap_v1,
+        &[1],
+        &[0],
+        None,
+    )
+    .unwrap();
+    assert_eq!(compact_hist.rows.len(), 1);
+    assert_eq!(
+        compact_hist.rows[0].get(0),
+        Some(&Value::String("val_10".to_string()))
+    );
+    assert_eq!(compact_hist.stats, ScanStats::default());
+
+    // 4. Equivalence at latest snapshot between full read and compact read
+    let full_latest =
+        read_column_partition_core(&cat_snap2, &engine, &colstore_dir, part_id, snap_v3).unwrap();
+    let compact_latest = read_column_partition_compact_core(
+        &cat_snap2,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap_v3,
+        &[0, 1],
+        &[0],
+        None,
+    )
+    .unwrap();
+    assert_eq!(full_latest, compact_latest.rows);
+}
+
+#[test]
+fn test_compact_read_validation_errors() {
+    use htap_colstore::Predicate;
+    use htap_convert::read_column_partition_compact_core;
+
+    let dir = tempdir().unwrap();
+    let (cat_store, engine, _table_id, part_id, _tablet_id, _schema) = make_test_setup(dir.path());
+    let colstore_dir = dir.path().join("colstore");
+
+    commit_put(&engine, part_id.as_u64(), 1, Some("val_1"));
+    let cat_snap = cat_store.load().unwrap().unwrap();
+    let snap = engine.snapshot();
+
+    // Out of bounds requested column
+    let err = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[99],
+        &[0],
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // Empty pk_indices
+    let err = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[0],
+        &[],
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // Out of bounds pk_indices
+    let err = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[0],
+        &[99],
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // Mismatched pk_indices (schema has PK at 0, passing [1])
+    let err = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[0],
+        &[1],
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // Predicate type mismatch (column 0 is Int64, value is String)
+    let err = read_column_partition_compact_core(
+        &cat_snap,
+        &engine,
+        &colstore_dir,
+        part_id,
+        snap,
+        &[0],
+        &[0],
+        Some(Predicate::Eq {
+            column: 0,
+            value: Value::String("foo".into()),
+        }),
+    )
+    .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+}

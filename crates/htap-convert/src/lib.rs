@@ -20,8 +20,8 @@ use htap_catalog::{
     StorageDescriptor, StorageFormat, TabletId,
 };
 pub use htap_catalog::{MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS};
-pub use htap_colstore::SegmentOptions;
 use htap_colstore::{validate_segment_schema, ScanRequest, SegmentReader, SegmentWriter};
+pub use htap_colstore::{Predicate, ScanStats, SegmentOptions};
 use htap_common::{
     encode_key, read_file_exact_bounded, HtapError, Result, Row, Schema, Value, Version,
 };
@@ -1286,6 +1286,280 @@ pub fn read_column_partition(
     read_column_partition_core(&cat_snap, rowstore, colstore_root, partition_id, snapshot)
 }
 
+/// Result of a projection-aware compact partition read containing projected rows and columnar scan statistics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactReadResult {
+    /// Compact rows projected according to requested source column layout.
+    pub rows: Vec<Row>,
+    /// Aggregated columnar scan statistics across scanned segments.
+    pub stats: ScanStats,
+}
+
+impl CompactReadResult {
+    /// Create a new compact read result with rows and columnar scan statistics.
+    pub fn new(rows: Vec<Row>, stats: ScanStats) -> Self {
+        Self { rows, stats }
+    }
+}
+
+fn compact_row(row: &Row, requested_columns: &[usize]) -> Result<Row> {
+    let mut values = Vec::with_capacity(requested_columns.len());
+    for &idx in requested_columns {
+        let val = row
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| HtapError::Internal(format!("row missing column index {idx}")))?;
+        values.push(val);
+    }
+    Ok(Row::new(values))
+}
+
+/// Reads visible compact rows for a partition, projecting only the requested source columns,
+/// overlaying rowstore mutations on top of columnar segments, with optional predicate pushdown.
+///
+/// Accepts a loaded [`CatalogSnapshot`], [`Engine`], columnar storage root path, target partition ID,
+/// target snapshot, requested source column indices layout, primary key indices, and an optional
+/// pushdown predicate.
+///
+/// Row/no manifest/historical snapshot paths stay semantically identical, compacting full rows to the
+/// requested layout. The manifest path opens each segment and scans with a projection union of
+/// requested columns and PK indices, applies the optional predicate, reads rowstore scan once, suppresses
+/// base rows with post-base newest versions, overlays Puts, and removes Deletes. Returns rows in deterministic
+/// primary-key order along with aggregate [`ScanStats`] across segments.
+#[allow(clippy::too_many_arguments)]
+pub fn read_column_partition_compact_core(
+    cat_snap: &CatalogSnapshot,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    partition_id: PartitionId,
+    snapshot: impl Into<Snapshot>,
+    requested_columns: &[usize],
+    pk_indices: &[usize],
+    predicate: Option<Predicate>,
+) -> Result<CompactReadResult> {
+    let part_desc = cat_snap
+        .partition(partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?;
+
+    let table_desc = cat_snap
+        .table(part_desc.table_id)
+        .ok_or_else(|| HtapError::NotFound(format!("table {} not found", part_desc.table_id)))?;
+
+    let schema = &table_desc.schema;
+
+    for &idx in requested_columns {
+        if idx >= schema.len() {
+            return Err(HtapError::InvalidArgument(format!(
+                "requested column index {idx} out of bounds (schema has {} columns)",
+                schema.len()
+            )));
+        }
+    }
+
+    if pk_indices.is_empty() {
+        return Err(HtapError::InvalidArgument(
+            "pk_indices cannot be empty".into(),
+        ));
+    }
+
+    for &idx in pk_indices {
+        if idx >= schema.len() {
+            return Err(HtapError::InvalidArgument(format!(
+                "primary key column index {idx} out of bounds (schema has {} columns)",
+                schema.len()
+            )));
+        }
+    }
+
+    if pk_indices != table_desc.primary_key.as_slice() {
+        return Err(HtapError::InvalidArgument(format!(
+            "pk_indices {:?} do not match table primary key {:?}",
+            pk_indices, table_desc.primary_key
+        )));
+    }
+
+    if let Some(pred) = &predicate {
+        pred.validate(schema)?;
+    }
+
+    let target_snapshot = snapshot.into();
+
+    if part_desc.tablets.is_empty() {
+        return Err(HtapError::InvalidArgument(format!(
+            "partition {partition_id} has no tablets"
+        )));
+    }
+    if part_desc.tablets.len() != 1 {
+        return Err(HtapError::Unsupported(format!(
+            "partition {partition_id} has {} tablets; exactly 1 tablet is required",
+            part_desc.tablets.len()
+        )));
+    }
+    let tablet_id = part_desc.tablets[0];
+    let tablet = cat_snap
+        .tablet(tablet_id)
+        .ok_or_else(|| HtapError::NotFound(format!("tablet {tablet_id} not found")))?;
+
+    // If there is no column manifest or partition is Row, read directly from rowstore.
+    if tablet.column_manifest.is_none() || matches!(part_desc.storage, StorageDescriptor::Row) {
+        let entries = rowstore.scan_partition(partition_id.as_u64(), target_snapshot)?;
+        let full_rows = collapse_entries_to_rows(&entries);
+        let compact_rows = full_rows
+            .iter()
+            .map(|r| compact_row(r, requested_columns))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(CompactReadResult {
+            rows: compact_rows,
+            stats: ScanStats::default(),
+        });
+    }
+
+    let manifest = open(colstore_root, tablet_id)?;
+    let base_version = manifest.base_version;
+
+    // Rowstore is authoritative for historical reads before manifest base_version.
+    if target_snapshot.version < base_version {
+        let entries = rowstore.scan_partition(partition_id.as_u64(), target_snapshot)?;
+        let full_rows = collapse_entries_to_rows(&entries);
+        let compact_rows = full_rows
+            .iter()
+            .map(|r| compact_row(r, requested_columns))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(CompactReadResult {
+            rows: compact_rows,
+            stats: ScanStats::default(),
+        });
+    }
+
+    // 1. Scan rowstore once at target_snapshot and find newest visible version per key.
+    let rowstore_entries = rowstore.scan_partition(partition_id.as_u64(), target_snapshot)?;
+    let mut post_base_puts: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
+    let mut post_base_deletes: HashSet<Vec<u8>> = HashSet::new();
+    let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+
+    for entry in &rowstore_entries {
+        let user_key = &entry.key.user_key;
+        if seen_keys.insert(user_key.clone()) && entry.key.version > base_version {
+            match &entry.value {
+                ValueKind::Put(row) => {
+                    post_base_puts.insert(user_key.clone(), row.clone());
+                }
+                ValueKind::Delete => {
+                    post_base_deletes.insert(user_key.clone());
+                }
+            }
+        }
+    }
+
+    // 2. Build scan projection: union of requested columns and PK indices.
+    let mut scan_projection = Vec::new();
+    for &idx in requested_columns {
+        if !scan_projection.contains(&idx) {
+            scan_projection.push(idx);
+        }
+    }
+    for &idx in pk_indices {
+        if !scan_projection.contains(&idx) {
+            scan_projection.push(idx);
+        }
+    }
+
+    let batch_req_positions: Vec<usize> = requested_columns
+        .iter()
+        .map(|&req_col| scan_projection.iter().position(|&p| p == req_col).unwrap())
+        .collect();
+
+    let batch_pk_positions: Vec<usize> = pk_indices
+        .iter()
+        .map(|&pk_col| scan_projection.iter().position(|&p| p == pk_col).unwrap())
+        .collect();
+
+    let mut map: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
+    let mut total_stats = ScanStats::default();
+
+    // 3. Open each segment and scan.
+    for entry in &manifest.segments {
+        let seg_path = resolve_segment_path(colstore_root, tablet_id, &entry.path)?;
+        let reader = SegmentReader::open(&seg_path)?;
+        let req = ScanRequest::new(scan_projection.clone(), predicate.clone());
+        let scan_res = reader.scan(&req)?;
+
+        total_stats.candidate_blocks += scan_res.stats.candidate_blocks;
+        total_stats.skipped_blocks += scan_res.stats.skipped_blocks;
+        total_stats.decoded_blocks += scan_res.stats.decoded_blocks;
+        total_stats.returned_rows += scan_res.stats.returned_rows;
+
+        for batch in scan_res.batches {
+            let n = batch.num_rows();
+            for r in 0..n {
+                let mut pk_values = Vec::with_capacity(batch_pk_positions.len());
+                for &pos in &batch_pk_positions {
+                    let val = batch.columns[pos].get(r).ok_or_else(|| {
+                        HtapError::Corruption(format!("missing value at row {r} in column vector"))
+                    })?;
+                    pk_values.push(val);
+                }
+                let key = encode_key(&pk_values)?;
+
+                // Post-base newest version suppresses base
+                if post_base_deletes.contains(&key) || post_base_puts.contains_key(&key) {
+                    continue;
+                }
+
+                let mut req_values = Vec::with_capacity(batch_req_positions.len());
+                for &pos in &batch_req_positions {
+                    let val = batch.columns[pos].get(r).ok_or_else(|| {
+                        HtapError::Corruption(format!("missing value at row {r} in column vector"))
+                    })?;
+                    req_values.push(val);
+                }
+                map.insert(key, Row::new(req_values));
+            }
+        }
+    }
+
+    // 4. Put overlays / inserts
+    for (key, full_row) in post_base_puts {
+        let compact = compact_row(&full_row, requested_columns)?;
+        map.insert(key, compact);
+    }
+
+    Ok(CompactReadResult {
+        rows: map.into_values().collect(),
+        stats: total_stats,
+    })
+}
+
+/// Reads visible compact rows for a partition, projecting only the requested source columns,
+/// overlaying rowstore mutations on top of columnar segments, with optional predicate pushdown.
+///
+/// Convenience wrapper over [`read_column_partition_compact_core`] that loads the catalog snapshot from `catalog`.
+#[allow(clippy::too_many_arguments)]
+pub fn read_column_partition_compact(
+    catalog: &dyn CatalogStore,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    partition_id: PartitionId,
+    snapshot: impl Into<Snapshot>,
+    requested_columns: &[usize],
+    pk_indices: &[usize],
+    predicate: Option<Predicate>,
+) -> Result<CompactReadResult> {
+    let cat_snap = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+    read_column_partition_compact_core(
+        &cat_snap,
+        rowstore,
+        colstore_root,
+        partition_id,
+        snapshot,
+        requested_columns,
+        pk_indices,
+        predicate,
+    )
+}
+
 /// Local single-node row-to-column conversion and columnar materialization engine.
 ///
 /// Manages conversions of partitions from row-oriented storage into columnar segments,
@@ -1382,6 +1656,44 @@ impl LocalConverter {
     /// Read visible rows for a partition at the current visible snapshot of the rowstore.
     pub fn read_column_partition_current(&self, partition_id: PartitionId) -> Result<Vec<Row>> {
         self.read_column_partition(partition_id, self.rowstore.snapshot())
+    }
+
+    /// Read visible compact rows for a partition at `snapshot`, overlaying rowstore mutations on columnar segments.
+    pub fn read_column_partition_compact(
+        &self,
+        partition_id: PartitionId,
+        snapshot: impl Into<Snapshot>,
+        requested_columns: &[usize],
+        pk_indices: &[usize],
+        predicate: Option<Predicate>,
+    ) -> Result<CompactReadResult> {
+        read_column_partition_compact(
+            self.catalog.as_ref(),
+            self.rowstore.as_ref(),
+            &self.colstore_root,
+            partition_id,
+            snapshot,
+            requested_columns,
+            pk_indices,
+            predicate,
+        )
+    }
+
+    /// Read visible compact rows for a partition at the current visible snapshot of the rowstore.
+    pub fn read_column_partition_compact_current(
+        &self,
+        partition_id: PartitionId,
+        requested_columns: &[usize],
+        pk_indices: &[usize],
+        predicate: Option<Predicate>,
+    ) -> Result<CompactReadResult> {
+        self.read_column_partition_compact(
+            partition_id,
+            self.rowstore.snapshot(),
+            requested_columns,
+            pk_indices,
+            predicate,
+        )
     }
 }
 

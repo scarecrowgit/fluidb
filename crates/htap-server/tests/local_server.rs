@@ -1598,3 +1598,192 @@ fn test_analytic_materialized_column_base_plus_delta() {
         other => panic!("expected Query, got {other:?}"),
     }
 }
+
+#[test]
+fn test_analytic_row_vs_column_base_plus_delta_equivalence() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    // Create Row reference table and Column target table
+    server
+        .execute("CREATE TABLE t_row (id BIGINT PRIMARY KEY, category VARCHAR, price BIGINT, rating INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE t_col (id BIGINT PRIMARY KEY, category VARCHAR, price BIGINT, rating INT);")
+        .unwrap();
+
+    let insert_initial = |tbl: &str| {
+        vec![
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (1, 'tech', 100, 5);"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (2, 'tech', 200, 4);"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (3, 'books', 50, 5);"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (4, NULL, 30, 3);"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (5, 'books', 80, NULL);"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (6, 'furniture', 500, 2);"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (7, 'tech', 150, 4);"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (8, 'furniture', 300, NULL);"),
+        ]
+    };
+
+    for sql in insert_initial("t_row") {
+        server.execute(&sql).unwrap();
+    }
+    for sql in insert_initial("t_col") {
+        server.execute(&sql).unwrap();
+    }
+
+    // Convert t_col to Column storage
+    server.convert_table("t_col").unwrap();
+
+    // Apply identical mutation sequences post-base to both tables:
+    // 1. Update key 2 (tech 200 -> tech 220)
+    // 2. Delete key 3 (books 50)
+    // 3. Insert key 9 (tech 400, 5)
+    // 4. Insert then delete key 10
+    // 5. Update key 5 (books 80 -> NULL 85)
+    let mutations = |tbl: &str| {
+        vec![
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (2, 'tech', 220, 4);"),
+            format!("DELETE FROM {tbl} WHERE id = 3;"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (9, 'tech', 400, 5);"),
+            format!(
+                "INSERT INTO {tbl} (id, category, price, rating) VALUES (10, 'other', 999, 1);"
+            ),
+            format!("DELETE FROM {tbl} WHERE id = 10;"),
+            format!("INSERT INTO {tbl} (id, category, price, rating) VALUES (5, NULL, 85, NULL);"),
+        ]
+    };
+
+    for sql in mutations("t_row") {
+        server.execute(&sql).unwrap();
+    }
+    for sql in mutations("t_col") {
+        server.execute(&sql).unwrap();
+    }
+
+    // List of equivalent analytical queries:
+    let queries = [
+        // 1. Plain scan with projection & reordering
+        "SELECT category, id FROM {tbl};",
+        // 2. Projection subset (single column)
+        "SELECT price FROM {tbl};",
+        // 3. Unprojected filter and NotEq (!=)
+        "SELECT id, price FROM {tbl} WHERE category != 'tech';",
+        // 4. Null predicate: IS NULL
+        "SELECT id, price FROM {tbl} WHERE category IS NULL;",
+        // 5. Null predicate: IS NOT NULL
+        "SELECT id, category FROM {tbl} WHERE rating IS NOT NULL;",
+        // 6. Compound filter (AND with range and NotEq)
+        "SELECT id, category, price FROM {tbl} WHERE price >= 100 AND category != 'furniture';",
+        // 7. Global aggregates (COUNT, SUM, MIN, MAX, nullable columns)
+        "SELECT COUNT(*), COUNT(rating), COUNT(category), SUM(price), MIN(price), MAX(price) FROM {tbl};",
+        // 8. Grouped aggregation on nullable column
+        "SELECT category, COUNT(*), SUM(price) FROM {tbl} GROUP BY category;",
+        // 9. Grouped aggregation with filter
+        "SELECT category, COUNT(*), SUM(price) FROM {tbl} WHERE price > 50 GROUP BY category;",
+        // 10. Filter matching no rows with global aggregates
+        "SELECT COUNT(*), SUM(price), MIN(price) FROM {tbl} WHERE price > 10000;",
+    ];
+
+    for q_template in queries {
+        let sql_row = q_template.replace("{tbl}", "t_row");
+        let sql_col = q_template.replace("{tbl}", "t_col");
+
+        let res_row = match server.execute(&sql_row).unwrap() {
+            StatementResult::Query(qr) => qr,
+            other => panic!("expected query result, got {other:?}"),
+        };
+        let res_col = match server.execute(&sql_col).unwrap() {
+            StatementResult::Query(qr) => qr,
+            other => panic!("expected query result, got {other:?}"),
+        };
+
+        assert_eq!(
+            res_row.columns(),
+            res_col.columns(),
+            "columns mismatch for query: {q_template}"
+        );
+        assert_eq!(
+            res_row.rows(),
+            res_col.rows(),
+            "rows mismatch for query: {q_template}"
+        );
+    }
+}
+
+#[test]
+fn test_pushdown_predicate_selection_and_pruning_stats() {
+    use htap_server::olap::{plan_source_columns, select_pushdown_predicate};
+    use htap_sql::{bind, parse_one};
+
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE items (id BIGINT PRIMARY KEY, name VARCHAR, price BIGINT);")
+        .unwrap();
+
+    let cat_snap = LocalCatalogStore::open(dir.path().join("catalog"))
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+
+    // 1. NotEq must NEVER be pushed down
+    let ast1 = parse_one("SELECT name FROM items WHERE price != 100;").unwrap();
+    let bound1 = match bind(&ast1, &cat_snap).unwrap() {
+        htap_sql::BoundStatement::AnalyticSelect(sel) => sel,
+        _ => unreachable!(),
+    };
+    assert!(select_pushdown_predicate(bound1.filter.as_ref()).is_none());
+
+    // 2. AND with NotEq and Eq must select Eq, not NotEq or AND as a whole
+    let ast2 = parse_one("SELECT name FROM items WHERE price != 100 AND id = 5;").unwrap();
+    let bound2 = match bind(&ast2, &cat_snap).unwrap() {
+        htap_sql::BoundStatement::AnalyticSelect(sel) => sel,
+        _ => unreachable!(),
+    };
+    let pred2 = select_pushdown_predicate(bound2.filter.as_ref());
+    assert_eq!(
+        pred2,
+        Some(htap_convert::Predicate::Eq {
+            column: 0,
+            value: Value::Int64(5),
+        })
+    );
+
+    // 3. Range and null predicates are selected deterministically
+    let ast3 = parse_one("SELECT name FROM items WHERE price >= 50;").unwrap();
+    let bound3 = match bind(&ast3, &cat_snap).unwrap() {
+        htap_sql::BoundStatement::AnalyticSelect(sel) => sel,
+        _ => unreachable!(),
+    };
+    let pred3 = select_pushdown_predicate(bound3.filter.as_ref());
+    assert_eq!(
+        pred3,
+        Some(htap_convert::Predicate::Gte {
+            column: 2,
+            value: Value::Int64(50),
+        })
+    );
+
+    let ast4 = parse_one("SELECT name FROM items WHERE name IS NULL;").unwrap();
+    let bound4 = match bind(&ast4, &cat_snap).unwrap() {
+        htap_sql::BoundStatement::AnalyticSelect(sel) => sel,
+        _ => unreachable!(),
+    };
+    let pred4 = select_pushdown_predicate(bound4.filter.as_ref());
+    assert_eq!(pred4, Some(htap_convert::Predicate::IsNull { column: 1 }));
+
+    // 4. Plan source columns planning and mapping
+    let ast5 =
+        parse_one("SELECT name, COUNT(*) FROM items WHERE price > 10 GROUP BY name;").unwrap();
+    let bound5 = match bind(&ast5, &cat_snap).unwrap() {
+        htap_sql::BoundStatement::AnalyticSelect(sel) => sel,
+        _ => unreachable!(),
+    };
+    let (src_cols, mapping) = plan_source_columns(&bound5);
+    // name is col 1, price is col 2
+    assert_eq!(src_cols, vec![1, 2]);
+    assert_eq!(mapping.get(&1), Some(&0));
+    assert_eq!(mapping.get(&2), Some(&1));
+}
