@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use htap_common::{HtapError, Result, Schema};
+use htap_common::{HtapError, Result, Schema, Version};
 use serde::{Deserialize, Serialize};
 
 macro_rules! define_id {
@@ -84,6 +84,90 @@ pub enum StorageDescriptor {
     },
 }
 
+/// Execution phase of an active storage format conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConversionPhase {
+    /// Source snapshot version pinned; segments not yet fully written.
+    SnapshotPinned,
+    /// Columnar segments written to disk and verified.
+    SegmentsWritten,
+    /// Conversion catch-up completed and ready for catalog cutover.
+    ReadyToPublish,
+}
+
+/// Descriptor tracking an in-flight storage format conversion for a partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversionDescriptor {
+    /// Generation identifier matching the storage descriptor converting generation.
+    pub generation: u64,
+    /// Source storage format.
+    pub from: StorageFormat,
+    /// Target storage format.
+    pub to: StorageFormat,
+    /// MVCC snapshot version pinned at the beginning of conversion.
+    pub snapshot_version: Version,
+    /// Current execution phase.
+    pub phase: ConversionPhase,
+}
+
+impl ConversionDescriptor {
+    /// Create a new conversion descriptor.
+    pub fn new(
+        generation: u64,
+        from: StorageFormat,
+        to: StorageFormat,
+        snapshot_version: Version,
+        phase: ConversionPhase,
+    ) -> Self {
+        Self {
+            generation,
+            from,
+            to,
+            snapshot_version,
+            phase,
+        }
+    }
+}
+
+/// Reference to an on-disk columnar segment manifest for a tablet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnManifestRef {
+    /// Catalog metadata generation when this manifest reference was established.
+    pub generation: u64,
+    /// Root-relative path to the manifest file (no absolute paths or '..' traversals).
+    pub path: String,
+    /// MVCC base snapshot version that this columnar manifest represents.
+    pub base_version: Version,
+    /// Total number of columnar segments referenced by the manifest.
+    pub segment_count: u64,
+    /// Total number of data rows across all columnar segments in the manifest.
+    pub row_count: u64,
+}
+
+impl ColumnManifestRef {
+    /// Create a new columnar manifest reference.
+    pub fn new(
+        generation: u64,
+        path: impl Into<String>,
+        base_version: Version,
+        segment_count: u64,
+        row_count: u64,
+    ) -> Self {
+        Self {
+            generation,
+            path: path.into(),
+            base_version,
+            segment_count,
+            row_count,
+        }
+    }
+}
+
+/// Maximum reasonable number of segments per tablet manifest reference.
+pub const MAX_MANIFEST_SEGMENTS: u64 = 10_000_000;
+/// Maximum reasonable number of rows per tablet manifest reference.
+pub const MAX_MANIFEST_ROWS: u64 = 1_000_000_000_000_000;
+
 /// Metadata descriptor for a relational table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableDescriptor {
@@ -137,6 +221,9 @@ pub struct PartitionDescriptor {
     pub tablets: Vec<TabletId>,
     /// Generation version for this partition metadata.
     pub generation: u64,
+    /// In-flight conversion metadata, if converting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion: Option<ConversionDescriptor>,
 }
 
 impl PartitionDescriptor {
@@ -156,7 +243,14 @@ impl PartitionDescriptor {
             storage,
             tablets,
             generation,
+            conversion: None,
         }
+    }
+
+    /// Set conversion descriptor metadata.
+    pub fn with_conversion(mut self, conversion: impl Into<Option<ConversionDescriptor>>) -> Self {
+        self.conversion = conversion.into();
+        self
     }
 }
 
@@ -173,6 +267,9 @@ pub struct TabletDescriptor {
     pub replicas: Vec<ReplicaId>,
     /// Generation version for this tablet metadata.
     pub generation: u64,
+    /// Column manifest reference if in Column or Converting-to-Column format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_manifest: Option<ColumnManifestRef>,
 }
 
 impl TabletDescriptor {
@@ -190,7 +287,17 @@ impl TabletDescriptor {
             bucket,
             replicas,
             generation,
+            column_manifest: None,
         }
+    }
+
+    /// Set column manifest reference.
+    pub fn with_column_manifest(
+        mut self,
+        column_manifest: impl Into<Option<ColumnManifestRef>>,
+    ) -> Self {
+        self.column_manifest = column_manifest.into();
+        self
     }
 }
 
@@ -245,6 +352,42 @@ pub struct CatalogSnapshot {
     pub tablets: Vec<TabletDescriptor>,
     /// All replicas across tablets.
     pub replicas: Vec<ReplicaDescriptor>,
+}
+
+fn validate_manifest_path(path_str: &str) -> Result<()> {
+    let trimmed = path_str.trim();
+    if trimmed.is_empty() {
+        return Err(HtapError::InvalidArgument(
+            "column manifest path cannot be empty".into(),
+        ));
+    }
+    if path_str.starts_with('/') || path_str.starts_with('\\') {
+        return Err(HtapError::InvalidArgument(format!(
+            "column manifest path '{path_str}' must be relative, not absolute"
+        )));
+    }
+    let p = std::path::Path::new(path_str);
+    if p.is_absolute() {
+        return Err(HtapError::InvalidArgument(format!(
+            "column manifest path '{path_str}' must be relative, not absolute"
+        )));
+    }
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                return Err(HtapError::InvalidArgument(format!(
+                    "column manifest path '{path_str}' cannot contain parent directory traversal ('..')"
+                )));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(HtapError::InvalidArgument(format!(
+                    "column manifest path '{path_str}' must be relative, not absolute"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 impl CatalogSnapshot {
@@ -465,6 +608,79 @@ impl CatalogSnapshot {
                     part.id, part.table_id
                 )));
             }
+
+            // Storage and conversion descriptor validation
+            if let Some(conv) = &part.conversion {
+                if conv.generation == 0 {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition id {} conversion generation must be > 0",
+                        part.id
+                    )));
+                }
+                if conv.from == conv.to {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition id {} conversion 'from' and 'to' formats cannot be identical ({:?})",
+                        part.id, conv.from
+                    )));
+                }
+                if conv.snapshot_version.get() == 0 {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition id {} conversion snapshot version must be > 0",
+                        part.id
+                    )));
+                }
+                if conv.to == StorageFormat::Row
+                    && matches!(conv.phase, ConversionPhase::SegmentsWritten)
+                {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition id {} conversion phase SegmentsWritten is invalid when converting to Row",
+                        part.id
+                    )));
+                }
+            }
+
+            match &part.storage {
+                StorageDescriptor::Converting {
+                    from,
+                    to,
+                    generation,
+                } => {
+                    if *generation == 0 {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition id {} Converting storage generation must be > 0",
+                            part.id
+                        )));
+                    }
+                    if from == to {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition id {} Converting storage from and to must differ",
+                            part.id
+                        )));
+                    }
+                    if let Some(conv) = &part.conversion {
+                        if conv.generation != *generation {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "partition id {} storage generation {} does not match conversion generation {}",
+                                part.id, generation, conv.generation
+                            )));
+                        }
+                        if conv.from != *from || conv.to != *to {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "partition id {} storage direction ({:?} -> {:?}) does not match conversion direction ({:?} -> {:?})",
+                                part.id, from, to, conv.from, conv.to
+                            )));
+                        }
+                    }
+                }
+                StorageDescriptor::Row | StorageDescriptor::Column => {
+                    if part.conversion.is_some() {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition id {} has storage format {:?} but contains conversion metadata",
+                            part.id, part.storage
+                        )));
+                    }
+                }
+            }
         }
 
         // Check bidirectional ownership between Tables and Partitions
@@ -503,7 +719,7 @@ impl CatalogSnapshot {
             }
         }
 
-        // 3. Validate tablets: unique IDs, FK to partition.
+        // 3. Validate tablets: unique IDs, FK to partition, column manifest validation.
         let mut seen_tablet_ids = HashSet::with_capacity(self.tablets.len());
         for tablet in &self.tablets {
             if !seen_tablet_ids.insert(tablet.id) {
@@ -519,6 +735,90 @@ impl CatalogSnapshot {
                     "tablet {} references nonexistent partition {}",
                     tablet.id, tablet.partition_id
                 )));
+            }
+
+            // Column manifest reference validation
+            if let Some(manifest) = &tablet.column_manifest {
+                if manifest.generation == 0 {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "tablet id {} column manifest generation must be > 0",
+                        tablet.id
+                    )));
+                }
+                if manifest.base_version.get() == 0 {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "tablet id {} column manifest base_version must be > 0",
+                        tablet.id
+                    )));
+                }
+                validate_manifest_path(&manifest.path)?;
+                if manifest.segment_count == 0 && manifest.row_count > 0 {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "tablet id {} column manifest row_count {} > 0 but segment_count is 0",
+                        tablet.id, manifest.row_count
+                    )));
+                }
+                if manifest.segment_count > MAX_MANIFEST_SEGMENTS {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "tablet id {} column manifest segment_count {} exceeds maximum allowed {}",
+                        tablet.id, manifest.segment_count, MAX_MANIFEST_SEGMENTS
+                    )));
+                }
+                if manifest.row_count > MAX_MANIFEST_ROWS {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "tablet id {} column manifest row_count {} exceeds maximum allowed {}",
+                        tablet.id, manifest.row_count, MAX_MANIFEST_ROWS
+                    )));
+                }
+
+                let parent_part = self.partition(tablet.partition_id).ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "tablet {} references nonexistent partition {}",
+                        tablet.id, tablet.partition_id
+                    ))
+                })?;
+
+                match &parent_part.storage {
+                    StorageDescriptor::Column => {
+                        // Valid columnar state.
+                    }
+                    StorageDescriptor::Converting { to, generation, .. }
+                        if *to == StorageFormat::Column =>
+                    {
+                        // Valid Converting-to-Column state.
+                        if let Some(conv) = &parent_part.conversion {
+                            if manifest.generation != conv.generation {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "tablet id {} column manifest generation {} does not match partition conversion generation {}",
+                                    tablet.id, manifest.generation, conv.generation
+                                )));
+                            }
+                            if matches!(conv.phase, ConversionPhase::SnapshotPinned) {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "tablet id {} column manifest cannot be present while partition is in SnapshotPinned phase",
+                                    tablet.id
+                                )));
+                            }
+                        } else if manifest.generation != *generation {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "tablet id {} column manifest generation {} does not match partition converting generation {}",
+                                tablet.id, manifest.generation, generation
+                            )));
+                        }
+                    }
+                    StorageDescriptor::Row => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "tablet id {} has column manifest but parent partition {} has Row storage",
+                            tablet.id, parent_part.id
+                        )));
+                    }
+                    StorageDescriptor::Converting { to, .. } => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "tablet id {} has column manifest but parent partition {} is converting to {:?}",
+                            tablet.id, parent_part.id, to
+                        )));
+                    }
+                }
             }
         }
 
@@ -739,5 +1039,26 @@ mod tests {
         let empty = CatalogSnapshot::empty();
         assert_eq!(empty.generation, 0);
         assert!(empty.validate().is_ok());
+    }
+
+    #[test]
+    fn test_conversion_and_manifest_descriptors() {
+        let manifest =
+            ColumnManifestRef::new(1, "segments/manifest_0.json", Version::new(10), 4, 100_000);
+        let conv = ConversionDescriptor::new(
+            1,
+            StorageFormat::Row,
+            StorageFormat::Column,
+            Version::new(10),
+            ConversionPhase::SegmentsWritten,
+        );
+
+        let json_m = serde_json::to_string(&manifest).unwrap();
+        let dec_m: ColumnManifestRef = serde_json::from_str(&json_m).unwrap();
+        assert_eq!(dec_m, manifest);
+
+        let json_c = serde_json::to_string(&conv).unwrap();
+        let dec_c: ConversionDescriptor = serde_json::from_str(&json_c).unwrap();
+        assert_eq!(dec_c, conv);
     }
 }

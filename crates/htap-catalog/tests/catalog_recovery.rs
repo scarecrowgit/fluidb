@@ -4,7 +4,7 @@ use std::fs;
 
 use htap_catalog::local::{encode_snapshot, FORMAT_VERSION, HEADER_MAGIC};
 use htap_catalog::*;
-use htap_common::{ColumnDef, DataType, HtapError, Schema};
+use htap_common::{ColumnDef, DataType, HtapError, Schema, Version};
 use tempfile::TempDir;
 
 fn make_schema() -> Schema {
@@ -333,6 +333,13 @@ fn test_invalid_pk_and_schema() {
         to: StorageFormat::Column,
         generation: 1,
     };
+    snap_converting.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(1),
+        ConversionPhase::SnapshotPinned,
+    ));
     store.compare_and_set(0, snap_converting.clone()).unwrap();
     let loaded = store.load().unwrap().unwrap();
     assert_eq!(loaded, snap_converting);
@@ -577,4 +584,536 @@ fn test_atomic_replacement_and_failed_cas_no_disk_change() {
     let reopened = LocalCatalogStore::open(temp.path()).unwrap();
     assert_eq!(reopened.current_generation().unwrap(), 2);
     assert_eq!(reopened.load().unwrap().unwrap(), snap2);
+}
+
+#[test]
+fn test_conversion_metadata_and_manifest_roundtrip_and_reopen() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    // Initial Row-format snapshot at generation 1
+    let snap1 = make_valid_snapshot(1);
+    store.compare_and_set(0, snap1.clone()).unwrap();
+
+    // Step 1: Advance to Converting state at generation 2
+    let mut snap2 = snap1.clone();
+    snap2.generation = 2;
+    snap2.partitions[0].generation = 2;
+    snap2.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: 2,
+    };
+    snap2.partitions[0].conversion = Some(ConversionDescriptor::new(
+        2,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(42),
+        ConversionPhase::SegmentsWritten,
+    ));
+    snap2.tablets[0].generation = 2;
+    snap2.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        2,
+        "manifests/part_10_tablet_100.json",
+        Version::new(42),
+        5,
+        250_000,
+    ));
+
+    store.compare_and_set(1, snap2.clone()).unwrap();
+
+    // Reopen and verify Converting snapshot recovered cleanly from disk
+    let reopened = LocalCatalogStore::open(temp.path()).unwrap();
+    let recovered2 = reopened.load().unwrap().expect("snap2 should be recovered");
+    assert_eq!(recovered2, snap2);
+
+    let part = recovered2.partition(PartitionId::new(10)).unwrap();
+    let conv = part.conversion.as_ref().unwrap();
+    assert_eq!(conv.generation, 2);
+    assert_eq!(conv.from, StorageFormat::Row);
+    assert_eq!(conv.to, StorageFormat::Column);
+    assert_eq!(conv.snapshot_version, Version::new(42));
+    assert_eq!(conv.phase, ConversionPhase::SegmentsWritten);
+
+    let tab = recovered2.tablet(TabletId::new(100)).unwrap();
+    let manifest = tab.column_manifest.as_ref().unwrap();
+    assert_eq!(manifest.generation, 2);
+    assert_eq!(manifest.path, "manifests/part_10_tablet_100.json");
+    assert_eq!(manifest.base_version, Version::new(42));
+    assert_eq!(manifest.segment_count, 5);
+    assert_eq!(manifest.row_count, 250_000);
+
+    // Step 2: Cut over to Column format at generation 3
+    let mut snap3 = snap2.clone();
+    snap3.generation = 3;
+    snap3.partitions[0].generation = 3;
+    snap3.partitions[0].storage = StorageDescriptor::Column;
+    snap3.partitions[0].conversion = None;
+    // Tablet keeps its column manifest reference from generation 2
+    snap3.tablets[0].generation = 3;
+
+    reopened.compare_and_set(2, snap3.clone()).unwrap();
+
+    // Reopen and verify Column snapshot recovered cleanly
+    drop(reopened);
+    let reopened2 = LocalCatalogStore::open(temp.path()).unwrap();
+    let recovered3 = reopened2
+        .load()
+        .unwrap()
+        .expect("snap3 should be recovered");
+    assert_eq!(recovered3, snap3);
+    assert_eq!(recovered3.partitions[0].storage, StorageDescriptor::Column);
+    assert!(recovered3.partitions[0].conversion.is_none());
+    assert_eq!(
+        recovered3.tablets[0].column_manifest,
+        snap2.tablets[0].column_manifest
+    );
+}
+
+#[test]
+fn test_invalid_conversion_combinations() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    // 1. Storage is Row but conversion descriptor is present
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(10),
+        ConversionPhase::SnapshotPinned,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("Row"));
+
+    // 2. Storage is Column but conversion descriptor is present
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Column,
+        StorageFormat::Row,
+        Version::new(10),
+        ConversionPhase::SnapshotPinned,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("Column"));
+
+    // 3. Storage Converting generation != conversion generation
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        2, // mismatch: storage is 1
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(10),
+        ConversionPhase::SnapshotPinned,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("does not match conversion generation"));
+
+    // 4. Storage Converting direction != conversion direction
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Column, // mismatch: storage from is Row
+        StorageFormat::Row,    // mismatch: storage to is Column
+        Version::new(10),
+        ConversionPhase::SnapshotPinned,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("direction"));
+
+    // 5. Conversion generation is 0
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        0, // invalid: 0
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(10),
+        ConversionPhase::SnapshotPinned,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("generation must be > 0"));
+
+    // 6. Conversion from == to
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Row, // invalid
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Row,
+        StorageFormat::Row, // invalid: from == to
+        Version::new(10),
+        ConversionPhase::SnapshotPinned,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("identical") || err.to_string().contains("differ"));
+
+    // 7. Conversion snapshot version is 0 (invalid MVCC version)
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(0), // invalid: 0
+        ConversionPhase::SnapshotPinned,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("snapshot version must be > 0"));
+
+    // 8. Conversion to Row with SegmentsWritten phase
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Column,
+        to: StorageFormat::Row,
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Column,
+        StorageFormat::Row,
+        Version::new(10),
+        ConversionPhase::SegmentsWritten, // invalid when converting to Row
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("invalid when converting to Row"));
+}
+
+#[test]
+fn test_invalid_column_manifest_and_paths() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    // 1. Column manifest on Row partition
+    let mut snap = make_valid_snapshot(1);
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "manifests/tab.json",
+        Version::new(1),
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("Row storage"));
+
+    // 2. Column manifest on Converting partition with to == Row
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Column,
+        to: StorageFormat::Row,
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Column,
+        StorageFormat::Row,
+        Version::new(1),
+        ConversionPhase::SnapshotPinned,
+    ));
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "manifests/tab.json",
+        Version::new(1),
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("converting to Row"));
+
+    // 3. Column manifest generation mismatch with conversion generation
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(1),
+        ConversionPhase::SegmentsWritten,
+    ));
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        2, // mismatch: conversion is 1
+        "manifests/tab.json",
+        Version::new(1),
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("does not match partition conversion generation"));
+
+    // 4. Column manifest generation == 0
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        0, // invalid: 0
+        "manifests/tab.json",
+        Version::new(1),
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("manifest generation must be > 0"));
+
+    // 5. Column manifest base_version == 0
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "manifests/tab.json",
+        Version::new(0), // invalid: 0
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("base_version must be > 0"));
+
+    // 6. Column manifest empty path
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "   ", // empty path
+        Version::new(1),
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("path cannot be empty"));
+
+    // 7. Column manifest absolute path
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "/etc/passwd", // absolute path
+        Version::new(1),
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("must be relative"));
+
+    // 8. Column manifest path traversal with ..
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "manifests/../escape.json", // path traversal
+        Version::new(1),
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("cannot contain parent directory traversal"));
+
+    // 9. Column manifest segment_count == 0 && row_count > 0
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "manifests/tab.json",
+        Version::new(1),
+        0,   // 0 segments
+        100, // > 0 rows
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("row_count 100 > 0 but segment_count is 0"));
+
+    // 10. Column manifest excessive segment_count
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "manifests/tab.json",
+        Version::new(1),
+        MAX_MANIFEST_SEGMENTS + 1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("segment_count"));
+
+    // 11. Column manifest excessive row_count
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Column;
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "manifests/tab.json",
+        Version::new(1),
+        1,
+        MAX_MANIFEST_ROWS + 1,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("row_count"));
+
+    // 12. Column manifest present when conversion phase is SnapshotPinned
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: 1,
+    };
+    snap.partitions[0].conversion = Some(ConversionDescriptor::new(
+        1,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(1),
+        ConversionPhase::SnapshotPinned, // cannot have manifest at this phase
+    ));
+    snap.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        1,
+        "manifests/tab.json",
+        Version::new(1),
+        1,
+        100,
+    ));
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("SnapshotPinned phase"));
+}
+
+#[test]
+fn test_conversion_stale_cas() {
+    let temp = TempDir::new().unwrap();
+    let catalog_path = temp.path().join("CATALOG");
+    let tmp_path = temp.path().join("CATALOG.tmp");
+
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    let snap1 = make_valid_snapshot(1);
+    store.compare_and_set(0, snap1.clone()).unwrap();
+
+    let bytes_gen1 = fs::read(&catalog_path).unwrap();
+
+    // Stale expected generation CAS rejection
+    let mut snap_converting = snap1.clone();
+    snap_converting.generation = 2;
+    snap_converting.partitions[0].generation = 2;
+    snap_converting.partitions[0].storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: 2,
+    };
+    snap_converting.partitions[0].conversion = Some(ConversionDescriptor::new(
+        2,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(10),
+        ConversionPhase::SegmentsWritten,
+    ));
+    snap_converting.tablets[0].generation = 2;
+    snap_converting.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        2,
+        "manifests/t100.json",
+        Version::new(10),
+        1,
+        500,
+    ));
+
+    // Present stale expected = 0 when current is 1
+    let err = store
+        .compare_and_set(0, snap_converting.clone())
+        .unwrap_err();
+    assert!(matches!(err, HtapError::Conflict(_)));
+    assert!(!tmp_path.exists());
+    assert_eq!(fs::read(&catalog_path).unwrap(), bytes_gen1);
+
+    // Present invalid CAS where target generation <= expected
+    let mut snap_non_advancing = snap_converting.clone();
+    snap_non_advancing.generation = 1; // not advancing
+    let err = store.compare_and_set(1, snap_non_advancing).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(!tmp_path.exists());
+    assert_eq!(fs::read(&catalog_path).unwrap(), bytes_gen1);
+
+    // Present semantic error (e.g. invalid manifest path with ..)
+    let mut snap_invalid_manifest = snap_converting.clone();
+    snap_invalid_manifest.tablets[0].column_manifest = Some(ColumnManifestRef::new(
+        2,
+        "manifests/../../secret.json",
+        Version::new(10),
+        1,
+        500,
+    ));
+    let err = store.compare_and_set(1, snap_invalid_manifest).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(!tmp_path.exists());
+    assert_eq!(fs::read(&catalog_path).unwrap(), bytes_gen1);
+
+    // Successful CAS to Converting gen 2
+    store.compare_and_set(1, snap_converting.clone()).unwrap();
+    assert_eq!(store.current_generation().unwrap(), 2);
+    let bytes_gen2 = fs::read(&catalog_path).unwrap();
+    assert_ne!(bytes_gen1, bytes_gen2);
+
+    // Stale CAS attempt to cutover to Column presenting expected = 1 when current is 2
+    let mut snap_column = snap_converting.clone();
+    snap_column.generation = 3;
+    snap_column.partitions[0].generation = 3;
+    snap_column.partitions[0].storage = StorageDescriptor::Column;
+    snap_column.partitions[0].conversion = None;
+    snap_column.tablets[0].generation = 3;
+
+    let err = store.compare_and_set(1, snap_column.clone()).unwrap_err();
+    assert!(matches!(err, HtapError::Conflict(_)));
+    assert_eq!(store.current_generation().unwrap(), 2);
+    assert_eq!(fs::read(&catalog_path).unwrap(), bytes_gen2);
+
+    // Successful cutover to Column gen 3
+    store.compare_and_set(2, snap_column.clone()).unwrap();
+    assert_eq!(store.current_generation().unwrap(), 3);
+    assert_eq!(store.load().unwrap().unwrap(), snap_column);
 }
