@@ -196,6 +196,12 @@ split-brain. We implement the term fence and session fence in the
 `Coordinator` trait so that both the Raft and ZooKeeper backends inherit the
 guarantee rather than each re-implementing it.
 
+**Phase 6 implementation note.** In the local Phase 6 MVP (`htap-coord`), this fencing model is realized via `Coordinator` and `LocalCoordinator` using durable `HTAPCRD1` envelopes:
+- Scoped leadership grants strictly monotonic fencing tokens (`FencingToken`) with durable token watermarks that are never reused across restarts.
+- Fenced catalog CAS (`fenced_catalog_compare_and_set`) serializes leader token validation and catalog compare-and-set updates under the coordinator's state lock, rejecting stale leaders (`HtapError::Fenced`) before mutations can touch the catalog. Verified in `crates/htap-coord/tests/local_coordinator.rs` and `crates/htap-coord/tests/placement_movement.rs`.
+- Deterministic placement planning (`plan_placement`) and replica staging/activation (`stage_placement_addition`, `activate_placement_addition`) execute under this fence validation.
+- Architectural boundaries: direct `CatalogStore` CAS and older movement repair APIs bypass this coordinator fence; no Raft/`openraft` or ZooKeeper backend, watches/locks/KV semantics, distributed consensus, cross-process exclusion, remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance are implemented.
+
 ### 10. Journal-then-apply with a shared applier
 
 Every metadata mutation takes the form `log(record, |wal| { apply_to_memory() })`

@@ -19,7 +19,18 @@ with durable tablet columnar manifest envelopes, a four-phase state machine
 (`SnapshotPinned -> SegmentsWritten -> ReadyToPublish -> Column`), atomic per-tablet manifest and
 catalog publication, rowstore-authoritative base-plus-delta overlay, and online point writes/reads on
 converting and columnar storage partitions.
+Phase 5 has a completed local movement MVP (`htap-movement`): durable jobs (`HTAPJOB1`), CSV/JSONL
+streaming import/export, and tablet snapshot clone/verify/repair (`HTAPMNF1`).
+Phase 6 has a completed local coordination and placement MVP (`htap-coord`): synchronous `Coordinator`
+trait, durable `LocalCoordinator` persisting at `COORDINATOR` (`HTAPCRD1`), deterministic sorted membership,
+strictly monotonic fencing tokens (`FencingToken`), coordinator-fenced catalog CAS
+(`fenced_catalog_compare_and_set`), deterministic placement planner (`plan_placement`), and coordinator-fenced
+local replica staging and activation simulation (`stage_placement_addition`, `activate_placement_addition`,
+`activate_placement_plan`).
 Later components described below remain `planned` or `in progress` (explicitly deferred:
+direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
+ZooKeeper backend, watches/locks/KV semantics, distributed consensus, cross-process exclusion,
+remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
 reverse `Column -> Row` conversion, delete vectors, physical rowstore reclamation, compaction,
 SQL analytical scans, multi-partition routing, MySQL wire protocol/`htapd` daemon,
 sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/`ALTER`/`DROP`, and broad MySQL compatibility).
@@ -81,10 +92,10 @@ See [`PROGRESS.md`](./PROGRESS.md).
       +---------------------------------------------------------------+
 
    +----------------------+  +----------------------+  +-----------------+
-   | htap-catalog         |  | htap-coord   planned |  | htap-movement   |
-   | durable local store, |  | local | Raft | ZK    |  | placement,      |
-   | topology, recovery   |  | fencing tokens       |  | repair (local)  |
-   | in progress          |  |                      |  | IMPLEMENTED     |
+   | htap-catalog         |  | htap-coord (localMVP)|  | htap-movement   |
+   | durable local store, |  | local | Raft(plan)   |  | placement,      |
+   | topology, recovery   |  | ZK(plan) | fence CAS |  | repair (local)  |
+   | in progress          |  | IMPLEMENTED (MVP)    |  | IMPLEMENTED     |
    +----------------------+  +----------------------+  +-----------------+
 
    +---------------------------------------------------------------+
@@ -279,28 +290,62 @@ StorageDescriptor::Column
 
 ## Coordination
 
-**Status: `planned`** (the `htap-coord` crate exists as a skeleton).
+**Status: `in progress (local MVP)`** (`htap-coord` implements local durable coordination, membership, fencing, and fenced catalog CAS).
 
-A `Coordinator` trait covers leader election, membership, a metadata KV store,
-watches, and distributed locks. Three backends are planned:
+The synchronous `Coordinator` trait defines cluster coordination, membership tracking, scoped leadership election, fence validation, and atomic coordinator-fenced catalog compare-and-set updates:
 
-| Backend | Purpose |
-| ------- | ------- |
-| Local single-node | Tests and the demo. |
-| Embedded Raft (`openraft`) | The distributed default. |
-| ZooKeeper | Integration with existing ensembles. |
+```rust
+pub trait Coordinator: Send + Sync {
+    fn register_node(&self, node_id: NodeId) -> Result<()>;
+    fn remove_node(&self, node_id: NodeId) -> Result<()>;
+    fn list_nodes(&self) -> Result<Vec<NodeId>>;
+    fn acquire_leadership(&self, scope: &str, holder: NodeId) -> Result<Leadership>;
+    fn current_leadership(&self, scope: &str) -> Result<Option<Leadership>>;
+    fn release_leadership(&self, scope: &str) -> Result<()>;
+    fn replace_leadership(&self, scope: &str, holder: NodeId) -> Result<Leadership>;
+    fn validate_fence(&self, scope: &str, token: FencingToken) -> Result<()>;
+    fn fenced_catalog_compare_and_set(
+        &self,
+        scope: &str,
+        token: FencingToken,
+        catalog: &dyn CatalogStore,
+        expected_generation: u64,
+        next: CatalogSnapshot,
+    ) -> Result<()>;
+}
+```
 
-**Fencing tokens** (`htap-common::FencingToken`, `implemented`) are issued on
-leadership acquisition and validated on every metadata mutation. The term
-fence and session fence described in [`RESEARCH.md`](./RESEARCH.md) live in the
-`Coordinator` trait, so both the Raft and ZooKeeper backends inherit the
-guarantee rather than re-implementing it.
+### Local coordinator implementation (`LocalCoordinator`)
+
+The single-node implementation (`LocalCoordinator`) persists membership, scoped leadership leases, highest scope tokens, and next token allocator state at `<root>/COORDINATOR` using the `HTAPCRD1` binary envelope format (`HEADER_MAGIC = b"HTAPCRD1"`, `FORMAT_VERSION = 1`, 18-byte header with payload length and CRC32C checksum). Updates follow atomic staging semantics (`COORDINATOR.tmp` write -> fsync -> rename -> directory fsync).
+
+Key operational guarantees:
+- **Sorted membership:** `list_nodes` returns registered `NodeId` entries in deterministic ascending order.
+- **Strictly monotonic tokens:** Fencing tokens (`FencingToken`) advance strictly monotonically on every leadership acquisition and replacement, and are persisted durably so that tokens are never reused across process restarts.
+- **Fenced catalog compare-and-set:** `fenced_catalog_compare_and_set` executes under the coordinator's state lock, validating that the caller's fencing token matches the current active leader token for the target scope before invoking `CatalogStore::compare_and_set`. Stale leaders receive `HtapError::Fenced` and cannot mutate catalog state.
+
+### Backend status and roadmap
+
+| Backend | Status | Purpose |
+| ------- | ------ | ------- |
+| Local single-node (`LocalCoordinator`) | `implemented (local MVP)` | Single-node durable coordinator with `HTAPCRD1` envelopes, intra-process mutex serialization, and fenced catalog CAS. |
+| Embedded Raft (`openraft`) | `planned` | Distributed consensus default for multi-node deployments. |
+| ZooKeeper | `planned` | Integration with existing external ensembles. |
+
+### Architectural boundaries and explicitly deferred capabilities
+
+- **Direct CatalogStore CAS and movement repair bypass fence:** Direct calls to `CatalogStore::compare_and_set` and older movement repair APIs (`htap_movement::repair_replica`) operate directly against catalog storage without coordinator fence validation. Fencing is strictly enforced when mutations route through `fenced_catalog_compare_and_set` or `activate_placement_addition`.
+- **No cross-process concurrency exclusion:** `LocalCoordinator` serializes state internally with an intra-process mutex (`parking_lot::Mutex`). Multi-process concurrent access to the same coordinator root directory is unsupported and lacks OS-level or distributed locking.
+- **No distributed consensus:** Neither Raft (`openraft`) nor ZooKeeper backends are implemented. Consensus is single-node local only.
+- **No watches, distributed locks, or KV store semantics:** The `Coordinator` trait focuses on membership, scoped leadership, and catalog CAS gating. General-purpose KV storage, ephemeral path watches, and lock lease expirations are deferred.
+- **No remote physical movement or network transport:** Tablet movement and placement activation execute locally using `htap_movement::LocalDataMover`, local filesystem paths, and local rowstore engine snapshots.
+- **No leader handoff, ongoing replication, capacity/rack placement, or live rebalance:** Leadership turnover immediately revokes previous tokens but executes no consensus handoff protocol; replication uses static snapshot clone packages rather than ongoing log replication; dynamic placement does not rebalance live clusters or consider rack topology or storage capacity.
 
 ---
 
-## Sharding
+## Sharding and placement
 
-**Status: `in progress`** (the `htap-catalog` and `htap-movement` crates implement single-node tablet sharding, clone packages, and replica repair; multi-node coordination is planned).
+**Status: `in progress`** (the `htap-catalog`, `htap-movement`, and `htap-coord` crates implement single-node tablet sharding, clone packages, deterministic placement planning, and local replica activation simulation; multi-node network coordination is planned).
 
 ```text
 Table
@@ -310,6 +355,24 @@ Table
 ```
 
 The **tablet is the unit of placement, replication, movement, and repair**.
+
+### Deterministic placement planning (`plan_placement`)
+
+The placement planner computes pure, deterministic, colocation-free replica placement plans over an immutable `CatalogSnapshot`, a candidate `NodeId` list, and a target replication factor:
+1. **Canonical sorting:** Sorts candidate nodes and tablets in ascending order of their IDs to ensure identical plans regardless of input order.
+2. **Colocation prevention:** Strictly validates that no node hosts multiple replicas of the same tablet.
+3. **Greedy load balancing:** Preserves existing healthy replicas and assigns new replicas to candidate nodes with the lowest current replica count, breaking ties deterministically by smallest `NodeId`.
+4. **Monotonic replica ID allocation:** Allocates new `ReplicaId` values starting from `max_existing_id + 1` with checked arithmetic overflow validation.
+
+### Coordinator-mediated local replica activation
+
+Replica activation proceeds through coordinator-fenced phases:
+1. **Staging (`stage_placement_addition`):** Under coordinator fence validation for the tablet scope, registers target `ReplicaDescriptor` in the catalog with `is_leader = false` and `healthy = false` via `fenced_catalog_compare_and_set`.
+2. **Logical clone & package verification:** Generates a snapshot clone package via `htap_movement::clone_tablet` and verifies package checksums and metadata via `htap_movement::verify_package` (`HTAPMNF1`).
+3. **Activation (`activate_placement_addition`):** Transitions the target replica to `healthy = true` via `fenced_catalog_compare_and_set`. If cloning, verification, or fencing fails at any step, the target replica remains unready (`healthy = false`) in the catalog.
+4. **Batch activation (`activate_placement_plan`):** Sequentially stages, clones, verifies, and activates all additions in a `PlacementPlan`.
+
+### Hash bucketing contract
 
 The hash bucketing contract is fixed explicitly and versioned: the bucket is
 `crc32(concatenated per-column binary encodings) % tablet_count`, where the
