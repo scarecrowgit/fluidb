@@ -11,8 +11,8 @@ pub mod store;
 pub use local::LocalCatalogStore;
 pub use model::{
     CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase, NodeId,
-    PartitionDescriptor, PartitionId, ReplicaDescriptor, ReplicaId, StorageDescriptor,
-    StorageFormat, TableDescriptor, TableId, TabletDescriptor, TabletId, MAX_MANIFEST_ROWS,
-    MAX_MANIFEST_SEGMENTS,
+    PartitionDescriptor, PartitionId, PartitionSource, PartitioningDescriptor, PartitioningMethod,
+    RangeBound, ReplicaDescriptor, ReplicaId, StorageDescriptor, StorageFormat, TableDescriptor,
+    TableId, TableSelector, TabletDescriptor, TabletId, MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS,
 };
 pub use store::CatalogStore;

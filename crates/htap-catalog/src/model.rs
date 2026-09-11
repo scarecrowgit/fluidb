@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use htap_common::{HtapError, Result, Schema, Version};
+use htap_common::{HtapError, Result, Schema, Value, Version};
 use serde::{Deserialize, Serialize};
 
 macro_rules! define_id {
@@ -168,6 +168,47 @@ pub const MAX_MANIFEST_SEGMENTS: u64 = 10_000_000;
 /// Maximum reasonable number of rows per tablet manifest reference.
 pub const MAX_MANIFEST_ROWS: u64 = 1_000_000_000_000_000;
 
+/// Partitioning strategy method for a partitioned relational table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PartitioningMethod {
+    /// Range partitioning where partitions cover non-overlapping intervals `[lower, upper)`.
+    Range,
+    /// List partitioning where partitions cover disjoint sets of explicit values.
+    List,
+}
+
+/// Partitioning descriptor defining key column and partitioning method.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PartitioningDescriptor {
+    /// Zero-based column index in table schema used as partition key.
+    pub key_column: usize,
+    /// Partitioning method (Range or List).
+    pub method: PartitioningMethod,
+}
+
+impl PartitioningDescriptor {
+    /// Create a new partitioning descriptor.
+    pub fn new(key_column: usize, method: PartitioningMethod) -> Self {
+        Self { key_column, method }
+    }
+}
+
+/// Boundary for a range partition: lower-inclusive, upper-exclusive (`[lower, upper)`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RangeBound {
+    /// Inclusive lower bound.
+    pub lower: Value,
+    /// Exclusive upper bound.
+    pub upper: Value,
+}
+
+impl RangeBound {
+    /// Create a new range bound (`[lower, upper)`).
+    pub fn new(lower: Value, upper: Value) -> Self {
+        Self { lower, upper }
+    }
+}
+
 /// Metadata descriptor for a relational table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableDescriptor {
@@ -183,6 +224,9 @@ pub struct TableDescriptor {
     pub partitions: Vec<PartitionId>,
     /// Schema or metadata generation version for this table.
     pub generation: u64,
+    /// Partitioning strategy descriptor, if table is partitioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioning: Option<PartitioningDescriptor>,
 }
 
 impl TableDescriptor {
@@ -202,6 +246,96 @@ impl TableDescriptor {
             primary_key,
             partitions,
             generation,
+            partitioning: None,
+        }
+    }
+
+    /// Set partitioning descriptor metadata.
+    pub fn with_partitioning(
+        mut self,
+        partitioning: impl Into<Option<PartitioningDescriptor>>,
+    ) -> Self {
+        self.partitioning = partitioning.into();
+        self
+    }
+
+    /// Route a partition key value to the matching partition ID using `self.partitions` order.
+    ///
+    /// - For unpartitioned tables: routes to its sole partition (error if not exactly 1 partition).
+    /// - For Range partitioning: routes to the partition where `lower <= value < upper`.
+    /// - For List partitioning: routes to the partition containing `value`.
+    /// - If unmatched: returns [`HtapError::InvalidArgument`].
+    pub fn route_partition_value<S: PartitionSource + ?Sized>(
+        &self,
+        source: &S,
+        value: &Value,
+    ) -> Result<PartitionId> {
+        match &self.partitioning {
+            None => {
+                if self.partitions.len() == 1 {
+                    Ok(self.partitions[0])
+                } else {
+                    Err(HtapError::InvalidArgument(format!(
+                        "unpartitioned table '{}' must have exactly one partition to route, found {}",
+                        self.name,
+                        self.partitions.len()
+                    )))
+                }
+            }
+            Some(partitioning) => {
+                if partitioning.key_column >= self.schema.len() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition key column index {} out of bounds for table '{}' (schema length {})",
+                        partitioning.key_column,
+                        self.name,
+                        self.schema.len()
+                    )));
+                }
+                let key_col = &self.schema.columns()[partitioning.key_column];
+                if value.is_null() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition key value cannot be null for table '{}'",
+                        self.name
+                    )));
+                }
+                if value.data_type() != Some(key_col.data_type) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition key value type mismatch for table '{}': expected {:?}, got {:?}",
+                        self.name,
+                        key_col.data_type,
+                        value.data_type()
+                    )));
+                }
+
+                for &part_id in &self.partitions {
+                    let part = source.find_partition(part_id).ok_or_else(|| {
+                        HtapError::InvalidArgument(format!(
+                            "table '{}' references partition id {} which was not found",
+                            self.name, part_id
+                        ))
+                    })?;
+
+                    match partitioning.method {
+                        PartitioningMethod::Range => {
+                            if let Some(range) = &part.range {
+                                if range.lower <= *value && *value < range.upper {
+                                    return Ok(part_id);
+                                }
+                            }
+                        }
+                        PartitioningMethod::List => {
+                            if part.list_values.iter().any(|v| v == value) {
+                                return Ok(part_id);
+                            }
+                        }
+                    }
+                }
+
+                Err(HtapError::InvalidArgument(format!(
+                    "partition key value {} does not match any partition in table '{}'",
+                    value, self.name
+                )))
+            }
         }
     }
 }
@@ -224,6 +358,12 @@ pub struct PartitionDescriptor {
     /// In-flight conversion metadata, if converting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversion: Option<ConversionDescriptor>,
+    /// Range bounds if belonging to a range-partitioned table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<RangeBound>,
+    /// List values if belonging to a list-partitioned table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_values: Vec<Value>,
 }
 
 impl PartitionDescriptor {
@@ -244,12 +384,26 @@ impl PartitionDescriptor {
             tablets,
             generation,
             conversion: None,
+            range: None,
+            list_values: Vec::new(),
         }
     }
 
     /// Set conversion descriptor metadata.
     pub fn with_conversion(mut self, conversion: impl Into<Option<ConversionDescriptor>>) -> Self {
         self.conversion = conversion.into();
+        self
+    }
+
+    /// Set range bound metadata.
+    pub fn with_range(mut self, range: impl Into<Option<RangeBound>>) -> Self {
+        self.range = range.into();
+        self
+    }
+
+    /// Set list values metadata.
+    pub fn with_list_values(mut self, list_values: impl Into<Vec<Value>>) -> Self {
+        self.list_values = list_values.into();
         self
     }
 }
@@ -352,6 +506,82 @@ pub struct CatalogSnapshot {
     pub tablets: Vec<TabletDescriptor>,
     /// All replicas across tablets.
     pub replicas: Vec<ReplicaDescriptor>,
+}
+
+/// Trait for partition lookup sources used during partition value routing.
+pub trait PartitionSource {
+    /// Look up a partition descriptor by its partition identifier.
+    fn find_partition(&self, id: PartitionId) -> Option<&PartitionDescriptor>;
+}
+
+impl PartitionSource for CatalogSnapshot {
+    fn find_partition(&self, id: PartitionId) -> Option<&PartitionDescriptor> {
+        self.partition(id)
+    }
+}
+
+impl PartitionSource for [PartitionDescriptor] {
+    fn find_partition(&self, id: PartitionId) -> Option<&PartitionDescriptor> {
+        self.iter().find(|p| p.id == id)
+    }
+}
+
+impl PartitionSource for Vec<PartitionDescriptor> {
+    fn find_partition(&self, id: PartitionId) -> Option<&PartitionDescriptor> {
+        self.iter().find(|p| p.id == id)
+    }
+}
+
+impl PartitionSource for &[PartitionDescriptor] {
+    fn find_partition(&self, id: PartitionId) -> Option<&PartitionDescriptor> {
+        self.iter().find(|p| p.id == id)
+    }
+}
+
+impl PartitionSource for [&PartitionDescriptor] {
+    fn find_partition(&self, id: PartitionId) -> Option<&PartitionDescriptor> {
+        self.iter().copied().find(|p| p.id == id)
+    }
+}
+
+impl PartitionSource for Vec<&PartitionDescriptor> {
+    fn find_partition(&self, id: PartitionId) -> Option<&PartitionDescriptor> {
+        self.iter().copied().find(|p| p.id == id)
+    }
+}
+
+impl PartitionSource for &[&PartitionDescriptor] {
+    fn find_partition(&self, id: PartitionId) -> Option<&PartitionDescriptor> {
+        self.iter().copied().find(|p| p.id == id)
+    }
+}
+
+/// Trait for types that can resolve to a [`TableDescriptor`] within a catalog snapshot.
+pub trait TableSelector<'a> {
+    /// Resolve the table descriptor reference.
+    fn resolve_table(self, snapshot: &'a CatalogSnapshot) -> Result<&'a TableDescriptor>;
+}
+
+impl<'a> TableSelector<'a> for TableId {
+    fn resolve_table(self, snapshot: &'a CatalogSnapshot) -> Result<&'a TableDescriptor> {
+        snapshot
+            .table(self)
+            .ok_or_else(|| HtapError::InvalidArgument(format!("table id {} not found", self)))
+    }
+}
+
+impl<'a> TableSelector<'a> for &'a TableId {
+    fn resolve_table(self, snapshot: &'a CatalogSnapshot) -> Result<&'a TableDescriptor> {
+        snapshot
+            .table(*self)
+            .ok_or_else(|| HtapError::InvalidArgument(format!("table id {} not found", *self)))
+    }
+}
+
+impl<'a> TableSelector<'a> for &'a TableDescriptor {
+    fn resolve_table(self, _snapshot: &'a CatalogSnapshot) -> Result<&'a TableDescriptor> {
+        Ok(self)
+    }
 }
 
 fn validate_manifest_path(path_str: &str) -> Result<()> {
@@ -468,6 +698,23 @@ impl CatalogSnapshot {
             .collect()
     }
 
+    /// Route a partition key value to the matching partition ID.
+    ///
+    /// The table can be specified as a [`TableId`] or as a `&TableDescriptor`.
+    ///
+    /// - For unpartitioned tables: routes to its sole partition (error if not exactly 1 partition).
+    /// - For Range partitioning: routes to the partition where `lower <= value < upper`.
+    /// - For List partitioning: routes to the partition containing `value`.
+    /// - If unmatched: returns [`HtapError::InvalidArgument`].
+    pub fn route_partition_value<'a>(
+        &'a self,
+        table: impl TableSelector<'a>,
+        value: &Value,
+    ) -> Result<PartitionId> {
+        let table_desc = table.resolve_table(self)?;
+        table_desc.route_partition_value(self, value)
+    }
+
     /// Validate the catalog snapshot for semantic correctness.
     ///
     /// Checks:
@@ -573,6 +820,37 @@ impl CatalogSnapshot {
                     )));
                 }
             }
+
+            if let Some(partitioning) = &table.partitioning {
+                if partitioning.key_column >= schema_len {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition key index {} out of bounds for table '{}' (schema length {})",
+                        partitioning.key_column, table.name, schema_len
+                    )));
+                }
+
+                let key_col = &table.schema.columns()[partitioning.key_column];
+                if !table.primary_key.contains(&partitioning.key_column) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition key column '{}' (index {}) in table '{}' must be part of primary key",
+                        key_col.name, partitioning.key_column, table.name
+                    )));
+                }
+
+                if key_col.nullable {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition key column '{}' (index {}) in table '{}' cannot be nullable",
+                        key_col.name, partitioning.key_column, table.name
+                    )));
+                }
+
+                if table.partitions.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partitioned table '{}' (id {}) must have at least one partition",
+                        table.name, table.id
+                    )));
+                }
+            }
         }
 
         // 2. Validate partitions: unique IDs, non-empty names, unique names per table, FK to table.
@@ -607,6 +885,122 @@ impl CatalogSnapshot {
                     "partition {} references nonexistent table {}",
                     part.id, part.table_id
                 )));
+            }
+
+            if part.range.is_some() && !part.list_values.is_empty() {
+                return Err(HtapError::InvalidArgument(format!(
+                    "partition '{}' (id {}) defines both range bound and list values",
+                    part.name, part.id
+                )));
+            }
+
+            let parent_table = self.table(part.table_id).ok_or_else(|| {
+                HtapError::InvalidArgument(format!(
+                    "partition {} references nonexistent table {}",
+                    part.id, part.table_id
+                ))
+            })?;
+
+            match &parent_table.partitioning {
+                None => {
+                    if part.range.is_some() {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{}' (id {}) has range bound but parent table '{}' is unpartitioned",
+                            part.name, part.id, parent_table.name
+                        )));
+                    }
+                    if !part.list_values.is_empty() {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{}' (id {}) has list values but parent table '{}' is unpartitioned",
+                            part.name, part.id, parent_table.name
+                        )));
+                    }
+                }
+                Some(partitioning) => {
+                    let key_col = &parent_table.schema.columns()[partitioning.key_column];
+                    let expected_type = key_col.data_type;
+
+                    match partitioning.method {
+                        PartitioningMethod::Range => {
+                            if !part.list_values.is_empty() {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "partition '{}' (id {}) has list values but parent table '{}' uses range partitioning",
+                                    part.name, part.id, parent_table.name
+                                )));
+                            }
+                            let range = part.range.as_ref().ok_or_else(|| {
+                                HtapError::InvalidArgument(format!(
+                                    "partition '{}' (id {}) in range-partitioned table '{}' is missing range bound",
+                                    part.name, part.id, parent_table.name
+                                ))
+                            })?;
+
+                            if range.lower.is_null()
+                                || range.lower.data_type() != Some(expected_type)
+                            {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "range partition '{}' (id {}) lower bound has invalid type: expected {:?}, got {:?}",
+                                    part.name,
+                                    part.id,
+                                    expected_type,
+                                    range.lower.data_type()
+                                )));
+                            }
+                            if range.upper.is_null()
+                                || range.upper.data_type() != Some(expected_type)
+                            {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "range partition '{}' (id {}) upper bound has invalid type: expected {:?}, got {:?}",
+                                    part.name,
+                                    part.id,
+                                    expected_type,
+                                    range.upper.data_type()
+                                )));
+                            }
+                            if range.lower >= range.upper {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "range partition '{}' (id {}) in table '{}' has invalid bounds: lower ({}) must be strictly less than upper ({})",
+                                    part.name, part.id, parent_table.name, range.lower, range.upper
+                                )));
+                            }
+                        }
+                        PartitioningMethod::List => {
+                            if part.range.is_some() {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "partition '{}' (id {}) has range bound but parent table '{}' uses list partitioning",
+                                    part.name, part.id, parent_table.name
+                                )));
+                            }
+                            if part.list_values.is_empty() {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "partition '{}' (id {}) in list-partitioned table '{}' has empty list values",
+                                    part.name, part.id, parent_table.name
+                                )));
+                            }
+
+                            let mut seen_part_values =
+                                HashSet::with_capacity(part.list_values.len());
+                            for val in &part.list_values {
+                                if val.is_null() || val.data_type() != Some(expected_type) {
+                                    return Err(HtapError::InvalidArgument(format!(
+                                        "list partition value '{}' in partition '{}' (id {}) has invalid type: expected {:?}, got {:?}",
+                                        val,
+                                        part.name,
+                                        part.id,
+                                        expected_type,
+                                        val.data_type()
+                                    )));
+                                }
+                                if !seen_part_values.insert(val) {
+                                    return Err(HtapError::InvalidArgument(format!(
+                                        "partition '{}' (id {}) contains duplicate list value '{}'",
+                                        part.name, part.id, val
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Storage and conversion descriptor validation
@@ -707,6 +1101,50 @@ impl CatalogSnapshot {
                     )));
                 }
                 claimed_partitions.insert(part_id);
+            }
+
+            if let Some(partitioning) = &table.partitioning {
+                match partitioning.method {
+                    PartitioningMethod::Range => {
+                        let mut ranges = Vec::with_capacity(table.partitions.len());
+                        for &part_id in &table.partitions {
+                            if let Some(part) = self.partition(part_id) {
+                                if let Some(range) = &part.range {
+                                    ranges.push((part.id, &part.name, &range.lower, &range.upper));
+                                }
+                            }
+                        }
+                        for i in 0..ranges.len() {
+                            for j in (i + 1)..ranges.len() {
+                                let (id1, name1, l1, u1) = ranges[i];
+                                let (id2, name2, l2, u2) = ranges[j];
+                                let max_lower = std::cmp::max(l1, l2);
+                                let min_upper = std::cmp::min(u1, u2);
+                                if max_lower < min_upper {
+                                    return Err(HtapError::InvalidArgument(format!(
+                                        "table '{}' has overlapping range partitions: partition '{}' (id {}) [{}, {}) overlaps with partition '{}' (id {}) [{}, {})",
+                                        table.name, name1, id1, l1, u1, name2, id2, l2, u2
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    PartitioningMethod::List => {
+                        let mut seen_table_list_values = HashSet::new();
+                        for &part_id in &table.partitions {
+                            if let Some(part) = self.partition(part_id) {
+                                for val in &part.list_values {
+                                    if !seen_table_list_values.insert(val) {
+                                        return Err(HtapError::InvalidArgument(format!(
+                                            "table '{}' has duplicate list value '{}' across partitions (found in partition '{}' id {})",
+                                            table.name, val, part.name, part.id
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1060,5 +1498,23 @@ mod tests {
         let json_c = serde_json::to_string(&conv).unwrap();
         let dec_c: ConversionDescriptor = serde_json::from_str(&json_c).unwrap();
         assert_eq!(dec_c, conv);
+    }
+
+    #[test]
+    fn test_partitioning_descriptors() {
+        let p_desc = PartitioningDescriptor::new(1, PartitioningMethod::Range);
+        let json_p = serde_json::to_string(&p_desc).unwrap();
+        let dec_p: PartitioningDescriptor = serde_json::from_str(&json_p).unwrap();
+        assert_eq!(dec_p, p_desc);
+
+        let bound = RangeBound::new(Value::Int64(10), Value::Int64(100));
+        let json_b = serde_json::to_string(&bound).unwrap();
+        let dec_b: RangeBound = serde_json::from_str(&json_b).unwrap();
+        assert_eq!(dec_b, bound);
+
+        let list_method = PartitioningMethod::List;
+        let json_lm = serde_json::to_string(&list_method).unwrap();
+        let dec_lm: PartitioningMethod = serde_json::from_str(&json_lm).unwrap();
+        assert_eq!(dec_lm, list_method);
     }
 }

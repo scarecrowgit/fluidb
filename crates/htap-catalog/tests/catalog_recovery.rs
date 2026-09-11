@@ -4,7 +4,7 @@ use std::fs;
 
 use htap_catalog::local::{encode_snapshot, FORMAT_VERSION, HEADER_MAGIC};
 use htap_catalog::*;
-use htap_common::{ColumnDef, DataType, HtapError, Schema, Version};
+use htap_common::{ColumnDef, DataType, HtapError, Schema, Value, Version};
 use tempfile::TempDir;
 
 fn make_schema() -> Schema {
@@ -1139,4 +1139,882 @@ fn test_conversion_stale_cas() {
     store.compare_and_set(2, snap_column.clone()).unwrap();
     assert_eq!(store.current_generation().unwrap(), 3);
     assert_eq!(store.load().unwrap().unwrap(), snap_column);
+}
+
+#[test]
+fn test_partitioning_legacy_decode_and_reopen() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    // Legacy JSON format with no partitioning/range/list_values fields
+    let legacy_json = r#"{
+        "generation": 1,
+        "tables": [{
+            "id": 1,
+            "name": "users",
+            "schema": {
+                "columns": [
+                    {"name": "id", "data_type": "Int64", "nullable": false, "primary_key": true},
+                    {"name": "val", "data_type": "String", "nullable": true, "primary_key": false}
+                ]
+            },
+            "primary_key": [0],
+            "partitions": [10],
+            "generation": 1
+        }],
+        "partitions": [{
+            "id": 10,
+            "table_id": 1,
+            "name": "p0",
+            "storage": "Row",
+            "tablets": [100],
+            "generation": 1
+        }],
+        "tablets": [{
+            "id": 100,
+            "partition_id": 10,
+            "bucket": 0,
+            "replicas": [1000],
+            "generation": 1
+        }],
+        "replicas": [{
+            "id": 1000,
+            "tablet_id": 100,
+            "node_id": 42,
+            "is_leader": true,
+            "healthy": true,
+            "generation": 1
+        }]
+    }"#;
+
+    let snap: CatalogSnapshot = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(snap.generation, 1);
+    assert!(snap.tables[0].partitioning.is_none());
+    assert!(snap.partitions[0].range.is_none());
+    assert!(snap.partitions[0].list_values.is_empty());
+
+    // Single-partition legacy descriptor validates cleanly
+    snap.validate().unwrap();
+
+    // Store, CAS, and reopen
+    store.compare_and_set(0, snap.clone()).unwrap();
+    let reopened = LocalCatalogStore::open(temp.path()).unwrap();
+    let recovered = reopened.load().unwrap().unwrap();
+    assert_eq!(recovered, snap);
+
+    // Unpartitioned table routes any value to its sole partition
+    assert_eq!(
+        recovered
+            .route_partition_value(TableId::new(1), &Value::Int64(42))
+            .unwrap(),
+        PartitionId::new(10)
+    );
+    assert_eq!(
+        recovered.tables[0]
+            .route_partition_value(&recovered, &Value::String("anything".into()))
+            .unwrap(),
+        PartitionId::new(10)
+    );
+}
+
+#[test]
+fn test_range_partitioning_routing_and_boundaries() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".to_string(),
+            data_type: DataType::String,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let p0_id = PartitionId::new(10);
+    let p1_id = PartitionId::new(11);
+    let p2_id = PartitionId::new(12);
+
+    let table = TableDescriptor::new(
+        TableId::new(1),
+        "events",
+        schema,
+        vec![0],
+        vec![p0_id, p1_id, p2_id],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![TabletId::new(100)],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+
+    let p1 = PartitionDescriptor::new(
+        p1_id,
+        TableId::new(1),
+        "p1",
+        StorageDescriptor::Row,
+        vec![TabletId::new(101)],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(100), Value::Int64(200)));
+
+    let p2 = PartitionDescriptor::new(
+        p2_id,
+        TableId::new(1),
+        "p2",
+        StorageDescriptor::Row,
+        vec![TabletId::new(102)],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(200), Value::Int64(300)));
+
+    let tabs = vec![
+        TabletDescriptor::new(TabletId::new(100), p0_id, 0, vec![ReplicaId::new(1000)], 1),
+        TabletDescriptor::new(TabletId::new(101), p1_id, 0, vec![ReplicaId::new(1001)], 1),
+        TabletDescriptor::new(TabletId::new(102), p2_id, 0, vec![ReplicaId::new(1002)], 1),
+    ];
+
+    let reps = vec![
+        ReplicaDescriptor::new(
+            ReplicaId::new(1000),
+            TabletId::new(100),
+            NodeId::new(1),
+            true,
+            true,
+            1,
+        ),
+        ReplicaDescriptor::new(
+            ReplicaId::new(1001),
+            TabletId::new(101),
+            NodeId::new(2),
+            true,
+            true,
+            1,
+        ),
+        ReplicaDescriptor::new(
+            ReplicaId::new(1002),
+            TabletId::new(102),
+            NodeId::new(3),
+            true,
+            true,
+            1,
+        ),
+    ];
+
+    let parts = vec![p0.clone(), p1.clone(), p2.clone()];
+    let snap = CatalogSnapshot::new(1, vec![table.clone()], parts.clone(), tabs, reps);
+    snap.validate().unwrap();
+
+    // Verify boundaries: lower inclusive, upper exclusive
+    // p0: [0, 100)
+    assert_eq!(
+        snap.route_partition_value(TableId::new(1), &Value::Int64(0))
+            .unwrap(),
+        p0_id
+    );
+    assert_eq!(
+        snap.route_partition_value(TableId::new(1), &Value::Int64(50))
+            .unwrap(),
+        p0_id
+    );
+    assert_eq!(
+        snap.route_partition_value(TableId::new(1), &Value::Int64(99))
+            .unwrap(),
+        p0_id
+    );
+
+    // p1: [100, 200) -> 100 must route to p1, not p0
+    assert_eq!(
+        snap.route_partition_value(TableId::new(1), &Value::Int64(100))
+            .unwrap(),
+        p1_id
+    );
+    assert_eq!(
+        snap.route_partition_value(TableId::new(1), &Value::Int64(150))
+            .unwrap(),
+        p1_id
+    );
+    assert_eq!(
+        snap.route_partition_value(TableId::new(1), &Value::Int64(199))
+            .unwrap(),
+        p1_id
+    );
+
+    // p2: [200, 300) -> 200 must route to p2, not p1
+    assert_eq!(
+        snap.route_partition_value(TableId::new(1), &Value::Int64(200))
+            .unwrap(),
+        p2_id
+    );
+    assert_eq!(
+        snap.route_partition_value(TableId::new(1), &Value::Int64(299))
+            .unwrap(),
+        p2_id
+    );
+
+    // Out-of-range / unmatched values return InvalidArgument
+    let err = snap
+        .route_partition_value(TableId::new(1), &Value::Int64(300))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    let err = snap
+        .route_partition_value(TableId::new(1), &Value::Int64(-1))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    let err = snap
+        .route_partition_value(TableId::new(1), &Value::Int64(999))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // TableDescriptor routing helper
+    assert_eq!(
+        table
+            .route_partition_value(&snap, &Value::Int64(100))
+            .unwrap(),
+        p1_id
+    );
+    assert_eq!(
+        table
+            .route_partition_value(&parts, &Value::Int64(250))
+            .unwrap(),
+        p2_id
+    );
+    assert_eq!(
+        snap.route_partition_value(&table, &Value::Int64(0))
+            .unwrap(),
+        p0_id
+    );
+
+    // CAS and reopen
+    store.compare_and_set(0, snap.clone()).unwrap();
+    let reopened = LocalCatalogStore::open(temp.path()).unwrap();
+    let recovered = reopened.load().unwrap().unwrap();
+    assert_eq!(recovered, snap);
+    assert_eq!(
+        recovered
+            .route_partition_value(TableId::new(1), &Value::Int64(100))
+            .unwrap(),
+        p1_id
+    );
+}
+
+#[test]
+fn test_list_partitioning_routing() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "region".to_string(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: true,
+        },
+    ])
+    .unwrap();
+
+    let p_east_id = PartitionId::new(20);
+    let p_west_id = PartitionId::new(21);
+
+    let table = TableDescriptor::new(
+        TableId::new(2),
+        "accounts",
+        schema,
+        vec![0, 1],
+        vec![p_east_id, p_west_id],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(1, PartitioningMethod::List));
+
+    let p_east = PartitionDescriptor::new(
+        p_east_id,
+        TableId::new(2),
+        "p_east",
+        StorageDescriptor::Row,
+        vec![TabletId::new(200)],
+        1,
+    )
+    .with_list_values(vec![
+        Value::String("us-east-1".into()),
+        Value::String("us-east-2".into()),
+    ]);
+
+    let p_west = PartitionDescriptor::new(
+        p_west_id,
+        TableId::new(2),
+        "p_west",
+        StorageDescriptor::Row,
+        vec![TabletId::new(201)],
+        1,
+    )
+    .with_list_values(vec![
+        Value::String("us-west-1".into()),
+        Value::String("us-west-2".into()),
+    ]);
+
+    let tabs = vec![
+        TabletDescriptor::new(
+            TabletId::new(200),
+            p_east_id,
+            0,
+            vec![ReplicaId::new(2000)],
+            1,
+        ),
+        TabletDescriptor::new(
+            TabletId::new(201),
+            p_west_id,
+            0,
+            vec![ReplicaId::new(2001)],
+            1,
+        ),
+    ];
+    let reps = vec![
+        ReplicaDescriptor::new(
+            ReplicaId::new(2000),
+            TabletId::new(200),
+            NodeId::new(1),
+            true,
+            true,
+            1,
+        ),
+        ReplicaDescriptor::new(
+            ReplicaId::new(2001),
+            TabletId::new(201),
+            NodeId::new(2),
+            true,
+            true,
+            1,
+        ),
+    ];
+
+    let snap = CatalogSnapshot::new(1, vec![table], vec![p_east, p_west], tabs, reps);
+    snap.validate().unwrap();
+
+    // Exact matching
+    assert_eq!(
+        snap.route_partition_value(TableId::new(2), &Value::String("us-east-1".into()))
+            .unwrap(),
+        p_east_id
+    );
+    assert_eq!(
+        snap.route_partition_value(TableId::new(2), &Value::String("us-east-2".into()))
+            .unwrap(),
+        p_east_id
+    );
+    assert_eq!(
+        snap.route_partition_value(TableId::new(2), &Value::String("us-west-1".into()))
+            .unwrap(),
+        p_west_id
+    );
+    assert_eq!(
+        snap.route_partition_value(TableId::new(2), &Value::String("us-west-2".into()))
+            .unwrap(),
+        p_west_id
+    );
+
+    // Unmatched
+    let err = snap
+        .route_partition_value(TableId::new(2), &Value::String("eu-central-1".into()))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    let err = snap
+        .route_partition_value(TableId::new(2), &Value::String("".into()))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // CAS and reopen
+    store.compare_and_set(0, snap.clone()).unwrap();
+    let reopened = LocalCatalogStore::open(temp.path()).unwrap();
+    let recovered = reopened.load().unwrap().unwrap();
+    assert_eq!(recovered, snap);
+}
+
+#[test]
+fn test_partitioning_duplicate_violations() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "code".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    // 1. Duplicate list value in the same partition
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].schema = schema.clone();
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::List));
+    snap.partitions[0].list_values = vec![Value::Int64(10), Value::Int64(10)];
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("duplicate list value"));
+
+    // 2. Duplicate list value across different partitions in the same table
+    let mut snap2 = make_valid_snapshot(1);
+    snap2.tables[0].schema = schema.clone();
+    snap2.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::List));
+    snap2.partitions[0].list_values = vec![Value::Int64(10), Value::Int64(20)];
+
+    let p2_id = PartitionId::new(11);
+    let t2_id = TabletId::new(101);
+    let r2_id = ReplicaId::new(1001);
+    snap2.tables[0].partitions.push(p2_id);
+    snap2.partitions.push(
+        PartitionDescriptor::new(
+            p2_id,
+            TableId::new(1),
+            "p1",
+            StorageDescriptor::Row,
+            vec![t2_id],
+            1,
+        )
+        .with_list_values(vec![Value::Int64(20), Value::Int64(30)]), // 20 is duplicate
+    );
+    snap2
+        .tablets
+        .push(TabletDescriptor::new(t2_id, p2_id, 0, vec![r2_id], 1));
+    snap2.replicas.push(ReplicaDescriptor::new(
+        r2_id,
+        t2_id,
+        NodeId::new(2),
+        true,
+        true,
+        1,
+    ));
+    let err = snap2.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("duplicate list value"));
+}
+
+#[test]
+fn test_range_overlap_and_order_violations() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    // Helper to build a 2-partition range snapshot
+    let build_range_snap = |r1: RangeBound, r2: RangeBound| {
+        let p1_id = PartitionId::new(10);
+        let p2_id = PartitionId::new(11);
+        let t1_id = TabletId::new(100);
+        let t2_id = TabletId::new(101);
+        let r1_id = ReplicaId::new(1000);
+        let r2_id = ReplicaId::new(1001);
+
+        let table = TableDescriptor::new(
+            TableId::new(1),
+            "t",
+            schema.clone(),
+            vec![0],
+            vec![p1_id, p2_id],
+            1,
+        )
+        .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+        let p1 = PartitionDescriptor::new(
+            p1_id,
+            TableId::new(1),
+            "p1",
+            StorageDescriptor::Row,
+            vec![t1_id],
+            1,
+        )
+        .with_range(r1);
+        let p2 = PartitionDescriptor::new(
+            p2_id,
+            TableId::new(1),
+            "p2",
+            StorageDescriptor::Row,
+            vec![t2_id],
+            1,
+        )
+        .with_range(r2);
+
+        let tablets = vec![
+            TabletDescriptor::new(t1_id, p1_id, 0, vec![r1_id], 1),
+            TabletDescriptor::new(t2_id, p2_id, 0, vec![r2_id], 1),
+        ];
+        let replicas = vec![
+            ReplicaDescriptor::new(r1_id, t1_id, NodeId::new(1), true, true, 1),
+            ReplicaDescriptor::new(r2_id, t2_id, NodeId::new(2), true, true, 1),
+        ];
+
+        CatalogSnapshot::new(1, vec![table], vec![p1, p2], tablets, replicas)
+    };
+
+    // 1. Overlap: [0, 100) and [50, 150)
+    let snap = build_range_snap(
+        RangeBound::new(Value::Int64(0), Value::Int64(100)),
+        RangeBound::new(Value::Int64(50), Value::Int64(150)),
+    );
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("overlapping range"));
+
+    // 2. Identical: [0, 100) and [0, 100)
+    let snap = build_range_snap(
+        RangeBound::new(Value::Int64(0), Value::Int64(100)),
+        RangeBound::new(Value::Int64(0), Value::Int64(100)),
+    );
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("overlapping range"));
+
+    // 3. Nested: [0, 100) and [20, 80)
+    let snap = build_range_snap(
+        RangeBound::new(Value::Int64(0), Value::Int64(100)),
+        RangeBound::new(Value::Int64(20), Value::Int64(80)),
+    );
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("overlapping range"));
+
+    // 4. Inverted range order: lower > upper ([100, 50))
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].schema = schema.clone();
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.partitions[0].range = Some(RangeBound::new(Value::Int64(100), Value::Int64(50)));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("strictly less than upper"));
+
+    // 5. Empty range: lower == upper ([100, 100))
+    snap.partitions[0].range = Some(RangeBound::new(Value::Int64(100), Value::Int64(100)));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("strictly less than upper"));
+}
+
+#[test]
+fn test_partitioning_type_and_null_violations() {
+    // 1. Partition key column nullable in schema
+    let schema_nullable = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: true, // nullable!
+        primary_key: true,
+    }])
+    .unwrap();
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].schema = schema_nullable;
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.partitions[0].range = Some(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("cannot be nullable"));
+
+    // 2. Partition key column index out of bounds
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(99, PartitioningMethod::Range));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("out of bounds"));
+
+    // 3. Partition key column not part of primary key
+    let mut snap = make_valid_snapshot(1);
+    // column 1 is 'val' with primary_key: false
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(1, PartitioningMethod::Range));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("must be part of primary key"));
+
+    // 4. Range lower bound type mismatch
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.partitions[0].range = Some(RangeBound::new(
+        Value::String("0".into()),
+        Value::Int64(100),
+    ));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("invalid type"));
+
+    // 5. Range upper bound type mismatch
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.partitions[0].range = Some(RangeBound::new(
+        Value::Int64(0),
+        Value::String("100".into()),
+    ));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("invalid type"));
+
+    // 6. Range bound is Null
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.partitions[0].range = Some(RangeBound::new(Value::Null, Value::Int64(100)));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("invalid type"));
+
+    // 7. List value type mismatch
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::List));
+    snap.partitions[0].list_values = vec![Value::String("bad".into())];
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("invalid type"));
+
+    // 8. List value is Null
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::List));
+    snap.partitions[0].list_values = vec![Value::Null];
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("invalid type"));
+
+    // 9. Routing with wrong value type
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.partitions[0].range = Some(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    snap.validate().unwrap();
+
+    let err = snap
+        .route_partition_value(TableId::new(1), &Value::String("wrong".into()))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("type mismatch"));
+
+    // 10. Routing with Null value on partitioned table
+    let err = snap
+        .route_partition_value(TableId::new(1), &Value::Null)
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("cannot be null"));
+}
+
+#[test]
+fn test_partitioning_ownership_and_method_consistency() {
+    // 1. Range table has partition missing range bound
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.partitions[0].range = None;
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("missing range bound"));
+
+    // 2. Range table has partition with list values
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.partitions[0].range = Some(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    snap.partitions[0].list_values = vec![Value::Int64(50)];
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("defines both range bound and list values"));
+
+    // 3. List table has partition with range bound
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::List));
+    snap.partitions[0].range = Some(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    snap.partitions[0].list_values = vec![Value::Int64(50)];
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("defines both range bound and list values"));
+
+    // 4. List table has partition with empty list values
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::List));
+    snap.partitions[0].list_values = vec![];
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("empty list values"));
+
+    // 5. Unpartitioned table has partition with range bound
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].range = Some(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("parent table 'users' is unpartitioned"));
+
+    // 6. Unpartitioned table has partition with list values
+    let mut snap = make_valid_snapshot(1);
+    snap.partitions[0].list_values = vec![Value::Int64(50)];
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("parent table 'users' is unpartitioned"));
+
+    // 7. Partitioned table with 0 partitions
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+    snap.tables[0].partitions.clear();
+    snap.partitions.clear();
+    snap.tablets.clear();
+    snap.replicas.clear();
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("must have at least one partition"));
+
+    // 8. Routing non-existent table ID
+    let valid_snap = make_valid_snapshot(1);
+    let err = valid_snap
+        .route_partition_value(TableId::new(999), &Value::Int64(0))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("not found"));
+
+    // 9. Unpartitioned table with 2 partitions fails routing
+    let mut snap = make_valid_snapshot(1);
+    let p2_id = PartitionId::new(11);
+    let t2_id = TabletId::new(101);
+    let r2_id = ReplicaId::new(1001);
+    snap.tables[0].partitions.push(p2_id);
+    snap.partitions.push(PartitionDescriptor::new(
+        p2_id,
+        TableId::new(1),
+        "p1",
+        StorageDescriptor::Row,
+        vec![t2_id],
+        1,
+    ));
+    snap.tablets
+        .push(TabletDescriptor::new(t2_id, p2_id, 0, vec![r2_id], 1));
+    snap.replicas.push(ReplicaDescriptor::new(
+        r2_id,
+        t2_id,
+        NodeId::new(2),
+        true,
+        true,
+        1,
+    ));
+    snap.validate().unwrap(); // Validates structurally
+
+    let err = snap
+        .route_partition_value(TableId::new(1), &Value::Int64(42))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("must have exactly one partition to route"));
+}
+
+#[test]
+fn test_partitioning_cas_and_reopen_lifecycle() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    // Gen 1: Range-partitioned table with 1 partition [0, 100)
+    let p0_id = PartitionId::new(10);
+    let t0_id = TabletId::new(100);
+    let r0_id = ReplicaId::new(1000);
+    let table = TableDescriptor::new(
+        TableId::new(1),
+        "data",
+        schema.clone(),
+        vec![0],
+        vec![p0_id],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![t0_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    let t0 = TabletDescriptor::new(t0_id, p0_id, 0, vec![r0_id], 1);
+    let r0 = ReplicaDescriptor::new(r0_id, t0_id, NodeId::new(1), true, true, 1);
+
+    let snap1 = CatalogSnapshot::new(1, vec![table], vec![p0], vec![t0], vec![r0]);
+    store.compare_and_set(0, snap1.clone()).unwrap();
+
+    // Gen 2: Add partition p1 [100, 200)
+    let p1_id = PartitionId::new(11);
+    let t1_id = TabletId::new(101);
+    let r1_id = ReplicaId::new(1001);
+
+    let mut snap2 = snap1.clone();
+    snap2.generation = 2;
+    snap2.tables[0].generation = 2;
+    snap2.tables[0].partitions.push(p1_id);
+    snap2.partitions.push(
+        PartitionDescriptor::new(
+            p1_id,
+            TableId::new(1),
+            "p1",
+            StorageDescriptor::Row,
+            vec![t1_id],
+            2,
+        )
+        .with_range(RangeBound::new(Value::Int64(100), Value::Int64(200))),
+    );
+    snap2
+        .tablets
+        .push(TabletDescriptor::new(t1_id, p1_id, 0, vec![r1_id], 2));
+    snap2.replicas.push(ReplicaDescriptor::new(
+        r1_id,
+        t1_id,
+        NodeId::new(2),
+        true,
+        true,
+        2,
+    ));
+
+    // Stale CAS expected = 0 rejects
+    let err = store.compare_and_set(0, snap2.clone()).unwrap_err();
+    assert!(matches!(err, HtapError::Conflict(_)));
+
+    // Valid CAS 1 -> 2
+    store.compare_and_set(1, snap2).unwrap();
+    assert_eq!(store.current_generation().unwrap(), 2);
+
+    // Reopen and check routing across both partitions
+    let reopened = LocalCatalogStore::open(temp.path()).unwrap();
+    let recovered = reopened.load().unwrap().unwrap();
+    assert_eq!(recovered.generation, 2);
+    assert_eq!(
+        recovered
+            .route_partition_value(TableId::new(1), &Value::Int64(50))
+            .unwrap(),
+        p0_id
+    );
+    assert_eq!(
+        recovered
+            .route_partition_value(TableId::new(1), &Value::Int64(150))
+            .unwrap(),
+        p1_id
+    );
 }
