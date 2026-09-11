@@ -404,6 +404,33 @@ fn test_malformed_sql_returns_invalid_argument() {
 }
 
 #[test]
+fn test_mysql_partition_ddl_rejected_at_parser_level() {
+    let cases = [
+        "CREATE TABLE t (id INT, val INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+        "CREATE TABLE t (id INT, val INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+        "CREATE TABLE t (id INT, val INT) PARTITION BY RANGE COLUMNS (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+        "CREATE TABLE t (id INT, val INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3, 4))",
+        "CREATE TABLE t (id INT, val INT) PARTITION BY LIST COLUMNS (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3, 4))",
+    ];
+
+    for case in cases {
+        let res = parse_one(case);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected InvalidArgument for MySQL partition DDL {:?}, got {:?}",
+            case,
+            res
+        );
+        if let Err(HtapError::InvalidArgument(msg)) = res {
+            assert!(
+                msg.contains("SQL parse error"),
+                "expected 'SQL parse error' in error message for {case:?}, got: {msg}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_empty_whitespace_sql_returns_invalid_argument() {
     let cases = [
         "",

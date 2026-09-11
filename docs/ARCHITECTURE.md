@@ -282,7 +282,13 @@ A router inspects the **bound** statement and the partition's **storage descript
   - Literal `INSERT` and PK `DELETE` route to `Route::RowstoreWrite` regardless of whether the partition is `Row`, `Column`, or `Converting`, preserving rowstore write-authority and zero mutation downtime.
   - Complete-PK `SELECT` routes to `Route::RowstorePointRead { key }` across all three storage formats, strictly bypassing analytical execution and the converter.
   - `AnalyticSelect` routes to `Route::OlapScan` across `Row`, `Column`, and `Converting` formats.
-- **Current SQL-Created Row Topology:** While `classify_route` accepts all three descriptors, tables created via SQL DDL (`CREATE TABLE`) in `LocalServer` are currently initialized exclusively with a single-partition `StorageDescriptor::Row` topology. Setting a partition to `Column` or `Converting` occurs via `LocalServer::convert_table`, catalog updates, or `LocalConverter` workflows.
+- **Current SQL-Created Row Topology and Partitioning Boundary:**
+  - While `classify_route` accepts all three descriptors (`Row`, `Column`, `Converting`), tables created via SQL DDL (`CREATE TABLE`) in `LocalServer` are currently initialized exclusively with an unpartitioned, single-partition `StorageDescriptor::Row` topology (`partitions.len() == 1`, `tablets.len() == 1`). Multi-partition execution is not yet exposed through SQL.
+  - Setting a partition to `Column` or `Converting` occurs via `LocalServer::convert_table`, catalog updates, or `LocalConverter` workflows.
+  - The internal catalog already features validated finite range/list metadata (`PartitioningDescriptor`, `PartitioningMethod::Range`/`List`, `RangeBound`) and routing helpers (`TableDescriptor::route_partition_value`, `CatalogSnapshot::route_partition_value`) for controlled/admin fixtures.
+  - The SQL parser and binder currently reject MySQL partition DDL before binding: `parse_one` returns `HtapError::InvalidArgument` under `sqlparser 0.62` / `MySqlDialect` for `CREATE TABLE ... PARTITION BY RANGE ...` and `PARTITION BY LIST ...` because the pinned parser does not retain MySQL partition definitions. If partition clauses or `partition_by` AST fields are supplied, the binder rejects them with `HtapError::Unsupported`; no lossy reinterpretation of unrelated `CreateTable.partition_by` AST is made.
+  - Hash buckets / tablet sharding, partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), and distributed multi-partition execution remain deferred.
+  - If a future parser upgrade or custom AST is pursued, finite typed range/list definitions must be explicitly mapped; `MAXVALUE` and partition options remain unsupported until the internal catalog model changes.
 - **Explicitly Deferred OLAP & SQL Capabilities:** Direct SegmentReader pushdown optimization is implemented for the compact base path (single leaf pushdown). Joins, CTEs (`WITH`), window functions (`OVER`), `ORDER BY`, `LIMIT`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates, compound AND pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, multi-tablet or distributed partition scans, resource quotas/spill/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth remain deferred.
 
 This separation is enforced **by construction, not by a runtime heuristic**:
@@ -650,6 +656,13 @@ The **tablet is the unit of placement, replication, movement, and repair**.
 
 **Current LocalServer Single-Tablet Requirement vs. Placement Simulation:**
 `LocalServer` currently requires tables to have exactly one partition, one tablet, and one healthy leader replica (verified in `crates/htap-server/tests/local_server.rs`). Sharding and placement capabilities (`plan_placement`, `stage_placement_addition`, `activate_placement_addition`, `activate_placement_plan`) operate purely on catalog metadata, placement planning algorithms, and local replica snapshot clone/activation simulation (verified in `crates/htap-coord/tests/placement_movement.rs` and `crates/htap-movement/tests/tablet_simulation.rs`). They do not provide physical sharded SQL serving across multiple nodes.
+
+**Catalog Partitioning Model vs. SQL Boundary:**
+- The `htap-catalog` crate already contains validated finite range and list partitioning metadata (`PartitioningDescriptor`, `PartitioningMethod::Range`, `PartitioningMethod::List`, `RangeBound`) and routing helpers (`route_partition_value`) designed for controlled and admin fixtures.
+- At the SQL boundary, MySQL partition DDL (`CREATE TABLE ... PARTITION BY RANGE ...` / `PARTITION BY LIST ...`) is rejected before binding (`parse_one` returns `HtapError::InvalidArgument` under `sqlparser 0.62` / `MySqlDialect`), and any populated `CreateTable.partition_by` or partition clauses are rejected by the binder (`HtapError::Unsupported`). No lossy reinterpretation of unrelated AST fields is made.
+- Tables created via SQL DDL remain unpartitioned with a default single partition, and multi-partition execution is not yet exposed through SQL.
+- Hash buckets / tablet sharding, partition lifecycle DDL, and distributed execution remain deferred.
+- If a future parser upgrade or custom AST is pursued, finite typed range/list definitions must be explicitly mapped; `MAXVALUE` and partition options remain unsupported until internal catalog models change.
 
 ### Deterministic placement planning (`plan_placement`)
 

@@ -125,7 +125,7 @@ The workspace consists of modular crates separated by architectural boundaries:
 
 The SQL engine and embedded client execute an explicit, synchronous single-partition subset of SQL:
 
-- **`CREATE TABLE`:** Defines table schema with typed columns (`BIGINT`, `INT`, `VARCHAR`, etc.) and a primary key constraint.
+- **`CREATE TABLE`:** Defines table schema with typed columns (`BIGINT`, `INT`, `VARCHAR`, etc.) and a primary key constraint. Tables created via SQL DDL remain unpartitioned with a default single-partition / single-tablet topology; multi-partition execution is not yet exposed through SQL.
 - **Literal `INSERT`:** Single- or multi-row insert statements with literal value lists:
   ```sql
   INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30), (2, 'Bob', 25);
@@ -158,6 +158,12 @@ Direct `SegmentReader` pushdown optimization is now implemented for the compact 
 - DataFusion and Apache Arrow integration.
 - Full MySQL dialect breadth, sessions, and transaction controls (`BEGIN`, `COMMIT`, `ROLLBACK`).
 - Non-PK DML / DDL (`UPDATE`, `ALTER TABLE`, `DROP TABLE`).
+- **MySQL Partition DDL & Multi-Partition Execution Boundary:**
+  - The catalog already includes validated finite range/list metadata (`PartitioningDescriptor`, `PartitioningMethod::Range`/`List`, `RangeBound`) and routing helpers (`route_partition_value`) for controlled/admin fixtures.
+  - The SQL parser and binder currently reject MySQL partition DDL before binding: MySQL `CREATE TABLE ... PARTITION BY RANGE ...` and `PARTITION BY LIST ...` statements return `HtapError::InvalidArgument` from `parse_one` under `sqlparser 0.62` / `MySqlDialect`, because the pinned parser does not retain MySQL partition definitions. If partition clauses or `partition_by` AST fields are manually populated, the binder strictly rejects them (`HtapError::Unsupported`); no lossy reinterpretation of unrelated `CreateTable.partition_by` AST is made.
+  - SQL-created `LocalServer` tables remain unpartitioned with a default single partition; multi-partition execution is not yet exposed through SQL.
+  - Hash buckets / tablet sharding, partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), and distributed execution remain deferred.
+  - If a future parser upgrade or custom AST is pursued, finite typed range/list definitions must be explicitly mapped; `MAXVALUE` and partition options remain unsupported until internal catalog models change.
 
 ---
 
