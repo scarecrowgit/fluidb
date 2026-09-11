@@ -481,3 +481,86 @@ Option **(c)**.
 ### How to reverse it
 
 Upgrade `sqlparser-rs` to a version that retains MySQL partition definitions, or adopt a custom parser AST that explicitly extracts finite range and list partitions and maps them to the catalog model.
+
+---
+
+## ADR-012: Native Partitioned Table Execution and Multi-Partition DML/OLAP Execution in LocalServer
+
+`Status: Accepted`
+`Date: 2026-09-11`
+
+### Context
+
+While MySQL partition DDL is rejected at the parser level due to `sqlparser 0.62` AST limitations (ADR-011), the database engine required verified partition execution to demonstrate multi-partition DML and OLAP routing without waiting for parser changes or introducing lossy dialect workarounds.
+
+Partitioned tables require unambiguous topology specifications (finite range and list definitions), strict catalog validation against primary keys and data types, atomic catalog publication, single-transaction multi-partition mutation semantics, and point lookup preservation of the rowstore fast path.
+
+### Options considered
+
+- **(a)** Defer all partition execution until an upstream SQL parser upgrade allows SQL DDL partition creation.
+- **(b)** Implement custom regex / text pre-processing before SQL parsing to fake SQL partition DDL.
+- **(c)** Provide a typed, native non-SQL admin API (`LocalServer::create_partitioned_table`) taking explicit `PartitionedTableDefinition` with finite `PartitionTopology::Range` and `PartitionTopology::List`, execute DML/OLAP statements against partitioned tables, and keep SQL MySQL partition DDL strictly rejected at the parser level.
+
+### Decision
+
+Option **(c)**.
+
+1. **Native non-SQL admin API (`LocalServer::create_partitioned_table`):**
+   - Tables are defined via `PartitionedTableDefinition` with either `PartitionTopology::Range` (ordered half-open `[lower, upper)` intervals where `lower < upper`) or `PartitionTopology::List` (disjoint sets of explicit values).
+   - The table, partition descriptors, initial tablets, and replicas are published to the catalog in a single atomic `compare_and_set` operation.
+2. **Catalog validation rules:**
+   - The partition key column must be non-null and part of the table's primary key (`primary_key.contains(&key_column)`).
+   - Range bounds require `lower < upper`, non-overlapping intervals, and exact type alignment with the key column.
+   - List partitions require non-empty disjoint value lists without duplicate entries across or within partitions.
+   - Rejects empty partition definitions, duplicate partition names, and type mismatches.
+3. **Local topology invariants:**
+   - Each partition is initialized with `StorageDescriptor::Row`, exactly one bucket-0 row tablet (`tablets.len() == 1`, `bucket = 0`), and one healthy local leader replica on node 1 (`NodeId(1)`).
+   - No hash buckets, sub-partitioning, or physical sharding across distributed nodes is implemented.
+4. **Transactional multi-partition DML routing:**
+   - Multi-row `INSERT` routes each row by evaluating its partition key against catalog partition metadata (`route_partition_value`), validates partition storage format, and commits all mutations across all touched partitions in a single atomic transaction payload and single monotonically advanced version.
+   - Complete-PK `DELETE` resolves the partition key from the primary key, routes to the matching partition, and performs a rowstore point delete.
+   - Complete-PK `SELECT` resolves the partition key from the primary key, routes directly to the matching partition, and executes `Route::RowstorePointRead` via `Engine::get`, strictly bypassing analytical execution and format conversion.
+5. **Multi-partition analytic SELECT (`Route::OlapScan`):**
+   - Scans all partitions belonging to the table at a single visible transaction snapshot (using logical rowstore scans or compact columnar base-plus-delta scans per partition).
+   - Combines rows across all partitions and evaluates global or grouped projections, filters, and aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `GROUP BY`).
+   - Does not claim or implement partition pruning, parallel multi-core execution, or global cross-partition ordering.
+6. **SQL boundary alignment:**
+   - MySQL `PARTITION BY RANGE` and `PARTITION BY LIST` syntax remains rejected at parse time (`parse_one` returns `HtapError::InvalidArgument` under `sqlparser 0.62` / `MySqlDialect`). Tables created via SQL DDL remain unpartitioned (default single partition).
+7. **Single-partition format conversion guard:**
+   - `LocalServer::convert_table` explicitly verifies that the target table has exactly one partition and rejects multi-partition tables with `HtapError::Unsupported`.
+8. **Deferred capabilities:**
+   - Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), partition split/merge/drop, multi-partition conversion and movement, hash tablets, distributed/remote partition serving across network nodes, replica failover, and network wire protocol remain deferred.
+
+### Consequences
+
+- Multi-partition execution is proven and reliable in-process without relying on unvalidated SQL parser extensions.
+- Storage engine invariants (atomic versioned commits, rowstore point lookup fast path) remain intact.
+- Clear separation between the native admin topology API and SQL DDL parser boundaries.
+
+### Test Evidence
+
+- `crates/htap-server/tests/local_server.rs`:
+  - `test_partitioned_native_range_topology_catalog_reopen_continuation`
+  - `test_partitioned_native_list_topology_catalog_reopen_continuation`
+  - `test_partitioned_boundary_unmatched_null_type_errors`
+  - `test_partitioned_multi_row_insert_spanning_partitions_one_version_point_delete`
+  - `test_partitioned_composite_pk_partition_key_not_first`
+  - `test_partitioned_olap_across_partitions_and_empty_aggregate`
+  - `test_convert_table_multi_partition_guard`
+  - `test_partitioned_empty_topology_rejection_no_catalog_mutation`
+- `crates/htap-catalog/tests/catalog_recovery.rs`:
+  - `test_partitioning_legacy_decode_and_reopen`
+  - `test_range_partitioning_routing_and_boundaries`
+  - `test_list_partitioning_routing`
+  - `test_partitioning_duplicate_violations`
+  - `test_range_overlap_and_order_violations`
+  - `test_partitioning_type_and_null_violations`
+  - `test_partitioning_ownership_and_method_consistency`
+  - `test_partitioning_cas_and_reopen_lifecycle`
+- `crates/htap-sql/tests/parse_bind.rs`:
+  - `test_mysql_partition_ddl_rejected_at_parser_level`
+  - `test_negative_create_table`
+
+### How to reverse it
+
+When an upgraded SQL parser AST or custom parser supports MySQL partition DDL, map the parsed partition clauses into `PartitionedTableDefinition` and invoke `LocalServer::create_partitioned_table` from the SQL DDL binder.

@@ -36,6 +36,15 @@ The following operational facilities and production features are **explicitly no
 - **No Power-Loss Proof:** Integration crash tests prove recovery across process `SIGKILL` termination, not physical machine power loss, host kernel panics, or write cache invalidation.
 - **Whole-Dataset Materialization in Conversion, Export, and Clone:** HTAP conversion (`htap-convert`), data export (`htap-movement`, where exports materialize the full logical partition before writing), and tablet snapshot cloning materialize entire datasets into memory or intermediate files without streaming.
 - **External CopyOptions Paths Remain Caller-Controlled by Design:** While internal persistence files and paths are bounded and validated (`b7ff200`), external import/export paths specified via `CopyOptions` are caller-controlled by design and must be validated by the host application.
+- **Table Partitioning & Multi-Partition Execution Operational Boundary:**
+  - `LocalServer` supports partitioned tables defined exclusively through the native non-SQL API (`LocalServer::create_partitioned_table`) using `PartitionedTableDefinition` with finite `PartitionTopology::Range` (half-open `[lower, upper)` intervals) or `PartitionTopology::List` (disjoint value sets).
+  - SQL DDL (`CREATE TABLE`) creates unpartitioned tables with a default single partition. MySQL partition DDL (`PARTITION BY RANGE/LIST`) is rejected at parse time (`HtapError::InvalidArgument`) due to `sqlparser 0.62` AST limitations.
+  - Catalog validation guarantees that the partition key column is non-null and a member of the primary key, validates range bounds ordering and disjointness, verifies list value sets, and rejects duplicate partition names, type mismatches, and empty topologies.
+  - Local topology invariant: Each partition currently consists of exactly one bucket-0 row tablet and one healthy local leader replica on node 1 (`NodeId(1)`). Hash buckets, tablet sharding, dynamic rebalancing, and physical multi-node sharding are not implemented.
+  - Multi-row `INSERT` routes rows by partition key and commits all mutations across partitions in a single transaction payload and version step. Complete-PK `DELETE` and `SELECT` route by partition-key position; complete-PK `SELECT` strictly preserves the rowstore `Engine::get` fast path.
+  - Analytic `SELECT` scans all partitions at one visible snapshot and aggregates/groups rows globally; partition pruning, multi-core scan parallelism, and global cross-partition ordering are not implemented.
+  - Format conversion (`convert_table`) is guarded to single-partition tables and strictly rejects multi-partition tables (`HtapError::Unsupported`).
+  - Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), split/merge/drop, cross-partition movement, hash tablets, distributed serving, and replica failover remain deferred.
 
 ---
 

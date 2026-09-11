@@ -8,11 +8,14 @@
 //!
 //! # Supported SQL Subset
 //!
-//! The client supports the synchronous single-partition SQL subset implemented by the engine:
-//! - `CREATE TABLE`: Schema definitions specifying typed columns and primary keys.
-//! - Literal `INSERT`: Single- or multi-row inserts with literal value lists.
-//! - Complete-PK `DELETE`: Point deletes matching the complete primary key in the `WHERE` clause.
-//! - Complete-PK `SELECT`: Point lookups projecting expressions or all columns matching the complete primary key in the `WHERE` clause.
+//! The client supports the synchronous SQL subset implemented by the engine across
+//! unpartitioned tables (created via SQL DDL) and partitioned tables (created via the native
+//! [`LocalServer::create_partitioned_table`] API):
+//! - `CREATE TABLE`: Schema definitions specifying typed columns and primary keys. Tables created via SQL DDL are unpartitioned (default single partition); MySQL `PARTITION BY RANGE/LIST` syntax is rejected at the parser level due to `sqlparser 0.62` AST limitations.
+//! - Literal `INSERT`: Single- or multi-row inserts with literal value lists. On partitioned tables, rows are routed by partition key and committed atomically in a single transaction payload and version.
+//! - Complete-PK `DELETE`: Point deletes matching the complete primary key in the `WHERE` clause, routed to the target partition.
+//! - Complete-PK `SELECT`: Point lookups projecting expressions or all columns matching the complete primary key in the `WHERE` clause, routed to the target partition while strictly preserving the rowstore fast path.
+//! - Analytic `SELECT`: Narrow OLAP scans projecting columns or aggregates (`COUNT`, `SUM`, `MIN`, `MAX`) with AND-only filters and optional `GROUP BY`, scanning all partitions of the table at a single visible snapshot and combining results.
 //!
 //! # Explicit Scope Limitations & Non-Features
 //!
@@ -38,10 +41,11 @@ pub use htap_sql::{CommandResult, QueryResult, StatementResult};
 /// the current process memory.
 ///
 /// # Supported SQL Operations
-/// - `CREATE TABLE`
-/// - Literal `INSERT`
-/// - Complete-PK `DELETE`
-/// - Complete-PK `SELECT`
+/// - `CREATE TABLE` (creates unpartitioned table; MySQL `PARTITION BY` rejected at parse time)
+/// - Literal `INSERT` (routes by partition key on partitioned tables, atomic multi-row commit)
+/// - Complete-PK `DELETE` (routes by partition key)
+/// - Complete-PK `SELECT` (routes by partition key, preserving rowstore fast path)
+/// - Analytic `SELECT` (scans all partitions at current visible snapshot)
 ///
 /// # Unsupported Features & Limitations
 /// Does **not** support network connections (no host or port), MySQL wire protocol
@@ -68,10 +72,11 @@ impl EmbeddedClient {
     /// Synchronously executes a single SQL statement against the embedded server.
     ///
     /// # Supported Subset
-    /// - `CREATE TABLE`
-    /// - Literal `INSERT`
-    /// - Complete-PK `DELETE`
-    /// - Complete-PK `SELECT`
+    /// - `CREATE TABLE` (creates unpartitioned table; MySQL partition DDL rejected at parser level)
+    /// - Literal `INSERT` (routes by partition key on partitioned tables, single transaction version)
+    /// - Complete-PK `DELETE` (routed by partition key)
+    /// - Complete-PK `SELECT` (routed by partition key, takes rowstore fast path)
+    /// - Analytic `SELECT` (scans all partitions at current visible snapshot)
     ///
     /// # Errors
     ///
