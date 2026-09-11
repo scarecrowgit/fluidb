@@ -521,9 +521,9 @@ Option **(c)**.
    - Complete-PK `DELETE` resolves the partition key from the primary key, routes to the matching partition, and performs a rowstore point delete.
    - Complete-PK `SELECT` resolves the partition key from the primary key, routes directly to the matching partition, and executes `Route::RowstorePointRead` via `Engine::get`, strictly bypassing analytical execution and format conversion.
 5. **Multi-partition analytic SELECT (`Route::OlapScan`):**
-   - Scans all partitions belonging to the table at a single visible transaction snapshot (using logical rowstore scans or compact columnar base-plus-delta scans per partition).
-   - Combines rows across all partitions and evaluates global or grouped projections, filters, and aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `GROUP BY`).
-   - Does not claim or implement partition pruning, parallel multi-core execution, or global cross-partition ordering.
+   - Evaluates queries across partitions belonging to the table at a single visible transaction snapshot (using logical rowstore scans or compact columnar base-plus-delta scans per partition).
+   - Combines rows across partitions and evaluates global or grouped projections, filters, aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `GROUP BY`), and orderings.
+   - Conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented for narrow local OLAP; distributed fanout, disk spilling, query cancellation, and resource quotas remain deferred.
 6. **SQL boundary alignment:**
    - MySQL `PARTITION BY RANGE` and `PARTITION BY LIST` syntax remains rejected at parse time (`parse_one` returns `HtapError::InvalidArgument` under `sqlparser 0.62` / `MySqlDialect`). Tables created via SQL DDL remain unpartitioned (default single partition).
 7. **Single-partition format conversion guard:**
@@ -546,6 +546,9 @@ Option **(c)**.
   - `test_partitioned_multi_row_insert_spanning_partitions_one_version_point_delete`
   - `test_partitioned_composite_pk_partition_key_not_first`
   - `test_partitioned_olap_across_partitions_and_empty_aggregate`
+  - `test_partition_pruning_range_and_list_and_conservative_cases`
+  - `test_scan_worker_count_equivalence`
+  - `test_multi_partition_order_by_directions_nulls_and_tie_breaking`
   - `test_convert_table_multi_partition_guard`
   - `test_partitioned_empty_topology_rejection_no_catalog_mutation`
 - `crates/htap-catalog/tests/catalog_recovery.rs`:

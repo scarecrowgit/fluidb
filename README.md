@@ -173,11 +173,11 @@ Because MySQL partition DDL is not supported by the pinned SQL parser, partition
   - Format conversion (`LocalServer::convert_table`) is guarded to single-partition tables and explicitly rejects multi-partition tables (`HtapError::Unsupported`).
 
 ### Unsupported & Deferred SQL & Partition Features
-Direct `SegmentReader` pushdown optimization is implemented for the compact base path (single leaf pushdown). The following features are explicitly deferred:
+Direct `SegmentReader` pushdown optimization is implemented for the compact base path (single leaf pushdown). Simple unqualified source/projected column `ORDER BY` is implemented for `AnalyticSelect` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break. The following features are explicitly deferred:
 - Compound `AND` pushdown beyond one leaf, and `!=` pushdown (evaluated as residual SQL filters).
 - Vectorized aggregation and vectorized operator execution pipelines.
 - Joins and multiple tables in `FROM`, table aliases, CTEs (`WITH`), window functions (`OVER`), subqueries.
-- Query modifiers/clauses: `ORDER BY`, `LIMIT`, `HAVING`.
+- Query modifiers/clauses: expressions, aliases if rejected, and aggregate ordering in `ORDER BY`; broad MySQL ordering; `LIMIT`/`OFFSET`, `HAVING`.
 - Predicate expressions: `OR`, `NOT`, arithmetic, explicit type casts.
 - Aggregates: `AVG`, `DISTINCT` aggregates (`COUNT(DISTINCT ...)`).
 - Multi-tablet or distributed scans, partition pruning, parallel scan pipelines, resource quotas, disk spilling, query cancellation.

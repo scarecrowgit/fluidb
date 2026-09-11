@@ -221,6 +221,7 @@ mod tests {
             }],
             None,
             vec![],
+            vec![],
             schema,
         ));
 

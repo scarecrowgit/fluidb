@@ -1,6 +1,6 @@
 //! Execution results for SQL statements.
 
-use htap_common::types::{ColumnDef, Row};
+use htap_common::types::{ColumnDef, Row, Value};
 use htap_common::version::Version;
 
 /// Result of executing a SQL statement.
@@ -121,6 +121,57 @@ impl QueryResult {
     pub fn into_parts(self) -> (Vec<ColumnDef>, Vec<Row>) {
         (self.columns, self.rows)
     }
+
+    /// Sorts rows in-place by output column index, ascending direction, and NULL ordering,
+    /// with deterministic tie-breaking using the full output row.
+    ///
+    /// # NULL Ordering Policy
+    /// - If `nulls_first` is `true`, `Value::Null` sorts before any non-NULL value.
+    /// - If `nulls_first` is `false`, `Value::Null` sorts after any non-NULL value.
+    /// - When comparing two `Value::Null`s, they are considered equal.
+    /// - Non-NULL values are compared according to `asc` (true for ascending, false for descending).
+    /// - Equal comparisons on all specified columns are tie-broken deterministically by comparing
+    ///   the full output row values.
+    pub fn sort_by(&mut self, order_specs: &[(usize, bool, bool)]) {
+        if order_specs.is_empty() {
+            return;
+        }
+        self.rows.sort_by(|row_a, row_b| {
+            for &(col_idx, asc, nulls_first) in order_specs {
+                let val_a = row_a.get(col_idx).unwrap_or(&Value::Null);
+                let val_b = row_b.get(col_idx).unwrap_or(&Value::Null);
+                let cmp = match (val_a.is_null(), val_b.is_null()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => {
+                        if nulls_first {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        }
+                    }
+                    (false, true) => {
+                        if nulls_first {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Less
+                        }
+                    }
+                    (false, false) => {
+                        let ord = val_a.cmp(val_b);
+                        if asc {
+                            ord
+                        } else {
+                            ord.reverse()
+                        }
+                    }
+                };
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            row_a.values().cmp(row_b.values())
+        });
+    }
 }
 
 impl From<CommandResult> for StatementResult {
@@ -181,5 +232,87 @@ mod tests {
 
         let stmt_query: StatementResult = non_empty.clone().into();
         assert_eq!(stmt_query, StatementResult::Query(non_empty));
+    }
+
+    #[test]
+    fn test_query_result_sorting_and_null_policy() {
+        let cols = vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnDef {
+                name: "val".into(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+            },
+        ];
+
+        let make_qr = || {
+            QueryResult::new(
+                cols.clone(),
+                vec![
+                    Row::new(vec![Value::Int32(1), Value::Int32(20)]),
+                    Row::new(vec![Value::Int32(2), Value::Null]),
+                    Row::new(vec![Value::Int32(3), Value::Int32(10)]),
+                    Row::new(vec![Value::Int32(4), Value::Int32(20)]),
+                ],
+            )
+        };
+
+        // ASC, NULLS FIRST
+        let mut qr_asc_nf = make_qr();
+        qr_asc_nf.sort_by(&[(1, true, true)]);
+        assert_eq!(
+            qr_asc_nf.rows(),
+            &[
+                Row::new(vec![Value::Int32(2), Value::Null]),
+                Row::new(vec![Value::Int32(3), Value::Int32(10)]),
+                Row::new(vec![Value::Int32(1), Value::Int32(20)]), // tie-broken by id: 1 < 4
+                Row::new(vec![Value::Int32(4), Value::Int32(20)]),
+            ]
+        );
+
+        // ASC, NULLS LAST
+        let mut qr_asc_nl = make_qr();
+        qr_asc_nl.sort_by(&[(1, true, false)]);
+        assert_eq!(
+            qr_asc_nl.rows(),
+            &[
+                Row::new(vec![Value::Int32(3), Value::Int32(10)]),
+                Row::new(vec![Value::Int32(1), Value::Int32(20)]),
+                Row::new(vec![Value::Int32(4), Value::Int32(20)]),
+                Row::new(vec![Value::Int32(2), Value::Null]),
+            ]
+        );
+
+        // DESC, NULLS LAST
+        let mut qr_desc_nl = make_qr();
+        qr_desc_nl.sort_by(&[(1, false, false)]);
+        assert_eq!(
+            qr_desc_nl.rows(),
+            &[
+                Row::new(vec![Value::Int32(1), Value::Int32(20)]),
+                Row::new(vec![Value::Int32(4), Value::Int32(20)]),
+                Row::new(vec![Value::Int32(3), Value::Int32(10)]),
+                Row::new(vec![Value::Int32(2), Value::Null]),
+            ]
+        );
+
+        // DESC, NULLS FIRST
+        let mut qr_desc_nf = make_qr();
+        qr_desc_nf.sort_by(&[(1, false, true)]);
+        assert_eq!(
+            qr_desc_nf.rows(),
+            &[
+                Row::new(vec![Value::Int32(2), Value::Null]),
+                Row::new(vec![Value::Int32(1), Value::Int32(20)]),
+                Row::new(vec![Value::Int32(4), Value::Int32(20)]),
+                Row::new(vec![Value::Int32(3), Value::Int32(10)]),
+            ]
+        );
     }
 }

@@ -1256,8 +1256,10 @@ fn test_negative_select_and_delete() {
         "DELETE FROM db.users WHERE id = 1",
         "SELECT users.id FROM users WHERE id = 1",
         "SELECT * FROM users WHERE users.id = 1",
-        // ORDER BY
-        "SELECT * FROM users WHERE id = 1 ORDER BY id",
+        // Unsupported ORDER BY expressions / aggregates / qualified names
+        "SELECT * FROM users WHERE id = 1 ORDER BY id + 1",
+        "SELECT * FROM users WHERE id = 1 ORDER BY users.id",
+        "SELECT id, COUNT(*) FROM users GROUP BY id ORDER BY COUNT(*)",
         "DELETE FROM users WHERE id = 1 ORDER BY id",
         // LIMIT
         "SELECT * FROM users WHERE id = 1 LIMIT 1",
@@ -1600,6 +1602,61 @@ fn test_bind_analytic_select_valid() {
     let sql = "SELECT * FROM users WHERE id = 1 AND name = 'alice'";
     let bound = parse_and_bind(sql, &catalog).expect("valid PK + non-PK filter query");
     assert!(matches!(bound, BoundStatement::AnalyticSelect(_)));
+
+    // 13. Narrow ORDER BY defaults to ASC, NULLS FIRST
+    let sql = "SELECT name, age FROM users ORDER BY age";
+    let bound = parse_and_bind(sql, &catalog).expect("valid ORDER BY ASC default");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.order_by.len(), 1);
+            assert_eq!(select.order_by[0].column, 2); // age is column index 2
+            assert!(select.order_by[0].asc);
+            assert!(select.order_by[0].nulls_first);
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 14. Narrow ORDER BY DESC defaults to NULLS LAST
+    let sql = "SELECT name, age FROM users ORDER BY age DESC";
+    let bound = parse_and_bind(sql, &catalog).expect("valid ORDER BY DESC default");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.order_by.len(), 1);
+            assert_eq!(select.order_by[0].column, 2);
+            assert!(!select.order_by[0].asc);
+            assert!(!select.order_by[0].nulls_first);
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 15. Explicit NULLS LAST with ASC and NULLS FIRST with DESC
+    let sql = "SELECT name, age FROM users ORDER BY age ASC NULLS LAST, id DESC NULLS FIRST";
+    let bound = parse_and_bind(sql, &catalog).expect("valid explicit NULLS ordering");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.order_by.len(), 2);
+            assert_eq!(select.order_by[0].column, 2);
+            assert!(select.order_by[0].asc);
+            assert!(!select.order_by[0].nulls_first);
+            assert_eq!(select.order_by[1].column, 0);
+            assert!(!select.order_by[1].asc);
+            assert!(select.order_by[1].nulls_first);
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
+
+    // 16. ORDER BY with GROUP BY
+    let sql = "SELECT age, COUNT(*) FROM users GROUP BY age ORDER BY age DESC";
+    let bound = parse_and_bind(sql, &catalog).expect("valid grouped ORDER BY");
+    match bound {
+        BoundStatement::AnalyticSelect(select) => {
+            assert_eq!(select.group_by, vec![2]);
+            assert_eq!(select.order_by.len(), 1);
+            assert_eq!(select.order_by[0].column, 2);
+            assert!(!select.order_by[0].asc);
+        }
+        other => panic!("expected AnalyticSelect, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1635,6 +1692,10 @@ fn test_bind_analytic_select_negative() {
         "SELECT * FROM users WHERE 10 < age",
         // Reversed operands in equality
         "SELECT * FROM users WHERE 'alice' = name",
+        // Unknown column in ORDER BY
+        "SELECT * FROM users ORDER BY nonexistent",
+        // Column not in GROUP BY in ORDER BY
+        "SELECT age, COUNT(*) FROM users GROUP BY age ORDER BY id",
     ];
 
     for case in invalid_cases {
@@ -1656,6 +1717,10 @@ fn test_bind_analytic_select_negative() {
         "SELECT id AS user_id FROM users",
         // Aggregate alias
         "SELECT COUNT(*) AS total FROM users",
+        // Unsupported ORDER BY cases
+        "SELECT * FROM users ORDER BY id + 1",
+        "SELECT * FROM users ORDER BY users.id",
+        "SELECT id, COUNT(*) FROM users GROUP BY id ORDER BY COUNT(*)",
     ];
 
     for case in unsupported_cases {

@@ -14,8 +14,8 @@ use sqlparser::ast::{
 };
 
 use crate::ast::{
-    AggregateFunction, AnalyticExpr, AnalyticFilter, AnalyticSelect, BoundStatement, ComparisonOp,
-    CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
+    AggregateFunction, AnalyticExpr, AnalyticFilter, AnalyticOrderBy, AnalyticSelect,
+    BoundStatement, ComparisonOp, CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
 };
 
 /// Binds an AST [`Statement`] against the [`CatalogSnapshot`], performing strict semantic
@@ -1127,11 +1127,6 @@ fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatemen
             "CTEs (WITH clause) not supported".into(),
         ));
     }
-    if query.order_by.is_some() {
-        return Err(HtapError::Unsupported(
-            "ORDER BY clause not supported in SELECT".into(),
-        ));
-    }
     if query.limit_clause.is_some() {
         return Err(HtapError::Unsupported(
             "LIMIT clause not supported in SELECT".into(),
@@ -1269,7 +1264,10 @@ fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatemen
         GroupByExpr::All(_) => true,
     };
 
-    let is_candidate = !has_group_by
+    let has_order_by = query.order_by.is_some();
+
+    let is_candidate = !has_order_by
+        && !has_group_by
         && select.selection.is_some()
         && is_simple_or_wildcard_projection(&select.projection)
         && is_pk_equality_where(select.selection.as_ref().unwrap(), table_desc);
@@ -1359,6 +1357,13 @@ fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatemen
         }
     }
 
+    let order_by = bind_analytic_order_by(
+        query.order_by.as_ref(),
+        table_desc,
+        &group_by,
+        has_aggregates,
+    )?;
+
     let filter = bind_analytic_filter(select.selection.as_ref(), table_desc)?;
 
     let output_columns: Vec<CommonColumnDef> =
@@ -1370,6 +1375,7 @@ fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatemen
         projection,
         filter,
         group_by,
+        order_by,
         output_schema,
     )))
 }
@@ -1761,6 +1767,79 @@ fn bind_analytic_group_by(
             Ok(indices)
         }
     }
+}
+
+fn bind_analytic_order_by(
+    order_by: Option<&sqlparser::ast::OrderBy>,
+    table_desc: &TableDescriptor,
+    group_by: &[usize],
+    has_aggregates: bool,
+) -> Result<Vec<AnalyticOrderBy>> {
+    let order_by = match order_by {
+        Some(ob) => ob,
+        None => return Ok(Vec::new()),
+    };
+
+    if order_by.interpolate.is_some() {
+        return Err(HtapError::Unsupported(
+            "INTERPOLATE not supported in ORDER BY".into(),
+        ));
+    }
+
+    let exprs = match &order_by.kind {
+        sqlparser::ast::OrderByKind::Expressions(exprs) => exprs,
+        sqlparser::ast::OrderByKind::All(_) => {
+            return Err(HtapError::Unsupported("ORDER BY ALL not supported".into()));
+        }
+    };
+
+    let mut result = Vec::with_capacity(exprs.len());
+    for ob_expr in exprs {
+        if ob_expr.with_fill.is_some() {
+            return Err(HtapError::Unsupported(
+                "WITH FILL not supported in ORDER BY".into(),
+            ));
+        }
+
+        let col_name = match &ob_expr.expr {
+            Expr::Identifier(ident) => &ident.value,
+            Expr::CompoundIdentifier(_) => {
+                return Err(HtapError::Unsupported(
+                    "qualified column names not supported in ORDER BY".into(),
+                ));
+            }
+            Expr::Function(_) => {
+                return Err(HtapError::Unsupported(
+                    "aggregate ordering not supported in ORDER BY".into(),
+                ));
+            }
+            _ => {
+                return Err(HtapError::Unsupported(
+                    "expressions not supported in ORDER BY".into(),
+                ));
+            }
+        };
+
+        let col_idx = table_desc.schema.column_index(col_name).ok_or_else(|| {
+            HtapError::InvalidArgument(format!("unknown column '{col_name}' in ORDER BY"))
+        })?;
+
+        if (!group_by.is_empty() || has_aggregates) && !group_by.contains(&col_idx) {
+            return Err(HtapError::InvalidArgument(format!(
+                "column '{col_name}' must appear in the GROUP BY clause"
+            )));
+        }
+
+        let asc = ob_expr.options.asc.unwrap_or(true);
+        // Explicit deterministic policy:
+        // When nulls_first is specified, use it.
+        // Otherwise: ASC -> NULLS FIRST, DESC -> NULLS LAST.
+        let nulls_first = ob_expr.options.nulls_first.unwrap_or(asc);
+
+        result.push(AnalyticOrderBy::new(col_idx, asc, nulls_first));
+    }
+
+    Ok(result)
 }
 
 fn bind_analytic_filter(

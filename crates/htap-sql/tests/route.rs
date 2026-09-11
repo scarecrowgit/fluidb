@@ -145,13 +145,23 @@ fn test_route_classification() {
         "expected InvalidArgument for partial PK delete, got {partial_delete_err:?}"
     );
 
-    let unsupported_sql =
+    let order_by_sql =
         "SELECT amount FROM orders WHERE tenant_id = 42 AND order_id = 1000 ORDER BY amount";
-    let parsed_unsupported = parse_one(unsupported_sql).expect("parse ORDER BY");
-    let unsupported_err = bind(&parsed_unsupported, &catalog).expect_err("ORDER BY should fail");
+    let parsed_order_by = parse_one(order_by_sql).expect("parse ORDER BY");
+    let bound_order_by = bind(&parsed_order_by, &catalog).expect("bind ORDER BY");
+    assert_eq!(
+        classify_route(&bound_order_by, &StorageDescriptor::Row).unwrap(),
+        Route::OlapScan
+    );
+
+    let unsupported_sql =
+        "SELECT amount FROM orders WHERE tenant_id = 42 AND order_id = 1000 ORDER BY amount + 1";
+    let parsed_unsupported = parse_one(unsupported_sql).expect("parse ORDER BY expression");
+    let unsupported_err =
+        bind(&parsed_unsupported, &catalog).expect_err("ORDER BY expression should fail");
     assert!(
         matches!(unsupported_err, HtapError::Unsupported(_)),
-        "expected Unsupported for ORDER BY, got {unsupported_err:?}"
+        "expected Unsupported for ORDER BY expression, got {unsupported_err:?}"
     );
 
     let update_sql = "UPDATE orders SET amount = 100.0 WHERE tenant_id = 42 AND order_id = 1000";

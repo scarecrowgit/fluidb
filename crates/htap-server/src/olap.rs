@@ -10,11 +10,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use htap_catalog::{PartitionDescriptor, PartitioningMethod, TableDescriptor};
 use htap_common::error::{HtapError, Result};
 use htap_common::types::{ColumnDef, DataType, Row, Value};
 use htap_convert::Predicate;
 use htap_sql::ast::{
-    AggregateFunction, AnalyticExpr, AnalyticFilter, AnalyticSelect, ComparisonOp,
+    AggregateFunction, AnalyticExpr, AnalyticFilter, AnalyticOrderBy, AnalyticSelect, ComparisonOp,
 };
 use htap_sql::result::QueryResult;
 
@@ -52,8 +53,41 @@ pub fn execute_analytic_select(select: &AnalyticSelect, rows: Vec<Row>) -> Resul
     if !has_group_by {
         if !has_aggregates {
             // Case A: Plain scan / projection (no aggregates, no GROUP BY)
-            let mut projected_rows = Vec::with_capacity(filtered_rows.len());
-            for row in filtered_rows {
+            let mut rows = filtered_rows;
+            if !select.order_by.is_empty() {
+                rows.sort_by(|row_a, row_b| {
+                    for order in &select.order_by {
+                        let val_a = row_a.get(order.column).unwrap_or(&Value::Null);
+                        let val_b = row_b.get(order.column).unwrap_or(&Value::Null);
+                        let cmp =
+                            compare_values_with_order(val_a, val_b, order.asc, order.nulls_first);
+                        if cmp != std::cmp::Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                    // Deterministic tie-break with full output row
+                    let proj_a = select.projection.iter().map(|e| match e {
+                        AnalyticExpr::Column { index, .. } => {
+                            row_a.get(*index).unwrap_or(&Value::Null)
+                        }
+                        _ => &Value::Null,
+                    });
+                    let proj_b = select.projection.iter().map(|e| match e {
+                        AnalyticExpr::Column { index, .. } => {
+                            row_b.get(*index).unwrap_or(&Value::Null)
+                        }
+                        _ => &Value::Null,
+                    });
+                    let proj_cmp = proj_a.cmp(proj_b);
+                    if proj_cmp != std::cmp::Ordering::Equal {
+                        return proj_cmp;
+                    }
+                    row_a.values().cmp(row_b.values())
+                });
+            }
+
+            let mut projected_rows = Vec::with_capacity(rows.len());
+            for row in rows {
                 let mut values = Vec::with_capacity(select.projection.len());
                 for expr in &select.projection {
                     match expr {
@@ -125,7 +159,7 @@ pub fn execute_analytic_select(select: &AnalyticSelect, rows: Vec<Row>) -> Resul
             }
         }
 
-        let mut output_rows = Vec::with_capacity(groups.len());
+        let mut output_pairs = Vec::with_capacity(groups.len());
         for (group_key, group_accs) in groups {
             let mut row_values = Vec::with_capacity(select.projection.len());
             for (i, expr) in select.projection.iter().enumerate() {
@@ -150,9 +184,30 @@ pub fn execute_analytic_select(select: &AnalyticSelect, rows: Vec<Row>) -> Resul
                     }
                 }
             }
-            output_rows.push(Row::new(row_values));
+            output_pairs.push((group_key, Row::new(row_values)));
         }
 
+        if !select.order_by.is_empty() {
+            output_pairs.sort_by(|(key_a, row_a), (key_b, row_b)| {
+                for order in &select.order_by {
+                    let pos = select
+                        .group_by
+                        .iter()
+                        .position(|&idx| idx == order.column)
+                        .unwrap_or(0);
+                    let val_a = key_a.get(pos).unwrap_or(&Value::Null);
+                    let val_b = key_b.get(pos).unwrap_or(&Value::Null);
+                    let cmp = compare_values_with_order(val_a, val_b, order.asc, order.nulls_first);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                // Deterministic tie-break with full output row
+                row_a.values().cmp(row_b.values())
+            });
+        }
+
+        let output_rows = output_pairs.into_iter().map(|(_, r)| r).collect();
         Ok(QueryResult::new(output_columns, output_rows))
     }
 }
@@ -180,6 +235,10 @@ pub fn plan_source_columns(select: &AnalyticSelect) -> (Vec<usize>, BTreeMap<usi
 
     for &idx in &select.group_by {
         columns.insert(idx);
+    }
+
+    for order in &select.order_by {
+        columns.insert(order.column);
     }
 
     if let Some(filter) = &select.filter {
@@ -310,6 +369,18 @@ pub fn remap_analytic_select(
         .map(|&idx| remap_idx(idx))
         .collect::<Result<Vec<_>>>()?;
 
+    let new_order_by = select
+        .order_by
+        .iter()
+        .map(|order| {
+            Ok(AnalyticOrderBy {
+                column: remap_idx(order.column)?,
+                asc: order.asc,
+                nulls_first: order.nulls_first,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let new_filter = match &select.filter {
         Some(filter) => Some(remap_filter(filter, mapping)?),
         None => None,
@@ -320,6 +391,7 @@ pub fn remap_analytic_select(
         projection: new_projection,
         filter: new_filter,
         group_by: new_group_by,
+        order_by: new_order_by,
         output_schema: select.output_schema.clone(),
     })
 }
@@ -648,5 +720,521 @@ impl Accumulator {
             Accumulator::Min { value, .. } => value.clone().unwrap_or(Value::Null),
             Accumulator::Max { value, .. } => value.clone().unwrap_or(Value::Null),
         }
+    }
+}
+
+/// Compares two [`Value`] references according to sort direction and NULL ordering policy.
+///
+/// # NULL Ordering Policy
+/// - If `nulls_first` is `true`, `Value::Null` sorts before any non-NULL value.
+/// - If `nulls_first` is `false`, `Value::Null` sorts after any non-NULL value.
+/// - When comparing two `Value::Null`s, they are equal.
+/// - Non-NULL values are compared according to `asc`:
+///   - If `asc` is `true`, natural ascending order (`a.cmp(b)`).
+///   - If `asc` is `false`, descending order (`b.cmp(a)`).
+pub fn compare_values_with_order(
+    a: &Value,
+    b: &Value,
+    asc: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => {
+            if nulls_first {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if nulls_first {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }
+        (false, false) => {
+            let ord = a.cmp(b);
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        }
+    }
+}
+
+/// Conservatively prunes partitions based on table partitioning metadata and filter predicates.
+///
+/// Only prunes when provably safe for partition key `Eq`, range comparisons (`<`, `<=`, `>`, `>=`),
+/// `IsNull`, and `IsNotNull`.
+/// Retains all partitions for `!=`, ambiguous type comparisons, missing metadata, or unsupported operators.
+/// Preserves the original catalog order of retained partitions.
+pub fn prune_partitions<'a>(
+    table_desc: &TableDescriptor,
+    partitions: &[&'a PartitionDescriptor],
+    filter: Option<&AnalyticFilter>,
+) -> Vec<&'a PartitionDescriptor> {
+    let partitioning = match &table_desc.partitioning {
+        Some(p) => p,
+        None => return partitions.to_vec(),
+    };
+
+    let key_col_idx = partitioning.key_column;
+    let key_col = match table_desc.schema.column(key_col_idx) {
+        Some(col) => col,
+        None => return partitions.to_vec(),
+    };
+
+    let filter = match filter {
+        Some(f) => f,
+        None => return partitions.to_vec(),
+    };
+
+    let leaves = filter.leaves();
+
+    partitions
+        .iter()
+        .copied()
+        .filter(|part| {
+            for leaf in &leaves {
+                match leaf {
+                    AnalyticFilter::IsNull { column } if *column == key_col_idx => {
+                        // Partition key values in this architecture are strictly non-null.
+                        // Therefore, `key IS NULL` can never match any row in any partition.
+                        return false;
+                    }
+                    AnalyticFilter::IsNotNull { column } if *column == key_col_idx => {
+                        // All partitions contain non-null keys, so retain.
+                        continue;
+                    }
+                    AnalyticFilter::Comparison { column, op, value } if *column == key_col_idx => {
+                        if value.is_null() {
+                            // Comparison with NULL yields UNKNOWN/false in SQL.
+                            return false;
+                        }
+                        if value.data_type() != Some(key_col.data_type) {
+                            // Type mismatch: conservative retain.
+                            continue;
+                        }
+
+                        match partitioning.method {
+                            PartitioningMethod::Range => {
+                                let range = match &part.range {
+                                    Some(r) => r,
+                                    None => continue,
+                                };
+                                if range.lower.data_type() != Some(key_col.data_type)
+                                    || range.upper.data_type() != Some(key_col.data_type)
+                                {
+                                    continue;
+                                }
+
+                                match op {
+                                    ComparisonOp::Eq => {
+                                        if *value < range.lower || *value >= range.upper {
+                                            return false;
+                                        }
+                                    }
+                                    ComparisonOp::Lt => {
+                                        if range.lower >= *value {
+                                            return false;
+                                        }
+                                    }
+                                    ComparisonOp::Lte => {
+                                        if range.lower > *value {
+                                            return false;
+                                        }
+                                    }
+                                    ComparisonOp::Gt => {
+                                        if range.upper <= *value {
+                                            return false;
+                                        }
+                                    }
+                                    ComparisonOp::Gte => {
+                                        if range.upper <= *value {
+                                            return false;
+                                        }
+                                    }
+                                    ComparisonOp::NotEq => {
+                                        continue;
+                                    }
+                                }
+                            }
+                            PartitioningMethod::List => match op {
+                                ComparisonOp::Eq => {
+                                    if !part.list_values.iter().any(|v| v == value) {
+                                        return false;
+                                    }
+                                }
+                                ComparisonOp::Lt => {
+                                    if !part.list_values.iter().any(|v| v < value) {
+                                        return false;
+                                    }
+                                }
+                                ComparisonOp::Lte => {
+                                    if !part.list_values.iter().any(|v| v <= value) {
+                                        return false;
+                                    }
+                                }
+                                ComparisonOp::Gt => {
+                                    if !part.list_values.iter().any(|v| v > value) {
+                                        return false;
+                                    }
+                                }
+                                ComparisonOp::Gte => {
+                                    if !part.list_values.iter().any(|v| v >= value) {
+                                        return false;
+                                    }
+                                }
+                                ComparisonOp::NotEq => {
+                                    continue;
+                                }
+                            },
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use htap_catalog::{
+        PartitionId, PartitioningDescriptor, RangeBound, StorageDescriptor, TableId,
+    };
+    use htap_common::types::{ColumnDef, DataType, Schema};
+
+    #[test]
+    fn test_compare_values_with_order_semantics() {
+        let n = Value::Null;
+        let v1 = Value::Int64(10);
+        let v2 = Value::Int64(20);
+
+        // ASC, NULLS FIRST
+        assert_eq!(
+            compare_values_with_order(&n, &v1, true, true),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values_with_order(&v1, &n, true, true),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_values_with_order(&n, &n, true, true),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_values_with_order(&v1, &v2, true, true),
+            std::cmp::Ordering::Less
+        );
+
+        // ASC, NULLS LAST
+        assert_eq!(
+            compare_values_with_order(&n, &v1, true, false),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_values_with_order(&v1, &n, true, false),
+            std::cmp::Ordering::Less
+        );
+
+        // DESC, NULLS LAST
+        assert_eq!(
+            compare_values_with_order(&n, &v1, false, false),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_values_with_order(&v1, &n, false, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values_with_order(&v1, &v2, false, false),
+            std::cmp::Ordering::Greater
+        );
+
+        // DESC, NULLS FIRST
+        assert_eq!(
+            compare_values_with_order(&n, &v1, false, true),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_values_with_order(&v1, &n, false, true),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_prune_partitions_range_and_conservative() {
+        let schema = Schema::new(vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnDef {
+                name: "val".into(),
+                data_type: DataType::String,
+                nullable: false,
+                primary_key: false,
+            },
+        ])
+        .unwrap();
+
+        let mut table = TableDescriptor::new(
+            TableId::new(1),
+            "users",
+            schema,
+            vec![0],
+            vec![
+                PartitionId::new(10),
+                PartitionId::new(20),
+                PartitionId::new(30),
+            ],
+            1,
+        );
+        table.partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+        let p0 = PartitionDescriptor::new(
+            PartitionId::new(10),
+            TableId::new(1),
+            "p0",
+            StorageDescriptor::Row,
+            vec![],
+            1,
+        )
+        .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+
+        let p1 = PartitionDescriptor::new(
+            PartitionId::new(20),
+            TableId::new(1),
+            "p1",
+            StorageDescriptor::Row,
+            vec![],
+            1,
+        )
+        .with_range(RangeBound::new(Value::Int64(100), Value::Int64(200)));
+
+        let p2 = PartitionDescriptor::new(
+            PartitionId::new(30),
+            TableId::new(1),
+            "p2",
+            StorageDescriptor::Row,
+            vec![],
+            1,
+        )
+        .with_range(RangeBound::new(Value::Int64(200), Value::Int64(300)));
+
+        let partitions = [&p0, &p1, &p2];
+
+        // 1. Eq 50 -> only p0
+        let filter_eq = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Eq,
+            value: Value::Int64(50),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_eq));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].name, "p0");
+
+        // 2. Lt 100 -> only p0
+        let filter_lt = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Lt,
+            value: Value::Int64(100),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_lt));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].name, "p0");
+
+        // 3. Lte 100 -> p0 and p1 (since 100 is in p1)
+        let filter_lte = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Lte,
+            value: Value::Int64(100),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_lte));
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].name, "p0");
+        assert_eq!(res[1].name, "p1");
+
+        // 4. Gt 150 -> p1 and p2
+        let filter_gt = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Gt,
+            value: Value::Int64(150),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_gt));
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].name, "p1");
+        assert_eq!(res[1].name, "p2");
+
+        // 5. Gte 200 -> only p2
+        let filter_gte = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Gte,
+            value: Value::Int64(200),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_gte));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].name, "p2");
+
+        // 6. AND of Gte 100 and Lt 200 -> only p1
+        let filter_and = AnalyticFilter::And(vec![
+            AnalyticFilter::Comparison {
+                column: 0,
+                op: ComparisonOp::Gte,
+                value: Value::Int64(100),
+            },
+            AnalyticFilter::Comparison {
+                column: 0,
+                op: ComparisonOp::Lt,
+                value: Value::Int64(200),
+            },
+        ]);
+        let res = prune_partitions(&table, &partitions, Some(&filter_and));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].name, "p1");
+
+        // 7. Empty range: Lt 0 -> 0 partitions
+        let filter_empty = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Lt,
+            value: Value::Int64(0),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_empty));
+        assert_eq!(res.len(), 0);
+
+        // 8. Conservative NotEq 50 -> retains all
+        let filter_ne = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::NotEq,
+            value: Value::Int64(50),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_ne));
+        assert_eq!(res.len(), 3);
+
+        // 9. Non-partition key filter -> retains all
+        let filter_non_pk = AnalyticFilter::Comparison {
+            column: 1,
+            op: ComparisonOp::Eq,
+            value: Value::String("alice".into()),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_non_pk));
+        assert_eq!(res.len(), 3);
+
+        // 10. Type mismatch -> retains all (conservative)
+        let filter_mismatch = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Eq,
+            value: Value::String("bad".into()),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_mismatch));
+        assert_eq!(res.len(), 3);
+
+        // 11. IsNull on partition key -> 0 partitions (since partition keys are never null)
+        let filter_null = AnalyticFilter::IsNull { column: 0 };
+        let res = prune_partitions(&table, &partitions, Some(&filter_null));
+        assert_eq!(res.len(), 0);
+
+        // 12. IsNotNull on partition key -> retains all
+        let filter_not_null = AnalyticFilter::IsNotNull { column: 0 };
+        let res = prune_partitions(&table, &partitions, Some(&filter_not_null));
+        assert_eq!(res.len(), 3);
+    }
+
+    #[test]
+    fn test_prune_partitions_list_and_conservative() {
+        let schema = Schema::new(vec![
+            ColumnDef {
+                name: "region".into(),
+                data_type: DataType::String,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnDef {
+                name: "sales".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+            },
+        ])
+        .unwrap();
+
+        let mut table = TableDescriptor::new(
+            TableId::new(2),
+            "regional",
+            schema,
+            vec![0],
+            vec![PartitionId::new(10), PartitionId::new(20)],
+            1,
+        );
+        table.partitioning = Some(PartitioningDescriptor::new(0, PartitioningMethod::List));
+
+        let p_us = PartitionDescriptor::new(
+            PartitionId::new(10),
+            TableId::new(2),
+            "p_us",
+            StorageDescriptor::Row,
+            vec![],
+            1,
+        )
+        .with_list_values(vec![Value::String("US".into()), Value::String("CA".into())]);
+
+        let p_eu = PartitionDescriptor::new(
+            PartitionId::new(20),
+            TableId::new(2),
+            "p_eu",
+            StorageDescriptor::Row,
+            vec![],
+            1,
+        )
+        .with_list_values(vec![Value::String("EU".into()), Value::String("UK".into())]);
+
+        let partitions = [&p_us, &p_eu];
+
+        // 1. Eq 'US' -> only p_us
+        let filter_us = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Eq,
+            value: Value::String("US".into()),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_us));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].name, "p_us");
+
+        // 2. Eq 'UK' -> only p_eu
+        let filter_uk = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Eq,
+            value: Value::String("UK".into()),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_uk));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].name, "p_eu");
+
+        // 3. Eq 'JP' -> 0 partitions
+        let filter_jp = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::Eq,
+            value: Value::String("JP".into()),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_jp));
+        assert_eq!(res.len(), 0);
+
+        // 4. NotEq 'US' -> retains all
+        let filter_ne = AnalyticFilter::Comparison {
+            column: 0,
+            op: ComparisonOp::NotEq,
+            value: Value::String("US".into()),
+        };
+        let res = prune_partitions(&table, &partitions, Some(&filter_ne));
+        assert_eq!(res.len(), 2);
     }
 }

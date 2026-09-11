@@ -314,9 +314,9 @@ fn test_embedded_client_unsupported_sql_preserves_error_categories() {
         "expected Unsupported for UPDATE, got {err_update:?}"
     );
 
-    // 7. Unsupported query modifier ORDER BY -> Unsupported
+    // 7. Unsupported query modifier ORDER BY expression -> Unsupported
     let err_order = client
-        .execute("SELECT name FROM products WHERE id = 1 ORDER BY price;")
+        .execute("SELECT name FROM products WHERE id = 1 ORDER BY price + 1;")
         .unwrap_err();
     assert!(
         matches!(err_order, HtapError::Unsupported(_)),

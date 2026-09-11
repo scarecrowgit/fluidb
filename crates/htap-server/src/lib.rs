@@ -23,6 +23,7 @@ use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
 use htap_common::lock::ProcessLock;
 use htap_common::types::{ColumnDef, Mutation, Row, Schema, Value};
+use htap_convert::Predicate;
 use htap_movement::{
     CopyOptions, CopyReport, LocalDataMover, MovementJob, TabletCloneOptions, TabletPackageManifest,
 };
@@ -127,6 +128,9 @@ impl ListPartitionDefinition {
     }
 }
 
+/// Default bounded worker count for concurrent analytical partition scans.
+pub const DEFAULT_SCAN_WORKERS: usize = 4;
+
 /// Synchronous local database server.
 ///
 /// Encapsulates catalog metadata management, transactional write logging,
@@ -139,6 +143,7 @@ pub struct LocalServer {
     data_mover: LocalDataMover,
     execution_lock: Mutex<()>,
     colstore_dir: PathBuf,
+    scan_workers: usize,
 }
 
 impl LocalServer {
@@ -200,7 +205,28 @@ impl LocalServer {
             data_mover,
             execution_lock: Mutex::new(()),
             colstore_dir,
+            scan_workers: DEFAULT_SCAN_WORKERS,
         })
+    }
+
+    /// Configures the maximum number of worker threads used for concurrent partition scans.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn with_scan_workers(mut self, scan_workers: usize) -> Self {
+        self.scan_workers = scan_workers.max(1);
+        self
+    }
+
+    /// Sets the maximum number of worker threads used for concurrent partition scans.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn set_scan_workers(&mut self, scan_workers: usize) {
+        self.scan_workers = scan_workers.max(1);
+    }
+
+    /// Returns the configured scan worker thread count.
+    pub fn scan_workers(&self) -> usize {
+        self.scan_workers
     }
 
     /// Returns a borrowing façade for server-integrated data movement operations.
@@ -869,28 +895,184 @@ impl LocalServer {
         partitions: &[&PartitionDescriptor],
         catalog: &CatalogSnapshot,
     ) -> Result<StatementResult> {
+        // 1. Freeze catalog, snapshot, and plan
+        let selected_partitions =
+            olap::prune_partitions(table_desc, partitions, select.filter.as_ref());
         let snapshot = Snapshot::new(self.txn_manager.visible_version());
         let (source_columns, mapping) = olap::plan_source_columns(&select);
         let pushdown_predicate = olap::select_pushdown_predicate(select.filter.as_ref());
 
+        let n_parts = selected_partitions.len();
+        let num_workers = self.scan_workers.max(1).min(n_parts.max(1));
+
+        // 2. Concurrently execute partition scans with bounded workers
+        let partition_results: Vec<Result<Vec<Row>>> = if n_parts <= 1 || num_workers <= 1 {
+            selected_partitions
+                .iter()
+                .map(|p| {
+                    scan_partition_compact(
+                        &self.engine,
+                        &self.colstore_dir,
+                        catalog,
+                        p,
+                        snapshot,
+                        &source_columns,
+                        &table_desc.primary_key,
+                        pushdown_predicate.as_ref(),
+                    )
+                })
+                .collect()
+        } else {
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(num_workers);
+                for worker_id in 0..num_workers {
+                    let worker_parts: Vec<(usize, &PartitionDescriptor)> = selected_partitions
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|(idx, _)| idx % num_workers == worker_id)
+                        .collect();
+
+                    let engine = &self.engine;
+                    let colstore_dir = &self.colstore_dir;
+                    let source_cols = &source_columns;
+                    let pk = &table_desc.primary_key;
+                    let pred = pushdown_predicate.as_ref();
+
+                    handles.push(s.spawn(move || {
+                        let mut res = Vec::with_capacity(worker_parts.len());
+                        for (idx, part) in worker_parts {
+                            let part_res = scan_partition_compact(
+                                engine,
+                                colstore_dir,
+                                catalog,
+                                part,
+                                snapshot,
+                                source_cols,
+                                pk,
+                                pred,
+                            );
+                            res.push((idx, part_res));
+                        }
+                        res
+                    }));
+                }
+
+                let mut indexed_results = Vec::with_capacity(n_parts);
+                for handle in handles {
+                    let worker_res = handle.join().expect("scan worker thread panicked");
+                    indexed_results.extend(worker_res);
+                }
+                indexed_results.sort_by_key(|(idx, _)| *idx);
+                indexed_results.into_iter().map(|(_, res)| res).collect()
+            })
+        };
+
+        // 3. Deterministic partition-order merge
         let mut all_compact_rows = Vec::new();
+        for res in partition_results {
+            all_compact_rows.extend(res?);
+        }
 
-        for partition in partitions {
-            let tablet_id = partition.tablets[0];
-            let tablet = catalog
-                .tablet(tablet_id)
-                .ok_or_else(|| HtapError::Internal(format!("tablet {tablet_id} not found")))?;
+        // 4. Global filter, aggregate, group, and order
+        let result = olap::execute_analytic_select_compact(&select, all_compact_rows, &mapping)?;
+        Ok(StatementResult::Query(result))
+    }
+}
 
-            match &partition.storage {
-                StorageDescriptor::Row => {
-                    let entries = self
-                        .engine
-                        .scan_partition(partition.id.as_u64(), snapshot)?;
+#[allow(clippy::too_many_arguments)]
+fn scan_partition_compact(
+    engine: &Engine,
+    colstore_dir: &Path,
+    catalog: &CatalogSnapshot,
+    partition: &PartitionDescriptor,
+    snapshot: Snapshot,
+    source_columns: &[usize],
+    primary_key: &[usize],
+    pushdown_predicate: Option<&Predicate>,
+) -> Result<Vec<Row>> {
+    let tablet_id = partition.tablets[0];
+    let tablet = catalog
+        .tablet(tablet_id)
+        .ok_or_else(|| HtapError::Internal(format!("tablet {tablet_id} not found")))?;
+
+    match &partition.storage {
+        StorageDescriptor::Row => {
+            let entries = engine.scan_partition(partition.id.as_u64(), snapshot)?;
+            let rows = htap_convert::collapse_entries_to_rows(&entries);
+            let mut compact_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut values = Vec::with_capacity(source_columns.len());
+                for &idx in source_columns {
+                    let val = row.get(idx).cloned().ok_or_else(|| {
+                        HtapError::Internal(format!("row missing column index {idx}"))
+                    })?;
+                    values.push(val);
+                }
+                compact_rows.push(Row::new(values));
+            }
+            Ok(compact_rows)
+        }
+        StorageDescriptor::Column => {
+            let cat_manifest = tablet.column_manifest.as_ref().ok_or_else(|| {
+                HtapError::InvalidArgument(format!(
+                    "partition {} has Column storage but tablet {tablet_id} has no column manifest in catalog",
+                    partition.id
+                ))
+            })?;
+            let disk_manifest = htap_convert::open(colstore_dir, tablet_id)?;
+            if disk_manifest.generation != cat_manifest.generation {
+                return Err(HtapError::InvalidArgument(format!(
+                    "column manifest generation mismatch for tablet {tablet_id}: disk {} != catalog {}",
+                    disk_manifest.generation, cat_manifest.generation
+                )));
+            }
+            let compact_res = htap_convert::read_column_partition_compact_core(
+                catalog,
+                engine,
+                colstore_dir,
+                partition.id,
+                snapshot,
+                source_columns,
+                primary_key,
+                pushdown_predicate.cloned(),
+            )?;
+            Ok(compact_res.rows)
+        }
+        StorageDescriptor::Converting { .. } => match &tablet.column_manifest {
+            Some(cat_manifest) => {
+                let disk_manifest = htap_convert::open(colstore_dir, tablet_id)?;
+                if disk_manifest.generation != cat_manifest.generation {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "column manifest generation mismatch for converting tablet {tablet_id}: disk {} != catalog {}",
+                        disk_manifest.generation, cat_manifest.generation
+                    )));
+                }
+                let compact_res = htap_convert::read_column_partition_compact_core(
+                    catalog,
+                    engine,
+                    colstore_dir,
+                    partition.id,
+                    snapshot,
+                    source_columns,
+                    primary_key,
+                    pushdown_predicate.cloned(),
+                )?;
+                Ok(compact_res.rows)
+            }
+            None => {
+                let is_snapshot_pinned = partition
+                    .conversion
+                    .as_ref()
+                    .map(|c| c.phase == htap_catalog::ConversionPhase::SnapshotPinned)
+                    .unwrap_or(false);
+                if is_snapshot_pinned {
+                    let entries = engine.scan_partition(partition.id.as_u64(), snapshot)?;
                     let rows = htap_convert::collapse_entries_to_rows(&entries);
                     let mut compact_rows = Vec::with_capacity(rows.len());
                     for row in rows {
                         let mut values = Vec::with_capacity(source_columns.len());
-                        for &idx in &source_columns {
+                        for &idx in source_columns {
                             let val = row.get(idx).cloned().ok_or_else(|| {
                                 HtapError::Internal(format!("row missing column index {idx}"))
                             })?;
@@ -898,95 +1080,19 @@ impl LocalServer {
                         }
                         compact_rows.push(Row::new(values));
                     }
-                    all_compact_rows.extend(compact_rows);
+                    Ok(compact_rows)
+                } else {
+                    Err(HtapError::InvalidArgument(format!(
+                        "partition {} is converting without manifest but phase is not SnapshotPinned",
+                        partition.id
+                    )))
                 }
-                StorageDescriptor::Column => {
-                    let cat_manifest = tablet.column_manifest.as_ref().ok_or_else(|| {
-                        HtapError::InvalidArgument(format!(
-                            "partition {} has Column storage but tablet {tablet_id} has no column manifest in catalog",
-                            partition.id
-                        ))
-                    })?;
-                    let disk_manifest = htap_convert::open(&self.colstore_dir, tablet_id)?;
-                    if disk_manifest.generation != cat_manifest.generation {
-                        return Err(HtapError::InvalidArgument(format!(
-                            "column manifest generation mismatch for tablet {tablet_id}: disk {} != catalog {}",
-                            disk_manifest.generation, cat_manifest.generation
-                        )));
-                    }
-                    let compact_res = htap_convert::read_column_partition_compact_core(
-                        catalog,
-                        &self.engine,
-                        &self.colstore_dir,
-                        partition.id,
-                        snapshot,
-                        &source_columns,
-                        &table_desc.primary_key,
-                        pushdown_predicate.clone(),
-                    )?;
-                    all_compact_rows.extend(compact_res.rows);
-                }
-                StorageDescriptor::Converting { .. } => match &tablet.column_manifest {
-                    Some(cat_manifest) => {
-                        let disk_manifest = htap_convert::open(&self.colstore_dir, tablet_id)?;
-                        if disk_manifest.generation != cat_manifest.generation {
-                            return Err(HtapError::InvalidArgument(format!(
-                                "column manifest generation mismatch for converting tablet {tablet_id}: disk {} != catalog {}",
-                                disk_manifest.generation, cat_manifest.generation
-                            )));
-                        }
-                        let compact_res = htap_convert::read_column_partition_compact_core(
-                            catalog,
-                            &self.engine,
-                            &self.colstore_dir,
-                            partition.id,
-                            snapshot,
-                            &source_columns,
-                            &table_desc.primary_key,
-                            pushdown_predicate.clone(),
-                        )?;
-                        all_compact_rows.extend(compact_res.rows);
-                    }
-                    None => {
-                        let is_snapshot_pinned = partition
-                            .conversion
-                            .as_ref()
-                            .map(|c| c.phase == htap_catalog::ConversionPhase::SnapshotPinned)
-                            .unwrap_or(false);
-                        if is_snapshot_pinned {
-                            let entries = self
-                                .engine
-                                .scan_partition(partition.id.as_u64(), snapshot)?;
-                            let rows = htap_convert::collapse_entries_to_rows(&entries);
-                            let mut compact_rows = Vec::with_capacity(rows.len());
-                            for row in rows {
-                                let mut values = Vec::with_capacity(source_columns.len());
-                                for &idx in &source_columns {
-                                    let val = row.get(idx).cloned().ok_or_else(|| {
-                                        HtapError::Internal(format!(
-                                            "row missing column index {idx}"
-                                        ))
-                                    })?;
-                                    values.push(val);
-                                }
-                                compact_rows.push(Row::new(values));
-                            }
-                            all_compact_rows.extend(compact_rows);
-                        } else {
-                            return Err(HtapError::InvalidArgument(format!(
-                                "partition {} is converting without manifest but phase is not SnapshotPinned",
-                                partition.id
-                            )));
-                        }
-                    }
-                },
             }
-        }
-
-        let result = olap::execute_analytic_select_compact(&select, all_compact_rows, &mapping)?;
-        Ok(StatementResult::Query(result))
+        },
     }
+}
 
+impl LocalServer {
     /// Returns the columnar storage root directory for this local server.
     pub fn colstore_dir(&self) -> &Path {
         &self.colstore_dir

@@ -458,7 +458,7 @@ fn test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point() {
     assert!(err_scan.to_string().contains("has no column manifest"));
 
     let err_unsupported = server
-        .execute("SELECT val FROM c_table WHERE id = 1 ORDER BY val;")
+        .execute("SELECT val FROM c_table WHERE id = 1 ORDER BY val + 1;")
         .unwrap_err();
     assert!(matches!(err_unsupported, HtapError::Unsupported(_)));
 
@@ -536,7 +536,7 @@ fn test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point() {
     }
 
     let err_unsupported2 = server
-        .execute("SELECT val FROM c_table WHERE id = 2 ORDER BY val;")
+        .execute("SELECT val FROM c_table WHERE id = 2 ORDER BY val + 1;")
         .unwrap_err();
     assert!(matches!(err_unsupported2, HtapError::Unsupported(_)));
 }
@@ -1445,9 +1445,9 @@ fn test_analytic_unsupported_clauses() {
         .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, age INT);")
         .unwrap();
 
-    // ORDER BY is unsupported
+    // ORDER BY expression is unsupported
     let err_order = server
-        .execute("SELECT * FROM users ORDER BY age;")
+        .execute("SELECT * FROM users ORDER BY age + 1;")
         .unwrap_err();
     assert!(matches!(err_order, HtapError::Unsupported(_)));
 
@@ -2792,4 +2792,885 @@ fn test_partitioned_empty_topology_rejection_no_catalog_mutation() {
 
     let tab = snap_final.tablet(part.tablets[0]).unwrap();
     assert_eq!(tab.replicas[0].as_u64(), 2);
+}
+
+#[test]
+fn test_partition_pruning_range_and_list_and_conservative_cases() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    // 1. Setup Range Partitioned Table
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: false,
+        },
+        ColumnDef {
+            name: "category".into(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let range_def = PartitionedTableDefinition::new(
+        "items",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+                RangePartitionDefinition::new("p2", Value::Int64(200), Value::Int64(300)),
+            ],
+        },
+    );
+    server.create_partitioned_table(range_def).unwrap();
+
+    server
+        .execute(
+            "INSERT INTO items (id, val, category) VALUES \
+            (10, 100, 'A'), \
+            (20, 200, 'B'), \
+            (110, 300, 'A'), \
+            (120, 400, 'B'), \
+            (210, 500, 'A'), \
+            (220, 600, 'B');",
+        )
+        .unwrap();
+
+    // Range Pruning: Eq on partition key
+    let q_eq = server
+        .execute("SELECT id, val FROM items WHERE id = 110;")
+        .unwrap();
+    match q_eq {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(110)));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int64(300)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Range Pruning: Lt < 100 (only p0)
+    let q_lt = server
+        .execute("SELECT id, val FROM items WHERE id < 100 ORDER BY id;")
+        .unwrap();
+    match q_lt {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 2);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(10)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(20)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Range Pruning: Lte <= 110 (p0 and p1)
+    let q_lte = server
+        .execute("SELECT id, val FROM items WHERE id <= 110 ORDER BY id;")
+        .unwrap();
+    match q_lte {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(10)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(20)));
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::Int64(110)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Range Pruning: Gt > 150 (only p2)
+    let q_gt = server
+        .execute("SELECT id, val FROM items WHERE id > 150 ORDER BY id;")
+        .unwrap();
+    match q_gt {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 2);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(210)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(220)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Range Pruning: AND conjunction Gte 100 AND Lt 200 (only p1)
+    let q_and = server
+        .execute("SELECT id, val FROM items WHERE id >= 100 AND id < 200 ORDER BY id;")
+        .unwrap();
+    match q_and {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 2);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(110)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(120)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Range Pruning: Provably empty range
+    let q_empty1 = server
+        .execute("SELECT id, val FROM items WHERE id < 0;")
+        .unwrap();
+    match q_empty1 {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+    let q_empty2 = server
+        .execute("SELECT id, val FROM items WHERE id >= 500;")
+        .unwrap();
+    match q_empty2 {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Conservative: != retains all partitions
+    let q_ne = server
+        .execute("SELECT id FROM items WHERE id != 10 ORDER BY id;")
+        .unwrap();
+    match q_ne {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 5);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(20)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(110)));
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::Int64(120)));
+            assert_eq!(qr.rows()[3].get(0), Some(&Value::Int64(210)));
+            assert_eq!(qr.rows()[4].get(0), Some(&Value::Int64(220)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Conservative: non-partition key filter retains all partitions
+    let q_non_pk = server
+        .execute("SELECT id FROM items WHERE category = 'A' ORDER BY id;")
+        .unwrap();
+    match q_non_pk {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(10)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(110)));
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::Int64(210)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Conservative: IsNull prunes all partitions
+    let q_null = server
+        .execute("SELECT id FROM items WHERE id IS NULL;")
+        .unwrap();
+    match q_null {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Conservative: IsNotNull retains all partitions
+    let q_not_null = server
+        .execute("SELECT COUNT(*) FROM items WHERE id IS NOT NULL;")
+        .unwrap();
+    match q_not_null {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(6)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 2. Setup List Partitioned Table
+    let list_schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "region".into(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "score".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let list_def = PartitionedTableDefinition::new(
+        "regional",
+        list_schema,
+        vec![0, 1],
+        PartitionTopology::List {
+            key_column: 1,
+            partitions: vec![
+                ListPartitionDefinition::new(
+                    "p_us",
+                    vec![Value::String("US".into()), Value::String("CA".into())],
+                ),
+                ListPartitionDefinition::new(
+                    "p_eu",
+                    vec![Value::String("EU".into()), Value::String("UK".into())],
+                ),
+            ],
+        },
+    );
+    server.create_partitioned_table(list_def).unwrap();
+
+    server
+        .execute(
+            "INSERT INTO regional (id, region, score) VALUES \
+            (1, 'US', 10), \
+            (2, 'CA', 20), \
+            (3, 'EU', 30), \
+            (4, 'UK', 40);",
+        )
+        .unwrap();
+
+    // List Pruning: Eq 'US' (only p_us)
+    let q_us = server
+        .execute("SELECT id, score FROM regional WHERE region = 'US';")
+        .unwrap();
+    match q_us {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(1)));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int64(10)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // List Pruning: Eq 'EU' (only p_eu)
+    let q_eu = server
+        .execute("SELECT id, score FROM regional WHERE region = 'EU';")
+        .unwrap();
+    match q_eu {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(3)));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int64(30)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // List Pruning: Eq 'JP' (unmatched, 0 partitions)
+    let q_jp = server
+        .execute("SELECT id, score FROM regional WHERE region = 'JP';")
+        .unwrap();
+    match q_jp {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Conservative: != 'US' (retains all partitions)
+    let q_lne = server
+        .execute("SELECT id, score FROM regional WHERE region != 'US' ORDER BY id;")
+        .unwrap();
+    match q_lne {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(2)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(3)));
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::Int64(4)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_partition_storage_format_row_column_converting_equivalence() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    let cat_store =
+        std::sync::Arc::new(LocalCatalogStore::open(dir.path().join("catalog")).unwrap());
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: false,
+        },
+        ColumnDef {
+            name: "note".into(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "hybrid",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+                RangePartitionDefinition::new("p2", Value::Int64(200), Value::Int64(300)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    server
+        .execute(
+            "INSERT INTO hybrid (id, val, note) VALUES \
+            (10, 100, 'r1'), \
+            (20, 200, 'r2'), \
+            (110, 300, 'r3'), \
+            (120, 400, 'r4'), \
+            (210, 500, 'r5'), \
+            (220, 600, 'r6');",
+        )
+        .unwrap();
+
+    // Baseline queries against pure Rowstore
+    let baseline_agg = server
+        .execute("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM hybrid;")
+        .unwrap();
+    let baseline_scan = server
+        .execute("SELECT id, val FROM hybrid ORDER BY id;")
+        .unwrap();
+    let baseline_filtered = server
+        .execute("SELECT id, val FROM hybrid WHERE id >= 100 ORDER BY id;")
+        .unwrap();
+
+    // Now configure p1 as Column storage and p2 as Converting storage:
+    let snap = cat_store.load().unwrap().unwrap();
+    let p1_id = snap.partitions[1].id;
+    let p2_id = snap.partitions[2].id;
+
+    // Convert p1 using LocalConverter
+    let converter = htap_convert::LocalConverter::new(
+        std::sync::Arc::clone(&cat_store) as std::sync::Arc<dyn CatalogStore>,
+        std::sync::Arc::new(
+            htap_rowstore::Engine::open(htap_rowstore::EngineOptions::new(
+                dir.path().join("rowstore"),
+            ))
+            .unwrap(),
+        ),
+        server.colstore_dir(),
+        htap_convert::SegmentOptions::default(),
+    );
+    converter.convert_partition(p1_id).unwrap();
+
+    // Modify p2 in catalog to Converting storage with SnapshotPinned phase
+    let mut snap2 = cat_store.load().unwrap().unwrap();
+    let conv_gen = snap2.generation + 1;
+    snap2.generation = conv_gen;
+    let p2_part = snap2.partitions.iter_mut().find(|p| p.id == p2_id).unwrap();
+    p2_part.generation = conv_gen;
+    p2_part.storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: conv_gen,
+    };
+    p2_part.conversion = Some(ConversionDescriptor::new(
+        conv_gen,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(2),
+        ConversionPhase::SnapshotPinned,
+    ));
+    cat_store
+        .compare_and_set(snap2.generation - 1, snap2)
+        .unwrap();
+
+    // Execute queries over mixed Row + Column + Converting partitions:
+    let mixed_agg = server
+        .execute("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM hybrid;")
+        .unwrap();
+    let mixed_scan = server
+        .execute("SELECT id, val FROM hybrid ORDER BY id;")
+        .unwrap();
+    let mixed_filtered = server
+        .execute("SELECT id, val FROM hybrid WHERE id >= 100 ORDER BY id;")
+        .unwrap();
+
+    // Verify exact equivalence between pure Rowstore and mixed formats!
+    assert_eq!(mixed_agg, baseline_agg);
+    assert_eq!(mixed_scan, baseline_scan);
+    assert_eq!(mixed_filtered, baseline_filtered);
+}
+
+#[test]
+fn test_multi_partition_global_aggregates_and_groups() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+            primary_key: false,
+        },
+        ColumnDef {
+            name: "dept".into(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "salaries",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(10)),
+                RangePartitionDefinition::new("p1", Value::Int64(10), Value::Int64(20)),
+                RangePartitionDefinition::new("p2", Value::Int64(20), Value::Int64(30)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    server
+        .execute(
+            "INSERT INTO salaries (id, val, dept) VALUES \
+            (1, 100, 'eng'), \
+            (2, 150, 'sales'), \
+            (11, 200, 'eng'), \
+            (12, NULL, 'sales'), \
+            (21, 300, 'eng'), \
+            (22, 250, 'hr');",
+        )
+        .unwrap();
+
+    // 1. Global Aggregates across multiple partitions
+    let agg = server
+        .execute("SELECT COUNT(*), COUNT(val), SUM(val), MIN(val), MAX(val) FROM salaries;")
+        .unwrap();
+    match agg {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0), Some(&Value::Int64(6))); // COUNT(*)
+            assert_eq!(row.get(1), Some(&Value::Int64(5))); // COUNT(val) excluding NULL
+            assert_eq!(row.get(2), Some(&Value::Int64(1000))); // SUM(val)
+            assert_eq!(row.get(3), Some(&Value::Int64(100))); // MIN(val)
+            assert_eq!(row.get(4), Some(&Value::Int64(300))); // MAX(val)
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 2. Grouped Aggregates across multiple partitions with ORDER BY
+    let grouped = server
+        .execute("SELECT dept, COUNT(*), SUM(val) FROM salaries GROUP BY dept ORDER BY dept;")
+        .unwrap();
+    match grouped {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            // eng: 3 rows, sum 600
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("eng".into())));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::Int64(3)));
+            assert_eq!(qr.rows()[0].get(2), Some(&Value::Int64(600)));
+            // hr: 1 row, sum 250
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::String("hr".into())));
+            assert_eq!(qr.rows()[1].get(1), Some(&Value::Int64(1)));
+            assert_eq!(qr.rows()[1].get(2), Some(&Value::Int64(250)));
+            // sales: 2 rows, sum 150
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::String("sales".into())));
+            assert_eq!(qr.rows()[2].get(1), Some(&Value::Int64(2)));
+            assert_eq!(qr.rows()[2].get(2), Some(&Value::Int64(150)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 3. Empty filter aggregate returns single row with 0/NULLs
+    let empty_agg = server
+        .execute("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM salaries WHERE val > 99999;")
+        .unwrap();
+    match empty_agg {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0), Some(&Value::Int64(0)));
+            assert_eq!(row.get(1), Some(&Value::Null));
+            assert_eq!(row.get(2), Some(&Value::Null));
+            assert_eq!(row.get(3), Some(&Value::Null));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_multi_partition_order_by_directions_nulls_and_tie_breaking() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "score".into(),
+            data_type: DataType::Int32,
+            nullable: true,
+            primary_key: false,
+        },
+        ColumnDef {
+            name: "team".into(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "leaderboard",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(10)),
+                RangePartitionDefinition::new("p1", Value::Int64(10), Value::Int64(20)),
+                RangePartitionDefinition::new("p2", Value::Int64(20), Value::Int64(30)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // Insert across partitions with duplicates and NULLs:
+    // p0: (1, NULL, 'blue'), (2, 20, 'red')
+    // p1: (11, 10, 'green'), (12, 20, 'blue')
+    // p2: (21, NULL, 'green'), (22, 30, 'red')
+    server
+        .execute(
+            "INSERT INTO leaderboard (id, score, team) VALUES \
+            (1, NULL, 'blue'), \
+            (2, 20, 'red'), \
+            (11, 10, 'green'), \
+            (12, 20, 'blue'), \
+            (21, NULL, 'green'), \
+            (22, 30, 'red');",
+        )
+        .unwrap();
+
+    // 1. ASC default: NULLS FIRST
+    let q_asc = server
+        .execute("SELECT id, score FROM leaderboard ORDER BY score ASC, id ASC;")
+        .unwrap();
+    match q_asc {
+        StatementResult::Query(qr) => {
+            let ids: Vec<i64> = qr
+                .rows()
+                .iter()
+                .map(|r| match r.get(0).unwrap() {
+                    Value::Int64(v) => *v,
+                    _ => unreachable!(),
+                })
+                .collect();
+            // NULLs first (ids 1, 21), then 10 (id 11), 20 (ids 2, 12), 30 (id 22)
+            assert_eq!(ids, vec![1, 21, 11, 2, 12, 22]);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 2. DESC default: NULLS LAST
+    let q_desc = server
+        .execute("SELECT id, score FROM leaderboard ORDER BY score DESC, id ASC;")
+        .unwrap();
+    match q_desc {
+        StatementResult::Query(qr) => {
+            let ids: Vec<i64> = qr
+                .rows()
+                .iter()
+                .map(|r| match r.get(0).unwrap() {
+                    Value::Int64(v) => *v,
+                    _ => unreachable!(),
+                })
+                .collect();
+            // 30 (id 22), 20 (ids 2, 12), 10 (id 11), then NULLs last (ids 1, 21)
+            assert_eq!(ids, vec![22, 2, 12, 11, 1, 21]);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 3. Explicit ASC NULLS LAST
+    let q_asc_nl = server
+        .execute("SELECT id, score FROM leaderboard ORDER BY score ASC NULLS LAST, id ASC;")
+        .unwrap();
+    match q_asc_nl {
+        StatementResult::Query(qr) => {
+            let ids: Vec<i64> = qr
+                .rows()
+                .iter()
+                .map(|r| match r.get(0).unwrap() {
+                    Value::Int64(v) => *v,
+                    _ => unreachable!(),
+                })
+                .collect();
+            // 10 (id 11), 20 (ids 2, 12), 30 (id 22), then NULLs (ids 1, 21)
+            assert_eq!(ids, vec![11, 2, 12, 22, 1, 21]);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 4. Explicit DESC NULLS FIRST
+    let q_desc_nf = server
+        .execute("SELECT id, score FROM leaderboard ORDER BY score DESC NULLS FIRST, id ASC;")
+        .unwrap();
+    match q_desc_nf {
+        StatementResult::Query(qr) => {
+            let ids: Vec<i64> = qr
+                .rows()
+                .iter()
+                .map(|r| match r.get(0).unwrap() {
+                    Value::Int64(v) => *v,
+                    _ => unreachable!(),
+                })
+                .collect();
+            // NULLs first (ids 1, 21), then 30 (id 22), 20 (ids 2, 12), 10 (id 11)
+            assert_eq!(ids, vec![1, 21, 22, 2, 12, 11]);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 5. Deterministic tie-breaking on full output row
+    let q_tie = server
+        .execute("SELECT score, team FROM leaderboard WHERE score = 20 ORDER BY score ASC;")
+        .unwrap();
+    match q_tie {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 2);
+            // Tie-break on full output row: ('20', 'blue') < ('20', 'red')
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::String("blue".into())));
+            assert_eq!(qr.rows()[1].get(1), Some(&Value::String("red".into())));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 6. Grouped ORDER BY across partitions
+    let q_grp = server
+        .execute("SELECT team, COUNT(*) FROM leaderboard GROUP BY team ORDER BY team DESC;")
+        .unwrap();
+    match q_grp {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("red".into())));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::String("green".into())));
+            assert_eq!(qr.rows()[2].get(0), Some(&Value::String("blue".into())));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_scan_worker_count_equivalence() {
+    let dir = TempDir::new().unwrap();
+    let mut server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: false,
+        },
+        ColumnDef {
+            name: "tag".into(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "parallel_data",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(10)),
+                RangePartitionDefinition::new("p1", Value::Int64(10), Value::Int64(20)),
+                RangePartitionDefinition::new("p2", Value::Int64(20), Value::Int64(30)),
+                RangePartitionDefinition::new("p3", Value::Int64(30), Value::Int64(40)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    server
+        .execute(
+            "INSERT INTO parallel_data (id, val, tag) VALUES \
+            (1, 100, 'X'), (2, 200, 'Y'), \
+            (11, 150, 'X'), (12, 250, 'Z'), \
+            (21, 300, 'Y'), (22, 100, 'Z'), \
+            (31, 400, 'X'), (32, 350, 'Y');",
+        )
+        .unwrap();
+
+    // Query 1: Filter + Projection + ORDER BY
+    let q1 = "SELECT id, val, tag FROM parallel_data WHERE val >= 150 ORDER BY val DESC, id ASC;";
+    // Query 2: Grouped Aggregation + ORDER BY
+    let q2 = "SELECT tag, COUNT(*), SUM(val) FROM parallel_data GROUP BY tag ORDER BY tag ASC;";
+
+    let mut q1_results = Vec::new();
+    let mut q2_results = Vec::new();
+
+    for &workers in &[1, 2, 4, 8] {
+        server.set_scan_workers(workers);
+        assert_eq!(server.scan_workers(), workers);
+
+        let r1 = server.execute(q1).unwrap();
+        let r2 = server.execute(q2).unwrap();
+
+        q1_results.push(r1);
+        q2_results.push(r2);
+    }
+
+    // All worker counts must produce bit-for-bit identical results
+    for i in 1..q1_results.len() {
+        assert_eq!(
+            q1_results[0], q1_results[i],
+            "mismatch for query 1 at worker index {i}"
+        );
+        assert_eq!(
+            q2_results[0], q2_results[i],
+            "mismatch for query 2 at worker index {i}"
+        );
+    }
+}
+
+#[test]
+fn test_point_read_fast_path_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    // 1. Unpartitioned table point reads
+    server
+        .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, age INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO users (id, name, age) VALUES (1, 'alice', 30), (2, 'bob', 25);")
+        .unwrap();
+
+    let p1 = server
+        .execute("SELECT id, name, age FROM users WHERE id = 1;")
+        .unwrap();
+    match p1 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(1)));
+            assert_eq!(qr.rows()[0].get(1), Some(&Value::String("alice".into())));
+            assert_eq!(qr.rows()[0].get(2), Some(&Value::Int32(30)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // Absent point read on unpartitioned table preserves column metadata with 0 rows
+    let p_absent = server
+        .execute("SELECT id, name, age FROM users WHERE id = 999;")
+        .unwrap();
+    match p_absent {
+        StatementResult::Query(qr) => {
+            assert!(qr.is_empty());
+            assert_eq!(qr.num_rows(), 0);
+            assert_eq!(qr.columns().len(), 3);
+            assert_eq!(qr.columns()[0].name, "id");
+            assert_eq!(qr.columns()[1].name, "name");
+            assert_eq!(qr.columns()[2].name, "age");
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 2. Partitioned table point reads
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "p_table",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    server
+        .execute("INSERT INTO p_table (id, val) VALUES (42, 'answer'), (142, 'more');")
+        .unwrap();
+
+    let p_part = server
+        .execute("SELECT val FROM p_table WHERE id = 142;")
+        .unwrap();
+    match p_part {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("more".into())));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let p_part_absent = server
+        .execute("SELECT val FROM p_table WHERE id = 199;")
+        .unwrap();
+    match p_part_absent {
+        StatementResult::Query(qr) => {
+            assert!(qr.is_empty());
+            assert_eq!(qr.num_rows(), 0);
+            assert_eq!(qr.columns().len(), 1);
+            assert_eq!(qr.columns()[0].name, "val");
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
 }

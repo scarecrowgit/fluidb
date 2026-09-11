@@ -286,6 +286,34 @@ impl AnalyticExpr {
     }
 }
 
+/// Bound representation of an ORDER BY column specification in an analytical query.
+///
+/// In this strict execution slice, only simple unqualified column identifiers are supported.
+/// Direction can be ASC or DESC, with explicit deterministic NULL ordering:
+/// - ASC defaults to NULLS FIRST (NULL treated as lowest rank).
+/// - DESC defaults to NULLS LAST (NULL treated as lowest rank, placed at the end).
+/// - Explicit `NULLS FIRST` / `NULLS LAST` can override the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticOrderBy {
+    /// Zero-based column index in the table schema.
+    pub column: usize,
+    /// Sort ascending (`true`) or descending (`false`).
+    pub asc: bool,
+    /// Whether NULL values sort first (`true`) or last (`false`).
+    pub nulls_first: bool,
+}
+
+impl AnalyticOrderBy {
+    /// Create a new [`AnalyticOrderBy`] specification.
+    pub fn new(column: usize, asc: bool, nulls_first: bool) -> Self {
+        Self {
+            column,
+            asc,
+            nulls_first,
+        }
+    }
+}
+
 /// Bound representation of an analytical SELECT query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnalyticSelect {
@@ -297,6 +325,8 @@ pub struct AnalyticSelect {
     pub filter: Option<AnalyticFilter>,
     /// Column indices in source table schema for `GROUP BY`.
     pub group_by: Vec<usize>,
+    /// Order by column specifications.
+    pub order_by: Vec<AnalyticOrderBy>,
     /// Pre-computed output schema for the analytical query result.
     pub output_schema: Schema,
 }
@@ -308,6 +338,7 @@ impl AnalyticSelect {
         projection: Vec<AnalyticExpr>,
         filter: Option<AnalyticFilter>,
         group_by: Vec<usize>,
+        order_by: Vec<AnalyticOrderBy>,
         output_schema: Schema,
     ) -> Self {
         Self {
@@ -315,6 +346,7 @@ impl AnalyticSelect {
             projection,
             filter,
             group_by,
+            order_by,
             output_schema,
         }
     }
@@ -395,6 +427,7 @@ mod tests {
                 nullable: false,
             }],
             None,
+            vec![],
             vec![],
             schema,
         );
