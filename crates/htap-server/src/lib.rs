@@ -15,13 +15,14 @@ use std::sync::Arc;
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{
-    CatalogSnapshot, NodeId, PartitionDescriptor, PartitionId, ReplicaDescriptor, ReplicaId,
-    StorageDescriptor, TableDescriptor, TableId, TabletDescriptor, TabletId,
+    CatalogSnapshot, NodeId, PartitionDescriptor, PartitionId, PartitioningDescriptor,
+    PartitioningMethod, RangeBound, ReplicaDescriptor, ReplicaId, StorageDescriptor,
+    TableDescriptor, TableId, TabletDescriptor, TabletId,
 };
 use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
 use htap_common::lock::ProcessLock;
-use htap_common::types::{ColumnDef, Mutation, Row, Value};
+use htap_common::types::{ColumnDef, Mutation, Row, Schema, Value};
 use htap_movement::{
     CopyOptions, CopyReport, LocalDataMover, MovementJob, TabletCloneOptions, TabletPackageManifest,
 };
@@ -35,6 +36,96 @@ use htap_txn::{
     ParticipantId, ParticipantWork, RowstoreParticipant, TransactionManager, TransactionRequest,
 };
 use parking_lot::Mutex;
+
+/// Definition of a partitioned table to be created via [`LocalServer::create_partitioned_table`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionedTableDefinition {
+    /// Logical name of the partitioned table.
+    pub name: String,
+    /// Column definitions and schema of the table.
+    pub schema: Schema,
+    /// Schema column indices constituting the primary key.
+    pub primary_key: Vec<usize>,
+    /// Partition topology specification (Range or List).
+    pub topology: PartitionTopology,
+}
+
+impl PartitionedTableDefinition {
+    /// Creates a new partitioned table definition.
+    pub fn new(
+        name: impl Into<String>,
+        schema: Schema,
+        primary_key: Vec<usize>,
+        topology: PartitionTopology,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            primary_key,
+            topology,
+        }
+    }
+}
+
+/// Partitioning topology defining strategy and individual partitions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionTopology {
+    /// Range partitioning where partitions cover non-overlapping intervals `[lower, upper)`.
+    Range {
+        /// Zero-based column index in table schema used as partition key.
+        key_column: usize,
+        /// Ordered partition boundaries.
+        partitions: Vec<RangePartitionDefinition>,
+    },
+    /// List partitioning where partitions cover disjoint sets of explicit values.
+    List {
+        /// Zero-based column index in table schema used as partition key.
+        key_column: usize,
+        /// Explicit list value sets for each partition.
+        partitions: Vec<ListPartitionDefinition>,
+    },
+}
+
+/// Definition of a single range partition with half-open bound `[lower, upper)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangePartitionDefinition {
+    /// Partition name (unique within table).
+    pub name: String,
+    /// Inclusive lower bound value.
+    pub lower: Value,
+    /// Exclusive upper bound value.
+    pub upper: Value,
+}
+
+impl RangePartitionDefinition {
+    /// Creates a new range partition definition.
+    pub fn new(name: impl Into<String>, lower: Value, upper: Value) -> Self {
+        Self {
+            name: name.into(),
+            lower,
+            upper,
+        }
+    }
+}
+
+/// Definition of a single list partition with explicit values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPartitionDefinition {
+    /// Partition name (unique within table).
+    pub name: String,
+    /// Disjoint set of values belonging to this partition.
+    pub values: Vec<Value>,
+}
+
+impl ListPartitionDefinition {
+    /// Creates a new list partition definition.
+    pub fn new(name: impl Into<String>, values: Vec<Value>) -> Self {
+        Self {
+            name: name.into(),
+            values,
+        }
+    }
+}
 
 /// Synchronous local database server.
 ///
@@ -147,22 +238,21 @@ impl LocalServer {
                 self.execute_create_table(create, &catalog)
             }
             BoundStatement::Insert(insert) => {
-                let (table_desc, partition) =
-                    self.resolve_single_partition_table(&insert.table, &catalog)?;
-                let _route =
-                    classify_route(&BoundStatement::Insert(insert.clone()), &partition.storage)?;
-                self.execute_insert(insert, table_desc, partition.id)
+                let table_desc = self.resolve_table(&insert.table, &catalog)?;
+                self.execute_insert(insert, table_desc, &catalog)
             }
             BoundStatement::Delete(delete) => {
-                let (_table_desc, partition) =
-                    self.resolve_single_partition_table(&delete.table, &catalog)?;
+                let table_desc = self.resolve_table(&delete.table, &catalog)?;
+                let partition_id = self.route_pk_to_partition(table_desc, &delete.key, &catalog)?;
+                let partition = self.validate_partition(table_desc, partition_id, &catalog)?;
                 let _route =
                     classify_route(&BoundStatement::Delete(delete.clone()), &partition.storage)?;
                 self.execute_delete(delete, partition.id)
             }
             BoundStatement::Select(select) => {
-                let (table_desc, partition) =
-                    self.resolve_single_partition_table(&select.table, &catalog)?;
+                let table_desc = self.resolve_table(&select.table, &catalog)?;
+                let partition_id = self.route_pk_to_partition(table_desc, &select.key, &catalog)?;
+                let partition = self.validate_partition(table_desc, partition_id, &catalog)?;
                 let route =
                     classify_route(&BoundStatement::Select(select.clone()), &partition.storage)?;
                 let key = match route {
@@ -172,37 +262,236 @@ impl LocalServer {
                 self.execute_select(select, table_desc, partition.id, key)
             }
             BoundStatement::AnalyticSelect(select) => {
-                let (table_desc, partition) =
-                    self.resolve_single_partition_table(&select.table, &catalog)?;
-                let _route = classify_route(
-                    &BoundStatement::AnalyticSelect(select.clone()),
-                    &partition.storage,
-                )?;
-                self.execute_analytic_select(select, table_desc, partition, &catalog)
+                let (table_desc, partitions) =
+                    self.resolve_table_and_all_partitions(&select.table, &catalog)?;
+                for partition in &partitions {
+                    let _route = classify_route(
+                        &BoundStatement::AnalyticSelect(select.clone()),
+                        &partition.storage,
+                    )?;
+                }
+                self.execute_analytic_select(select, table_desc, &partitions, &catalog)
             }
         }
     }
 
-    fn resolve_single_partition_table<'a>(
+    /// Creates a new partitioned table according to the provided [`PartitionedTableDefinition`].
+    ///
+    /// The table and its partitions are persisted to the catalog in a single atomic CAS operation.
+    /// Each defined partition is initialized with Row storage, a single tablet (bucket 0), and a healthy
+    /// leader replica on node 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError::Conflict`] if a table with the same name already exists.
+    /// Returns [`HtapError::InvalidArgument`] if partition definitions are invalid, overlapping, or
+    /// schema/PK constraints are violated.
+    /// Returns [`HtapError::CounterOverflow`] if IDs or catalog generation overflow.
+    pub fn create_partitioned_table(
         &self,
-        table_name: &str,
-        catalog: &'a CatalogSnapshot,
-    ) -> Result<(&'a TableDescriptor, &'a PartitionDescriptor)> {
-        let table_desc = catalog
-            .table_by_name(table_name)
-            .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))?;
-
-        if table_desc.partitions.len() != 1 {
-            return Err(HtapError::Unsupported(format!(
-                "table '{table_name}' must have exactly one partition, found {}",
-                table_desc.partitions.len()
+        definition: PartitionedTableDefinition,
+    ) -> Result<StatementResult> {
+        let is_empty_topology = match &definition.topology {
+            PartitionTopology::Range { partitions, .. } => partitions.is_empty(),
+            PartitionTopology::List { partitions, .. } => partitions.is_empty(),
+        };
+        if is_empty_topology {
+            return Err(HtapError::InvalidArgument(format!(
+                "partitioned table '{}' must define at least one partition",
+                definition.name
             )));
         }
 
-        let partition_id = table_desc.partitions[0];
+        let _guard = self.execution_lock.lock();
+        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+
+        if catalog.table_by_name(&definition.name).is_some() {
+            return Err(HtapError::Conflict(format!(
+                "table '{}' already exists",
+                definition.name
+            )));
+        }
+
+        let max_table_id = catalog
+            .tables
+            .iter()
+            .map(|t| t.id.as_u64())
+            .max()
+            .unwrap_or(0);
+        let next_table_id = max_table_id
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "table_id",
+            })?;
+        let table_id = TableId::new(next_table_id);
+
+        let mut cur_partition_id = catalog
+            .partitions
+            .iter()
+            .map(|p| p.id.as_u64())
+            .max()
+            .unwrap_or(0);
+        let mut cur_tablet_id = catalog
+            .tablets
+            .iter()
+            .map(|t| t.id.as_u64())
+            .max()
+            .unwrap_or(0);
+        let mut cur_replica_id = catalog
+            .replicas
+            .iter()
+            .map(|r| r.id.as_u64())
+            .max()
+            .unwrap_or(0);
+
+        let next_generation =
+            catalog
+                .generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
+
+        let (partitioning_desc, partition_items) = match definition.topology {
+            PartitionTopology::Range {
+                key_column,
+                partitions,
+            } => (
+                PartitioningDescriptor::new(key_column, PartitioningMethod::Range),
+                partitions
+                    .into_iter()
+                    .map(|p| (p.name, Some(RangeBound::new(p.lower, p.upper)), Vec::new()))
+                    .collect::<Vec<_>>(),
+            ),
+            PartitionTopology::List {
+                key_column,
+                partitions,
+            } => (
+                PartitioningDescriptor::new(key_column, PartitioningMethod::List),
+                partitions
+                    .into_iter()
+                    .map(|p| (p.name, None, p.values))
+                    .collect::<Vec<_>>(),
+            ),
+        };
+
+        let mut table_partition_ids = Vec::with_capacity(partition_items.len());
+        let mut new_partitions = Vec::with_capacity(partition_items.len());
+        let mut new_tablets = Vec::with_capacity(partition_items.len());
+        let mut new_replicas = Vec::with_capacity(partition_items.len());
+
+        for (part_name, range_opt, list_values) in partition_items {
+            cur_partition_id =
+                cur_partition_id
+                    .checked_add(1)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "partition_id",
+                    })?;
+            let partition_id = PartitionId::new(cur_partition_id);
+
+            cur_tablet_id = cur_tablet_id
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "tablet_id",
+                })?;
+            let tablet_id = TabletId::new(cur_tablet_id);
+
+            cur_replica_id = cur_replica_id
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "replica_id",
+                })?;
+            let replica_id = ReplicaId::new(cur_replica_id);
+
+            let replica_desc = ReplicaDescriptor::new(
+                replica_id,
+                tablet_id,
+                NodeId::new(1),
+                true,
+                true,
+                next_generation,
+            );
+
+            let tablet_desc = TabletDescriptor::new(
+                tablet_id,
+                partition_id,
+                0,
+                vec![replica_id],
+                next_generation,
+            );
+
+            let mut partition_desc = PartitionDescriptor::new(
+                partition_id,
+                table_id,
+                part_name,
+                StorageDescriptor::Row,
+                vec![tablet_id],
+                next_generation,
+            );
+            if let Some(range) = range_opt {
+                partition_desc = partition_desc.with_range(range);
+            }
+            if !list_values.is_empty() {
+                partition_desc = partition_desc.with_list_values(list_values);
+            }
+
+            table_partition_ids.push(partition_id);
+            new_partitions.push(partition_desc);
+            new_tablets.push(tablet_desc);
+            new_replicas.push(replica_desc);
+        }
+
+        let table_desc = TableDescriptor::new(
+            table_id,
+            definition.name,
+            definition.schema,
+            definition.primary_key,
+            table_partition_ids,
+            next_generation,
+        )
+        .with_partitioning(partitioning_desc);
+
+        let mut tables = catalog.tables.clone();
+        tables.push(table_desc);
+
+        let mut partitions = catalog.partitions.clone();
+        partitions.extend(new_partitions);
+
+        let mut tablets = catalog.tablets.clone();
+        tablets.extend(new_tablets);
+
+        let mut replicas = catalog.replicas.clone();
+        replicas.extend(new_replicas);
+
+        let next_snapshot =
+            CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas);
+
+        self.catalog
+            .compare_and_set(catalog.generation, next_snapshot)?;
+
+        Ok(StatementResult::ddl(1))
+    }
+
+    fn resolve_table<'a>(
+        &self,
+        table_name: &str,
+        catalog: &'a CatalogSnapshot,
+    ) -> Result<&'a TableDescriptor> {
+        catalog
+            .table_by_name(table_name)
+            .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))
+    }
+
+    fn validate_partition<'a>(
+        &self,
+        table_desc: &TableDescriptor,
+        partition_id: PartitionId,
+        catalog: &'a CatalogSnapshot,
+    ) -> Result<&'a PartitionDescriptor> {
         let partition = catalog.partition(partition_id).ok_or_else(|| {
             HtapError::Internal(format!(
-                "partition {partition_id} referenced by table '{table_name}' not found in catalog"
+                "partition {partition_id} referenced by table '{}' not found in catalog",
+                table_desc.name
             ))
         })?;
 
@@ -261,7 +550,69 @@ impl LocalServer {
             )));
         }
 
+        Ok(partition)
+    }
+
+    fn resolve_table_and_all_partitions<'a>(
+        &self,
+        table_name: &str,
+        catalog: &'a CatalogSnapshot,
+    ) -> Result<(&'a TableDescriptor, Vec<&'a PartitionDescriptor>)> {
+        let table_desc = self.resolve_table(table_name, catalog)?;
+        let partitions = table_desc
+            .partitions
+            .iter()
+            .map(|&pid| self.validate_partition(table_desc, pid, catalog))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((table_desc, partitions))
+    }
+
+    fn resolve_single_partition_table<'a>(
+        &self,
+        table_name: &str,
+        catalog: &'a CatalogSnapshot,
+    ) -> Result<(&'a TableDescriptor, &'a PartitionDescriptor)> {
+        let table_desc = self.resolve_table(table_name, catalog)?;
+
+        if table_desc.partitions.len() != 1 {
+            return Err(HtapError::Unsupported(format!(
+                "table '{table_name}' must have exactly one partition, found {}",
+                table_desc.partitions.len()
+            )));
+        }
+
+        let partition = self.validate_partition(table_desc, table_desc.partitions[0], catalog)?;
         Ok((table_desc, partition))
+    }
+
+    fn route_pk_to_partition(
+        &self,
+        table_desc: &TableDescriptor,
+        pk_key: &[Value],
+        catalog: &CatalogSnapshot,
+    ) -> Result<PartitionId> {
+        match &table_desc.partitioning {
+            Some(partitioning) => {
+                let pk_pos = table_desc
+                    .primary_key
+                    .iter()
+                    .position(|&col_idx| col_idx == partitioning.key_column)
+                    .ok_or_else(|| {
+                        HtapError::InvalidArgument(format!(
+                            "partition key column index {} not found in primary key for table '{}'",
+                            partitioning.key_column, table_desc.name
+                        ))
+                    })?;
+                let part_val = pk_key.get(pk_pos).ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "primary key value missing index {pk_pos} for table '{}'",
+                        table_desc.name
+                    ))
+                })?;
+                table_desc.route_partition_value(catalog, part_val)
+            }
+            None => table_desc.route_partition_value(catalog, &Value::Null),
+        }
     }
 
     fn execute_create_table(
@@ -397,10 +748,29 @@ impl LocalServer {
         &self,
         insert: Insert,
         table_desc: &TableDescriptor,
-        partition_id: PartitionId,
+        catalog: &CatalogSnapshot,
     ) -> Result<StatementResult> {
         let mut mutations = Vec::with_capacity(insert.rows.len());
         for row in &insert.rows {
+            let partition_id = match &table_desc.partitioning {
+                Some(partitioning) => {
+                    let val = row.get(partitioning.key_column).ok_or_else(|| {
+                        HtapError::InvalidArgument(format!(
+                            "row missing partition key column index {}",
+                            partitioning.key_column
+                        ))
+                    })?;
+                    table_desc.route_partition_value(catalog, val)?
+                }
+                None => table_desc.route_partition_value(catalog, &Value::Null)?,
+            };
+
+            let partition = self.validate_partition(table_desc, partition_id, catalog)?;
+            let _route = classify_route(
+                &BoundStatement::Insert(Insert::new(&table_desc.name, vec![row.clone()])),
+                &partition.storage,
+            )?;
+
             let pk_values: Vec<Value> = table_desc
                 .primary_key
                 .iter()
@@ -496,66 +866,54 @@ impl LocalServer {
         &self,
         select: AnalyticSelect,
         table_desc: &TableDescriptor,
-        partition: &PartitionDescriptor,
+        partitions: &[&PartitionDescriptor],
         catalog: &CatalogSnapshot,
     ) -> Result<StatementResult> {
         let snapshot = Snapshot::new(self.txn_manager.visible_version());
-        let tablet_id = partition.tablets[0];
-        let tablet = catalog
-            .tablet(tablet_id)
-            .ok_or_else(|| HtapError::Internal(format!("tablet {tablet_id} not found")))?;
+        let (source_columns, mapping) = olap::plan_source_columns(&select);
+        let pushdown_predicate = olap::select_pushdown_predicate(select.filter.as_ref());
 
-        match &partition.storage {
-            StorageDescriptor::Row => {
-                let entries = self
-                    .engine
-                    .scan_partition(partition.id.as_u64(), snapshot)?;
-                let rows = htap_convert::collapse_entries_to_rows(&entries);
-                let result = olap::execute_analytic_select(&select, rows)?;
-                Ok(StatementResult::Query(result))
-            }
-            StorageDescriptor::Column => {
-                let cat_manifest = tablet.column_manifest.as_ref().ok_or_else(|| {
-                    HtapError::InvalidArgument(format!(
-                        "partition {} has Column storage but tablet {tablet_id} has no column manifest in catalog",
-                        partition.id
-                    ))
-                })?;
-                let disk_manifest = htap_convert::open(&self.colstore_dir, tablet_id)?;
-                if disk_manifest.generation != cat_manifest.generation {
-                    return Err(HtapError::InvalidArgument(format!(
-                        "column manifest generation mismatch for tablet {tablet_id}: disk {} != catalog {}",
-                        disk_manifest.generation, cat_manifest.generation
-                    )));
+        let mut all_compact_rows = Vec::new();
+
+        for partition in partitions {
+            let tablet_id = partition.tablets[0];
+            let tablet = catalog
+                .tablet(tablet_id)
+                .ok_or_else(|| HtapError::Internal(format!("tablet {tablet_id} not found")))?;
+
+            match &partition.storage {
+                StorageDescriptor::Row => {
+                    let entries = self
+                        .engine
+                        .scan_partition(partition.id.as_u64(), snapshot)?;
+                    let rows = htap_convert::collapse_entries_to_rows(&entries);
+                    let mut compact_rows = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let mut values = Vec::with_capacity(source_columns.len());
+                        for &idx in &source_columns {
+                            let val = row.get(idx).cloned().ok_or_else(|| {
+                                HtapError::Internal(format!("row missing column index {idx}"))
+                            })?;
+                            values.push(val);
+                        }
+                        compact_rows.push(Row::new(values));
+                    }
+                    all_compact_rows.extend(compact_rows);
                 }
-                let (source_columns, mapping) = olap::plan_source_columns(&select);
-                let pushdown_predicate = olap::select_pushdown_predicate(select.filter.as_ref());
-                let compact_res = htap_convert::read_column_partition_compact_core(
-                    catalog,
-                    &self.engine,
-                    &self.colstore_dir,
-                    partition.id,
-                    snapshot,
-                    &source_columns,
-                    &table_desc.primary_key,
-                    pushdown_predicate,
-                )?;
-                let result =
-                    olap::execute_analytic_select_compact(&select, compact_res.rows, &mapping)?;
-                Ok(StatementResult::Query(result))
-            }
-            StorageDescriptor::Converting { .. } => match &tablet.column_manifest {
-                Some(cat_manifest) => {
+                StorageDescriptor::Column => {
+                    let cat_manifest = tablet.column_manifest.as_ref().ok_or_else(|| {
+                        HtapError::InvalidArgument(format!(
+                            "partition {} has Column storage but tablet {tablet_id} has no column manifest in catalog",
+                            partition.id
+                        ))
+                    })?;
                     let disk_manifest = htap_convert::open(&self.colstore_dir, tablet_id)?;
                     if disk_manifest.generation != cat_manifest.generation {
                         return Err(HtapError::InvalidArgument(format!(
-                            "column manifest generation mismatch for converting tablet {tablet_id}: disk {} != catalog {}",
+                            "column manifest generation mismatch for tablet {tablet_id}: disk {} != catalog {}",
                             disk_manifest.generation, cat_manifest.generation
                         )));
                     }
-                    let (source_columns, mapping) = olap::plan_source_columns(&select);
-                    let pushdown_predicate =
-                        olap::select_pushdown_predicate(select.filter.as_ref());
                     let compact_res = htap_convert::read_column_partition_compact_core(
                         catalog,
                         &self.engine,
@@ -564,34 +922,69 @@ impl LocalServer {
                         snapshot,
                         &source_columns,
                         &table_desc.primary_key,
-                        pushdown_predicate,
+                        pushdown_predicate.clone(),
                     )?;
-                    let result =
-                        olap::execute_analytic_select_compact(&select, compact_res.rows, &mapping)?;
-                    Ok(StatementResult::Query(result))
+                    all_compact_rows.extend(compact_res.rows);
                 }
-                None => {
-                    let is_snapshot_pinned = partition
-                        .conversion
-                        .as_ref()
-                        .map(|c| c.phase == htap_catalog::ConversionPhase::SnapshotPinned)
-                        .unwrap_or(false);
-                    if is_snapshot_pinned {
-                        let entries = self
-                            .engine
-                            .scan_partition(partition.id.as_u64(), snapshot)?;
-                        let rows = htap_convert::collapse_entries_to_rows(&entries);
-                        let result = olap::execute_analytic_select(&select, rows)?;
-                        Ok(StatementResult::Query(result))
-                    } else {
-                        Err(HtapError::InvalidArgument(format!(
-                            "partition {} is converting without manifest but phase is not SnapshotPinned",
-                            partition.id
-                        )))
+                StorageDescriptor::Converting { .. } => match &tablet.column_manifest {
+                    Some(cat_manifest) => {
+                        let disk_manifest = htap_convert::open(&self.colstore_dir, tablet_id)?;
+                        if disk_manifest.generation != cat_manifest.generation {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "column manifest generation mismatch for converting tablet {tablet_id}: disk {} != catalog {}",
+                                disk_manifest.generation, cat_manifest.generation
+                            )));
+                        }
+                        let compact_res = htap_convert::read_column_partition_compact_core(
+                            catalog,
+                            &self.engine,
+                            &self.colstore_dir,
+                            partition.id,
+                            snapshot,
+                            &source_columns,
+                            &table_desc.primary_key,
+                            pushdown_predicate.clone(),
+                        )?;
+                        all_compact_rows.extend(compact_res.rows);
                     }
-                }
-            },
+                    None => {
+                        let is_snapshot_pinned = partition
+                            .conversion
+                            .as_ref()
+                            .map(|c| c.phase == htap_catalog::ConversionPhase::SnapshotPinned)
+                            .unwrap_or(false);
+                        if is_snapshot_pinned {
+                            let entries = self
+                                .engine
+                                .scan_partition(partition.id.as_u64(), snapshot)?;
+                            let rows = htap_convert::collapse_entries_to_rows(&entries);
+                            let mut compact_rows = Vec::with_capacity(rows.len());
+                            for row in rows {
+                                let mut values = Vec::with_capacity(source_columns.len());
+                                for &idx in &source_columns {
+                                    let val = row.get(idx).cloned().ok_or_else(|| {
+                                        HtapError::Internal(format!(
+                                            "row missing column index {idx}"
+                                        ))
+                                    })?;
+                                    values.push(val);
+                                }
+                                compact_rows.push(Row::new(values));
+                            }
+                            all_compact_rows.extend(compact_rows);
+                        } else {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "partition {} is converting without manifest but phase is not SnapshotPinned",
+                                partition.id
+                            )));
+                        }
+                    }
+                },
+            }
         }
+
+        let result = olap::execute_analytic_select_compact(&select, all_compact_rows, &mapping)?;
+        Ok(StatementResult::Query(result))
     }
 
     /// Returns the columnar storage root directory for this local server.

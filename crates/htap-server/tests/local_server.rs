@@ -3,14 +3,18 @@
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{
-    ConversionDescriptor, ConversionPhase, NodeId, PartitionId, ReplicaDescriptor, ReplicaId,
-    StorageDescriptor, StorageFormat, TableId, TabletId,
+    ConversionDescriptor, ConversionPhase, NodeId, PartitionId, PartitioningDescriptor,
+    PartitioningMethod, RangeBound, ReplicaDescriptor, ReplicaId, StorageDescriptor, StorageFormat,
+    TableId, TabletId,
 };
-use htap_common::types::{DataType, Value};
+use htap_common::types::{ColumnDef, DataType, Schema, Value};
 use htap_common::version::Version;
 use htap_common::HtapError;
 use htap_movement::{CopyOptions, DataFormat, MovementJobPhase, TabletCloneOptions};
-use htap_server::LocalServer;
+use htap_server::{
+    ListPartitionDefinition, LocalServer, PartitionTopology, PartitionedTableDefinition,
+    RangePartitionDefinition,
+};
 use htap_sql::result::{CommandResult, StatementResult};
 use tempfile::TempDir;
 
@@ -1786,4 +1790,1006 @@ fn test_pushdown_predicate_selection_and_pruning_stats() {
     assert_eq!(src_cols, vec![1, 2]);
     assert_eq!(mapping.get(&1), Some(&0));
     assert_eq!(mapping.get(&2), Some(&1));
+}
+
+#[test]
+fn test_partitioned_native_range_topology_catalog_reopen_continuation() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = LocalServer::open(dir.path()).unwrap();
+
+        let schema = Schema::new(vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnDef {
+                name: "name".into(),
+                data_type: DataType::String,
+                nullable: true,
+                primary_key: false,
+            },
+        ])
+        .unwrap();
+
+        let def = PartitionedTableDefinition::new(
+            "users",
+            schema,
+            vec![0],
+            PartitionTopology::Range {
+                key_column: 0,
+                partitions: vec![
+                    RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                    RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+                ],
+            },
+        );
+
+        let res = server.create_partitioned_table(def.clone()).unwrap();
+        assert_eq!(res, StatementResult::ddl(1));
+
+        // Duplicate table rejection
+        let err = server.create_partitioned_table(def).unwrap_err();
+        assert!(matches!(err, HtapError::Conflict(_)));
+    }
+
+    // Inspect catalog on disk
+    let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let snap = cat_store.load().unwrap().expect("snapshot must exist");
+    assert_eq!(snap.generation, 1);
+    assert_eq!(snap.tables.len(), 1);
+    assert_eq!(snap.partitions.len(), 2);
+    assert_eq!(snap.tablets.len(), 2);
+    assert_eq!(snap.replicas.len(), 2);
+
+    let table = &snap.tables[0];
+    assert_eq!(table.name, "users");
+    assert_eq!(table.id.as_u64(), 1);
+    assert_eq!(table.primary_key, vec![0]);
+    assert_eq!(
+        table.partitions,
+        vec![PartitionId::new(1), PartitionId::new(2)]
+    );
+    assert_eq!(
+        table.partitioning,
+        Some(PartitioningDescriptor::new(0, PartitioningMethod::Range))
+    );
+
+    let p0 = snap.partition(PartitionId::new(1)).unwrap();
+    assert_eq!(p0.name, "p0");
+    assert_eq!(p0.table_id, TableId::new(1));
+    assert_eq!(p0.storage, StorageDescriptor::Row);
+    assert_eq!(p0.tablets, vec![TabletId::new(1)]);
+    assert_eq!(
+        p0.range,
+        Some(RangeBound::new(Value::Int64(0), Value::Int64(100)))
+    );
+
+    let p1 = snap.partition(PartitionId::new(2)).unwrap();
+    assert_eq!(p1.name, "p1");
+    assert_eq!(p1.table_id, TableId::new(1));
+    assert_eq!(p1.storage, StorageDescriptor::Row);
+    assert_eq!(p1.tablets, vec![TabletId::new(2)]);
+    assert_eq!(
+        p1.range,
+        Some(RangeBound::new(Value::Int64(100), Value::Int64(200)))
+    );
+
+    let t1 = snap.tablet(TabletId::new(1)).unwrap();
+    assert_eq!(t1.partition_id, PartitionId::new(1));
+    assert_eq!(t1.bucket, 0);
+    assert_eq!(t1.replicas, vec![ReplicaId::new(1)]);
+
+    let r1 = snap.replica(ReplicaId::new(1)).unwrap();
+    assert_eq!(r1.tablet_id, TabletId::new(1));
+    assert_eq!(r1.node_id, NodeId::new(1));
+    assert!(r1.is_leader);
+    assert!(r1.healthy);
+
+    // Reopen server and verify persistence + ID continuation
+    let server2 = LocalServer::open(dir.path()).unwrap();
+    server2
+        .execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, amount DOUBLE);")
+        .unwrap();
+
+    let snap2 = cat_store.load().unwrap().expect("snapshot 2 must exist");
+    assert_eq!(snap2.generation, 2);
+    assert_eq!(snap2.tables.len(), 2);
+    assert_eq!(snap2.partitions.len(), 3);
+    assert_eq!(snap2.tablets.len(), 3);
+    assert_eq!(snap2.replicas.len(), 3);
+
+    let orders_tbl = snap2.table_by_name("orders").unwrap();
+    assert_eq!(orders_tbl.id.as_u64(), 2);
+    assert_eq!(orders_tbl.partitions[0].as_u64(), 3);
+
+    let orders_part = snap2.partition(PartitionId::new(3)).unwrap();
+    assert_eq!(orders_part.name, "p0");
+    assert_eq!(orders_part.tablets[0].as_u64(), 3);
+
+    let orders_tab = snap2.tablet(TabletId::new(3)).unwrap();
+    assert_eq!(orders_tab.replicas[0].as_u64(), 3);
+}
+
+#[test]
+fn test_partitioned_native_list_topology_catalog_reopen_continuation() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = LocalServer::open(dir.path()).unwrap();
+
+        let schema = Schema::new(vec![
+            ColumnDef {
+                name: "region".into(),
+                data_type: DataType::String,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnDef {
+                name: "revenue".into(),
+                data_type: DataType::Float64,
+                nullable: false,
+                primary_key: false,
+            },
+        ])
+        .unwrap();
+
+        let def = PartitionedTableDefinition::new(
+            "sales",
+            schema,
+            vec![0],
+            PartitionTopology::List {
+                key_column: 0,
+                partitions: vec![
+                    ListPartitionDefinition::new(
+                        "us",
+                        vec![
+                            Value::String("US-EAST".into()),
+                            Value::String("US-WEST".into()),
+                        ],
+                    ),
+                    ListPartitionDefinition::new(
+                        "eu",
+                        vec![
+                            Value::String("EU-CENTRAL".into()),
+                            Value::String("EU-WEST".into()),
+                        ],
+                    ),
+                ],
+            },
+        );
+
+        let res = server.create_partitioned_table(def).unwrap();
+        assert_eq!(res, StatementResult::ddl(1));
+    }
+
+    let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let snap = cat_store.load().unwrap().expect("snapshot must exist");
+    assert_eq!(snap.generation, 1);
+    assert_eq!(snap.tables.len(), 1);
+    assert_eq!(snap.partitions.len(), 2);
+
+    let table = &snap.tables[0];
+    assert_eq!(table.name, "sales");
+    assert_eq!(
+        table.partitioning,
+        Some(PartitioningDescriptor::new(0, PartitioningMethod::List))
+    );
+
+    let p0 = snap.partition(PartitionId::new(1)).unwrap();
+    assert_eq!(p0.name, "us");
+    assert_eq!(
+        p0.list_values,
+        vec![
+            Value::String("US-EAST".into()),
+            Value::String("US-WEST".into()),
+        ]
+    );
+
+    let p1 = snap.partition(PartitionId::new(2)).unwrap();
+    assert_eq!(p1.name, "eu");
+    assert_eq!(
+        p1.list_values,
+        vec![
+            Value::String("EU-CENTRAL".into()),
+            Value::String("EU-WEST".into()),
+        ]
+    );
+
+    // Reopen server and add second partitioned table with 2 partitions
+    let server2 = LocalServer::open(dir.path()).unwrap();
+    let schema2 = Schema::new(vec![ColumnDef {
+        name: "category".into(),
+        data_type: DataType::String,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let def2 = PartitionedTableDefinition::new(
+        "products",
+        schema2,
+        vec![0],
+        PartitionTopology::List {
+            key_column: 0,
+            partitions: vec![
+                ListPartitionDefinition::new("electronics", vec![Value::String("PHONE".into())]),
+                ListPartitionDefinition::new("apparel", vec![Value::String("SHIRT".into())]),
+            ],
+        },
+    );
+    server2.create_partitioned_table(def2).unwrap();
+
+    let snap2 = cat_store.load().unwrap().expect("snapshot 2 must exist");
+    assert_eq!(snap2.generation, 2);
+    assert_eq!(snap2.tables.len(), 2);
+    assert_eq!(snap2.partitions.len(), 4);
+    assert_eq!(snap2.tablets.len(), 4);
+    assert_eq!(snap2.replicas.len(), 4);
+
+    let prod = snap2.table_by_name("products").unwrap();
+    assert_eq!(prod.id.as_u64(), 2);
+    assert_eq!(
+        prod.partitions,
+        vec![PartitionId::new(3), PartitionId::new(4)]
+    );
+}
+
+#[test]
+fn test_partitioned_boundary_unmatched_null_type_errors() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::String,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "t_range",
+        schema.clone(),
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // 1. Boundary tests:
+    // id = 0 (inclusive lower bound of p0)
+    server
+        .execute("INSERT INTO t_range (id, val) VALUES (0, 'zero');")
+        .unwrap();
+    // id = 99 (upper edge of p0)
+    server
+        .execute("INSERT INTO t_range (id, val) VALUES (99, 'ninety-nine');")
+        .unwrap();
+    // id = 100 (exclusive upper of p0, inclusive lower of p1)
+    server
+        .execute("INSERT INTO t_range (id, val) VALUES (100, 'hundred');")
+        .unwrap();
+    // id = 199 (upper edge of p1)
+    server
+        .execute("INSERT INTO t_range (id, val) VALUES (199, 'one-ninety-nine');")
+        .unwrap();
+
+    // Point reads on all boundary keys
+    for &(k, expected) in &[
+        (0, "zero"),
+        (99, "ninety-nine"),
+        (100, "hundred"),
+        (199, "one-ninety-nine"),
+    ] {
+        let res = server
+            .execute(&format!("SELECT val FROM t_range WHERE id = {k};"))
+            .unwrap();
+        match res {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.num_rows(), 1);
+                assert_eq!(
+                    qr.rows()[0].get(0),
+                    Some(&Value::String(expected.to_string()))
+                );
+            }
+            other => panic!("expected query result, got {other:?}"),
+        }
+    }
+
+    // 2. Unmatched partition key tests
+    // id = 200 (at upper bound of p1, which is exclusive -> unmatched!)
+    let err_insert_200 = server
+        .execute("INSERT INTO t_range (id, val) VALUES (200, 'two-hundred');")
+        .unwrap_err();
+    assert!(matches!(err_insert_200, HtapError::InvalidArgument(_)));
+    assert!(err_insert_200
+        .to_string()
+        .contains("does not match any partition"));
+
+    // id = -1 (below lower bound of p0 -> unmatched!)
+    let err_insert_neg = server
+        .execute("INSERT INTO t_range (id, val) VALUES (-1, 'neg');")
+        .unwrap_err();
+    assert!(matches!(err_insert_neg, HtapError::InvalidArgument(_)));
+    assert!(err_insert_neg
+        .to_string()
+        .contains("does not match any partition"));
+
+    // Point select on unmatched key
+    let err_select_200 = server
+        .execute("SELECT val FROM t_range WHERE id = 200;")
+        .unwrap_err();
+    assert!(matches!(err_select_200, HtapError::InvalidArgument(_)));
+    assert!(err_select_200
+        .to_string()
+        .contains("does not match any partition"));
+
+    // Delete on unmatched key
+    let err_delete_200 = server
+        .execute("DELETE FROM t_range WHERE id = 200;")
+        .unwrap_err();
+    assert!(matches!(err_delete_200, HtapError::InvalidArgument(_)));
+    assert!(err_delete_200
+        .to_string()
+        .contains("does not match any partition"));
+
+    // 3. Null partition key test
+    let err_null = server
+        .execute("INSERT INTO t_range (id, val) VALUES (NULL, 'null_pk');")
+        .unwrap_err();
+    assert!(matches!(err_null, HtapError::InvalidArgument(_)));
+
+    // 4. Type mismatch tests
+    // SQL insert with incompatible type for partition key
+    let err_type = server
+        .execute("INSERT INTO t_range (id, val) VALUES ('not_an_int', 'foo');")
+        .unwrap_err();
+    assert!(matches!(err_type, HtapError::InvalidArgument(_)));
+
+    // create_partitioned_table with mismatched bound type
+    let err_def_type = server
+        .create_partitioned_table(PartitionedTableDefinition::new(
+            "bad_type",
+            schema.clone(),
+            vec![0],
+            PartitionTopology::Range {
+                key_column: 0,
+                partitions: vec![RangePartitionDefinition::new(
+                    "p0",
+                    Value::String("0".into()),
+                    Value::String("100".into()),
+                )],
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(err_def_type, HtapError::InvalidArgument(_)));
+
+    // create_partitioned_table with lower >= upper
+    let err_def_bounds = server
+        .create_partitioned_table(PartitionedTableDefinition::new(
+            "bad_bounds",
+            schema.clone(),
+            vec![0],
+            PartitionTopology::Range {
+                key_column: 0,
+                partitions: vec![RangePartitionDefinition::new(
+                    "p0",
+                    Value::Int64(100),
+                    Value::Int64(50),
+                )],
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(err_def_bounds, HtapError::InvalidArgument(_)));
+
+    // create_partitioned_table with overlapping ranges
+    let err_def_overlap = server
+        .create_partitioned_table(PartitionedTableDefinition::new(
+            "bad_overlap",
+            schema.clone(),
+            vec![0],
+            PartitionTopology::Range {
+                key_column: 0,
+                partitions: vec![
+                    RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                    RangePartitionDefinition::new("p1", Value::Int64(50), Value::Int64(150)),
+                ],
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(err_def_overlap, HtapError::InvalidArgument(_)));
+
+    // create_partitioned_table for List with duplicate list values across partitions
+    let err_def_dup_list = server
+        .create_partitioned_table(PartitionedTableDefinition::new(
+            "bad_dup_list",
+            schema,
+            vec![0],
+            PartitionTopology::List {
+                key_column: 0,
+                partitions: vec![
+                    ListPartitionDefinition::new("l0", vec![Value::Int64(1), Value::Int64(2)]),
+                    ListPartitionDefinition::new("l1", vec![Value::Int64(2), Value::Int64(3)]),
+                ],
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(err_def_dup_list, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_partitioned_multi_row_insert_spanning_partitions_one_version_point_delete() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "name".into(),
+            data_type: DataType::String,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "users",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(10)),
+                RangePartitionDefinition::new("p1", Value::Int64(10), Value::Int64(20)),
+                RangePartitionDefinition::new("p2", Value::Int64(20), Value::Int64(30)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // Multi-row INSERT spanning all 3 partitions in a single statement
+    let insert_res = server
+        .execute(
+            "INSERT INTO users (id, name) VALUES \
+            (1, 'alice'), \
+            (15, 'bob'), \
+            (25, 'carol'), \
+            (2, 'dave');",
+        )
+        .unwrap();
+
+    // Must be 4 rows affected and exactly 1 version
+    assert_eq!(insert_res, StatementResult::dml(4, Some(Version::new(2))));
+
+    // Point select from each partition
+    let sel1 = server
+        .execute("SELECT name FROM users WHERE id = 1;")
+        .unwrap();
+    assert_eq!(
+        sel1,
+        StatementResult::query(
+            vec![ColumnDef {
+                name: "name".into(),
+                data_type: DataType::String,
+                nullable: true,
+                primary_key: false
+            }],
+            vec![htap_common::types::Row::new(vec![Value::String(
+                "alice".into()
+            )])],
+        )
+    );
+
+    let sel15 = server
+        .execute("SELECT name FROM users WHERE id = 15;")
+        .unwrap();
+    assert_eq!(
+        sel15,
+        StatementResult::query(
+            vec![ColumnDef {
+                name: "name".into(),
+                data_type: DataType::String,
+                nullable: true,
+                primary_key: false
+            }],
+            vec![htap_common::types::Row::new(vec![Value::String(
+                "bob".into()
+            )])],
+        )
+    );
+
+    let sel25 = server
+        .execute("SELECT name FROM users WHERE id = 25;")
+        .unwrap();
+    assert_eq!(
+        sel25,
+        StatementResult::query(
+            vec![ColumnDef {
+                name: "name".into(),
+                data_type: DataType::String,
+                nullable: true,
+                primary_key: false
+            }],
+            vec![htap_common::types::Row::new(vec![Value::String(
+                "carol".into()
+            )])],
+        )
+    );
+
+    // DELETE id = 15 (in p1)
+    let del_res = server.execute("DELETE FROM users WHERE id = 15;").unwrap();
+    assert_eq!(del_res, StatementResult::dml(1, Some(Version::new(3))));
+
+    // Point select on id = 15 now returns empty
+    let sel15_after = server
+        .execute("SELECT name FROM users WHERE id = 15;")
+        .unwrap();
+    match sel15_after {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 0),
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // Other partitions unaffected
+    let sel1_after = server
+        .execute("SELECT name FROM users WHERE id = 1;")
+        .unwrap();
+    match sel1_after {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 1),
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_partitioned_composite_pk_partition_key_not_first() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "tenant_id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "region_code".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "name".into(),
+            data_type: DataType::String,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    // Partition key is region_code (index 1), which is the SECOND column in PK (vec![0, 1])
+    let def = PartitionedTableDefinition::new(
+        "tenants",
+        schema,
+        vec![0, 1],
+        PartitionTopology::Range {
+            key_column: 1,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int32(1), Value::Int32(10)),
+                RangePartitionDefinition::new("p1", Value::Int32(10), Value::Int32(20)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // Insert rows
+    server
+        .execute(
+            "INSERT INTO tenants (tenant_id, region_code, name) VALUES \
+            (100, 5, 'Corp A'), \
+            (100, 15, 'Corp B'), \
+            (200, 5, 'Corp C');",
+        )
+        .unwrap();
+
+    // Point select with composite PK where partition key is not first
+    let res_a = server
+        .execute("SELECT name FROM tenants WHERE tenant_id = 100 AND region_code = 5;")
+        .unwrap();
+    match res_a {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Corp A".into())));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    let res_b = server
+        .execute("SELECT name FROM tenants WHERE tenant_id = 100 AND region_code = 15;")
+        .unwrap();
+    match res_b {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Corp B".into())));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // Delete composite PK
+    server
+        .execute("DELETE FROM tenants WHERE tenant_id = 100 AND region_code = 15;")
+        .unwrap();
+
+    let res_b_del = server
+        .execute("SELECT name FROM tenants WHERE tenant_id = 100 AND region_code = 15;")
+        .unwrap();
+    match res_b_del {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 0),
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // Still present
+    let res_c = server
+        .execute("SELECT name FROM tenants WHERE tenant_id = 200 AND region_code = 5;")
+        .unwrap();
+    match res_c {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("Corp C".into())));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_partitioned_olap_across_partitions_and_empty_aggregate() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: false,
+        },
+        ColumnDef {
+            name: "category".into(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "metrics",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // 1. Empty table aggregates across partitions
+    let empty_global = server
+        .execute("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM metrics;")
+        .unwrap();
+    match empty_global {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let r = &qr.rows()[0];
+            assert_eq!(r.get(0), Some(&Value::Int64(0)));
+            assert_eq!(r.get(1), Some(&Value::Null));
+            assert_eq!(r.get(2), Some(&Value::Null));
+            assert_eq!(r.get(3), Some(&Value::Null));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    let empty_grouped = server
+        .execute("SELECT category, COUNT(*) FROM metrics GROUP BY category;")
+        .unwrap();
+    match empty_grouped {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 0);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // 2. Insert data across both partitions
+    server
+        .execute(
+            "INSERT INTO metrics (id, val, category) VALUES \
+            (10, 100, 'A'), \
+            (20, 200, 'B'), \
+            (30, 300, 'A'), \
+            (110, 400, 'A'), \
+            (120, 500, 'B');",
+        )
+        .unwrap();
+
+    // 3. Global aggregate across partitions
+    let global_res = server
+        .execute("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM metrics;")
+        .unwrap();
+    match global_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            let r = &qr.rows()[0];
+            assert_eq!(r.get(0), Some(&Value::Int64(5)));
+            assert_eq!(r.get(1), Some(&Value::Int64(1500)));
+            assert_eq!(r.get(2), Some(&Value::Int64(100)));
+            assert_eq!(r.get(3), Some(&Value::Int64(500)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // 4. Grouped aggregate across partitions
+    let grouped_res = server
+        .execute("SELECT category, COUNT(*), SUM(val) FROM metrics GROUP BY category;")
+        .unwrap();
+    match grouped_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 2);
+            let r0 = &qr.rows()[0];
+            let r1 = &qr.rows()[1];
+            assert_eq!(r0.get(0), Some(&Value::String("A".into())));
+            assert_eq!(r0.get(1), Some(&Value::Int64(3)));
+            assert_eq!(r0.get(2), Some(&Value::Int64(800)));
+
+            assert_eq!(r1.get(0), Some(&Value::String("B".into())));
+            assert_eq!(r1.get(1), Some(&Value::Int64(2)));
+            assert_eq!(r1.get(2), Some(&Value::Int64(700)));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    // 5. Filter scan across partitions
+    let filter_res = server
+        .execute("SELECT id, val FROM metrics WHERE val >= 300;")
+        .unwrap();
+    match filter_res {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 3);
+            let ids: Vec<i64> = qr
+                .rows()
+                .iter()
+                .map(|r| match r.get(0).unwrap() {
+                    Value::Int64(id) => *id,
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert_eq!(ids, vec![30, 110, 120]);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_convert_table_multi_partition_guard() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".into(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "multi_part",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(50)),
+                RangePartitionDefinition::new("p1", Value::Int64(50), Value::Int64(100)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // convert_table must fail with Unsupported because table has 2 partitions
+    let err = server.convert_table("multi_part").unwrap_err();
+    assert!(matches!(err, HtapError::Unsupported(_)));
+    assert!(err
+        .to_string()
+        .contains("must have exactly one partition, found 2"));
+}
+
+#[test]
+fn test_partitioned_empty_topology_rejection_no_catalog_mutation() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::String,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    // 1. Initially catalog is empty (no snapshot)
+    assert!(cat_store.load().unwrap().is_none());
+
+    // 2. Reject empty Range topology on uninitialized catalog
+    let empty_range_def = PartitionedTableDefinition::new(
+        "empty_range",
+        schema.clone(),
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![],
+        },
+    );
+    let err_range = server
+        .create_partitioned_table(empty_range_def)
+        .unwrap_err();
+    assert!(
+        matches!(err_range, HtapError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err_range:?}"
+    );
+    assert!(err_range
+        .to_string()
+        .contains("must define at least one partition"));
+
+    // Verify catalog still has no snapshot / no mutation
+    assert!(cat_store.load().unwrap().is_none());
+
+    // 3. Reject empty List topology on uninitialized catalog
+    let empty_list_def = PartitionedTableDefinition::new(
+        "empty_list",
+        schema.clone(),
+        vec![0],
+        PartitionTopology::List {
+            key_column: 0,
+            partitions: vec![],
+        },
+    );
+    let err_list = server.create_partitioned_table(empty_list_def).unwrap_err();
+    assert!(
+        matches!(err_list, HtapError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err_list:?}"
+    );
+    assert!(err_list
+        .to_string()
+        .contains("must define at least one partition"));
+
+    // Verify catalog still has no snapshot / no mutation
+    assert!(cat_store.load().unwrap().is_none());
+
+    // 4. Create a valid baseline table to advance catalog to generation 1
+    server
+        .execute("CREATE TABLE baseline (id BIGINT PRIMARY KEY, val VARCHAR);")
+        .unwrap();
+
+    let snap_before = cat_store.load().unwrap().expect("snapshot must exist");
+    assert_eq!(snap_before.generation, 1);
+    assert_eq!(snap_before.tables.len(), 1);
+    assert_eq!(snap_before.partitions.len(), 1);
+    assert_eq!(snap_before.tablets.len(), 1);
+    assert_eq!(snap_before.replicas.len(), 1);
+
+    // 5. Attempt empty Range table on populated catalog
+    let err_range_pop = server
+        .create_partitioned_table(PartitionedTableDefinition::new(
+            "empty_range_2",
+            schema.clone(),
+            vec![0],
+            PartitionTopology::Range {
+                key_column: 0,
+                partitions: vec![],
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(err_range_pop, HtapError::InvalidArgument(_)));
+    assert!(err_range_pop
+        .to_string()
+        .contains("must define at least one partition"));
+
+    // Verify catalog has not mutated at all
+    let snap_after_range = cat_store.load().unwrap().expect("snapshot must exist");
+    assert_eq!(snap_before, snap_after_range);
+
+    // 6. Attempt empty List table on populated catalog
+    let err_list_pop = server
+        .create_partitioned_table(PartitionedTableDefinition::new(
+            "empty_list_2",
+            schema.clone(),
+            vec![0],
+            PartitionTopology::List {
+                key_column: 0,
+                partitions: vec![],
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(err_list_pop, HtapError::InvalidArgument(_)));
+    assert!(err_list_pop
+        .to_string()
+        .contains("must define at least one partition"));
+
+    // Verify catalog has not mutated at all
+    let snap_after_list = cat_store.load().unwrap().expect("snapshot must exist");
+    assert_eq!(snap_before, snap_after_list);
+
+    // 7. Verify subsequent valid table gets expected sequential IDs (no IDs burned/leaked)
+    let valid_range_def = PartitionedTableDefinition::new(
+        "valid_range",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![RangePartitionDefinition::new(
+                "p0",
+                Value::Int64(0),
+                Value::Int64(10),
+            )],
+        },
+    );
+    server.create_partitioned_table(valid_range_def).unwrap();
+
+    let snap_final = cat_store
+        .load()
+        .unwrap()
+        .expect("final snapshot must exist");
+    assert_eq!(snap_final.generation, 2);
+    assert_eq!(snap_final.tables.len(), 2);
+    assert_eq!(snap_final.partitions.len(), 2);
+    assert_eq!(snap_final.tablets.len(), 2);
+    assert_eq!(snap_final.replicas.len(), 2);
+
+    let tbl = snap_final.table_by_name("valid_range").unwrap();
+    assert_eq!(tbl.id.as_u64(), 2);
+    assert_eq!(tbl.partitions[0].as_u64(), 2);
+
+    let part = snap_final.partition(tbl.partitions[0]).unwrap();
+    assert_eq!(part.tablets[0].as_u64(), 2);
+
+    let tab = snap_final.tablet(part.tablets[0]).unwrap();
+    assert_eq!(tab.replicas[0].as_u64(), 2);
 }
