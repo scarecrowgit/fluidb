@@ -404,30 +404,186 @@ fn test_malformed_sql_returns_invalid_argument() {
 }
 
 #[test]
-fn test_mysql_partition_ddl_rejected_at_parser_level() {
+fn test_mysql_partition_ddl_parsed_and_bound() {
     let cases = [
-        "CREATE TABLE t (id INT, val INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
-        "CREATE TABLE t (id INT, val INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN MAXVALUE)",
-        "CREATE TABLE t (id INT, val INT) PARTITION BY RANGE COLUMNS (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
-        "CREATE TABLE t (id INT, val INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3, 4))",
-        "CREATE TABLE t (id INT, val INT) PARTITION BY LIST COLUMNS (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3, 4))",
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT) PARTITION BY RANGE COLUMNS (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20))",
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3, 4))",
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT) PARTITION BY LIST COLUMNS (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3, 4))",
     ];
 
+    let cat = CatalogSnapshot::empty();
     for case in cases {
+        let stmt = parse_one(case).expect("should parse successfully");
+        let bound = bind(&stmt, &cat).expect("should bind successfully");
+        match bound {
+            BoundStatement::CreateTable(create) => {
+                assert!(
+                    create.partitioning.is_some(),
+                    "expected partitioning for {case}"
+                );
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_mysql_partition_ddl_negative_parser_and_binder() {
+    let catalog = CatalogSnapshot::empty();
+
+    // 1. Partition options (ENGINE, COMMENT, TABLESPACE) are rejected at parse time
+    let option_cases = [
+        "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10) ENGINE = InnoDB)",
+        "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10) COMMENT = 'test comment')",
+        "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10) TABLESPACE = ts1)",
+        "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10) DATA DIRECTORY = '/data')",
+    ];
+    for case in option_cases {
         let res = parse_one(case);
         assert!(
             matches!(res, Err(HtapError::InvalidArgument(_))),
-            "expected InvalidArgument for MySQL partition DDL {:?}, got {:?}",
-            case,
-            res
+            "expected parse error for option case {case:?}, got {res:?}"
         );
-        if let Err(HtapError::InvalidArgument(msg)) = res {
-            assert!(
-                msg.contains("SQL parse error"),
-                "expected 'SQL parse error' in error message for {case:?}, got: {msg}"
-            );
-        }
     }
+
+    // 2. SUBPARTITION syntax is rejected at parse time
+    let subpartition_cases = [
+        "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) SUBPARTITION BY HASH(id) (PARTITION p0 VALUES LESS THAN (10))",
+        "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10) (SUBPARTITION s0))",
+    ];
+    for case in subpartition_cases {
+        let res = parse_one(case);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected parse error for subpartition case {case:?}, got {res:?}"
+        );
+    }
+
+    // 3. LIST DEFAULT is rejected (syntax without parens fails parser; with parens fails binder)
+    let list_default_noparens = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN DEFAULT)";
+    let res = parse_one(list_default_noparens);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(_))),
+        "expected parse error for LIST DEFAULT without parens, got {res:?}"
+    );
+
+    let list_default_case = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p1 VALUES IN (DEFAULT))";
+    let stmt = parse_one(list_default_case).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(_))),
+        "expected binder error for LIST DEFAULT, got {res:?}"
+    );
+
+    // 4. Malformed and non-final MAXVALUE
+    // Non-final MAXVALUE parses, but is rejected by binder
+    let nonfinal_maxvalue = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN MAXVALUE, PARTITION p1 VALUES LESS THAN (20))";
+    let stmt = parse_one(nonfinal_maxvalue).expect("should parse non-final MAXVALUE");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("defined after MAXVALUE partition")),
+        "expected binder error for non-final MAXVALUE, got {res:?}"
+    );
+
+    // Malformed MAXVALUE in tuple
+    let malformed_maxvalue_tuple = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (MAXVALUE, 10))";
+    let res = parse_one(malformed_maxvalue_tuple);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(_))),
+        "expected parse error for tuple MAXVALUE, got {res:?}"
+    );
+
+    // 5. Multi-column COLUMNS (parses, but rejected by binder as Unsupported)
+    let multi_col_range = "CREATE TABLE t (id INT, k INT, PRIMARY KEY (id, k)) PARTITION BY RANGE COLUMNS (id, k) (PARTITION p0 VALUES LESS THAN (10))";
+    let stmt = parse_one(multi_col_range).expect("should parse multi-column range");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::Unsupported(ref msg)) if msg.contains("multi-column partitioning is not supported")),
+        "expected Unsupported for multi-column range, got {res:?}"
+    );
+
+    let multi_col_list = "CREATE TABLE t (id INT, k INT, PRIMARY KEY (id, k)) PARTITION BY LIST COLUMNS (id, k) (PARTITION p0 VALUES IN (1, 2))";
+    let stmt = parse_one(multi_col_list).expect("should parse multi-column list");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::Unsupported(ref msg)) if msg.contains("multi-column partitioning is not supported")),
+        "expected Unsupported for multi-column list, got {res:?}"
+    );
+
+    // 6. Expressions in PARTITION BY (parses, but rejected by binder as Unsupported)
+    let expr_range = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id + 1) (PARTITION p0 VALUES LESS THAN (10))";
+    let stmt = parse_one(expr_range).expect("should parse range expression");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::Unsupported(ref msg)) if msg.contains("expressions in PARTITION BY are not supported")),
+        "expected Unsupported for range expression, got {res:?}"
+    );
+
+    let expr_list = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY LIST (id * 2) (PARTITION p0 VALUES IN (1, 2))";
+    let stmt = parse_one(expr_list).expect("should parse list expression");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::Unsupported(ref msg)) if msg.contains("expressions in PARTITION BY are not supported")),
+        "expected Unsupported for list expression, got {res:?}"
+    );
+
+    // 7. Duplicate names / duplicate list values (parses, but rejected by binder as InvalidArgument)
+    // Duplicate partition name in RANGE
+    let dup_name_range = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p0 VALUES LESS THAN (20))";
+    let stmt = parse_one(dup_name_range).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("duplicate partition name 'p0'")),
+        "expected InvalidArgument for dup partition name in range, got {res:?}"
+    );
+
+    // Duplicate partition name in LIST
+    let dup_name_list = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1), PARTITION p0 VALUES IN (2))";
+    let stmt = parse_one(dup_name_list).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("duplicate partition name 'p0'")),
+        "expected InvalidArgument for dup partition name in list, got {res:?}"
+    );
+
+    // Duplicate list value within same partition
+    let dup_val_intra = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 1))";
+    let stmt = parse_one(dup_val_intra).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("duplicate list value '1'")),
+        "expected InvalidArgument for duplicate value within partition, got {res:?}"
+    );
+
+    // Duplicate list value across partitions
+    let dup_val_inter = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (2, 3))";
+    let stmt = parse_one(dup_val_inter).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("duplicate list value '2' across partitions")),
+        "expected InvalidArgument for duplicate value across partitions, got {res:?}"
+    );
+
+    // 8. Invalid range order (parses, but rejected by binder as InvalidArgument)
+    // Decreasing order
+    let decreasing_range = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (20), PARTITION p1 VALUES LESS THAN (10))";
+    let stmt = parse_one(decreasing_range).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("strictly increasing")),
+        "expected InvalidArgument for decreasing range order, got {res:?}"
+    );
+
+    // Equal adjacent bounds
+    let equal_range = "CREATE TABLE t (id INT PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (10))";
+    let stmt = parse_one(equal_range).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("strictly increasing")),
+        "expected InvalidArgument for equal range bounds, got {res:?}"
+    );
 }
 
 #[test]

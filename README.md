@@ -125,7 +125,7 @@ The workspace consists of modular crates separated by architectural boundaries:
 
 The SQL engine and embedded client execute an explicit, synchronous subset of SQL across unpartitioned and partitioned tables:
 
-- **`CREATE TABLE`:** Defines table schema with typed columns (`BIGINT`, `INT`, `VARCHAR`, etc.) and a primary key constraint. Tables created via SQL DDL remain unpartitioned with a default single-partition / single-tablet row topology (`partitions.len() == 1`, `tablets.len() == 1`). MySQL `PARTITION BY RANGE/LIST` syntax is rejected at the parser level; partitioned tables are created via the native admin API.
+- **`CREATE TABLE`:** Defines table schema with typed columns (`BIGINT`, `INT`, `VARCHAR`, etc.) and a primary key constraint. Tables created without partitioning clauses receive a default single-partition / single-tablet row topology (`partitions.len() == 1`, `tablets.len() == 1`, default partition `"p0"`). MySQL `PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via SQL DDL as well as via the native admin API.
 - **Literal `INSERT`:** Single- or multi-row insert statements with literal value lists:
   ```sql
   INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30), (2, 'Bob', 25);
@@ -150,16 +150,19 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
   - Base scan pushdown optimization: For materialized `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads unioning primary key and requested columns, safely pushing down at most one eligible predicate leaf (`=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) directly into `SegmentReader::scan`. Stale base rows are suppressed via newest post-base rowstore deltas, mutations (`Put`/`Delete`) are overlaid, and rows are ordered by primary key deterministically before complete residual SQL filter, aggregate, and group evaluation. `ScanStats`/pruning is tracked internally as execution evidence, but SQL evaluation operates on materialized logical rows (vectorized aggregation is not implemented).
   - Point read isolation: Complete-PK `Route::RowstorePointRead` queries remain strictly isolated, separate, and unchanged.
 
-### Native Partitioned Table Execution (Non-SQL Admin API)
+### Partitioned Table Support (SQL DDL & Native Admin API)
 
-Because MySQL partition DDL is not supported by the pinned SQL parser, partitioned table topology is defined and managed via the native `LocalServer` admin API:
+Partitioned tables can be defined via SQL DDL or via the native `LocalServer` admin API:
 
-- **Topology API:** `LocalServer::create_partitioned_table(definition)` accepts a [`PartitionedTableDefinition`](crates/htap-server/src/lib.rs) with:
+- **Supported SQL Partition DDL:**
+  - `PARTITION BY RANGE (col)` or `PARTITION BY RANGE COLUMNS (col)` with `(PARTITION p0 VALUES LESS THAN (v0), ..., PARTITION pN VALUES LESS THAN (vN) | VALUES LESS THAN MAXVALUE)`.
+  - `PARTITION BY LIST (col)` or `PARTITION BY LIST COLUMNS (col)` with `(PARTITION p0 VALUES IN (v1, v2), ...)`.
+- **Native Topology API:** `LocalServer::create_partitioned_table(definition)` accepts a [`PartitionedTableDefinition`](crates/htap-server/src/lib.rs) with:
   - `PartitionTopology::Range { key_column, partitions }`: ordered non-overlapping half-open intervals `[lower, upper)`.
   - `PartitionTopology::List { key_column, partitions }`: disjoint sets of explicit values.
 - **Catalog Validation:**
-  - The partition key column must be a non-null column included in the primary key (`primary_key` must contain `key_column`).
-  - Range bounds require `lower < upper`, strictly non-overlapping intervals, and typed compatibility with the key column.
+  - The partition key column must be a single non-null column included in the primary key (`primary_key` must contain `key_column`).
+  - Range bounds require strictly increasing values (`prev_bound < curr_bound`), non-overlapping intervals, and typed compatibility with the key column. `MAXVALUE` is permitted only on the final range partition.
   - List partitions require non-empty disjoint value lists without duplicate entries across or within partitions.
   - Duplicate partition names, empty partition lists, type mismatches, and schema/table name collisions are rejected with `HtapError::InvalidArgument` or `HtapError::Conflict`.
 - **Local Topology Invariant:**
@@ -185,15 +188,17 @@ Direct `SegmentReader` pushdown optimization is implemented for the compact base
 - Full MySQL dialect breadth, sessions, and transaction controls (`BEGIN`, `COMMIT`, `ROLLBACK`).
 - Non-PK DML / DDL (`UPDATE`, `ALTER TABLE`, `DROP TABLE`).
 - **MySQL Partition DDL & Partition Lifecycle Boundary:**
-  - SQL parser rejection: MySQL `CREATE TABLE ... PARTITION BY RANGE ...` and `PARTITION BY LIST ...` return `HtapError::InvalidArgument` from `parse_one` under `sqlparser 0.62` / `MySqlDialect` because the pinned parser does not retain MySQL partition definitions. If partition clauses or `partition_by` AST fields are manually populated, the binder rejects them with `HtapError::Unsupported`; no lossy reinterpretation of unrelated AST nodes is made. Native admin API (`create_partitioned_table`) is the supported mechanism to define partition topology.
+  - Supported SQL partitioning: MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via vendored `sqlparser` and bound to validated catalog partition models.
+  - Unsupported partitioning forms: Partition options (`ENGINE`, `COMMENT`, `TABLESPACE`, `DATA DIRECTORY`), `SUBPARTITION`, `LIST DEFAULT`, expressions in partition keys, multi-column `COLUMNS`, and non-final/malformed `MAXVALUE` are strictly rejected with parse or binder errors.
   - Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), partition split, merge, and drop remain deferred.
   - Multi-partition format conversion, multi-partition data movement, hash tablets, distributed/remote partition serving across network nodes, replica failover, and network wire protocol remain deferred.
-  - Future parser upgrades require explicit mapping of finite typed range/list definitions; `MAXVALUE` and partition options remain unsupported until catalog models change.
 
 ### Verification & Test Evidence
 
 Partition metadata and execution are verified by named integration test suites:
 - **Server Partition Execution Tests (`crates/htap-server/tests/local_server.rs`):**
+  - `test_sql_range_partitioning_ddl_and_maxvalue_routing`: verifies SQL range partitioning DDL and MAXVALUE routing.
+  - `test_sql_list_partitioning_ddl_and_routing`: verifies SQL list partitioning DDL and routing.
   - `test_partitioned_native_range_topology_catalog_reopen_continuation`: verifies range topology creation, CAS persistence, catalog reload, and version continuation across reopen.
   - `test_partitioned_native_list_topology_catalog_reopen_continuation`: verifies list topology creation, catalog reload, and reopen.
   - `test_partitioned_boundary_unmatched_null_type_errors`: verifies rejection of out-of-range keys, unmatched list values, NULL partition keys, and type mismatches.
@@ -204,8 +209,8 @@ Partition metadata and execution are verified by named integration test suites:
   - `test_partitioned_empty_topology_rejection_no_catalog_mutation`: verifies that empty partition topology definitions are rejected without mutating catalog state.
 - **Catalog Recovery & Validation Tests (`crates/htap-catalog/tests/catalog_recovery.rs`):**
   - `test_partitioning_legacy_decode_and_reopen`, `test_range_partitioning_routing_and_boundaries`, `test_list_partitioning_routing`, `test_partitioning_duplicate_violations`, `test_range_overlap_and_order_violations`, `test_partitioning_type_and_null_violations`, `test_partitioning_ownership_and_method_consistency`, `test_partitioning_cas_and_reopen_lifecycle`.
-- **SQL Parser Boundary Tests (`crates/htap-sql/tests/parse_bind.rs`):**
-  - `test_mysql_partition_ddl_rejected_at_parser_level`, `test_negative_create_table`.
+- **SQL Parser Boundary & Partition Tests (`crates/htap-sql/tests/parse_bind.rs`):**
+  - `test_mysql_partition_ddl_parsed_and_bound`, `test_mysql_partition_ddl_negative_parser_and_binder`, `test_negative_create_table`.
 
 *(Local embedded prototype only; no production claim.)*
 

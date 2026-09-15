@@ -209,9 +209,10 @@ Option **(a)**.
 - The system is bound by `sqlparser-rs` dialect coverage.
 - Unsupported syntax must fail with a **clear error** rather than be silently
   mis-parsed.
-- Specifically, MySQL partition DDL (`PARTITION BY RANGE`, `PARTITION BY LIST`)
-  is not retained in AST by `sqlparser 0.62` under `MySqlDialect` and is rejected
-  at parse time with `HtapError::InvalidArgument`, avoiding lossy reinterpretation (see ADR-011).
+- Typed MySQL partition DDL (`PARTITION BY RANGE [COLUMNS]`, `PARTITION BY LIST [COLUMNS]`)
+  is supported via vendored `sqlparser` with typed AST representations (see ADR-013),
+  while unsupported forms (options, subpartitioning, expressions, multi-column COLUMNS,
+  lifecycle ALTER) fail with clear errors rather than lossy reinterpretation.
 
 ### How to reverse it
 
@@ -446,41 +447,39 @@ Extend the benchmark harness into multi-process client/server benchmarks when ne
 
 ## ADR-011: SQL Parser Boundary for Partition DDL and Catalog Partition Model Alignment
 
-`Status: Accepted`
-`Date: 2026-09-11`
+`Status: Superseded by ADR-013`
+`Date: 2026-09-11 (Updated: 2026-09-15)`
 
 ### Context
 
 The database catalog (`htap-catalog`) features a validated partition model with finite typed range and list partitioning (`PartitioningDescriptor`, `PartitioningMethod::Range`, `PartitioningMethod::List`, `RangeBound`, `TableDescriptor::route_partition_value`, `CatalogSnapshot::route_partition_value`), utilized in controlled and admin test fixtures.
 
-However, the SQL layer uses `sqlparser 0.62` with `MySqlDialect`. MySQL partition DDL syntax (`CREATE TABLE ... PARTITION BY RANGE ...` and `PARTITION BY LIST ...`) is not retained in the AST by `sqlparser 0.62`, which only models generic dialect-specific partition expressions (such as BigQuery or ClickHouse `CreateTable.partition_by`). Attempting to support MySQL partition DDL via ad-hoc string parsing or lossy mapping of unrelated AST fields would compromise architectural boundaries and data integrity.
+However, upstream `sqlparser 0.62` with `MySqlDialect` did not retain MySQL partition DDL syntax (`CREATE TABLE ... PARTITION BY RANGE ...` and `PARTITION BY LIST ...`) in its AST, rejecting such statements during SQL DDL. Attempting to support MySQL partition DDL via ad-hoc string parsing or lossy mapping of unrelated AST fields would compromise architectural boundaries and data integrity.
 
 ### Options considered
 
 - **(a)** Implement ad-hoc regex or string pre-parsing to extract MySQL partition clauses before invoking `sqlparser`.
 - **(b)** Coerce unrelated `CreateTable.partition_by` expressions through lossy reinterpretation into internal partition descriptors.
-- **(c)** Enforce a strict parser and binder boundary: verify that MySQL partition DDL is rejected with `HtapError::InvalidArgument` from `parse_one` under `sqlparser 0.62` / `MySqlDialect`, and ensure manually constructed AST partition fields are rejected by the binder (`HtapError::Unsupported`). Preserve the internal catalog's validated finite range/list metadata for controlled/admin fixtures, keep SQL-created `LocalServer` tables unpartitioned (default single partition), and defer multi-partition execution through SQL.
+- **(c)** Enforce a strict parser and binder boundary until an AST-retaining parser is adopted: verify that MySQL partition DDL is rejected with `HtapError::InvalidArgument` from `parse_one` under upstream `sqlparser 0.62` / `MySqlDialect`, and ensure manually constructed AST partition fields are rejected by the binder (`HtapError::Unsupported`). Preserve the internal catalog's validated finite range/list metadata for controlled/admin fixtures, keep SQL-created `LocalServer` tables unpartitioned (default single partition), and defer multi-partition execution through SQL.
 
 ### Decision
 
-Option **(c)**.
+Option **(c)** (initially adopted; superseded by ADR-013).
 
-1. **Strict parser-level rejection:** MySQL `CREATE TABLE ... PARTITION BY RANGE ...` and `PARTITION BY LIST ...` syntax fails during `parse_one` under `sqlparser 0.62` with `MySqlDialect`, returning `HtapError::InvalidArgument`.
-2. **Strict binder rejection & no lossy AST reinterpretation:** If an AST with `partition_by` or other partitioning clauses is constructed manually, `htap-sql::bind` rejects it with `HtapError::Unsupported`. No lossy reinterpretation of unrelated `CreateTable.partition_by` AST is made.
-3. **Preservation of catalog metadata:** The catalog maintains its validated finite range/list descriptors and routing helpers for controlled/admin fixtures.
-4. **SQL-created tables remain single-partition:** Tables created via SQL DDL in `LocalServer` remain unpartitioned with a default single partition; multi-partition execution is not yet exposed through SQL.
-5. **Deferred capabilities:** Hash buckets / tablet sharding, partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), and distributed multi-partition execution remain deferred.
-6. **Future upgrade constraints:** If a future parser upgrade or custom AST is pursued, finite typed range and list partition definitions must be explicitly mapped to the catalog model; `MAXVALUE` and partition options remain unsupported until the catalog model itself changes.
+1. **Strict parser-level rejection (superseded by ADR-013):** Upstream MySQL `CREATE TABLE ... PARTITION BY RANGE ...` and `PARTITION BY LIST ...` syntax initially failed during `parse_one`, returning `HtapError::InvalidArgument`. ADR-013 replaced upstream `sqlparser` with a vendored copy adding typed AST support.
+2. **Strict binder rejection & no lossy AST reinterpretation:** Generic/unrelated `partition_by` AST clauses continue to be rejected by `htap-sql::bind` with `HtapError::Unsupported`. Unsupported partition options, subpartitioning, expressions, multi-column COLUMNS, and partition lifecycle DDL remain strictly rejected.
+3. **Preservation of catalog metadata:** The catalog maintains its validated finite range/list descriptors and routing helpers.
+4. **SQL-created tables:** Unpartitioned SQL DDL creates a default single partition `p0`; partitioned SQL DDL creates validated range/list topologies as defined in ADR-013.
+5. **Deferred capabilities:** Hash buckets / tablet sharding, partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), cross-partition UPDATE row movement, and distributed multi-partition execution remain deferred.
 
 ### Consequences
 
-- Production Rust logic remains clean without ad-hoc regex parsers or lossy AST hacks.
-- The boundary between SQL DDL capabilities and internal catalog capabilities is explicitly documented and tested.
-- Future parser integrations have a clear specification for mapping finite typed range/list definitions.
+- Historical record of the initial parser boundary prior to vendored AST support.
+- Clear separation between validated finite partition AST structures and lossy dialect workarounds.
 
 ### How to reverse it
 
-Upgrade `sqlparser-rs` to a version that retains MySQL partition definitions, or adopt a custom parser AST that explicitly extracts finite range and list partitions and maps them to the catalog model.
+Superseded by ADR-013.
 
 ---
 
@@ -491,7 +490,7 @@ Upgrade `sqlparser-rs` to a version that retains MySQL partition definitions, or
 
 ### Context
 
-While MySQL partition DDL is rejected at the parser level due to `sqlparser 0.62` AST limitations (ADR-011), the database engine required verified partition execution to demonstrate multi-partition DML and OLAP routing without waiting for parser changes or introducing lossy dialect workarounds.
+While MySQL partition DDL was initially rejected at the parser level due to upstream `sqlparser 0.62` AST limitations (ADR-011), the database engine required verified partition execution to demonstrate multi-partition DML and OLAP routing without waiting for parser changes or introducing lossy dialect workarounds.
 
 Partitioned tables require unambiguous topology specifications (finite range and list definitions), strict catalog validation against primary keys and data types, atomic catalog publication, single-transaction multi-partition mutation semantics, and point lookup preservation of the rowstore fast path.
 
@@ -524,8 +523,8 @@ Option **(c)**.
    - Evaluates queries across partitions belonging to the table at a single visible transaction snapshot (using logical rowstore scans or compact columnar base-plus-delta scans per partition).
    - Combines rows across partitions and evaluates global or grouped projections, filters, aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `GROUP BY`), and orderings.
    - Conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented for narrow local OLAP; distributed fanout, disk spilling, query cancellation, and resource quotas remain deferred.
-6. **SQL boundary alignment:**
-   - MySQL `PARTITION BY RANGE` and `PARTITION BY LIST` syntax remains rejected at parse time (`parse_one` returns `HtapError::InvalidArgument` under `sqlparser 0.62` / `MySqlDialect`). Tables created via SQL DDL remain unpartitioned (default single partition).
+6. **SQL boundary alignment (updated by ADR-013):**
+   - Tables created via standard SQL DDL without partitioning clauses remain unpartitioned with a default single partition `p0`. With ADR-013, MySQL `PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` DDL is parsed via vendored `sqlparser` and creates partitioned topologies through unified catalog publication.
 7. **Single-partition format conversion guard:**
    - `LocalServer::convert_table` explicitly verifies that the target table has exactly one partition and rejects multi-partition tables with `HtapError::Unsupported`.
 8. **Deferred capabilities:**
@@ -535,11 +534,13 @@ Option **(c)**.
 
 - Multi-partition execution is proven and reliable in-process without relying on unvalidated SQL parser extensions.
 - Storage engine invariants (atomic versioned commits, rowstore point lookup fast path) remain intact.
-- Clear separation between the native admin topology API and SQL DDL parser boundaries.
+- Both native admin API and SQL DDL create identical validated partition models.
 
 ### Test Evidence
 
 - `crates/htap-server/tests/local_server.rs`:
+  - `test_sql_range_partitioning_ddl_and_maxvalue_routing`
+  - `test_sql_list_partitioning_ddl_and_routing`
   - `test_partitioned_native_range_topology_catalog_reopen_continuation`
   - `test_partitioned_native_list_topology_catalog_reopen_continuation`
   - `test_partitioned_boundary_unmatched_null_type_errors`
@@ -561,9 +562,50 @@ Option **(c)**.
   - `test_partitioning_ownership_and_method_consistency`
   - `test_partitioning_cas_and_reopen_lifecycle`
 - `crates/htap-sql/tests/parse_bind.rs`:
-  - `test_mysql_partition_ddl_rejected_at_parser_level`
+  - `test_mysql_partition_ddl_parsed_and_bound`
+  - `test_mysql_partition_ddl_negative_parser_and_binder`
+
+---
+
+## ADR-013: Vendored Apache-2.0 `sqlparser` with Typed MySQL Partitioning Grammar
+
+`Status: Accepted`
+`Date: 2026-09-15`
+
+### Context
+
+ADR-011 recorded the limitation that upstream `sqlparser 0.62` did not retain MySQL `PARTITION BY RANGE/LIST` syntax in its AST, rejecting such statements during SQL DDL.
+To support typed grammar-backed MySQL `CREATE TABLE ... PARTITION BY RANGE/LIST` without lossy regex or suffix slicing, a minimal patch was needed.
+
+### Decision
+
+1. Vendor Apache-2.0-licensed `sqlparser 0.62.0` under workspace directory `vendor/sqlparser`.
+2. Extend `CreateTable` AST and parser grammar with `MysqlPartitionBy`, `MysqlPartitionDef`, `MysqlPartitionValues`, and `MysqlLessThanBound` (supporting `MAXVALUE`, `VALUES LESS THAN`, `VALUES IN`, and `COLUMNS (...)`), preserving all existing public parser APIs.
+3. Extend catalog `RangeBound` to support optional endpoints (`None` for unbounded / `MAXVALUE`), while retaining serde backwards-compatibility with existing non-optional representation.
+4. Unify table creation in `LocalServer` across SQL partitioned, SQL unpartitioned (default `p0`), and native administrative creation through a single lock-safe helper `create_table_internal`.
+5. Strict binding in `htap-sql` validates partition keys against PK and non-null constraints, verifies increasing order for RANGE bounds, and checks disjointness of LIST values.
+6. Provenance and Apache-2.0 licensing recorded in `ATTRIBUTION.md`.
+
+### Consequences
+
+- Typed MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` (including `VALUES LESS THAN MAXVALUE`) are supported directly via SQL DDL.
+- Unsupported partition forms (partition options such as `ENGINE`/`COMMENT`/`TABLESPACE`, `SUBPARTITION`, `LIST DEFAULT`, expressions in partition key, multi-column `COLUMNS`, non-final `MAXVALUE`) are strictly rejected with clear errors.
+- Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), partition split/merge/drop, cross-partition row movement on UPDATE, hash tablets, distributed serving, and replica failover remain deferred.
+
+### Test Evidence
+
+- `crates/htap-sql/tests/parse_bind.rs`:
+  - `test_mysql_partition_ddl_parsed_and_bound`
+  - `test_mysql_partition_ddl_negative_parser_and_binder`
   - `test_negative_create_table`
+- `crates/htap-server/tests/local_server.rs`:
+  - `test_sql_range_partitioning_ddl_and_maxvalue_routing`
+  - `test_sql_list_partitioning_ddl_and_routing`
+- `crates/htap-catalog/tests/catalog_recovery.rs`:
+  - `test_partitioning_legacy_decode_and_reopen`
+  - `test_range_partitioning_routing_and_boundaries`
+  - `test_list_partitioning_routing`
 
 ### How to reverse it
 
-When an upgraded SQL parser AST or custom parser supports MySQL partition DDL, map the parsed partition clauses into `PartitionedTableDefinition` and invoke `LocalServer::create_partitioned_table` from the SQL DDL binder.
+When an upstream SQL parser AST natively supports MySQL partition DDL, replace the vendored crate with upstream dependency and align AST mapping.

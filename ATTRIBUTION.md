@@ -94,6 +94,44 @@ all coordination is implemented via `htap-coord::LocalCoordinator`.
 
 ---
 
+## Apache DataFusion sqlparser-rs
+
+The workspace vendors a minimally patched copy of `sqlparser` 0.62.0 under `vendor/sqlparser`
+licensed under Apache-2.0.
+
+- **Upstream Project:** Apache DataFusion `sqlparser-rs`
+- **Upstream Repository:** `https://github.com/apache/datafusion-sqlparser-rs`
+- **Release / Source Artifact:** Tag `0.62.0` (crates.io crate `sqlparser-0.62.0.crate`)
+- **License:** Apache License, Version 2.0 (preserved in `vendor/sqlparser/LICENSE.TXT`)
+- **Local Patch Scope and Files:**
+  - `vendor/sqlparser/src/ast/ddl.rs`: Adds AST types `MysqlPartitionBy`, `MysqlPartitionDef`, `MysqlPartitionValues`, and `MysqlLessThanBound`; adds `pub mysql_partition_by: Option<MysqlPartitionBy>` to `CreateTable`.
+  - `vendor/sqlparser/src/ast/mod.rs`: Re-exports `MysqlPartitionBy`, `MysqlPartitionDef`, `MysqlPartitionValues`, `MysqlLessThanBound`.
+  - `vendor/sqlparser/src/ast/helpers/stmt_create_table.rs`: Adds `pub mysql_partition_by: Option<MysqlPartitionBy>` and builder method `mysql_partition_by` to `CreateTableBuilder`.
+  - `vendor/sqlparser/src/parser/mod.rs`: Implements `maybe_parse_mysql_partition_by` and `parse_mysql_partition_def` to parse MySQL `PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` with `VALUES LESS THAN (...)` / `MAXVALUE` and `VALUES IN (...)`, invoked during table creation parsing.
+- **How to Refresh / Rebase:**
+  1. Obtain target upstream release or commit from `https://github.com/apache/datafusion-sqlparser-rs`.
+  2. Extract files into `vendor/sqlparser`, ensuring no nested `.git` metadata is preserved.
+  3. Re-apply the MySQL partition AST definitions in `src/ast/ddl.rs`, builder integration in `src/ast/helpers/stmt_create_table.rs`, module exports in `src/ast/mod.rs`, and parser hooks in `src/parser/mod.rs`.
+  4. Ensure `vendor/sqlparser/LICENSE.TXT` and `vendor/sqlparser/Cargo.toml` are intact.
+  5. Run `cargo check -p sqlparser` and workspace tests (`cargo test --workspace`) to verify compatibility.
+
+> sqlparser-rs
+> Copyright 2018-present Apache DataFusion Authors
+>
+> Licensed under the Apache License, Version 2.0 (the "License");
+> you may not use this file except in compliance with the License.
+> You may obtain a copy of the License at
+>
+>     http://www.apache.org/licenses/LICENSE-2.0
+>
+> Unless required by applicable law or agreed to in writing, software
+> distributed under the License is distributed on an "AS IS" BASIS,
+> WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+> See the License for the specific language governing permissions and
+> limitations under the License.
+
+---
+
 ## Statement
 
 No StarRocks, Apache Kudu, or Apache ZooKeeper source file was vendored,
@@ -102,3 +140,4 @@ were studied as architectural references; only the local MVP subset is
 implemented independently in Rust, while proposals such as delete vectors,
 shared multi-format WAL, openraft, DataFusion, and ZooKeeper coordination
 backends remain reference proposals or deferred future work.
+The `sqlparser` crate is vendored under `vendor/sqlparser` under Apache-2.0 with provenance recorded above.

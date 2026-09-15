@@ -3674,3 +3674,195 @@ fn test_point_read_fast_path_unchanged() {
         other => panic!("expected Query, got {other:?}"),
     }
 }
+
+#[test]
+fn test_sql_range_partitioning_ddl_and_maxvalue_routing() {
+    let temp = TempDir::new().unwrap();
+    let server = LocalServer::open(temp.path()).unwrap();
+
+    // 1. Create partitioned table via SQL DDL with RANGE and MAXVALUE
+    let ddl = "CREATE TABLE sales (id BIGINT PRIMARY KEY, amount DOUBLE) \
+               PARTITION BY RANGE (id) ( \
+                   PARTITION p0 VALUES LESS THAN (100), \
+                   PARTITION p1 VALUES LESS THAN (200), \
+                   PARTITION p_max VALUES LESS THAN MAXVALUE \
+               );";
+    let res = server.execute(ddl).unwrap();
+    assert_eq!(res, StatementResult::ddl(1));
+
+    // Verify catalog structure
+    let cat_store = LocalCatalogStore::open(temp.path().join("catalog")).unwrap();
+    let snap = cat_store.load().unwrap().unwrap();
+    let tbl = snap.table_by_name("sales").unwrap();
+    assert_eq!(tbl.partitions.len(), 3);
+    let p_desc = tbl.partitioning.as_ref().unwrap();
+    assert_eq!(p_desc.method, PartitioningMethod::Range);
+    assert_eq!(p_desc.key_column, 0);
+
+    // Verify RangeBound endpoints in catalog
+    let p0 = snap
+        .partitions
+        .iter()
+        .find(|p| p.table_id == tbl.id && p.name == "p0")
+        .unwrap();
+    assert_eq!(p0.range.as_ref().unwrap().lower, None);
+    assert_eq!(p0.range.as_ref().unwrap().upper, Some(Value::Int64(100)));
+    let p1 = snap
+        .partitions
+        .iter()
+        .find(|p| p.table_id == tbl.id && p.name == "p1")
+        .unwrap();
+    assert_eq!(p1.range.as_ref().unwrap().lower, Some(Value::Int64(100)));
+    assert_eq!(p1.range.as_ref().unwrap().upper, Some(Value::Int64(200)));
+    let p_max = snap
+        .partitions
+        .iter()
+        .find(|p| p.table_id == tbl.id && p.name == "p_max")
+        .unwrap();
+    assert_eq!(p_max.range.as_ref().unwrap().lower, Some(Value::Int64(200)));
+    assert_eq!(p_max.range.as_ref().unwrap().upper, None);
+
+    // 2. Multi-row insert across partitions in one commit version
+    let insert_sql = "INSERT INTO sales (id, amount) VALUES (50, 10.5), (150, 20.5), (999, 99.9);";
+    let ins_res = server.execute(insert_sql).unwrap();
+    assert_eq!(ins_res, StatementResult::dml(3, Some(Version::new(2))));
+
+    // 3. Point lookups
+    let s0 = server
+        .execute("SELECT amount FROM sales WHERE id = 50;")
+        .unwrap();
+    match s0 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Float64(10.5)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let s_max = server
+        .execute("SELECT amount FROM sales WHERE id = 999;")
+        .unwrap();
+    match s_max {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Float64(99.9)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 4. Point delete
+    let del_res = server.execute("DELETE FROM sales WHERE id = 150;").unwrap();
+    assert_eq!(del_res, StatementResult::dml(1, Some(Version::new(3))));
+
+    let s1_del = server
+        .execute("SELECT amount FROM sales WHERE id = 150;")
+        .unwrap();
+    match s1_del {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 0);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 5. Reopen server and verify state continuity
+    drop(server);
+    let reopened = LocalServer::open(temp.path()).unwrap();
+
+    let s0_reopened = reopened
+        .execute("SELECT amount FROM sales WHERE id = 50;")
+        .unwrap();
+    match s0_reopened {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Float64(10.5)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let s_max_reopened = reopened
+        .execute("SELECT amount FROM sales WHERE id = 999;")
+        .unwrap();
+    match s_max_reopened {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Float64(99.9)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_sql_list_partitioning_ddl_and_routing() {
+    let temp = TempDir::new().unwrap();
+    let server = LocalServer::open(temp.path()).unwrap();
+
+    // 1. Create partitioned table via SQL DDL with LIST
+    let ddl = "CREATE TABLE regions (code INT PRIMARY KEY, name VARCHAR) \
+               PARTITION BY LIST (code) ( \
+                   PARTITION p_us VALUES IN (1, 2), \
+                   PARTITION p_eu VALUES IN (3, 4) \
+               );";
+    let res = server.execute(ddl).unwrap();
+    assert_eq!(res, StatementResult::ddl(1));
+
+    // 2. Insert across partitions in one commit version
+    let ins_res = server
+        .execute("INSERT INTO regions (code, name) VALUES (1, 'US-East'), (3, 'EU-Central');")
+        .unwrap();
+    assert_eq!(ins_res, StatementResult::dml(2, Some(Version::new(2))));
+
+    // 3. Point lookups
+    let q1 = server
+        .execute("SELECT name FROM regions WHERE code = 1;")
+        .unwrap();
+    match q1 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("US-East".into())));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let q3 = server
+        .execute("SELECT name FROM regions WHERE code = 3;")
+        .unwrap();
+    match q3 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(
+                qr.rows()[0].get(0),
+                Some(&Value::String("EU-Central".into()))
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 4. Point delete
+    let del = server
+        .execute("DELETE FROM regions WHERE code = 1;")
+        .unwrap();
+    assert_eq!(del, StatementResult::dml(1, Some(Version::new(3))));
+
+    // 5. Unmatched value insert rejected
+    let err = server
+        .execute("INSERT INTO regions (code, name) VALUES (99, 'Asia');")
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // 6. Reopen server and verify
+    drop(server);
+    let reopened = LocalServer::open(temp.path()).unwrap();
+    let q3_reopened = reopened
+        .execute("SELECT name FROM regions WHERE code = 3;")
+        .unwrap();
+    match q3_reopened {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(
+                qr.rows()[0].get(0),
+                Some(&Value::String("EU-Central".into()))
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}

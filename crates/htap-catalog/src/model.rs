@@ -194,18 +194,44 @@ impl PartitioningDescriptor {
 }
 
 /// Boundary for a range partition: lower-inclusive, upper-exclusive (`[lower, upper)`).
+/// Endpoints can be unbounded (`lower: None` represents negative infinity, `upper: None` represents positive infinity/MAXVALUE).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RangeBound {
-    /// Inclusive lower bound.
-    pub lower: Value,
-    /// Exclusive upper bound.
-    pub upper: Value,
+    /// Inclusive lower bound (`None` represents negative infinity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lower: Option<Value>,
+    /// Exclusive upper bound (`None` represents MAXVALUE / positive infinity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upper: Option<Value>,
 }
 
 impl RangeBound {
-    /// Create a new range bound (`[lower, upper)`).
+    /// Create a new bounded range bound (`[lower, upper)`).
     pub fn new(lower: Value, upper: Value) -> Self {
+        Self {
+            lower: Some(lower),
+            upper: Some(upper),
+        }
+    }
+
+    /// Create a range bound with optional endpoints (`[lower, upper)`).
+    pub fn new_opt(lower: Option<Value>, upper: Option<Value>) -> Self {
         Self { lower, upper }
+    }
+
+    /// Returns true if `value` is within this range bound `[lower, upper)`.
+    pub fn contains(&self, value: &Value) -> bool {
+        if let Some(l) = &self.lower {
+            if value < l {
+                return false;
+            }
+        }
+        if let Some(u) = &self.upper {
+            if value >= u {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -318,7 +344,7 @@ impl TableDescriptor {
                     match partitioning.method {
                         PartitioningMethod::Range => {
                             if let Some(range) = &part.range {
-                                if range.lower <= *value && *value < range.upper {
+                                if range.contains(value) {
                                     return Ok(part_id);
                                 }
                             }
@@ -935,33 +961,35 @@ impl CatalogSnapshot {
                                 ))
                             })?;
 
-                            if range.lower.is_null()
-                                || range.lower.data_type() != Some(expected_type)
-                            {
-                                return Err(HtapError::InvalidArgument(format!(
-                                    "range partition '{}' (id {}) lower bound has invalid type: expected {:?}, got {:?}",
-                                    part.name,
-                                    part.id,
-                                    expected_type,
-                                    range.lower.data_type()
-                                )));
+                            if let Some(l) = &range.lower {
+                                if l.is_null() || l.data_type() != Some(expected_type) {
+                                    return Err(HtapError::InvalidArgument(format!(
+                                        "range partition '{}' (id {}) lower bound has invalid type: expected {:?}, got {:?}",
+                                        part.name,
+                                        part.id,
+                                        expected_type,
+                                        l.data_type()
+                                    )));
+                                }
                             }
-                            if range.upper.is_null()
-                                || range.upper.data_type() != Some(expected_type)
-                            {
-                                return Err(HtapError::InvalidArgument(format!(
-                                    "range partition '{}' (id {}) upper bound has invalid type: expected {:?}, got {:?}",
-                                    part.name,
-                                    part.id,
-                                    expected_type,
-                                    range.upper.data_type()
-                                )));
+                            if let Some(u) = &range.upper {
+                                if u.is_null() || u.data_type() != Some(expected_type) {
+                                    return Err(HtapError::InvalidArgument(format!(
+                                        "range partition '{}' (id {}) upper bound has invalid type: expected {:?}, got {:?}",
+                                        part.name,
+                                        part.id,
+                                        expected_type,
+                                        u.data_type()
+                                    )));
+                                }
                             }
-                            if range.lower >= range.upper {
-                                return Err(HtapError::InvalidArgument(format!(
-                                    "range partition '{}' (id {}) in table '{}' has invalid bounds: lower ({}) must be strictly less than upper ({})",
-                                    part.name, part.id, parent_table.name, range.lower, range.upper
-                                )));
+                            if let (Some(l), Some(u)) = (&range.lower, &range.upper) {
+                                if l >= u {
+                                    return Err(HtapError::InvalidArgument(format!(
+                                        "range partition '{}' (id {}) in table '{}' has invalid bounds: lower ({}) must be strictly less than upper ({})",
+                                        part.name, part.id, parent_table.name, l, u
+                                    )));
+                                }
                             }
                         }
                         PartitioningMethod::List => {
@@ -1110,7 +1138,12 @@ impl CatalogSnapshot {
                         for &part_id in &table.partitions {
                             if let Some(part) = self.partition(part_id) {
                                 if let Some(range) = &part.range {
-                                    ranges.push((part.id, &part.name, &range.lower, &range.upper));
+                                    ranges.push((
+                                        part.id,
+                                        &part.name,
+                                        range.lower.as_ref(),
+                                        range.upper.as_ref(),
+                                    ));
                                 }
                             }
                         }
@@ -1118,12 +1151,30 @@ impl CatalogSnapshot {
                             for j in (i + 1)..ranges.len() {
                                 let (id1, name1, l1, u1) = ranges[i];
                                 let (id2, name2, l2, u2) = ranges[j];
-                                let max_lower = std::cmp::max(l1, l2);
-                                let min_upper = std::cmp::min(u1, u2);
-                                if max_lower < min_upper {
+                                // Check overlap between [l1, u1) and [l2, u2)
+                                // They overlap iff max(l1, l2) < min(u1, u2)
+                                let overlaps = match (l1, l2, u1, u2) {
+                                    // If l1 >= u2, they don't overlap
+                                    (Some(l1_val), _, _, Some(u2_val)) if l1_val >= u2_val => false,
+                                    // If l2 >= u1, they don't overlap
+                                    (_, Some(l2_val), Some(u1_val), _) if l2_val >= u1_val => false,
+                                    // Otherwise, they overlap!
+                                    _ => true,
+                                };
+                                if overlaps {
+                                    let l1_str =
+                                        l1.map(|v| v.to_string()).unwrap_or_else(|| "-inf".into());
+                                    let u1_str = u1
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_else(|| "MAXVALUE".into());
+                                    let l2_str =
+                                        l2.map(|v| v.to_string()).unwrap_or_else(|| "-inf".into());
+                                    let u2_str = u2
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_else(|| "MAXVALUE".into());
                                     return Err(HtapError::InvalidArgument(format!(
                                         "table '{}' has overlapping range partitions: partition '{}' (id {}) [{}, {}) overlaps with partition '{}' (id {}) [{}, {})",
-                                        table.name, name1, id1, l1, u1, name2, id2, l2, u2
+                                        table.name, name1, id1, l1_str, u1_str, name2, id2, l2_str, u2_str
                                     )));
                                 }
                             }
@@ -1511,6 +1562,17 @@ mod tests {
         let json_b = serde_json::to_string(&bound).unwrap();
         let dec_b: RangeBound = serde_json::from_str(&json_b).unwrap();
         assert_eq!(dec_b, bound);
+
+        // Test backward-compatible JSON decode where lower and upper were direct values
+        let legacy_json = r#"{"lower":{"Int64":10},"upper":{"Int64":100}}"#;
+        let dec_legacy: RangeBound = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(dec_legacy, bound);
+
+        // Test unbounded upper (MAXVALUE)
+        let maxvalue_bound = RangeBound::new_opt(Some(Value::Int64(100)), None);
+        let json_mv = serde_json::to_string(&maxvalue_bound).unwrap();
+        let dec_mv: RangeBound = serde_json::from_str(&json_mv).unwrap();
+        assert_eq!(maxvalue_bound, dec_mv);
 
         let list_method = PartitioningMethod::List;
         let json_lm = serde_json::to_string(&list_method).unwrap();

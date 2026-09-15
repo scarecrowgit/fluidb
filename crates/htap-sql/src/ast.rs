@@ -53,6 +53,47 @@ pub struct CreateTable {
     pub schema: Schema,
     /// Indices of primary key columns in `schema`.
     pub primary_key: Vec<usize>,
+    /// Optional partitioning specification.
+    pub partitioning: Option<BoundPartitioning>,
+}
+
+/// Bound partitioning specification on a CREATE TABLE statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundPartitioning {
+    /// Range partitioning where partitions cover intervals `[lower, upper)`.
+    Range {
+        /// Column index in schema used as partition key.
+        key_column: usize,
+        /// Ordered partition bounds.
+        partitions: Vec<BoundRangePartition>,
+    },
+    /// List partitioning where partitions cover disjoint sets of explicit values.
+    List {
+        /// Column index in schema used as partition key.
+        key_column: usize,
+        /// Explicit list value sets for each partition.
+        partitions: Vec<BoundListPartition>,
+    },
+}
+
+/// Bound range partition definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundRangePartition {
+    /// Partition name.
+    pub name: String,
+    /// Lower bound (None means -inf).
+    pub lower: Option<Value>,
+    /// Upper bound (None means MAXVALUE / +inf).
+    pub upper: Option<Value>,
+}
+
+/// Bound list partition definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundListPartition {
+    /// Partition name.
+    pub name: String,
+    /// Explicit values for this partition.
+    pub values: Vec<Value>,
 }
 
 impl CreateTable {
@@ -62,7 +103,14 @@ impl CreateTable {
             name: name.into(),
             schema,
             primary_key,
+            partitioning: None,
         }
+    }
+
+    /// Set partitioning on [`CreateTable`].
+    pub fn with_partitioning(mut self, partitioning: impl Into<Option<BoundPartitioning>>) -> Self {
+        self.partitioning = partitioning.into();
+        self
     }
 }
 

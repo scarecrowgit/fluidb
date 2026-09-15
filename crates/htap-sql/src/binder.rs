@@ -8,14 +8,16 @@ use htap_common::types::{
 use sqlparser::ast::{
     BinaryOperator, ColumnOption, CreateTable as SqlCreateTable, CreateTableOptions,
     Delete as SqlDelete, DuplicateTreatment, Expr, FromTable, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, IndexColumn, Insert as SqlInsert, ObjectName, ObjectNamePart,
-    OrderByExpr, PrimaryKeyConstraint, Query, SelectItem, SetExpr, Statement, TableConstraint,
-    TableFactor, TableObject, UnaryOperator,
+    FunctionArguments, GroupByExpr, Ident, IndexColumn, Insert as SqlInsert, MysqlLessThanBound,
+    MysqlPartitionBy, MysqlPartitionValues, ObjectName, ObjectNamePart, OrderByExpr,
+    PrimaryKeyConstraint, Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor,
+    TableObject, UnaryOperator,
 };
 
 use crate::ast::{
     AggregateFunction, AnalyticExpr, AnalyticFilter, AnalyticOrderBy, AnalyticSelect,
-    BoundStatement, ComparisonOp, CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
+    BoundListPartition, BoundPartitioning, BoundRangePartition, BoundStatement, ComparisonOp,
+    CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
 };
 
 /// Binds an AST [`Statement`] against the [`CatalogSnapshot`], performing strict semantic
@@ -458,11 +460,257 @@ fn bind_create_table(stmt: &SqlCreateTable, _catalog: &CatalogSnapshot) -> Resul
     };
 
     let schema = Schema::new(column_defs)?;
-    Ok(BoundStatement::CreateTable(CreateTable::new(
-        table_name,
-        schema,
-        final_pk_indices,
-    )))
+
+    let bound_partitioning = if let Some(ref mysql_part) = stmt.mysql_partition_by {
+        Some(bind_mysql_partitioning(
+            mysql_part,
+            &schema,
+            &final_pk_indices,
+        )?)
+    } else {
+        None
+    };
+
+    let mut create = CreateTable::new(table_name, schema, final_pk_indices);
+    if let Some(part) = bound_partitioning {
+        create = create.with_partitioning(part);
+    }
+    Ok(BoundStatement::CreateTable(create))
+}
+
+fn bind_mysql_partitioning(
+    mysql_part: &MysqlPartitionBy,
+    schema: &Schema,
+    pk_indices: &[usize],
+) -> Result<BoundPartitioning> {
+    match mysql_part {
+        MysqlPartitionBy::Range {
+            columns,
+            expr,
+            partitions,
+        } => {
+            let key_column = resolve_partition_key_column(
+                columns.as_deref(),
+                expr.as_ref(),
+                schema,
+                pk_indices,
+            )?;
+            let key_col_def = &schema.columns()[key_column];
+
+            if partitions.is_empty() {
+                return Err(HtapError::InvalidArgument(
+                    "PARTITION BY RANGE must define at least one partition".into(),
+                ));
+            }
+
+            let mut seen_names = std::collections::HashSet::new();
+            let mut bound_partitions = Vec::with_capacity(partitions.len());
+            let mut cur_lower: Option<Value> = None;
+            let mut had_maxvalue = false;
+
+            for part_def in partitions {
+                let part_name = part_def.name.value.clone();
+                if part_name.is_empty() {
+                    return Err(HtapError::InvalidArgument(
+                        "partition name cannot be empty".into(),
+                    ));
+                }
+                if !seen_names.insert(part_name.clone()) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate partition name '{part_name}'"
+                    )));
+                }
+
+                if had_maxvalue {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition '{part_name}' defined after MAXVALUE partition"
+                    )));
+                }
+
+                let bound = match &part_def.values {
+                    MysqlPartitionValues::LessThan(b) => b,
+                    MysqlPartitionValues::In(_) => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' in PARTITION BY RANGE must use VALUES LESS THAN"
+                        )));
+                    }
+                };
+
+                let cur_upper = match bound {
+                    MysqlLessThanBound::MaxValue => {
+                        had_maxvalue = true;
+                        None
+                    }
+                    MysqlLessThanBound::Expr(bound_expr) => {
+                        let val = parse_literal_value(bound_expr, key_col_def)?;
+                        if val.is_null() {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "range partition '{part_name}' bound cannot be NULL"
+                            )));
+                        }
+                        if let Some(ref prev_val) = cur_lower {
+                            if &val <= prev_val {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "VALUES LESS THAN value must be strictly increasing: {val} <= {prev_val}"
+                                )));
+                            }
+                        }
+                        Some(val)
+                    }
+                };
+
+                bound_partitions.push(BoundRangePartition {
+                    name: part_name,
+                    lower: cur_lower.clone(),
+                    upper: cur_upper.clone(),
+                });
+
+                cur_lower = cur_upper;
+            }
+
+            Ok(BoundPartitioning::Range {
+                key_column,
+                partitions: bound_partitions,
+            })
+        }
+        MysqlPartitionBy::List {
+            columns,
+            expr,
+            partitions,
+        } => {
+            let key_column = resolve_partition_key_column(
+                columns.as_deref(),
+                expr.as_ref(),
+                schema,
+                pk_indices,
+            )?;
+            let key_col_def = &schema.columns()[key_column];
+
+            if partitions.is_empty() {
+                return Err(HtapError::InvalidArgument(
+                    "PARTITION BY LIST must define at least one partition".into(),
+                ));
+            }
+
+            let mut seen_names = std::collections::HashSet::new();
+            let mut seen_values = std::collections::HashSet::new();
+            let mut bound_partitions = Vec::with_capacity(partitions.len());
+
+            for part_def in partitions {
+                let part_name = part_def.name.value.clone();
+                if part_name.is_empty() {
+                    return Err(HtapError::InvalidArgument(
+                        "partition name cannot be empty".into(),
+                    ));
+                }
+                if !seen_names.insert(part_name.clone()) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate partition name '{part_name}'"
+                    )));
+                }
+
+                let exprs = match &part_def.values {
+                    MysqlPartitionValues::In(exprs) => exprs,
+                    MysqlPartitionValues::LessThan(_) => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' in PARTITION BY LIST must use VALUES IN"
+                        )));
+                    }
+                };
+
+                if exprs.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition '{part_name}' has empty VALUES IN list"
+                    )));
+                }
+
+                let mut part_values = Vec::with_capacity(exprs.len());
+                let mut seen_in_part = std::collections::HashSet::new();
+                for e in exprs {
+                    let val = parse_literal_value(e, key_col_def)?;
+                    if val.is_null() {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "list partition '{part_name}' value cannot be NULL"
+                        )));
+                    }
+                    if !seen_in_part.insert(val.clone()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' contains duplicate list value '{val}'"
+                        )));
+                    }
+                    if !seen_values.insert(val.clone()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "duplicate list value '{val}' across partitions (found in partition '{part_name}')"
+                        )));
+                    }
+                    part_values.push(val);
+                }
+
+                bound_partitions.push(BoundListPartition {
+                    name: part_name,
+                    values: part_values,
+                });
+            }
+
+            Ok(BoundPartitioning::List {
+                key_column,
+                partitions: bound_partitions,
+            })
+        }
+    }
+}
+
+fn resolve_partition_key_column(
+    columns: Option<&[Ident]>,
+    expr: Option<&Expr>,
+    schema: &Schema,
+    pk_indices: &[usize],
+) -> Result<usize> {
+    let col_name = if let Some(cols) = columns {
+        if cols.len() != 1 {
+            return Err(HtapError::Unsupported(
+                "multi-column partitioning is not supported".into(),
+            ));
+        }
+        &cols[0].value
+    } else if let Some(e) = expr {
+        match e {
+            Expr::Identifier(ident) => &ident.value,
+            _ => {
+                return Err(HtapError::Unsupported(
+                    "expressions in PARTITION BY are not supported, only column identifiers".into(),
+                ));
+            }
+        }
+    } else {
+        return Err(HtapError::InvalidArgument(
+            "PARTITION BY requires a column or expression".into(),
+        ));
+    };
+
+    let col_idx = schema
+        .columns()
+        .iter()
+        .position(|c| c.name == *col_name)
+        .ok_or_else(|| {
+            HtapError::InvalidArgument(format!(
+                "partition key column '{col_name}' not found in schema"
+            ))
+        })?;
+
+    if !pk_indices.contains(&col_idx) {
+        return Err(HtapError::InvalidArgument(format!(
+            "partition key column '{col_name}' must be part of the primary key"
+        )));
+    }
+
+    if schema.columns()[col_idx].nullable {
+        return Err(HtapError::InvalidArgument(format!(
+            "partition key column '{col_name}' cannot be nullable"
+        )));
+    }
+
+    Ok(col_idx)
 }
 
 fn expr_to_primary_key_constraint(expr: &Expr) -> Result<PrimaryKeyConstraint> {

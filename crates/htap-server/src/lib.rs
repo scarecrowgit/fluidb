@@ -29,7 +29,8 @@ use htap_movement::{
 };
 use htap_rowstore::{Engine, EngineOptions, Snapshot};
 use htap_sql::ast::{
-    AnalyticSelect, BoundStatement, CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
+    AnalyticSelect, BoundPartitioning, BoundStatement, CreateTable, DeleteByPrimaryKey, Insert,
+    PointSelect,
 };
 use htap_sql::result::StatementResult;
 use htap_sql::route::{classify_route, Route};
@@ -94,17 +95,36 @@ pub struct RangePartitionDefinition {
     pub name: String,
     /// Inclusive lower bound value.
     pub lower: Value,
-    /// Exclusive upper bound value.
+    /// Exclusive upper bound value (or MAXVALUE if None).
     pub upper: Value,
+    /// Optional lower bound (for unbounded/MAXVALUE representation).
+    pub lower_opt: Option<Value>,
+    /// Optional upper bound (for unbounded/MAXVALUE representation).
+    pub upper_opt: Option<Value>,
 }
 
 impl RangePartitionDefinition {
-    /// Creates a new range partition definition.
+    /// Creates a new range partition definition with bounded endpoints.
     pub fn new(name: impl Into<String>, lower: Value, upper: Value) -> Self {
         Self {
             name: name.into(),
-            lower,
-            upper,
+            lower: lower.clone(),
+            upper: upper.clone(),
+            lower_opt: Some(lower),
+            upper_opt: Some(upper),
+        }
+    }
+
+    /// Creates a range partition definition with optional endpoints.
+    pub fn new_opt(name: impl Into<String>, lower: Option<Value>, upper: Option<Value>) -> Self {
+        let l = lower.clone().unwrap_or(Value::Null);
+        let u = upper.clone().unwrap_or(Value::Null);
+        Self {
+            name: name.into(),
+            lower: l,
+            upper: u,
+            lower_opt: lower,
+            upper_opt: upper,
         }
     }
 }
@@ -301,40 +321,19 @@ impl LocalServer {
         }
     }
 
-    /// Creates a new partitioned table according to the provided [`PartitionedTableDefinition`].
-    ///
-    /// The table and its partitions are persisted to the catalog in a single atomic CAS operation.
-    /// Each defined partition is initialized with Row storage, a single tablet (bucket 0), and a healthy
-    /// leader replica on node 1.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HtapError::Conflict`] if a table with the same name already exists.
-    /// Returns [`HtapError::InvalidArgument`] if partition definitions are invalid, overlapping, or
-    /// schema/PK constraints are violated.
-    /// Returns [`HtapError::CounterOverflow`] if IDs or catalog generation overflow.
-    pub fn create_partitioned_table(
+    /// Internal lock-safe helper for table creation (unpartitioned and partitioned).
+    fn create_table_internal(
         &self,
-        definition: PartitionedTableDefinition,
+        catalog: &CatalogSnapshot,
+        name: String,
+        schema: Schema,
+        primary_key: Vec<usize>,
+        partitioning_desc: Option<PartitioningDescriptor>,
+        partition_items: Vec<(String, Option<RangeBound>, Vec<Value>)>,
     ) -> Result<StatementResult> {
-        let is_empty_topology = match &definition.topology {
-            PartitionTopology::Range { partitions, .. } => partitions.is_empty(),
-            PartitionTopology::List { partitions, .. } => partitions.is_empty(),
-        };
-        if is_empty_topology {
-            return Err(HtapError::InvalidArgument(format!(
-                "partitioned table '{}' must define at least one partition",
-                definition.name
-            )));
-        }
-
-        let _guard = self.execution_lock.lock();
-        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
-
-        if catalog.table_by_name(&definition.name).is_some() {
+        if catalog.table_by_name(&name).is_some() {
             return Err(HtapError::Conflict(format!(
-                "table '{}' already exists",
-                definition.name
+                "table '{name}' already exists"
             )));
         }
 
@@ -377,29 +376,6 @@ impl LocalServer {
                 .ok_or(HtapError::CounterOverflow {
                     counter: "catalog_generation",
                 })?;
-
-        let (partitioning_desc, partition_items) = match definition.topology {
-            PartitionTopology::Range {
-                key_column,
-                partitions,
-            } => (
-                PartitioningDescriptor::new(key_column, PartitioningMethod::Range),
-                partitions
-                    .into_iter()
-                    .map(|p| (p.name, Some(RangeBound::new(p.lower, p.upper)), Vec::new()))
-                    .collect::<Vec<_>>(),
-            ),
-            PartitionTopology::List {
-                key_column,
-                partitions,
-            } => (
-                PartitioningDescriptor::new(key_column, PartitioningMethod::List),
-                partitions
-                    .into_iter()
-                    .map(|p| (p.name, None, p.values))
-                    .collect::<Vec<_>>(),
-            ),
-        };
 
         let mut table_partition_ids = Vec::with_capacity(partition_items.len());
         let mut new_partitions = Vec::with_capacity(partition_items.len());
@@ -467,15 +443,17 @@ impl LocalServer {
             new_replicas.push(replica_desc);
         }
 
-        let table_desc = TableDescriptor::new(
+        let mut table_desc = TableDescriptor::new(
             table_id,
-            definition.name,
-            definition.schema,
-            definition.primary_key,
+            name,
+            schema,
+            primary_key,
             table_partition_ids,
             next_generation,
-        )
-        .with_partitioning(partitioning_desc);
+        );
+        if let Some(p_desc) = partitioning_desc {
+            table_desc = table_desc.with_partitioning(p_desc);
+        }
 
         let mut tables = catalog.tables.clone();
         tables.push(table_desc);
@@ -496,6 +474,76 @@ impl LocalServer {
             .compare_and_set(catalog.generation, next_snapshot)?;
 
         Ok(StatementResult::ddl(1))
+    }
+
+    /// Creates a new partitioned table according to the provided [`PartitionedTableDefinition`].
+    ///
+    /// The table and its partitions are persisted to the catalog in a single atomic CAS operation.
+    /// Each defined partition is initialized with Row storage, a single tablet (bucket 0), and a healthy
+    /// leader replica on node 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError::Conflict`] if a table with the same name already exists.
+    /// Returns [`HtapError::InvalidArgument`] if partition definitions are invalid, overlapping, or
+    /// schema/PK constraints are violated.
+    /// Returns [`HtapError::CounterOverflow`] if IDs or catalog generation overflow.
+    pub fn create_partitioned_table(
+        &self,
+        definition: PartitionedTableDefinition,
+    ) -> Result<StatementResult> {
+        let is_empty_topology = match &definition.topology {
+            PartitionTopology::Range { partitions, .. } => partitions.is_empty(),
+            PartitionTopology::List { partitions, .. } => partitions.is_empty(),
+        };
+        if is_empty_topology {
+            return Err(HtapError::InvalidArgument(format!(
+                "partitioned table '{}' must define at least one partition",
+                definition.name
+            )));
+        }
+
+        let _guard = self.execution_lock.lock();
+        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+
+        let (partitioning_desc, partition_items) = match definition.topology {
+            PartitionTopology::Range {
+                key_column,
+                partitions,
+            } => (
+                PartitioningDescriptor::new(key_column, PartitioningMethod::Range),
+                partitions
+                    .into_iter()
+                    .map(|p| {
+                        let bound = if p.lower_opt.is_some() || p.upper_opt.is_some() {
+                            RangeBound::new_opt(p.lower_opt, p.upper_opt)
+                        } else {
+                            RangeBound::new(p.lower, p.upper)
+                        };
+                        (p.name, Some(bound), Vec::new())
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            PartitionTopology::List {
+                key_column,
+                partitions,
+            } => (
+                PartitioningDescriptor::new(key_column, PartitioningMethod::List),
+                partitions
+                    .into_iter()
+                    .map(|p| (p.name, None, p.values))
+                    .collect::<Vec<_>>(),
+            ),
+        };
+
+        self.create_table_internal(
+            &catalog,
+            definition.name,
+            definition.schema,
+            definition.primary_key,
+            Some(partitioning_desc),
+            partition_items,
+        )
     }
 
     fn resolve_table<'a>(
@@ -646,128 +694,50 @@ impl LocalServer {
         create: CreateTable,
         catalog: &CatalogSnapshot,
     ) -> Result<StatementResult> {
-        if catalog.table_by_name(&create.name).is_some() {
-            return Err(HtapError::Conflict(format!(
-                "table '{}' already exists",
-                create.name
-            )));
-        }
+        let (partitioning_desc, partition_items) = match create.partitioning {
+            Some(BoundPartitioning::Range {
+                key_column,
+                partitions,
+            }) => (
+                Some(PartitioningDescriptor::new(
+                    key_column,
+                    PartitioningMethod::Range,
+                )),
+                partitions
+                    .into_iter()
+                    .map(|p| {
+                        (
+                            p.name,
+                            Some(RangeBound::new_opt(p.lower, p.upper)),
+                            Vec::new(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Some(BoundPartitioning::List {
+                key_column,
+                partitions,
+            }) => (
+                Some(PartitioningDescriptor::new(
+                    key_column,
+                    PartitioningMethod::List,
+                )),
+                partitions
+                    .into_iter()
+                    .map(|p| (p.name, None, p.values))
+                    .collect::<Vec<_>>(),
+            ),
+            None => (None, vec![("p0".to_string(), None, Vec::new())]),
+        };
 
-        let max_table_id = catalog
-            .tables
-            .iter()
-            .map(|t| t.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let next_table_id = max_table_id
-            .checked_add(1)
-            .ok_or(HtapError::CounterOverflow {
-                counter: "table_id",
-            })?;
-        let table_id = TableId::new(next_table_id);
-
-        let max_partition_id = catalog
-            .partitions
-            .iter()
-            .map(|p| p.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let next_partition_id =
-            max_partition_id
-                .checked_add(1)
-                .ok_or(HtapError::CounterOverflow {
-                    counter: "partition_id",
-                })?;
-        let partition_id = PartitionId::new(next_partition_id);
-
-        let max_tablet_id = catalog
-            .tablets
-            .iter()
-            .map(|t| t.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let next_tablet_id = max_tablet_id
-            .checked_add(1)
-            .ok_or(HtapError::CounterOverflow {
-                counter: "tablet_id",
-            })?;
-        let tablet_id = TabletId::new(next_tablet_id);
-
-        let max_replica_id = catalog
-            .replicas
-            .iter()
-            .map(|r| r.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let next_replica_id = max_replica_id
-            .checked_add(1)
-            .ok_or(HtapError::CounterOverflow {
-                counter: "replica_id",
-            })?;
-        let replica_id = ReplicaId::new(next_replica_id);
-
-        let next_generation =
-            catalog
-                .generation
-                .checked_add(1)
-                .ok_or(HtapError::CounterOverflow {
-                    counter: "catalog_generation",
-                })?;
-
-        let table_desc = TableDescriptor::new(
-            table_id,
+        self.create_table_internal(
+            catalog,
             create.name,
             create.schema,
             create.primary_key,
-            vec![partition_id],
-            next_generation,
-        );
-
-        let partition_desc = PartitionDescriptor::new(
-            partition_id,
-            table_id,
-            "p0",
-            StorageDescriptor::Row,
-            vec![tablet_id],
-            next_generation,
-        );
-
-        let tablet_desc = TabletDescriptor::new(
-            tablet_id,
-            partition_id,
-            0,
-            vec![replica_id],
-            next_generation,
-        );
-
-        let replica_desc = ReplicaDescriptor::new(
-            replica_id,
-            tablet_id,
-            NodeId::new(1),
-            true,
-            true,
-            next_generation,
-        );
-
-        let mut tables = catalog.tables.clone();
-        tables.push(table_desc);
-
-        let mut partitions = catalog.partitions.clone();
-        partitions.push(partition_desc);
-
-        let mut tablets = catalog.tablets.clone();
-        tablets.push(tablet_desc);
-
-        let mut replicas = catalog.replicas.clone();
-        replicas.push(replica_desc);
-
-        let next_snapshot =
-            CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas);
-
-        self.catalog
-            .compare_and_set(catalog.generation, next_snapshot)?;
-
-        Ok(StatementResult::ddl(1))
+            partitioning_desc,
+            partition_items,
+        )
     }
 
     fn execute_insert(

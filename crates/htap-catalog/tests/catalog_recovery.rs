@@ -1410,6 +1410,114 @@ fn test_range_partitioning_routing_and_boundaries() {
             .unwrap(),
         p1_id
     );
+
+    // RangeBound optional lower/upper and MAXVALUE routing
+    let maxvalue_table_id = TableId::new(2);
+    let maxvalue_table = TableDescriptor::new(
+        maxvalue_table_id,
+        "events",
+        Schema::new(vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnDef {
+                name: "payload".into(),
+                data_type: DataType::String,
+                nullable: true,
+                primary_key: false,
+            },
+        ])
+        .unwrap(),
+        vec![0],
+        vec![PartitionId::new(20), PartitionId::new(21)],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p20 = PartitionDescriptor::new(
+        PartitionId::new(20),
+        maxvalue_table_id,
+        "p0",
+        StorageDescriptor::Row,
+        vec![TabletId::new(200)],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+
+    let p21 = PartitionDescriptor::new(
+        PartitionId::new(21),
+        maxvalue_table_id,
+        "p_max",
+        StorageDescriptor::Row,
+        vec![TabletId::new(201)],
+        1,
+    )
+    .with_range(RangeBound::new_opt(Some(Value::Int64(100)), None));
+
+    let t200 = TabletDescriptor::new(
+        TabletId::new(200),
+        PartitionId::new(20),
+        0,
+        vec![ReplicaId::new(2000)],
+        1,
+    );
+    let t201 = TabletDescriptor::new(
+        TabletId::new(201),
+        PartitionId::new(21),
+        0,
+        vec![ReplicaId::new(2001)],
+        1,
+    );
+    let r2000 = ReplicaDescriptor::new(
+        ReplicaId::new(2000),
+        TabletId::new(200),
+        NodeId::new(1),
+        true,
+        true,
+        1,
+    );
+    let r2001 = ReplicaDescriptor::new(
+        ReplicaId::new(2001),
+        TabletId::new(201),
+        NodeId::new(1),
+        true,
+        true,
+        1,
+    );
+
+    let mv_snap = CatalogSnapshot::new(
+        1,
+        vec![maxvalue_table],
+        vec![p20, p21],
+        vec![t200, t201],
+        vec![r2000, r2001],
+    );
+    mv_snap.validate().unwrap();
+    assert_eq!(
+        mv_snap
+            .route_partition_value(maxvalue_table_id, &Value::Int64(50))
+            .unwrap(),
+        PartitionId::new(20)
+    );
+    assert_eq!(
+        mv_snap
+            .route_partition_value(maxvalue_table_id, &Value::Int64(100))
+            .unwrap(),
+        PartitionId::new(21)
+    );
+    assert_eq!(
+        mv_snap
+            .route_partition_value(maxvalue_table_id, &Value::Int64(999999))
+            .unwrap(),
+        PartitionId::new(21)
+    );
+    // Below lower bound of p0
+    assert!(mv_snap
+        .route_partition_value(maxvalue_table_id, &Value::Int64(-1))
+        .is_err());
 }
 
 #[test]

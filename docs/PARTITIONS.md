@@ -6,14 +6,14 @@ This document provides a code-grounded, comprehensive architectural guide to the
 
 ## 1. Scope and Creation Boundary
 
-Partitioning in the local HTAP engine separates native internal administrative topology configuration from the user-facing SQL parsing interface.
+Partitioning in the local HTAP engine is accessible both through typed SQL DDL and through the native internal administrative topology API.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│ SQL Interface (sqlparser 0.62 / MySqlDialect)                          │
+│ SQL Interface (vendored sqlparser / MySqlDialect)                      │
 │                                                                        │
 │   CREATE TABLE ...                 --> Unpartitioned table (p0)        │
-│   CREATE TABLE ... PARTITION BY .. --> REJECTED (HtapError::InvalidArg)│
+│   CREATE TABLE ... PARTITION BY .. --> Supported typed RANGE/LIST DDL   │
 └──────────────────────────────────┬─────────────────────────────────────┘
                                    │
 ┌──────────────────────────────────▼─────────────────────────────────────┐
@@ -27,15 +27,37 @@ Partitioning in the local HTAP engine separates native internal administrative t
 
 ### SQL DDL: Default Single-Partition (`p0`) Behavior
 
-Standard SQL DDL executed through `LocalServer::execute` or `LocalServer::execute_create_table` creates an **unpartitioned** table. In the catalog model:
+Standard SQL DDL executed through `LocalServer::execute` or `LocalServer::execute_create_table` without a `PARTITION BY` clause creates an **unpartitioned** table. In the catalog model:
 - `TableDescriptor.partitioning` is set to `None`.
 - The table contains exactly one default partition named `"p0"`.
 - The partition is assigned a single tablet (`bucket = 0`) and a single local leader replica on node 1 (`NodeId(1)`).
 - All DML mutations and queries route to this single partition automatically.
 
+### Supported SQL Partition DDL Grammar and Constraints
+
+MySQL partitioning syntax is supported for finite RANGE and LIST partitioning:
+- **`PARTITION BY RANGE (col)` / `PARTITION BY RANGE COLUMNS (col)`:**
+  Defined with partition definitions using `PARTITION name VALUES LESS THAN (value)` and optional final `PARTITION name VALUES LESS THAN MAXVALUE`. Values must be strictly increasing (`v0 < v1 < ... < vN`).
+- **`PARTITION BY LIST (col)` / `PARTITION BY LIST COLUMNS (col)`:**
+  Defined with partition definitions using `PARTITION name VALUES IN (val1, val2, ...)`. Values must be non-empty, non-null, and mutually disjoint across all partitions.
+- **Partition Key Constraints:**
+  The partition key must be a single column, must exist in the schema, must be non-null, and must be included in the primary key (`table.primary_key.contains(&key_column)`).
+
+### Strict Rejection of Unsupported Partitioning Forms
+
+To maintain data integrity and avoid lossy dialect workarounds, non-supported partition syntax is strictly rejected:
+- **Partition Options:** Options such as `ENGINE = ...`, `COMMENT = ...`, `TABLESPACE = ...`, or `DATA DIRECTORY = ...` in partition definitions are rejected at parse time with `HtapError::InvalidArgument`.
+- **Subpartitioning:** `SUBPARTITION BY ...` or `SUBPARTITION` clauses are rejected at parse time with `HtapError::InvalidArgument`.
+- **LIST DEFAULT:** `VALUES IN (DEFAULT)` or `VALUES IN DEFAULT` are rejected with parse or binder errors.
+- **Expressions:** Partition expressions such as `PARTITION BY RANGE (id + 1)` are rejected by the binder with `HtapError::Unsupported("expressions in PARTITION BY are not supported, only column identifiers")`.
+- **Multi-column COLUMNS:** Multi-column keys like `RANGE COLUMNS (a, b)` or `LIST COLUMNS (a, b)` are rejected by the binder with `HtapError::Unsupported("multi-column partitioning is not supported")`.
+- **Malformed / Non-Final MAXVALUE:** Non-final `MAXVALUE` partitions are rejected by the binder with `HtapError::InvalidArgument`. Malformed MAXVALUE syntax (e.g. within compound tuples) fails at parse time.
+- **Generic AST partition_by:** Generic non-MySQL AST `partition_by` is rejected by the binder with `HtapError::Unsupported`.
+- **Partition Lifecycle DDL:** `ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`, partition split/merge/drop, cross-partition row movement on UPDATE, and hash/key partitioning remain deferred.
+
 ### Native Administrative API: Finite Range and List Partitioning
 
-Partitioned tables are defined exclusively via the native in-process API:
+Partitioned tables may also be defined via the native in-process API:
 ```rust
 pub fn create_partitioned_table(
     &self,
@@ -55,13 +77,6 @@ pub fn create_partitioned_table(
 
 **Empty Topology Rejection:**
 Attempting to create a partitioned table with an empty partition vector (`partitions.is_empty()`) is rejected before acquiring the execution lock, mutating the catalog, or allocating IDs, returning `HtapError::InvalidArgument` (`test_partitioned_empty_topology_rejection_no_catalog_mutation` in `crates/htap-server/tests/local_server.rs`).
-
-### Rejection of MySQL Partition DDL
-
-MySQL partitioning syntax (`PARTITION BY RANGE (...)`, `PARTITION BY RANGE COLUMNS (...)`, `PARTITION BY LIST (...)`, `PARTITION BY LIST COLUMNS (...)`, and `PARTITION BY ... VALUES LESS THAN MAXVALUE`) is intentionally **not** supported via SQL DDL:
-- **Parser Level (`sqlparser 0.62` / `MySqlDialect`):** The pinned parser grammar does not retain MySQL partition definitions in its AST. All MySQL partition DDL strings fail during `parse_one` and return `HtapError::InvalidArgument("SQL parse error: ...")`. Verified in `crates/htap-sql/tests/parse_bind.rs`: `test_mysql_partition_ddl_rejected_at_parser_level`.
-- **Binder Level:** If a `Statement::CreateTable` AST node is manually constructed with `partition_by = Some(...)`, `htap-sql::bind` (`crates/htap-sql/src/binder.rs:172`) rejects it with `HtapError::Unsupported("ORDER BY / PARTITION BY / CLUSTER BY not supported in CREATE TABLE")`. Verified via manual-AST rejection in `crates/htap-sql/tests/parse_bind.rs:979-986`: `test_negative_create_table`.
-- No lossy regex pre-parsing or coercion of unrelated AST fields is permitted (ADR-011).
 
 ---
 
@@ -461,9 +476,9 @@ To maintain rigorous production invariants, HTAP explicitly delineates implement
 
 | Capability / Area | Status in Local Server | Architectural / Deferred Status |
 |---|---|---|
-| **SQL Partition DDL** | `CREATE TABLE` creates unpartitioned `p0`; MySQL partition DDL rejected (`InvalidArgument`) | Deferred until SQL parser/binder upgrade supports lossless MySQL partition syntax |
+| **SQL Partition DDL** | Supported for finite `RANGE [COLUMNS]` (including `MAXVALUE`) and `LIST [COLUMNS]`; unpartitioned creates `p0` | Options, subpartitioning, expressions, multi-column COLUMNS, and non-final MAXVALUE rejected |
 | **Partition Lifecycle DDL** | None | `ALTER TABLE ADD/DROP/REORGANIZE PARTITION` deferred |
-| **Topology Specification** | Finite `PartitionTopology::Range` and `List` via `LocalServer::create_partitioned_table` | Catch-all `MAXVALUE` and `DEFAULT` options deferred |
+| **Topology Specification** | Finite `PartitionTopology::Range` (with optional unbounded upper) and `List` via SQL DDL or `LocalServer::create_partitioned_table` | Catch-all `DEFAULT` options deferred |
 | **Tablet Sharding / Hashing** | Exactly 1 bucket-0 tablet per partition | Hash bucket rings, sub-partitioning, and dynamic tablet splitting deferred |
 | **Replica Topology** | Exactly 1 local leader replica on `NodeId(1)` | Multi-node replica placement, Raft consensus groups, and failover deferred |
 | **Multi-Partition DML** | Multi-row INSERT committed in 1 transaction payload and version step | Cross-partition row movement on partition key UPDATE deferred |

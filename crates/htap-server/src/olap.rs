@@ -825,36 +825,49 @@ pub fn prune_partitions<'a>(
                                     Some(r) => r,
                                     None => continue,
                                 };
-                                if range.lower.data_type() != Some(key_col.data_type)
-                                    || range.upper.data_type() != Some(key_col.data_type)
-                                {
-                                    continue;
+                                if let Some(l) = &range.lower {
+                                    if l.data_type() != Some(key_col.data_type) {
+                                        continue;
+                                    }
+                                }
+                                if let Some(u) = &range.upper {
+                                    if u.data_type() != Some(key_col.data_type) {
+                                        continue;
+                                    }
                                 }
 
                                 match op {
                                     ComparisonOp::Eq => {
-                                        if *value < range.lower || *value >= range.upper {
+                                        if !range.contains(value) {
                                             return false;
                                         }
                                     }
                                     ComparisonOp::Lt => {
-                                        if range.lower >= *value {
-                                            return false;
+                                        if let Some(l) = &range.lower {
+                                            if l >= value {
+                                                return false;
+                                            }
                                         }
                                     }
                                     ComparisonOp::Lte => {
-                                        if range.lower > *value {
-                                            return false;
+                                        if let Some(l) = &range.lower {
+                                            if l > value {
+                                                return false;
+                                            }
                                         }
                                     }
                                     ComparisonOp::Gt => {
-                                        if range.upper <= *value {
-                                            return false;
+                                        if let Some(u) = &range.upper {
+                                            if u <= value {
+                                                return false;
+                                            }
                                         }
                                     }
                                     ComparisonOp::Gte => {
-                                        if range.upper <= *value {
-                                            return false;
+                                        if let Some(u) = &range.upper {
+                                            if u <= value {
+                                                return false;
+                                            }
                                         }
                                     }
                                     ComparisonOp::NotEq => {
