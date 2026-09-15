@@ -10,7 +10,10 @@ use htap_catalog::{
 };
 use htap_colstore::SegmentOptions;
 use htap_common::{ColumnDef, DataType, HtapError, Row, Schema, Value, Version};
-use htap_convert::{manifest_path, write_segment, LocalConverter, TabletColumnManifest};
+use htap_convert::{
+    manifest_path, write_segment, ConversionAction, ConversionErrorCategory, ConversionPolicy,
+    LocalConverter, TabletColumnManifest,
+};
 use htap_rowstore::{Engine, EngineOptions, Mutation};
 use tempfile::tempdir;
 
@@ -1507,4 +1510,332 @@ fn test_compact_read_validation_errors() {
     )
     .unwrap_err();
     assert!(matches!(err, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_demote_partition_to_row_clearing_manifest_and_retained_data() {
+    let dir = tempdir().unwrap();
+    let (cat_store, engine, _table_id, part_id, tablet_id, _schema) = make_test_setup(dir.path());
+    let colstore_dir = dir.path().join("colstore");
+
+    // Commit rows to rowstore
+    for i in 1..=5 {
+        commit_put(&engine, part_id.as_u64(), i, Some(&format!("val-{i}")));
+    }
+
+    let converter = LocalConverter::new(
+        Arc::clone(&cat_store) as Arc<dyn CatalogStore>,
+        Arc::clone(&engine),
+        &colstore_dir,
+        SegmentOptions::default(),
+    );
+
+    // Convert to Column
+    let conv_rep = converter.convert_partition_to_column(part_id).unwrap();
+    assert_eq!(conv_rep.action, ConversionAction::Converted);
+    assert_eq!(conv_rep.final_storage, StorageDescriptor::Column);
+    assert!(conv_rep.manifest.is_some());
+
+    // Verify catalog has Column storage and tablet column_manifest
+    let cat_col = cat_store.load().unwrap().unwrap();
+    assert_eq!(
+        cat_col.partition(part_id).unwrap().storage,
+        StorageDescriptor::Column
+    );
+    assert!(cat_col.tablet(tablet_id).unwrap().column_manifest.is_some());
+    let gen_before = cat_col.generation;
+
+    // Demote to Row
+    let dem_rep = converter.demote_partition_to_row(part_id).unwrap();
+    assert_eq!(dem_rep.action, ConversionAction::DemotedToRow);
+    assert_eq!(dem_rep.starting_storage, StorageDescriptor::Column);
+    assert_eq!(dem_rep.final_storage, StorageDescriptor::Row);
+    assert!(dem_rep.manifest.is_none());
+    assert!(dem_rep.is_success());
+
+    // Verify catalog: Row storage, no conversion descriptor, tablet column_manifest cleared
+    let cat_row = cat_store.load().unwrap().unwrap();
+    let p_desc = cat_row.partition(part_id).unwrap();
+    assert_eq!(p_desc.storage, StorageDescriptor::Row);
+    assert!(p_desc.conversion.is_none());
+    assert!(cat_row.tablet(tablet_id).unwrap().column_manifest.is_none());
+    assert!(cat_row.generation > gen_before);
+    assert_eq!(p_desc.generation, cat_row.generation);
+    assert_eq!(
+        cat_row.tablet(tablet_id).unwrap().generation,
+        cat_row.generation
+    );
+
+    // Verify on-disk files are retained
+    let m_path = manifest_path(&colstore_dir, tablet_id);
+    assert!(m_path.is_file(), "manifest file should be retained on disk");
+    let t_dir = htap_convert::tablet_dir(&colstore_dir, tablet_id);
+    let gen_dir = t_dir.join(format!(
+        "gen-{}",
+        conv_rep.manifest.as_ref().unwrap().generation
+    ));
+    assert!(
+        gen_dir.join("seg-0.col").is_file(),
+        "columnar segment file should be retained on disk"
+    );
+
+    // Verify query reads visible rows from rowstore
+    let rows = converter.read_column_partition_current(part_id).unwrap();
+    assert_eq!(rows.len(), 5);
+
+    // Repeated demote is idempotent AlreadyAtTarget
+    let rep2 = converter.demote_partition_to_row(part_id).unwrap();
+    assert_eq!(rep2.action, ConversionAction::AlreadyAtTarget);
+    assert_eq!(rep2.final_storage, StorageDescriptor::Row);
+}
+
+#[test]
+fn test_demote_partition_rejections_active_converting_and_missing_and_corrupt() {
+    let dir = tempdir().unwrap();
+    let (cat_store, engine, _table_id, part_id, tablet_id, _schema) = make_test_setup(dir.path());
+    let colstore_dir = dir.path().join("colstore");
+
+    let converter = LocalConverter::new(
+        Arc::clone(&cat_store) as Arc<dyn CatalogStore>,
+        Arc::clone(&engine),
+        &colstore_dir,
+        SegmentOptions::default(),
+    );
+
+    // 1. Active converting rejects demote
+    let cur_cat = cat_store.load().unwrap().unwrap();
+    let next_gen = cur_cat.generation + 1;
+    let mut cat_converting = cur_cat.clone();
+    cat_converting.generation = next_gen;
+    let p = cat_converting
+        .partitions
+        .iter_mut()
+        .find(|p| p.id == part_id)
+        .unwrap();
+    p.generation = next_gen;
+    p.storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: next_gen,
+    };
+    p.conversion = Some(ConversionDescriptor::new(
+        next_gen,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(1),
+        ConversionPhase::SnapshotPinned,
+    ));
+    cat_store
+        .compare_and_set(cur_cat.generation, cat_converting)
+        .unwrap();
+
+    let dem_rep = converter.demote_partition_to_row(part_id).unwrap();
+    assert_eq!(dem_rep.action, ConversionAction::Blocked);
+    assert!(!dem_rep.is_success());
+    assert!(dem_rep
+        .error
+        .unwrap()
+        .contains("active in-flight conversion"));
+
+    // Reset and convert normally to Column
+    let _ = commit_put(&engine, part_id.as_u64(), 10, Some("x"));
+    let _ = converter.convert_partition_to_column(part_id).unwrap();
+
+    // 2. Corrupt manifest returns corruption Err
+    let m_path = manifest_path(&colstore_dir, tablet_id);
+    std::fs::write(&m_path, b"GARBAGE_BYTES_THAT_ARE_NOT_VALID_MANIFEST").unwrap();
+    let err = converter.demote_partition_to_row(part_id).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+
+    // 3. Missing manifest blocks demotion
+    std::fs::remove_file(&m_path).unwrap();
+    let dem_rep2 = converter.demote_partition_to_row(part_id).unwrap();
+    assert_eq!(dem_rep2.action, ConversionAction::Blocked);
+    assert!(!dem_rep2.is_success());
+}
+
+#[test]
+fn test_table_conversion_multi_partition_and_mixed_blocking() {
+    let dir = tempdir().unwrap();
+    let cat_dir = dir.path().join("catalog");
+    let row_dir = dir.path().join("rowstore");
+    let colstore_dir = dir.path().join("colstore");
+
+    let cat_store = Arc::new(LocalCatalogStore::open(cat_dir).unwrap());
+    let engine = Arc::new(Engine::open(EngineOptions::new(row_dir)).unwrap());
+    let schema = test_schema();
+
+    let table_id = TableId::new(1);
+    let p0_id = PartitionId::new(10);
+    let p1_id = PartitionId::new(20);
+    let t0_id = TabletId::new(100);
+    let t1_id = TabletId::new(200);
+    let r0_id = ReplicaId::new(1000);
+    let r1_id = ReplicaId::new(2000);
+
+    let table = TableDescriptor::new(
+        table_id,
+        "multi_table",
+        schema.clone(),
+        vec![0],
+        vec![p0_id, p1_id],
+        1,
+    );
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        table_id,
+        "p0",
+        StorageDescriptor::Row,
+        vec![t0_id],
+        1,
+    );
+    let p1 = PartitionDescriptor::new(
+        p1_id,
+        table_id,
+        "p1",
+        StorageDescriptor::Row,
+        vec![t1_id],
+        1,
+    );
+    let t0 = TabletDescriptor::new(t0_id, p0_id, 0, vec![r0_id], 1);
+    let t1 = TabletDescriptor::new(t1_id, p1_id, 0, vec![r1_id], 1);
+    let r0 = ReplicaDescriptor::new(r0_id, t0_id, NodeId::new(1), true, true, 1);
+    let r1 = ReplicaDescriptor::new(r1_id, t1_id, NodeId::new(1), true, true, 1);
+
+    let snap = CatalogSnapshot::new(1, vec![table], vec![p0, p1], vec![t0, t1], vec![r0, r1]);
+    cat_store.compare_and_set(0, snap).unwrap();
+
+    // Commit rows into both partitions
+    commit_put(&engine, p0_id.as_u64(), 1, Some("p0-val1"));
+    commit_put(&engine, p1_id.as_u64(), 2, Some("p1-val2"));
+
+    let converter = LocalConverter::new(
+        Arc::clone(&cat_store) as Arc<dyn CatalogStore>,
+        Arc::clone(&engine),
+        &colstore_dir,
+        SegmentOptions::default(),
+    );
+
+    // Convert multi-partition table to Column
+    let t_rep = converter.convert_table_to_column("multi_table").unwrap();
+    assert_eq!(t_rep.table_name, "multi_table");
+    assert_eq!(t_rep.target_format, StorageFormat::Column);
+    assert_eq!(t_rep.partitions.len(), 2);
+    assert!(t_rep.is_success());
+    // Deterministic ordering by partition ID
+    assert_eq!(t_rep.partitions[0].partition_id, p0_id);
+    assert_eq!(t_rep.partitions[1].partition_id, p1_id);
+    assert_eq!(t_rep.partitions[0].action, ConversionAction::Converted);
+    assert_eq!(t_rep.partitions[1].action, ConversionAction::Converted);
+
+    // Demote table to Row
+    let d_rep = converter.convert_table_to_row("multi_table").unwrap();
+    assert_eq!(d_rep.target_format, StorageFormat::Row);
+    assert!(d_rep.is_success());
+    assert_eq!(d_rep.partitions[0].action, ConversionAction::DemotedToRow);
+    assert_eq!(d_rep.partitions[1].action, ConversionAction::DemotedToRow);
+
+    // Tamper with replica 1: make it unhealthy
+    let cur_cat = cat_store.load().unwrap().unwrap();
+    let next_gen = cur_cat.generation + 1;
+    let mut cat_tampered = cur_cat.clone();
+    cat_tampered.generation = next_gen;
+    let rep1_mut = cat_tampered
+        .replicas
+        .iter_mut()
+        .find(|r| r.id == r1_id)
+        .unwrap();
+    rep1_mut.healthy = false;
+    cat_store
+        .compare_and_set(cur_cat.generation, cat_tampered)
+        .unwrap();
+
+    // Mixed success/blocking: p0 converts, p1 blocked
+    let mixed_rep = converter.convert_table_to_column("multi_table").unwrap();
+    assert!(!mixed_rep.is_success());
+    assert_eq!(mixed_rep.partitions[0].action, ConversionAction::Converted);
+    assert_eq!(mixed_rep.partitions[1].action, ConversionAction::Blocked);
+    assert_eq!(
+        mixed_rep.partitions[1].error_category,
+        Some(ConversionErrorCategory::Conflict)
+    );
+}
+
+#[test]
+fn test_conversion_tick_resumes_snapshot_pinned() {
+    let dir = tempdir().unwrap();
+    let (cat_store, engine, table_id, part_id, tablet_id, _schema) = make_test_setup(dir.path());
+    let colstore_dir = dir.path().join("colstore");
+
+    commit_put(&engine, part_id.as_u64(), 1, Some("tick-val1"));
+
+    let converter = LocalConverter::new(
+        Arc::clone(&cat_store) as Arc<dyn CatalogStore>,
+        Arc::clone(&engine),
+        &colstore_dir,
+        SegmentOptions::default(),
+    );
+
+    // 1. Idempotent tick on clean state
+    let empty_tick = converter
+        .conversion_tick(&ConversionPolicy::manual())
+        .unwrap();
+    assert!(empty_tick.tables.is_empty());
+    assert!(empty_tick.is_success());
+
+    // 2. Put partition in Converting state with SnapshotPinned
+    let cur_cat = cat_store.load().unwrap().unwrap();
+    let next_gen = cur_cat.generation + 1;
+    let mut cat_converting = cur_cat.clone();
+    cat_converting.generation = next_gen;
+    let p = cat_converting
+        .partitions
+        .iter_mut()
+        .find(|p| p.id == part_id)
+        .unwrap();
+    p.generation = next_gen;
+    p.storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: next_gen,
+    };
+    p.conversion = Some(ConversionDescriptor::new(
+        next_gen,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(1),
+        ConversionPhase::SnapshotPinned,
+    ));
+    cat_store
+        .compare_and_set(cur_cat.generation, cat_converting)
+        .unwrap();
+
+    // 3. Tick resumes the in-flight job
+    let tick_rep = converter
+        .conversion_tick(&ConversionPolicy::manual())
+        .unwrap();
+    assert_eq!(tick_rep.tables.len(), 1);
+    assert_eq!(tick_rep.tables[0].table_id, table_id);
+    let p_rep = tick_rep.tables[0].partition_report(part_id).unwrap();
+    assert_eq!(p_rep.action, ConversionAction::Resumed);
+    assert_eq!(p_rep.final_storage, StorageDescriptor::Column);
+    assert!(p_rep.manifest.is_some());
+
+    // 4. Verify catalog is now Column and has column_manifest
+    let reloaded = cat_store.load().unwrap().unwrap();
+    assert_eq!(
+        reloaded.partition(part_id).unwrap().storage,
+        StorageDescriptor::Column
+    );
+    assert!(reloaded
+        .tablet(tablet_id)
+        .unwrap()
+        .column_manifest
+        .is_some());
+
+    // 5. Subsequent tick is a no-op / idempotent
+    let tick2 = converter
+        .conversion_tick(&ConversionPolicy::manual())
+        .unwrap();
+    assert!(tick2.tables.is_empty());
 }

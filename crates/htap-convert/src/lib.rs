@@ -1,8 +1,7 @@
-//! Row-to-column conversion engine and durable tablet columnar manifests.
+//! Row-to-column conversion, column-to-row metadata demotion, and durable tablet columnar manifests.
 //!
-//! Conversion is row-to-column only; bidirectional/reverse conversion is not supported.
-//!
-//! Provides the crash-safe [`TabletColumnManifest`], writer helpers for columnar segments,
+//! Provides conversion state machine management, metadata demotion to row storage,
+//! crash-safe [`TabletColumnManifest`], writer helpers for columnar segments,
 //! and envelope serialization with CRC32-C verification.
 
 #![forbid(unsafe_code)]
@@ -17,7 +16,7 @@ use std::sync::Arc;
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{
     CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase, PartitionId,
-    StorageDescriptor, StorageFormat, TabletId,
+    StorageDescriptor, StorageFormat, TableId, TabletId,
 };
 pub use htap_catalog::{MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS};
 use htap_colstore::{validate_segment_schema, ScanRequest, SegmentReader, SegmentWriter};
@@ -27,6 +26,248 @@ use htap_common::{
 };
 use htap_rowstore::{Engine, MemtableEntry, Snapshot, ValueKind};
 use serde::{Deserialize, Serialize};
+
+/// Action taken or outcome of a conversion attempt on a partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConversionAction {
+    /// Partition was converted from row to columnar storage.
+    Converted,
+    /// Partition was already at the target storage layout.
+    AlreadyAtTarget,
+    /// In-flight conversion was resumed and completed.
+    Resumed,
+    /// Partition was metadata-demoted from columnar back to row storage.
+    DemotedToRow,
+    /// Conversion was blocked by operational or topology constraints.
+    Blocked,
+    /// Conversion failed due to an error during execution.
+    Failed,
+}
+
+impl std::fmt::Display for ConversionAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Converted => write!(f, "Converted"),
+            Self::AlreadyAtTarget => write!(f, "AlreadyAtTarget"),
+            Self::Resumed => write!(f, "Resumed"),
+            Self::DemotedToRow => write!(f, "DemotedToRow"),
+            Self::Blocked => write!(f, "Blocked"),
+            Self::Failed => write!(f, "Failed"),
+        }
+    }
+}
+
+/// Category of error when a partition conversion fails or is blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConversionErrorCategory {
+    /// Validation or argument error (e.g. invalid partition topology).
+    Validation,
+    /// Feature or configuration not supported (e.g. multi-tablet partition).
+    Unsupported,
+    /// Concurrency or state conflict (e.g. active conversion, replica not leader).
+    Conflict,
+    /// Data or manifest corruption detected.
+    Corruption,
+    /// Storage or filesystem I/O error.
+    Io,
+    /// Required catalog or storage entity not found.
+    NotFound,
+    /// Internal engine error.
+    Internal,
+}
+
+impl From<&HtapError> for ConversionErrorCategory {
+    fn from(err: &HtapError) -> Self {
+        match err {
+            HtapError::Io(_) => Self::Io,
+            HtapError::Corruption(_) => Self::Corruption,
+            HtapError::NotFound(_) => Self::NotFound,
+            HtapError::InvalidArgument(_) => Self::Validation,
+            HtapError::Conflict(_) => Self::Conflict,
+            HtapError::Fenced { .. } => Self::Conflict,
+            HtapError::CounterOverflow { .. } => Self::Internal,
+            HtapError::DurablePending { .. } => Self::Internal,
+            HtapError::Unsupported(_) => Self::Unsupported,
+            HtapError::Internal(_) => Self::Internal,
+        }
+    }
+}
+
+impl std::fmt::Display for ConversionErrorCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation => write!(f, "Validation"),
+            Self::Unsupported => write!(f, "Unsupported"),
+            Self::Conflict => write!(f, "Conflict"),
+            Self::Corruption => write!(f, "Corruption"),
+            Self::Io => write!(f, "Io"),
+            Self::NotFound => write!(f, "NotFound"),
+            Self::Internal => write!(f, "Internal"),
+        }
+    }
+}
+
+/// Public report summarizing the conversion outcome for a single partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionConversionReport {
+    /// Unique identifier of the partition.
+    pub partition_id: PartitionId,
+    /// Logical name of the partition.
+    pub partition_name: String,
+    /// Starting storage descriptor before conversion was attempted.
+    pub starting_storage: StorageDescriptor,
+    /// Final storage descriptor after conversion attempt.
+    pub final_storage: StorageDescriptor,
+    /// Action taken or outcome of the conversion.
+    pub action: ConversionAction,
+    /// Published columnar manifest, if target was Column and conversion or verification succeeded.
+    pub manifest: Option<TabletColumnManifest>,
+    /// Error category if conversion failed or was blocked.
+    pub error_category: Option<ConversionErrorCategory>,
+    /// Error description string if conversion failed or was blocked.
+    pub error: Option<String>,
+}
+
+impl PartitionConversionReport {
+    /// Returns true if the partition conversion succeeded (not blocked and not failed).
+    pub fn is_success(&self) -> bool {
+        !matches!(
+            self.action,
+            ConversionAction::Blocked | ConversionAction::Failed
+        )
+    }
+}
+
+/// Public report summarizing the conversion outcome for an entire table across all its partitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableConversionReport {
+    /// Identifier of the table.
+    pub table_id: TableId,
+    /// Logical name of the table.
+    pub table_name: String,
+    /// Target storage format requested.
+    pub target_format: StorageFormat,
+    /// Reports for each partition in the table, ordered deterministically.
+    pub partitions: Vec<PartitionConversionReport>,
+}
+
+impl TableConversionReport {
+    /// Create a new table conversion report.
+    pub fn new(
+        table_id: TableId,
+        table_name: impl Into<String>,
+        target_format: StorageFormat,
+        partitions: Vec<PartitionConversionReport>,
+    ) -> Self {
+        Self {
+            table_id,
+            table_name: table_name.into(),
+            target_format,
+            partitions,
+        }
+    }
+
+    /// Returns true if all partition conversions succeeded without being blocked or failing.
+    pub fn is_success(&self) -> bool {
+        self.partitions.iter().all(|p| p.is_success())
+    }
+
+    /// Find a partition report by partition ID.
+    pub fn partition_report(
+        &self,
+        partition_id: PartitionId,
+    ) -> Option<&PartitionConversionReport> {
+        self.partitions
+            .iter()
+            .find(|p| p.partition_id == partition_id)
+    }
+
+    /// Find a partition report by partition name.
+    pub fn partition_report_by_name(
+        &self,
+        partition_name: &str,
+    ) -> Option<&PartitionConversionReport> {
+        self.partitions
+            .iter()
+            .find(|p| p.partition_name == partition_name)
+    }
+}
+
+/// Explicit target specification for synchronous conversion policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConversionTarget {
+    /// Target an entire table by name.
+    Table {
+        /// Name of the table.
+        name: String,
+        /// Target storage format.
+        target: StorageFormat,
+    },
+    /// Target an individual partition by ID.
+    Partition {
+        /// ID of the partition.
+        id: PartitionId,
+        /// Target storage format.
+        target: StorageFormat,
+    },
+}
+
+/// Execution policy controlling synchronous conversion ticks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConversionPolicy {
+    /// Explicit target list for conversion.
+    /// If empty (manual default policy), tick only resumes existing in-flight `Converting` jobs.
+    pub targets: Vec<ConversionTarget>,
+}
+
+impl ConversionPolicy {
+    /// Create a manual policy that only resumes existing in-flight `Converting` jobs.
+    pub fn manual() -> Self {
+        Self {
+            targets: Vec::new(),
+        }
+    }
+
+    /// Add a table target to the policy.
+    pub fn with_table(mut self, name: impl Into<String>, target: StorageFormat) -> Self {
+        self.targets.push(ConversionTarget::Table {
+            name: name.into(),
+            target,
+        });
+        self
+    }
+
+    /// Add a partition target to the policy.
+    pub fn with_partition(mut self, id: PartitionId, target: StorageFormat) -> Self {
+        self.targets
+            .push(ConversionTarget::Partition { id, target });
+        self
+    }
+}
+
+/// Report summarizing all table conversions performed during a synchronous conversion tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConversionTickReport {
+    /// Table conversion reports produced during the tick.
+    pub tables: Vec<TableConversionReport>,
+}
+
+impl ConversionTickReport {
+    /// Create a new conversion tick report with the given table reports.
+    pub fn new(tables: Vec<TableConversionReport>) -> Self {
+        Self { tables }
+    }
+
+    /// Returns true if all table conversions in this tick succeeded.
+    pub fn is_success(&self) -> bool {
+        self.tables.iter().all(|t| t.is_success())
+    }
+
+    /// Returns all partition reports across all tables in this tick.
+    pub fn partition_reports(&self) -> Vec<&PartitionConversionReport> {
+        self.tables.iter().flat_map(|t| &t.partitions).collect()
+    }
+}
 
 /// Header magic bytes for tablet manifest files (`HTAPTBM1`).
 pub const HEADER_MAGIC: &[u8; 8] = b"HTAPTBM1";
@@ -1560,6 +1801,744 @@ pub fn read_column_partition_compact(
     )
 }
 
+fn is_fatal_catalog_error(err: &HtapError) -> bool {
+    matches!(
+        err,
+        HtapError::CounterOverflow { .. } | HtapError::DurablePending { .. }
+    )
+}
+
+/// Perform row-to-column conversion for a partition, returning a structured [`PartitionConversionReport`].
+pub fn convert_partition_to_column(
+    catalog: &dyn CatalogStore,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    options: &SegmentOptions,
+    partition_id: PartitionId,
+) -> Result<PartitionConversionReport> {
+    let cat_snap = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+    let part_desc = cat_snap
+        .partition(partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?
+        .clone();
+
+    let starting_storage = part_desc.storage.clone();
+
+    // If already Column format, verify manifest is valid.
+    if matches!(starting_storage, StorageDescriptor::Column) {
+        if part_desc.conversion.is_some() {
+            return Ok(PartitionConversionReport {
+                partition_id,
+                partition_name: part_desc.name,
+                starting_storage: starting_storage.clone(),
+                final_storage: starting_storage,
+                action: ConversionAction::Blocked,
+                manifest: None,
+                error_category: Some(ConversionErrorCategory::Conflict),
+                error: Some(format!(
+                    "partition {partition_id} has Column storage but active conversion descriptor is present"
+                )),
+            });
+        }
+        if part_desc.tablets.len() != 1 {
+            return Ok(PartitionConversionReport {
+                partition_id,
+                partition_name: part_desc.name,
+                starting_storage: starting_storage.clone(),
+                final_storage: starting_storage,
+                action: ConversionAction::Blocked,
+                manifest: None,
+                error_category: Some(ConversionErrorCategory::Unsupported),
+                error: Some(format!(
+                    "partition {partition_id} has {} tablets; exactly 1 tablet is required",
+                    part_desc.tablets.len()
+                )),
+            });
+        }
+        let tablet_id = part_desc.tablets[0];
+        let tablet = cat_snap.tablet(tablet_id).ok_or_else(|| {
+            HtapError::Internal(format!(
+                "tablet {tablet_id} referenced by partition {partition_id} not found in catalog"
+            ))
+        })?;
+        let cat_mref = match &tablet.column_manifest {
+            Some(mref) => mref,
+            None => {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Blocked,
+                    manifest: None,
+                    error_category: Some(ConversionErrorCategory::NotFound),
+                    error: Some(format!(
+                        "partition {partition_id} in Column storage missing tablet column_manifest in catalog"
+                    )),
+                });
+            }
+        };
+
+        match open(colstore_root, tablet_id) {
+            Ok(disk_manifest) => {
+                if disk_manifest.generation != cat_mref.generation
+                    || disk_manifest.base_version != cat_mref.base_version
+                    || disk_manifest.segments.len() as u64 != cat_mref.segment_count
+                    || disk_manifest.total_rows() != cat_mref.row_count
+                {
+                    return Ok(PartitionConversionReport {
+                        partition_id,
+                        partition_name: part_desc.name,
+                        starting_storage: starting_storage.clone(),
+                        final_storage: starting_storage,
+                        action: ConversionAction::Blocked,
+                        manifest: None,
+                        error_category: Some(ConversionErrorCategory::Conflict),
+                        error: Some(format!(
+                            "column manifest on disk does not match catalog reference for tablet {tablet_id}"
+                        )),
+                    });
+                }
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: StorageDescriptor::Column,
+                    final_storage: StorageDescriptor::Column,
+                    action: ConversionAction::AlreadyAtTarget,
+                    manifest: Some(disk_manifest),
+                    error_category: None,
+                    error: None,
+                });
+            }
+            Err(HtapError::Corruption(msg)) => return Err(HtapError::Corruption(msg)),
+            Err(err) => {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Failed,
+                    manifest: None,
+                    error_category: Some((&err).into()),
+                    error: Some(format!("failed to open columnar manifest on disk: {err}")),
+                });
+            }
+        }
+    }
+
+    // Check topology prerequisites before attempting conversion
+    if part_desc.tablets.is_empty() || part_desc.tablets.len() != 1 {
+        return Ok(PartitionConversionReport {
+            partition_id,
+            partition_name: part_desc.name,
+            starting_storage: starting_storage.clone(),
+            final_storage: starting_storage,
+            action: ConversionAction::Blocked,
+            manifest: None,
+            error_category: Some(ConversionErrorCategory::Unsupported),
+            error: Some(format!(
+                "partition {partition_id} has {} tablets; exactly 1 tablet is required for conversion",
+                part_desc.tablets.len()
+            )),
+        });
+    }
+
+    let tablet_id = part_desc.tablets[0];
+    let tablet_desc = match cat_snap.tablet(tablet_id) {
+        Some(t) => t,
+        None => {
+            return Ok(PartitionConversionReport {
+                partition_id,
+                partition_name: part_desc.name,
+                starting_storage: starting_storage.clone(),
+                final_storage: starting_storage,
+                action: ConversionAction::Blocked,
+                manifest: None,
+                error_category: Some(ConversionErrorCategory::NotFound),
+                error: Some(format!(
+                    "tablet {tablet_id} referenced by partition {partition_id} not found in catalog"
+                )),
+            });
+        }
+    };
+
+    if tablet_desc.replicas.is_empty() || tablet_desc.replicas.len() != 1 {
+        return Ok(PartitionConversionReport {
+            partition_id,
+            partition_name: part_desc.name,
+            starting_storage: starting_storage.clone(),
+            final_storage: starting_storage,
+            action: ConversionAction::Blocked,
+            manifest: None,
+            error_category: Some(ConversionErrorCategory::Unsupported),
+            error: Some(format!(
+                "tablet {tablet_id} has {} replicas; exactly 1 replica is required for conversion",
+                tablet_desc.replicas.len()
+            )),
+        });
+    }
+
+    let replica_id = tablet_desc.replicas[0];
+    let replica_desc = match cat_snap.replica(replica_id) {
+        Some(r) => r,
+        None => {
+            return Ok(PartitionConversionReport {
+                partition_id,
+                partition_name: part_desc.name,
+                starting_storage: starting_storage.clone(),
+                final_storage: starting_storage,
+                action: ConversionAction::Blocked,
+                manifest: None,
+                error_category: Some(ConversionErrorCategory::NotFound),
+                error: Some(format!(
+                    "replica {replica_id} for tablet {tablet_id} not found in catalog"
+                )),
+            });
+        }
+    };
+
+    if !replica_desc.healthy {
+        return Ok(PartitionConversionReport {
+            partition_id,
+            partition_name: part_desc.name,
+            starting_storage: starting_storage.clone(),
+            final_storage: starting_storage,
+            action: ConversionAction::Blocked,
+            manifest: None,
+            error_category: Some(ConversionErrorCategory::Conflict),
+            error: Some(format!(
+                "replica {replica_id} for tablet {tablet_id} is not healthy"
+            )),
+        });
+    }
+
+    if !replica_desc.is_leader {
+        return Ok(PartitionConversionReport {
+            partition_id,
+            partition_name: part_desc.name,
+            starting_storage: starting_storage.clone(),
+            final_storage: starting_storage,
+            action: ConversionAction::Blocked,
+            manifest: None,
+            error_category: Some(ConversionErrorCategory::Conflict),
+            error: Some(format!(
+                "replica {replica_id} for tablet {tablet_id} is not leader"
+            )),
+        });
+    }
+
+    let was_converting = matches!(starting_storage, StorageDescriptor::Converting { .. });
+
+    match convert_partition(catalog, rowstore, colstore_root, options, partition_id) {
+        Ok(manifest) => {
+            let action = if was_converting {
+                ConversionAction::Resumed
+            } else {
+                ConversionAction::Converted
+            };
+            Ok(PartitionConversionReport {
+                partition_id,
+                partition_name: part_desc.name,
+                starting_storage,
+                final_storage: StorageDescriptor::Column,
+                action,
+                manifest: Some(manifest),
+                error_category: None,
+                error: None,
+            })
+        }
+        Err(HtapError::Corruption(msg)) => Err(HtapError::Corruption(msg)),
+        Err(err) => Ok(PartitionConversionReport {
+            partition_id,
+            partition_name: part_desc.name,
+            starting_storage: starting_storage.clone(),
+            final_storage: starting_storage,
+            action: ConversionAction::Failed,
+            manifest: None,
+            error_category: Some((&err).into()),
+            error: Some(err.to_string()),
+        }),
+    }
+}
+
+/// Perform metadata demotion from Column to Row storage for a partition.
+///
+/// Requires stable completed Column storage with matching published manifest.
+/// Executes a single catalog CAS setting Row, clearing conversion and tablet column_manifest,
+/// and incrementing generations. Retains rowstore and colstore files on disk.
+pub fn demote_partition_to_row(
+    catalog: &dyn CatalogStore,
+    colstore_root: &Path,
+    partition_id: PartitionId,
+) -> Result<PartitionConversionReport> {
+    let cat_snap = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+    let part_desc = cat_snap
+        .partition(partition_id)
+        .ok_or_else(|| HtapError::NotFound(format!("partition {partition_id} not found")))?
+        .clone();
+
+    let starting_storage = part_desc.storage.clone();
+
+    match &starting_storage {
+        StorageDescriptor::Row => {
+            if part_desc.conversion.is_some() {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Blocked,
+                    manifest: None,
+                    error_category: Some(ConversionErrorCategory::Conflict),
+                    error: Some(format!(
+                        "partition {partition_id} has Row storage but conversion descriptor is present"
+                    )),
+                });
+            }
+            Ok(PartitionConversionReport {
+                partition_id,
+                partition_name: part_desc.name,
+                starting_storage: StorageDescriptor::Row,
+                final_storage: StorageDescriptor::Row,
+                action: ConversionAction::AlreadyAtTarget,
+                manifest: None,
+                error_category: None,
+                error: None,
+            })
+        }
+        StorageDescriptor::Converting { .. } => {
+            // Reject active in-flight conversion
+            Ok(PartitionConversionReport {
+                partition_id,
+                partition_name: part_desc.name,
+                starting_storage: starting_storage.clone(),
+                final_storage: starting_storage,
+                action: ConversionAction::Blocked,
+                manifest: None,
+                error_category: Some(ConversionErrorCategory::Conflict),
+                error: Some(format!(
+                    "cannot demote partition {partition_id} with active in-flight conversion"
+                )),
+            })
+        }
+        StorageDescriptor::Column => {
+            if part_desc.conversion.is_some() {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Blocked,
+                    manifest: None,
+                    error_category: Some(ConversionErrorCategory::Conflict),
+                    error: Some(format!(
+                        "partition {partition_id} has Column storage but active conversion descriptor is present"
+                    )),
+                });
+            }
+
+            if part_desc.tablets.is_empty() || part_desc.tablets.len() != 1 {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Blocked,
+                    manifest: None,
+                    error_category: Some(ConversionErrorCategory::Unsupported),
+                    error: Some(format!(
+                        "partition {partition_id} has {} tablets; exactly 1 tablet is required for demotion",
+                        part_desc.tablets.len()
+                    )),
+                });
+            }
+
+            let tablet_id = part_desc.tablets[0];
+            let tablet_desc = match cat_snap.tablet(tablet_id) {
+                Some(t) => t,
+                None => {
+                    return Ok(PartitionConversionReport {
+                        partition_id,
+                        partition_name: part_desc.name,
+                        starting_storage: starting_storage.clone(),
+                        final_storage: starting_storage,
+                        action: ConversionAction::Blocked,
+                        manifest: None,
+                        error_category: Some(ConversionErrorCategory::NotFound),
+                        error: Some(format!(
+                            "tablet {tablet_id} referenced by partition {partition_id} not found in catalog"
+                        )),
+                    });
+                }
+            };
+
+            if tablet_desc.replicas.is_empty() || tablet_desc.replicas.len() != 1 {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Blocked,
+                    manifest: None,
+                    error_category: Some(ConversionErrorCategory::Unsupported),
+                    error: Some(format!(
+                        "tablet {tablet_id} has {} replicas; exactly 1 replica is required for demotion",
+                        tablet_desc.replicas.len()
+                    )),
+                });
+            }
+
+            let replica_id = tablet_desc.replicas[0];
+            let replica_desc = match cat_snap.replica(replica_id) {
+                Some(r) => r,
+                None => {
+                    return Ok(PartitionConversionReport {
+                        partition_id,
+                        partition_name: part_desc.name,
+                        starting_storage: starting_storage.clone(),
+                        final_storage: starting_storage,
+                        action: ConversionAction::Blocked,
+                        manifest: None,
+                        error_category: Some(ConversionErrorCategory::NotFound),
+                        error: Some(format!(
+                            "replica {replica_id} for tablet {tablet_id} not found in catalog"
+                        )),
+                    });
+                }
+            };
+
+            if !replica_desc.healthy {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Blocked,
+                    manifest: None,
+                    error_category: Some(ConversionErrorCategory::Conflict),
+                    error: Some(format!(
+                        "replica {replica_id} for tablet {tablet_id} is not healthy"
+                    )),
+                });
+            }
+
+            if !replica_desc.is_leader {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Blocked,
+                    manifest: None,
+                    error_category: Some(ConversionErrorCategory::Conflict),
+                    error: Some(format!(
+                        "replica {replica_id} for tablet {tablet_id} is not leader"
+                    )),
+                });
+            }
+
+            let manifest_ref = match &tablet_desc.column_manifest {
+                Some(r) => r,
+                None => {
+                    return Ok(PartitionConversionReport {
+                        partition_id,
+                        partition_name: part_desc.name,
+                        starting_storage: starting_storage.clone(),
+                        final_storage: starting_storage,
+                        action: ConversionAction::Blocked,
+                        manifest: None,
+                        error_category: Some(ConversionErrorCategory::NotFound),
+                        error: Some(format!(
+                            "partition {partition_id} in Column storage missing tablet column_manifest in catalog"
+                        )),
+                    });
+                }
+            };
+
+            let disk_manifest = match open(colstore_root, tablet_id) {
+                Ok(m) => m,
+                Err(HtapError::Corruption(msg)) => return Err(HtapError::Corruption(msg)),
+                Err(err) => {
+                    return Ok(PartitionConversionReport {
+                        partition_id,
+                        partition_name: part_desc.name,
+                        starting_storage: starting_storage.clone(),
+                        final_storage: starting_storage,
+                        action: ConversionAction::Blocked,
+                        manifest: None,
+                        error_category: Some((&err).into()),
+                        error: Some(format!("missing or unreadable manifest on disk: {err}")),
+                    });
+                }
+            };
+
+            if disk_manifest.generation != manifest_ref.generation
+                || disk_manifest.base_version != manifest_ref.base_version
+                || disk_manifest.segments.len() as u64 != manifest_ref.segment_count
+                || disk_manifest.total_rows() != manifest_ref.row_count
+            {
+                return Ok(PartitionConversionReport {
+                    partition_id,
+                    partition_name: part_desc.name,
+                    starting_storage: starting_storage.clone(),
+                    final_storage: starting_storage,
+                    action: ConversionAction::Blocked,
+                    manifest: None,
+                    error_category: Some(ConversionErrorCategory::Conflict),
+                    error: Some(format!(
+                        "column manifest on disk does not match catalog reference for tablet {tablet_id}"
+                    )),
+                });
+            }
+
+            // Execute the single catalog CAS
+            let current_cat = catalog
+                .load()?
+                .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+            let next_gen =
+                current_cat
+                    .generation
+                    .checked_add(1)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "catalog_generation",
+                    })?;
+
+            let mut next_cat = current_cat.clone();
+            next_cat.generation = next_gen;
+
+            let p_mut = next_cat
+                .partitions
+                .iter_mut()
+                .find(|p| p.id == partition_id)
+                .ok_or_else(|| {
+                    HtapError::NotFound(format!("partition {partition_id} not found"))
+                })?;
+            p_mut.generation = next_gen;
+            p_mut.storage = StorageDescriptor::Row;
+            p_mut.conversion = None;
+
+            let t_mut = next_cat
+                .tablets
+                .iter_mut()
+                .find(|t| t.id == tablet_id)
+                .ok_or_else(|| HtapError::NotFound(format!("tablet {tablet_id} not found")))?;
+            t_mut.generation = next_gen;
+            t_mut.column_manifest = None;
+
+            catalog.compare_and_set(current_cat.generation, next_cat)?;
+
+            Ok(PartitionConversionReport {
+                partition_id,
+                partition_name: part_desc.name,
+                starting_storage: StorageDescriptor::Column,
+                final_storage: StorageDescriptor::Row,
+                action: ConversionAction::DemotedToRow,
+                manifest: None,
+                error_category: None,
+                error: None,
+            })
+        }
+    }
+}
+
+/// Converts a partition to the target storage format (Column or Row).
+pub fn convert_partition_to_target(
+    catalog: &dyn CatalogStore,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    options: &SegmentOptions,
+    partition_id: PartitionId,
+    target: StorageFormat,
+) -> Result<PartitionConversionReport> {
+    match target {
+        StorageFormat::Column => {
+            convert_partition_to_column(catalog, rowstore, colstore_root, options, partition_id)
+        }
+        StorageFormat::Row => demote_partition_to_row(catalog, colstore_root, partition_id),
+    }
+}
+
+/// Converts all partitions of a table to the target storage format deterministically.
+pub fn convert_table(
+    catalog: &dyn CatalogStore,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    options: &SegmentOptions,
+    table_id: TableId,
+    target: StorageFormat,
+) -> Result<TableConversionReport> {
+    let cat_snap = catalog
+        .load()?
+        .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+
+    let table = cat_snap
+        .table(table_id)
+        .ok_or_else(|| HtapError::NotFound(format!("table {table_id} not found")))?;
+
+    let mut partition_ids = table.partitions.clone();
+    partition_ids.sort_by_key(|id| id.as_u64());
+
+    let mut partition_reports = Vec::with_capacity(partition_ids.len());
+
+    for part_id in partition_ids {
+        match convert_partition_to_target(
+            catalog,
+            rowstore,
+            colstore_root,
+            options,
+            part_id,
+            target,
+        ) {
+            Ok(report) => partition_reports.push(report),
+            Err(HtapError::Corruption(msg)) => return Err(HtapError::Corruption(msg)),
+            Err(err) if is_fatal_catalog_error(&err) => return Err(err),
+            Err(err) => {
+                let (part_name, cur_storage) = catalog
+                    .load()?
+                    .and_then(|snap| snap.partition(part_id).cloned())
+                    .map(|p| (p.name, p.storage))
+                    .unwrap_or_else(|| (format!("partition-{part_id}"), StorageDescriptor::Row));
+
+                partition_reports.push(PartitionConversionReport {
+                    partition_id: part_id,
+                    partition_name: part_name,
+                    starting_storage: cur_storage.clone(),
+                    final_storage: cur_storage,
+                    action: ConversionAction::Failed,
+                    manifest: None,
+                    error_category: Some((&err).into()),
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(TableConversionReport::new(
+        table.id,
+        table.name.clone(),
+        target,
+        partition_reports,
+    ))
+}
+
+/// Synchronously executes a conversion tick according to the given policy.
+///
+/// Under manual policy (empty target list), scans the catalog for partitions in
+/// [`StorageDescriptor::Converting`] state and resumes them to completion.
+/// When explicit targets are provided in the policy, processes those explicit targets.
+pub fn conversion_tick(
+    catalog: &dyn CatalogStore,
+    rowstore: &Engine,
+    colstore_root: &Path,
+    options: &SegmentOptions,
+    policy: &ConversionPolicy,
+) -> Result<ConversionTickReport> {
+    let cat_snap = match catalog.load()? {
+        Some(snap) => snap,
+        None => return Ok(ConversionTickReport::default()),
+    };
+
+    let mut table_reports = Vec::new();
+
+    if policy.targets.is_empty() {
+        // Manual default policy: resume persisted valid Converting jobs only.
+        let mut table_to_converting_parts: BTreeMap<TableId, Vec<PartitionId>> = BTreeMap::new();
+        for part in &cat_snap.partitions {
+            if matches!(part.storage, StorageDescriptor::Converting { .. }) {
+                table_to_converting_parts
+                    .entry(part.table_id)
+                    .or_default()
+                    .push(part.id);
+            }
+        }
+
+        for (t_id, mut part_ids) in table_to_converting_parts {
+            part_ids.sort_by_key(|id| id.as_u64());
+            let table_desc = cat_snap.table(t_id).ok_or_else(|| {
+                HtapError::Internal(format!(
+                    "table {t_id} referenced by converting partition not found"
+                ))
+            })?;
+
+            let mut partition_reports = Vec::with_capacity(part_ids.len());
+            for part_id in part_ids {
+                let report = convert_partition_to_column(
+                    catalog,
+                    rowstore,
+                    colstore_root,
+                    options,
+                    part_id,
+                )?;
+                partition_reports.push(report);
+            }
+
+            table_reports.push(TableConversionReport::new(
+                table_desc.id,
+                table_desc.name.clone(),
+                StorageFormat::Column,
+                partition_reports,
+            ));
+        }
+    } else {
+        // Explicit targets policy
+        for target in &policy.targets {
+            match target {
+                ConversionTarget::Table { name, target } => {
+                    let table = cat_snap
+                        .table_by_name(name)
+                        .ok_or_else(|| HtapError::NotFound(format!("table '{name}' not found")))?;
+                    let report = convert_table(
+                        catalog,
+                        rowstore,
+                        colstore_root,
+                        options,
+                        table.id,
+                        *target,
+                    )?;
+                    table_reports.push(report);
+                }
+                ConversionTarget::Partition { id, target } => {
+                    let part = cat_snap
+                        .partition(*id)
+                        .ok_or_else(|| HtapError::NotFound(format!("partition {id} not found")))?;
+                    let table = cat_snap.table(part.table_id).ok_or_else(|| {
+                        HtapError::NotFound(format!("table {} not found", part.table_id))
+                    })?;
+                    let report = convert_partition_to_target(
+                        catalog,
+                        rowstore,
+                        colstore_root,
+                        options,
+                        *id,
+                        *target,
+                    )?;
+                    if let Some(existing) =
+                        table_reports.iter_mut().find(|t| t.table_id == table.id)
+                    {
+                        existing.partitions.push(report);
+                    } else {
+                        table_reports.push(TableConversionReport::new(
+                            table.id,
+                            table.name.clone(),
+                            *target,
+                            vec![report],
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ConversionTickReport::new(table_reports))
+}
+
 /// Local single-node row-to-column conversion and columnar materialization engine.
 ///
 /// Manages conversions of partitions from row-oriented storage into columnar segments,
@@ -1636,6 +2615,99 @@ impl LocalConverter {
     /// Convert a partition to columnar format (alias for [`convert_partition`](Self::convert_partition)).
     pub fn convert(&self, partition_id: PartitionId) -> Result<TabletColumnManifest> {
         self.convert_partition(partition_id)
+    }
+
+    /// Converts a partition to the target storage format (Column or Row), returning a [`PartitionConversionReport`].
+    pub fn convert_partition_to_target(
+        &self,
+        partition_id: PartitionId,
+        target: StorageFormat,
+    ) -> Result<PartitionConversionReport> {
+        convert_partition_to_target(
+            self.catalog.as_ref(),
+            self.rowstore.as_ref(),
+            &self.colstore_root,
+            &self.options,
+            partition_id,
+            target,
+        )
+    }
+
+    /// Converts a partition to columnar format, returning a [`PartitionConversionReport`].
+    pub fn convert_partition_to_column(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<PartitionConversionReport> {
+        self.convert_partition_to_target(partition_id, StorageFormat::Column)
+    }
+
+    /// Converts a partition to row format (metadata demotion), returning a [`PartitionConversionReport`].
+    pub fn convert_partition_to_row(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<PartitionConversionReport> {
+        self.convert_partition_to_target(partition_id, StorageFormat::Row)
+    }
+
+    /// Demotes a columnar partition to row format (alias for [`convert_partition_to_row`](Self::convert_partition_to_row)).
+    pub fn demote_partition_to_row(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<PartitionConversionReport> {
+        self.convert_partition_to_row(partition_id)
+    }
+
+    /// Converts all partitions of a table to the target format deterministically by table ID.
+    pub fn convert_table(
+        &self,
+        table_id: TableId,
+        target: StorageFormat,
+    ) -> Result<TableConversionReport> {
+        convert_table(
+            self.catalog.as_ref(),
+            self.rowstore.as_ref(),
+            &self.colstore_root,
+            &self.options,
+            table_id,
+            target,
+        )
+    }
+
+    /// Converts all partitions of a table to the target format deterministically by table name.
+    pub fn convert_table_by_name(
+        &self,
+        table_name: &str,
+        target: StorageFormat,
+    ) -> Result<TableConversionReport> {
+        let cat = self
+            .catalog
+            .load()?
+            .ok_or_else(|| HtapError::NotFound("catalog is empty".into()))?;
+        let table = cat
+            .table_by_name(table_name)
+            .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))?;
+        self.convert_table(table.id, target)
+    }
+
+    /// Converts all partitions of a table to columnar format.
+    pub fn convert_table_to_column(&self, table_name: &str) -> Result<TableConversionReport> {
+        self.convert_table_by_name(table_name, StorageFormat::Column)
+    }
+
+    /// Converts all partitions of a table to row format (metadata demotion).
+    pub fn convert_table_to_row(&self, table_name: &str) -> Result<TableConversionReport> {
+        self.convert_table_by_name(table_name, StorageFormat::Row)
+    }
+
+    /// Synchronously executes a conversion tick according to the given policy.
+    pub fn conversion_tick(&self, policy: &ConversionPolicy) -> Result<ConversionTickReport> {
+        conversion_tick(
+            self.catalog.as_ref(),
+            self.rowstore.as_ref(),
+            &self.colstore_root,
+            &self.options,
+            policy,
+        )
     }
 
     /// Read visible rows for a partition at `snapshot`, overlaying rowstore mutations on columnar segments.

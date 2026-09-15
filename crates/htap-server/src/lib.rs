@@ -25,7 +25,11 @@ use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
 use htap_common::lock::ProcessLock;
 use htap_common::types::{ColumnDef, Mutation, Row, Schema, Value};
-use htap_convert::Predicate;
+pub use htap_convert::{
+    ConversionAction, ConversionErrorCategory, ConversionPolicy, ConversionTarget,
+    ConversionTickReport, PartitionConversionReport, Predicate, SegmentOptions,
+    TableConversionReport,
+};
 use htap_movement::{
     CopyOptions, CopyReport, LocalDataMover, MovementJob, TabletCloneOptions, TabletPackageManifest,
 };
@@ -108,6 +112,15 @@ pub struct LocalServer {
     scan_workers: usize,
 }
 
+impl std::fmt::Debug for LocalServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalServer")
+            .field("colstore_dir", &self.colstore_dir)
+            .field("scan_workers", &self.scan_workers)
+            .finish()
+    }
+}
+
 impl LocalServer {
     /// Opens or recovers a local server instance rooted at `root`.
     ///
@@ -158,6 +171,8 @@ impl LocalServer {
 
         let colstore_dir = canonical_root.join("colstore");
         std::fs::create_dir_all(&colstore_dir)?;
+
+        Self::validate_storage_state_on_open(&catalog, &colstore_dir)?;
 
         Ok(Self {
             _lock: lock_guard,
@@ -1077,6 +1092,197 @@ impl LocalServer {
             htap_convert::SegmentOptions::default(),
         );
         converter.convert_partition(partition_id)
+    }
+
+    /// Converts all partitions of a table to columnar format, returning a [`TableConversionReport`].
+    pub fn convert_table_to_column(&self, table_name: &str) -> Result<TableConversionReport> {
+        let _guard = self.execution_lock.lock();
+        let converter = htap_convert::LocalConverter::new(
+            Arc::clone(&self.catalog) as Arc<dyn CatalogStore>,
+            Arc::clone(&self.engine),
+            &self.colstore_dir,
+            SegmentOptions::default(),
+        );
+        converter.convert_table_to_column(table_name)
+    }
+
+    /// Demotes all partitions of a table from columnar format back to row storage, returning a [`TableConversionReport`].
+    pub fn convert_table_to_row(&self, table_name: &str) -> Result<TableConversionReport> {
+        let _guard = self.execution_lock.lock();
+        let converter = htap_convert::LocalConverter::new(
+            Arc::clone(&self.catalog) as Arc<dyn CatalogStore>,
+            Arc::clone(&self.engine),
+            &self.colstore_dir,
+            SegmentOptions::default(),
+        );
+        converter.convert_table_to_row(table_name)
+    }
+
+    /// Synchronously executes a conversion tick according to the given policy.
+    pub fn conversion_tick(&self, policy: ConversionPolicy) -> Result<ConversionTickReport> {
+        let _guard = self.execution_lock.lock();
+        let converter = htap_convert::LocalConverter::new(
+            Arc::clone(&self.catalog) as Arc<dyn CatalogStore>,
+            Arc::clone(&self.engine),
+            &self.colstore_dir,
+            SegmentOptions::default(),
+        );
+        converter.conversion_tick(&policy)
+    }
+
+    /// Synchronously executes a conversion tick using default manual policy (resuming in-flight converting jobs only).
+    pub fn tick(&self) -> Result<ConversionTickReport> {
+        self.conversion_tick(ConversionPolicy::manual())
+    }
+
+    fn validate_storage_state_on_open(
+        catalog: &LocalCatalogStore,
+        colstore_dir: &Path,
+    ) -> Result<()> {
+        let cat_snap = match catalog.load()? {
+            Some(snap) => snap,
+            None => return Ok(()),
+        };
+
+        for partition in &cat_snap.partitions {
+            match &partition.storage {
+                StorageDescriptor::Column => {
+                    if partition.tablets.is_empty() {
+                        return Err(HtapError::Corruption(format!(
+                            "partition {} in Column storage has no tablets",
+                            partition.id
+                        )));
+                    }
+                    if partition.tablets.len() != 1 {
+                        return Err(HtapError::Corruption(format!(
+                            "partition {} in Column storage has {} tablets; exactly 1 tablet is required",
+                            partition.id,
+                            partition.tablets.len()
+                        )));
+                    }
+                    if partition.conversion.is_some() {
+                        return Err(HtapError::Corruption(format!(
+                            "partition {} in Column storage has active conversion descriptor",
+                            partition.id
+                        )));
+                    }
+
+                    let tablet_id = partition.tablets[0];
+                    let tablet = cat_snap.tablet(tablet_id).ok_or_else(|| {
+                        HtapError::Corruption(format!(
+                            "tablet {tablet_id} referenced by partition {} not found in catalog",
+                            partition.id
+                        ))
+                    })?;
+
+                    let cat_manifest = tablet.column_manifest.as_ref().ok_or_else(|| {
+                        HtapError::Corruption(format!(
+                            "partition {} in Column storage missing tablet column_manifest in catalog",
+                            partition.id
+                        ))
+                    })?;
+
+                    let disk_manifest = htap_convert::open(colstore_dir, tablet_id)?;
+                    if disk_manifest.generation != cat_manifest.generation
+                        || disk_manifest.base_version != cat_manifest.base_version
+                        || disk_manifest.segments.len() as u64 != cat_manifest.segment_count
+                        || disk_manifest.total_rows() != cat_manifest.row_count
+                    {
+                        return Err(HtapError::Corruption(format!(
+                            "column manifest on disk does not match catalog reference for tablet {tablet_id}"
+                        )));
+                    }
+                }
+                StorageDescriptor::Converting {
+                    from,
+                    to,
+                    generation,
+                } => {
+                    if partition.tablets.is_empty() {
+                        return Err(HtapError::Corruption(format!(
+                            "partition {} in Converting storage has no tablets",
+                            partition.id
+                        )));
+                    }
+                    if partition.tablets.len() != 1 {
+                        return Err(HtapError::Corruption(format!(
+                            "partition {} in Converting storage has {} tablets; exactly 1 tablet is required",
+                            partition.id,
+                            partition.tablets.len()
+                        )));
+                    }
+                    if *from != StorageFormat::Row || *to != StorageFormat::Column {
+                        return Err(HtapError::Unsupported(format!(
+                            "partition {} has unsupported conversion direction: {from:?} -> {to:?}",
+                            partition.id
+                        )));
+                    }
+
+                    let tablet_id = partition.tablets[0];
+                    let _tablet = cat_snap.tablet(tablet_id).ok_or_else(|| {
+                        HtapError::Corruption(format!(
+                            "tablet {tablet_id} referenced by partition {} not found in catalog",
+                            partition.id
+                        ))
+                    })?;
+
+                    let conv = partition.conversion.as_ref().ok_or_else(|| {
+                        HtapError::Corruption(format!(
+                            "partition {} in Converting state without conversion descriptor",
+                            partition.id
+                        ))
+                    })?;
+
+                    if conv.generation != *generation || conv.from != *from || conv.to != *to {
+                        return Err(HtapError::Corruption(format!(
+                            "partition {} conversion descriptor does not match Converting storage",
+                            partition.id
+                        )));
+                    }
+
+                    match conv.phase {
+                        ConversionPhase::SnapshotPinned => {
+                            // Manifest may or may not exist yet; if it does, it must not contradict
+                            if let Ok(disk_manifest) = htap_convert::open(colstore_dir, tablet_id) {
+                                if disk_manifest.generation != conv.generation
+                                    || disk_manifest.base_version != conv.snapshot_version
+                                {
+                                    return Err(HtapError::Corruption(format!(
+                                        "partition {} has disk manifest inconsistent with pinned conversion descriptor",
+                                        partition.id
+                                    )));
+                                }
+                            }
+                        }
+                        ConversionPhase::SegmentsWritten | ConversionPhase::ReadyToPublish => {
+                            let disk_manifest = htap_convert::open(colstore_dir, tablet_id)?;
+                            if disk_manifest.generation != conv.generation
+                                || disk_manifest.base_version != conv.snapshot_version
+                            {
+                                return Err(HtapError::Corruption(format!(
+                                    "partition {} manifest on disk does not match conversion descriptor",
+                                    partition.id
+                                )));
+                            }
+                        }
+                    }
+                }
+                StorageDescriptor::Row => {
+                    if let Some(&tablet_id) = partition.tablets.first() {
+                        if let Some(tablet) = cat_snap.tablet(tablet_id) {
+                            if tablet.column_manifest.is_some() && partition.conversion.is_none() {
+                                return Err(HtapError::Corruption(format!(
+                                    "partition {} is in Row storage but tablet {tablet_id} has column manifest in catalog",
+                                    partition.id
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

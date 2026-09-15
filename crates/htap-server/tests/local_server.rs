@@ -12,8 +12,9 @@ use htap_common::version::Version;
 use htap_common::HtapError;
 use htap_movement::{CopyOptions, DataFormat, MovementJobPhase, TabletCloneOptions};
 use htap_server::{
-    ListPartitionDefinition, LocalServer, PartitionAlteration, PartitionTopology,
-    PartitionedTableDefinition, RangePartitionDefinition,
+    ConversionAction, ConversionErrorCategory, ConversionPolicy, ListPartitionDefinition,
+    LocalServer, PartitionAlteration, PartitionTopology, PartitionedTableDefinition,
+    RangePartitionDefinition,
 };
 use htap_sql::result::{CommandResult, StatementResult};
 use tempfile::TempDir;
@@ -4432,4 +4433,330 @@ fn test_server_alter_partitions_reopen_continuation() {
             other => panic!("expected Query, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn test_server_convert_table_multi_partition_reports_and_demotion_equivalence() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".into(),
+            data_type: DataType::String,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "events",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(50)),
+                RangePartitionDefinition::new("p1", Value::Int64(50), Value::Int64(100)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    server
+        .execute("INSERT INTO events (id, val) VALUES (10, 'v10'), (20, 'v20'), (60, 'v60'), (70, 'v70');")
+        .unwrap();
+
+    // Baseline point read and OLAP queries
+    let q_pt = server
+        .execute("SELECT val FROM events WHERE id = 10;")
+        .unwrap();
+    let q_olap = server
+        .execute("SELECT id, val FROM events ORDER BY id ASC;")
+        .unwrap();
+
+    // Convert multi-partition table to column
+    let conv_report = server.convert_table_to_column("events").unwrap();
+    assert_eq!(conv_report.table_name, "events");
+    assert_eq!(conv_report.target_format, StorageFormat::Column);
+    assert_eq!(conv_report.partitions.len(), 2);
+    assert!(conv_report.is_success());
+    assert_eq!(
+        conv_report.partitions[0].action,
+        ConversionAction::Converted
+    );
+    assert_eq!(
+        conv_report.partitions[1].action,
+        ConversionAction::Converted
+    );
+
+    // Queries on column storage match baseline
+    let q_pt_col = server
+        .execute("SELECT val FROM events WHERE id = 10;")
+        .unwrap();
+    let q_olap_col = server
+        .execute("SELECT id, val FROM events ORDER BY id ASC;")
+        .unwrap();
+    assert_eq!(q_pt, q_pt_col);
+    assert_eq!(q_olap, q_olap_col);
+
+    // Demote table to row
+    let demote_report = server.convert_table_to_row("events").unwrap();
+    assert_eq!(demote_report.target_format, StorageFormat::Row);
+    assert_eq!(demote_report.partitions.len(), 2);
+    assert!(demote_report.is_success());
+    assert_eq!(
+        demote_report.partitions[0].action,
+        ConversionAction::DemotedToRow
+    );
+    assert_eq!(
+        demote_report.partitions[1].action,
+        ConversionAction::DemotedToRow
+    );
+    assert_eq!(
+        demote_report.partitions[0].final_storage,
+        StorageDescriptor::Row
+    );
+    assert_eq!(
+        demote_report.partitions[1].final_storage,
+        StorageDescriptor::Row
+    );
+
+    // Verify catalog: tablet column_manifest cleared
+    let cat = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let cat_snap = cat.load().unwrap().unwrap();
+    for p in &cat_snap.partitions {
+        assert_eq!(p.storage, StorageDescriptor::Row);
+        assert!(p.conversion.is_none());
+        let t = cat_snap.tablet(p.tablets[0]).unwrap();
+        assert!(t.column_manifest.is_none());
+    }
+
+    // Queries after demotion match baseline (reverse demotion equivalence!)
+    let q_pt_row = server
+        .execute("SELECT val FROM events WHERE id = 10;")
+        .unwrap();
+    let q_olap_row = server
+        .execute("SELECT id, val FROM events ORDER BY id ASC;")
+        .unwrap();
+    assert_eq!(q_pt, q_pt_row);
+    assert_eq!(q_olap, q_olap_row);
+
+    // Post-demotion writes and deletes
+    server
+        .execute("INSERT INTO events (id, val) VALUES (30, 'v30'), (80, 'v80');")
+        .unwrap();
+    server.execute("DELETE FROM events WHERE id = 10;").unwrap();
+
+    let q_pt_deleted = server
+        .execute("SELECT val FROM events WHERE id = 10;")
+        .unwrap();
+    match q_pt_deleted {
+        StatementResult::Query(qr) => assert_eq!(qr.rows().len(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let q_pt_new = server
+        .execute("SELECT val FROM events WHERE id = 30;")
+        .unwrap();
+    match q_pt_new {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::String("v30".into())));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let q_olap_post = server
+        .execute("SELECT id FROM events ORDER BY id ASC;")
+        .unwrap();
+    match q_olap_post {
+        StatementResult::Query(qr) => {
+            let ids: Vec<i64> = qr
+                .rows()
+                .iter()
+                .map(|r| match r.get(0).unwrap() {
+                    Value::Int64(v) => *v,
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert_eq!(ids, vec![20, 30, 60, 70, 80]);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_server_convert_mixed_success_and_blocking() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".into(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "t_mixed",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(50)),
+                RangePartitionDefinition::new("p1", Value::Int64(50), Value::Int64(100)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    server
+        .execute("INSERT INTO t_mixed (id) VALUES (10), (60);")
+        .unwrap();
+
+    // Tamper with replica for p1 to make it non-leader
+    let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let cur_cat = cat_store.load().unwrap().unwrap();
+    let p1 = cur_cat.partitions.iter().find(|p| p.name == "p1").unwrap();
+    let t1 = cur_cat.tablet(p1.tablets[0]).unwrap();
+    let r1_id = t1.replicas[0];
+
+    let next_gen = cur_cat.generation + 1;
+    let mut modified_cat = cur_cat.clone();
+    modified_cat.generation = next_gen;
+    let r1_mut = modified_cat
+        .replicas
+        .iter_mut()
+        .find(|r| r.id == r1_id)
+        .unwrap();
+    r1_mut.is_leader = false;
+    cat_store
+        .compare_and_set(cur_cat.generation, modified_cat)
+        .unwrap();
+
+    // Attempt table conversion to column: should partially succeed
+    let rep = server.convert_table_to_column("t_mixed").unwrap();
+    assert!(!rep.is_success());
+    assert_eq!(rep.partitions.len(), 2);
+    assert_eq!(rep.partitions[0].action, ConversionAction::Converted);
+    assert_eq!(rep.partitions[0].final_storage, StorageDescriptor::Column);
+    assert_eq!(rep.partitions[1].action, ConversionAction::Blocked);
+    assert_eq!(rep.partitions[1].final_storage, StorageDescriptor::Row);
+    assert_eq!(
+        rep.partitions[1].error_category,
+        Some(ConversionErrorCategory::Conflict)
+    );
+}
+
+#[test]
+fn test_server_conversion_tick_idempotent_and_resume_snapshot_pinned() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    // Idempotent tick on empty server
+    let tick1 = server.tick().unwrap();
+    assert!(tick1.tables.is_empty());
+    assert!(tick1.is_success());
+    let tick2 = server.conversion_tick(ConversionPolicy::manual()).unwrap();
+    assert!(tick2.tables.is_empty());
+
+    // Create table with data
+    server
+        .execute("CREATE TABLE metrics (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO metrics (id, v) VALUES (1, 100);")
+        .unwrap();
+
+    // Put table partition in Converting with SnapshotPinned
+    let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let cur_cat = cat_store.load().unwrap().unwrap();
+    let p = &cur_cat.partitions[0];
+    let part_id = p.id;
+    let next_gen = cur_cat.generation + 1;
+    let mut converting_cat = cur_cat.clone();
+    converting_cat.generation = next_gen;
+    let p_mut = converting_cat
+        .partitions
+        .iter_mut()
+        .find(|p| p.id == part_id)
+        .unwrap();
+    p_mut.generation = next_gen;
+    p_mut.storage = StorageDescriptor::Converting {
+        from: StorageFormat::Row,
+        to: StorageFormat::Column,
+        generation: next_gen,
+    };
+    p_mut.conversion = Some(ConversionDescriptor::new(
+        next_gen,
+        StorageFormat::Row,
+        StorageFormat::Column,
+        Version::new(1),
+        ConversionPhase::SnapshotPinned,
+    ));
+    cat_store
+        .compare_and_set(cur_cat.generation, converting_cat)
+        .unwrap();
+
+    // Tick resumes the in-flight conversion
+    let tick3 = server.tick().unwrap();
+    assert_eq!(tick3.tables.len(), 1);
+    let p_rep = tick3.tables[0].partition_report(part_id).unwrap();
+    assert_eq!(p_rep.action, ConversionAction::Resumed);
+    assert_eq!(p_rep.final_storage, StorageDescriptor::Column);
+    assert!(p_rep.manifest.is_some());
+
+    // Subsequent tick is idempotent
+    let tick4 = server.tick().unwrap();
+    assert!(tick4.tables.is_empty());
+}
+
+#[test]
+fn test_server_open_fail_closed_missing_or_corrupt_manifest() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = LocalServer::open(dir.path()).unwrap();
+        server
+            .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+            .unwrap();
+        server
+            .execute("INSERT INTO t (id, v) VALUES (1, 10);")
+            .unwrap();
+        server.convert_table_to_column("t").unwrap();
+    }
+
+    // Server closed cleanly.
+    // Case 1: Corrupt manifest file
+    let colstore = dir.path().join("colstore");
+    let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let cat = cat_store.load().unwrap().unwrap();
+    let tablet_id = cat.partitions[0].tablets[0];
+    let m_path = htap_convert::manifest_path(&colstore, tablet_id);
+    assert!(m_path.is_file());
+
+    std::fs::write(&m_path, b"CORRUPTED_GARBAGE_BYTES_MANIFEST").unwrap();
+
+    // Reopen must fail closed with Corruption
+    let err = LocalServer::open(dir.path()).unwrap_err();
+    assert!(
+        matches!(err, HtapError::Corruption(_)),
+        "expected Corruption, got {err:?}"
+    );
+
+    // Case 2: Missing manifest file
+    std::fs::remove_file(&m_path).unwrap();
+    let err2 = LocalServer::open(dir.path()).unwrap_err();
+    assert!(
+        matches!(err2, HtapError::Io(_)) || matches!(err2, HtapError::Corruption(_)),
+        "expected open failure, got {err2:?}"
+    );
 }
