@@ -14,10 +14,12 @@ use std::sync::Arc;
 
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
-use htap_catalog::{
-    CatalogSnapshot, NodeId, PartitionDescriptor, PartitionId, PartitioningDescriptor,
-    PartitioningMethod, RangeBound, ReplicaDescriptor, ReplicaId, StorageDescriptor,
-    TableDescriptor, TableId, TabletDescriptor, TabletId,
+pub use htap_catalog::{
+    CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase,
+    ListPartitionDefinition, NodeId, PartitionAlteration, PartitionDefinition, PartitionDescriptor,
+    PartitionId, PartitioningDescriptor, PartitioningMethod, RangeBound, RangePartitionDefinition,
+    ReplicaDescriptor, ReplicaId, StorageDescriptor, StorageFormat, TableDescriptor, TableId,
+    TabletDescriptor, TabletId,
 };
 use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
@@ -86,66 +88,6 @@ pub enum PartitionTopology {
         /// Explicit list value sets for each partition.
         partitions: Vec<ListPartitionDefinition>,
     },
-}
-
-/// Definition of a single range partition with half-open bound `[lower, upper)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RangePartitionDefinition {
-    /// Partition name (unique within table).
-    pub name: String,
-    /// Inclusive lower bound value.
-    pub lower: Value,
-    /// Exclusive upper bound value (or MAXVALUE if None).
-    pub upper: Value,
-    /// Optional lower bound (for unbounded/MAXVALUE representation).
-    pub lower_opt: Option<Value>,
-    /// Optional upper bound (for unbounded/MAXVALUE representation).
-    pub upper_opt: Option<Value>,
-}
-
-impl RangePartitionDefinition {
-    /// Creates a new range partition definition with bounded endpoints.
-    pub fn new(name: impl Into<String>, lower: Value, upper: Value) -> Self {
-        Self {
-            name: name.into(),
-            lower: lower.clone(),
-            upper: upper.clone(),
-            lower_opt: Some(lower),
-            upper_opt: Some(upper),
-        }
-    }
-
-    /// Creates a range partition definition with optional endpoints.
-    pub fn new_opt(name: impl Into<String>, lower: Option<Value>, upper: Option<Value>) -> Self {
-        let l = lower.clone().unwrap_or(Value::Null);
-        let u = upper.clone().unwrap_or(Value::Null);
-        Self {
-            name: name.into(),
-            lower: l,
-            upper: u,
-            lower_opt: lower,
-            upper_opt: upper,
-        }
-    }
-}
-
-/// Definition of a single list partition with explicit values.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListPartitionDefinition {
-    /// Partition name (unique within table).
-    pub name: String,
-    /// Disjoint set of values belonging to this partition.
-    pub values: Vec<Value>,
-}
-
-impl ListPartitionDefinition {
-    /// Creates a new list partition definition.
-    pub fn new(name: impl Into<String>, values: Vec<Value>) -> Self {
-        Self {
-            name: name.into(),
-            values,
-        }
-    }
 }
 
 /// Default bounded worker count for concurrent analytical partition scans.
@@ -544,6 +486,60 @@ impl LocalServer {
             Some(partitioning_desc),
             partition_items,
         )
+    }
+
+    /// Alters partition topology of an existing partitioned table.
+    ///
+    /// Supports typed [`PartitionAlteration`]:
+    /// - [`PartitionAlteration::Add`]: Adds one or more partitions.
+    /// - [`PartitionAlteration::Drop`]: Drops one or more empty partitions.
+    /// - [`PartitionAlteration::Reorganize`]: Reorganizes contiguous empty source partitions into new target partitions.
+    ///
+    /// Executes under `execution_lock`. Source partitions for `Drop` and `Reorganize` are scanned
+    /// at the current visible snapshot; rowstore entries are collapsed to determine logical occupancy.
+    /// If any source partition contains active rows, the alteration is rejected with
+    /// [`HtapError::InvalidArgument`] without mutating the catalog or burning identifier sequences.
+    /// On success, candidate catalog snapshot is committed via a single atomic CAS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError::NotFound`] if the table or a named source partition does not exist.
+    /// Returns [`HtapError::InvalidArgument`] if the table is unpartitioned, all partitions would be dropped,
+    /// definitions overlap, sources are non-contiguous, or source partitions are populated.
+    /// Returns [`HtapError::Conflict`] if catalog CAS fails due to concurrent modification.
+    pub fn alter_partitions(
+        &self,
+        table_name: &str,
+        alteration: impl Into<PartitionAlteration>,
+    ) -> Result<StatementResult> {
+        let alteration = alteration.into();
+        let _guard = self.execution_lock.lock();
+        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+
+        let source_partitions =
+            catalog.source_partitions_for_alteration(table_name, &alteration)?;
+
+        if !source_partitions.is_empty() {
+            let snapshot = Snapshot::new(self.txn_manager.visible_version());
+            for part in &source_partitions {
+                let entries = self.engine.scan_partition(part.id.as_u64(), snapshot)?;
+                let rows = htap_convert::collapse_entries_to_rows(&entries);
+                if !rows.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "cannot alter partition '{}' of table '{table_name}': partition is populated with {} row(s)",
+                        part.name,
+                        rows.len()
+                    )));
+                }
+            }
+        }
+
+        let candidate = catalog.apply_partition_alteration(table_name, &alteration)?;
+
+        self.catalog
+            .compare_and_set(catalog.generation, candidate)?;
+
+        Ok(StatementResult::ddl(1))
     }
 
     fn resolve_table<'a>(

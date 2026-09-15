@@ -2126,3 +2126,816 @@ fn test_partitioning_cas_and_reopen_lifecycle() {
         p1_id
     );
 }
+
+#[test]
+fn test_partition_alteration_add_range_and_list() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let p0_id = PartitionId::new(10);
+    let t0_id = TabletId::new(100);
+    let r0_id = ReplicaId::new(1000);
+
+    let table = TableDescriptor::new(TableId::new(1), "t_range", schema, vec![0], vec![p0_id], 1)
+        .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![t0_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+
+    let snap = CatalogSnapshot::new(
+        1,
+        vec![table],
+        vec![p0],
+        vec![TabletDescriptor::new(t0_id, p0_id, 0, vec![r0_id], 1)],
+        vec![ReplicaDescriptor::new(
+            r0_id,
+            t0_id,
+            NodeId::new(1),
+            true,
+            true,
+            1,
+        )],
+    );
+
+    // 1. Add partition p1 to range table
+    let alteration = PartitionAlteration::add(vec![RangePartitionDefinition::new(
+        "p1",
+        Value::Int64(100),
+        Value::Int64(200),
+    )]);
+    let candidate = snap
+        .apply_partition_alteration("t_range", &alteration)
+        .unwrap();
+    assert_eq!(candidate.generation, 2);
+    let updated_t = candidate.table_by_name("t_range").unwrap();
+    assert_eq!(updated_t.partitions.len(), 2);
+    let p1_id = updated_t.partitions[1];
+    let p1_desc = candidate.partition(p1_id).unwrap();
+    assert_eq!(p1_desc.name, "p1");
+    assert_eq!(
+        candidate
+            .route_partition_value("t_range", &Value::Int64(50))
+            .unwrap(),
+        p0_id
+    );
+    assert_eq!(
+        candidate
+            .route_partition_value("t_range", &Value::Int64(150))
+            .unwrap(),
+        p1_id
+    );
+
+    // 2. Add partition with MAXVALUE upper bound
+    let alteration_max = PartitionAlteration::add(vec![RangePartitionDefinition::new_opt(
+        "p_max",
+        Some(Value::Int64(200)),
+        None,
+    )]);
+    let candidate_max = candidate
+        .apply_partition_alteration("t_range", &alteration_max)
+        .unwrap();
+    assert_eq!(candidate_max.generation, 3);
+    let updated_t_max = candidate_max.table_by_name("t_range").unwrap();
+    assert_eq!(updated_t_max.partitions.len(), 3);
+    let p_max_id = updated_t_max.partitions[2];
+    assert_eq!(
+        candidate_max
+            .route_partition_value("t_range", &Value::Int64(999))
+            .unwrap(),
+        p_max_id
+    );
+
+    // 3. List partition table ADD
+    let list_schema = Schema::new(vec![ColumnDef {
+        name: "code".to_string(),
+        data_type: DataType::Int32,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+    let lp0_id = PartitionId::new(20);
+    let lt0_id = TabletId::new(200);
+    let lr0_id = ReplicaId::new(2000);
+    let list_table = TableDescriptor::new(
+        TableId::new(2),
+        "t_list",
+        list_schema,
+        vec![0],
+        vec![lp0_id],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::List));
+    let lp0 = PartitionDescriptor::new(
+        lp0_id,
+        TableId::new(2),
+        "lp0",
+        StorageDescriptor::Row,
+        vec![lt0_id],
+        1,
+    )
+    .with_list_values(vec![Value::Int32(1), Value::Int32(2)]);
+
+    let list_snap = CatalogSnapshot::new(
+        1,
+        vec![list_table],
+        vec![lp0],
+        vec![TabletDescriptor::new(lt0_id, lp0_id, 0, vec![lr0_id], 1)],
+        vec![ReplicaDescriptor::new(
+            lr0_id,
+            lt0_id,
+            NodeId::new(1),
+            true,
+            true,
+            1,
+        )],
+    );
+
+    let list_alter = PartitionAlteration::add(vec![ListPartitionDefinition::new(
+        "lp1",
+        vec![Value::Int32(3), Value::Int32(4)],
+    )]);
+    let list_candidate = list_snap
+        .apply_partition_alteration("t_list", &list_alter)
+        .unwrap();
+    assert_eq!(list_candidate.generation, 2);
+    let updated_lt = list_candidate.table_by_name("t_list").unwrap();
+    assert_eq!(updated_lt.partitions.len(), 2);
+    let lp1_id = updated_lt.partitions[1];
+    assert_eq!(
+        list_candidate
+            .route_partition_value("t_list", &Value::Int32(3))
+            .unwrap(),
+        lp1_id
+    );
+}
+
+#[test]
+fn test_partition_alteration_drop_range_and_list() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let p0_id = PartitionId::new(10);
+    let p1_id = PartitionId::new(11);
+    let p2_id = PartitionId::new(12);
+
+    let t0_id = TabletId::new(100);
+    let t1_id = TabletId::new(101);
+    let t2_id = TabletId::new(102);
+
+    let r0_id = ReplicaId::new(1000);
+    let r1_id = ReplicaId::new(1001);
+    let r2_id = ReplicaId::new(1002);
+
+    let table = TableDescriptor::new(
+        TableId::new(1),
+        "t",
+        schema,
+        vec![0],
+        vec![p0_id, p1_id, p2_id],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![t0_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    let p1 = PartitionDescriptor::new(
+        p1_id,
+        TableId::new(1),
+        "p1",
+        StorageDescriptor::Row,
+        vec![t1_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(100), Value::Int64(200)));
+    let p2 = PartitionDescriptor::new(
+        p2_id,
+        TableId::new(1),
+        "p2",
+        StorageDescriptor::Row,
+        vec![t2_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(200), Value::Int64(300)));
+
+    let snap = CatalogSnapshot::new(
+        1,
+        vec![table],
+        vec![p0, p1, p2],
+        vec![
+            TabletDescriptor::new(t0_id, p0_id, 0, vec![r0_id], 1),
+            TabletDescriptor::new(t1_id, p1_id, 0, vec![r1_id], 1),
+            TabletDescriptor::new(t2_id, p2_id, 0, vec![r2_id], 1),
+        ],
+        vec![
+            ReplicaDescriptor::new(r0_id, t0_id, NodeId::new(1), true, true, 1),
+            ReplicaDescriptor::new(r1_id, t1_id, NodeId::new(1), true, true, 1),
+            ReplicaDescriptor::new(r2_id, t2_id, NodeId::new(1), true, true, 1),
+        ],
+    );
+
+    // Drop middle partition p1
+    let drop_alt = PartitionAlteration::drop(vec!["p1"]);
+    let candidate = snap.apply_partition_alteration("t", &drop_alt).unwrap();
+    assert_eq!(candidate.generation, 2);
+
+    let updated_t = candidate.table_by_name("t").unwrap();
+    assert_eq!(updated_t.partitions, vec![p0_id, p2_id]);
+    assert!(candidate.partition(p1_id).is_none());
+    assert!(candidate.tablet(t1_id).is_none());
+    assert!(candidate.replica(r1_id).is_none());
+
+    // Routing for 50 still works -> p0, 250 -> p2, 150 now errors
+    assert_eq!(
+        candidate
+            .route_partition_value("t", &Value::Int64(50))
+            .unwrap(),
+        p0_id
+    );
+    assert_eq!(
+        candidate
+            .route_partition_value("t", &Value::Int64(250))
+            .unwrap(),
+        p2_id
+    );
+    assert!(candidate
+        .route_partition_value("t", &Value::Int64(150))
+        .is_err());
+}
+
+#[test]
+fn test_partition_alteration_reorganize_contiguous() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let p0_id = PartitionId::new(10);
+    let p1_id = PartitionId::new(11);
+    let p2_id = PartitionId::new(12);
+    let p3_id = PartitionId::new(13);
+
+    let t0_id = TabletId::new(100);
+    let t1_id = TabletId::new(101);
+    let t2_id = TabletId::new(102);
+    let t3_id = TabletId::new(103);
+
+    let r0_id = ReplicaId::new(1000);
+    let r1_id = ReplicaId::new(1001);
+    let r2_id = ReplicaId::new(1002);
+    let r3_id = ReplicaId::new(1003);
+
+    let table = TableDescriptor::new(
+        TableId::new(1),
+        "t",
+        schema,
+        vec![0],
+        vec![p0_id, p1_id, p2_id, p3_id],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![t0_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    let p1 = PartitionDescriptor::new(
+        p1_id,
+        TableId::new(1),
+        "p1",
+        StorageDescriptor::Row,
+        vec![t1_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(100), Value::Int64(200)));
+    let p2 = PartitionDescriptor::new(
+        p2_id,
+        TableId::new(1),
+        "p2",
+        StorageDescriptor::Row,
+        vec![t2_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(200), Value::Int64(300)));
+    let p3 = PartitionDescriptor::new(
+        p3_id,
+        TableId::new(1),
+        "p3",
+        StorageDescriptor::Row,
+        vec![t3_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(300), Value::Int64(400)));
+
+    let snap = CatalogSnapshot::new(
+        1,
+        vec![table],
+        vec![p0, p1, p2, p3],
+        vec![
+            TabletDescriptor::new(t0_id, p0_id, 0, vec![r0_id], 1),
+            TabletDescriptor::new(t1_id, p1_id, 0, vec![r1_id], 1),
+            TabletDescriptor::new(t2_id, p2_id, 0, vec![r2_id], 1),
+            TabletDescriptor::new(t3_id, p3_id, 0, vec![r3_id], 1),
+        ],
+        vec![
+            ReplicaDescriptor::new(r0_id, t0_id, NodeId::new(1), true, true, 1),
+            ReplicaDescriptor::new(r1_id, t1_id, NodeId::new(1), true, true, 1),
+            ReplicaDescriptor::new(r2_id, t2_id, NodeId::new(1), true, true, 1),
+            ReplicaDescriptor::new(r3_id, t3_id, NodeId::new(1), true, true, 1),
+        ],
+    );
+
+    // Reorganize contiguous partitions [p1, p2] into [p12a, p12b]
+    let alt = PartitionAlteration::reorganize(
+        vec!["p1", "p2"],
+        vec![
+            RangePartitionDefinition::new("p12a", Value::Int64(100), Value::Int64(250)),
+            RangePartitionDefinition::new("p12b", Value::Int64(250), Value::Int64(300)),
+        ],
+    );
+
+    let candidate = snap.apply_partition_alteration("t", &alt).unwrap();
+    assert_eq!(candidate.generation, 2);
+
+    let updated_t = candidate.table_by_name("t").unwrap();
+    assert_eq!(updated_t.partitions.len(), 4);
+    assert_eq!(updated_t.partitions[0], p0_id);
+    assert_eq!(updated_t.partitions[3], p3_id);
+
+    let p12a_id = updated_t.partitions[1];
+    let p12b_id = updated_t.partitions[2];
+    assert_eq!(candidate.partition(p12a_id).unwrap().name, "p12a");
+    assert_eq!(candidate.partition(p12b_id).unwrap().name, "p12b");
+
+    // Old partitions and tablets removed
+    assert!(candidate.partition(p1_id).is_none());
+    assert!(candidate.partition(p2_id).is_none());
+    assert!(candidate.tablet(t1_id).is_none());
+    assert!(candidate.tablet(t2_id).is_none());
+
+    // Routing matches new topology
+    assert_eq!(
+        candidate
+            .route_partition_value("t", &Value::Int64(50))
+            .unwrap(),
+        p0_id
+    );
+    assert_eq!(
+        candidate
+            .route_partition_value("t", &Value::Int64(150))
+            .unwrap(),
+        p12a_id
+    );
+    assert_eq!(
+        candidate
+            .route_partition_value("t", &Value::Int64(275))
+            .unwrap(),
+        p12b_id
+    );
+    assert_eq!(
+        candidate
+            .route_partition_value("t", &Value::Int64(350))
+            .unwrap(),
+        p3_id
+    );
+}
+
+#[test]
+fn test_partition_alteration_negative_rules() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let p0_id = PartitionId::new(10);
+    let p1_id = PartitionId::new(11);
+    let p2_id = PartitionId::new(12);
+
+    let t0_id = TabletId::new(100);
+    let t1_id = TabletId::new(101);
+    let t2_id = TabletId::new(102);
+
+    let r0_id = ReplicaId::new(1000);
+    let r1_id = ReplicaId::new(1001);
+    let r2_id = ReplicaId::new(1002);
+
+    let table = TableDescriptor::new(
+        TableId::new(1),
+        "t",
+        schema,
+        vec![0],
+        vec![p0_id, p1_id, p2_id],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![t0_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+    let p1 = PartitionDescriptor::new(
+        p1_id,
+        TableId::new(1),
+        "p1",
+        StorageDescriptor::Row,
+        vec![t1_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(100), Value::Int64(200)));
+    let p2 = PartitionDescriptor::new(
+        p2_id,
+        TableId::new(1),
+        "p2",
+        StorageDescriptor::Row,
+        vec![t2_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(200), Value::Int64(300)));
+
+    let snap = CatalogSnapshot::new(
+        1,
+        vec![table],
+        vec![p0, p1, p2],
+        vec![
+            TabletDescriptor::new(t0_id, p0_id, 0, vec![r0_id], 1),
+            TabletDescriptor::new(t1_id, p1_id, 0, vec![r1_id], 1),
+            TabletDescriptor::new(t2_id, p2_id, 0, vec![r2_id], 1),
+        ],
+        vec![
+            ReplicaDescriptor::new(r0_id, t0_id, NodeId::new(1), true, true, 1),
+            ReplicaDescriptor::new(r1_id, t1_id, NodeId::new(1), true, true, 1),
+            ReplicaDescriptor::new(r2_id, t2_id, NodeId::new(1), true, true, 1),
+        ],
+    );
+
+    // 1. Alteration on unpartitioned table rejected
+    let unpart_snap = make_valid_snapshot(1);
+    let err = unpart_snap
+        .apply_partition_alteration("users", &PartitionAlteration::drop(vec!["p0"]))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("not partitioned"));
+
+    // 2. Add: duplicate name with existing partition
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::add(vec![RangePartitionDefinition::new(
+                "p1",
+                Value::Int64(300),
+                Value::Int64(400),
+            )]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("duplicate partition name"));
+
+    // 3. Add: duplicate name within alteration batch
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::add(vec![
+                RangePartitionDefinition::new("p_new", Value::Int64(300), Value::Int64(400)),
+                RangePartitionDefinition::new("p_new", Value::Int64(400), Value::Int64(500)),
+            ]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("duplicate partition name"));
+
+    // 4. Add: empty partition name
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::add(vec![RangePartitionDefinition::new(
+                "  ",
+                Value::Int64(300),
+                Value::Int64(400),
+            )]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("cannot be empty"));
+
+    // 5. Add: range partition with inverted bounds (lower >= upper)
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::add(vec![RangePartitionDefinition::new(
+                "p_inv",
+                Value::Int64(500),
+                Value::Int64(400),
+            )]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("strictly less than upper"));
+
+    // 6. Add: range partition overlapping existing partition
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::add(vec![RangePartitionDefinition::new(
+                "p_ovlp",
+                Value::Int64(150),
+                Value::Int64(250),
+            )]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("overlapping range"));
+
+    // 7. Add: method mismatch (List on Range table)
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::add(vec![ListPartitionDefinition::new(
+                "p_list",
+                vec![Value::Int64(999)],
+            )]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("cannot apply list partition definition to range-partitioned"));
+
+    // 8. Add: empty partition definitions
+    let err = snap
+        .apply_partition_alteration("t", &PartitionAlteration::Add { partitions: vec![] })
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // 9. Drop: drop all partitions ("no-last" rule)
+    let err = snap
+        .apply_partition_alteration("t", &PartitionAlteration::drop(vec!["p0", "p1", "p2"]))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("cannot drop all partitions"));
+
+    // 10. Drop: nonexistent partition
+    let err = snap
+        .apply_partition_alteration("t", &PartitionAlteration::drop(vec!["nonexistent"]))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::NotFound(_)));
+
+    // 11. Drop: duplicate partition names in drop list
+    let err = snap
+        .apply_partition_alteration("t", &PartitionAlteration::drop(vec!["p1", "p1"]))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("duplicate partition name"));
+
+    // 12. Drop: empty drop list
+    let err = snap
+        .apply_partition_alteration("t", &PartitionAlteration::Drop { partitions: vec![] })
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+
+    // 13. Reorganize: non-contiguous source partitions (p0 and p2, skipping p1)
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::reorganize(
+                vec!["p0", "p2"],
+                vec![RangePartitionDefinition::new(
+                    "p02",
+                    Value::Int64(0),
+                    Value::Int64(100),
+                )],
+            ),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("must be contiguous"));
+
+    // 14. Reorganize: target name collides with remaining partition (p0 is not reorganized, target names itself p0)
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::reorganize(
+                vec!["p1", "p2"],
+                vec![RangePartitionDefinition::new(
+                    "p0",
+                    Value::Int64(100),
+                    Value::Int64(300),
+                )],
+            ),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("already exists"));
+
+    // 15. Reorganize: target overlapping remaining partitions
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::reorganize(
+                vec!["p1", "p2"],
+                vec![RangePartitionDefinition::new(
+                    "p_wide",
+                    Value::Int64(50),
+                    Value::Int64(300),
+                )],
+            ),
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("overlapping range"));
+
+    // 16. Reorganize: empty sources or targets
+    let err = snap
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::Reorganize {
+                sources: vec![],
+                targets: vec![],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_partition_alteration_overflow_rejections() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let p0_id = PartitionId::new(10);
+    let t0_id = TabletId::new(100);
+    let r0_id = ReplicaId::new(1000);
+
+    let table = TableDescriptor::new(TableId::new(1), "t", schema, vec![0], vec![p0_id], u64::MAX)
+        .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![t0_id],
+        u64::MAX,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+
+    let mut snap = CatalogSnapshot::new(
+        u64::MAX, // Generation overflow!
+        vec![table],
+        vec![p0],
+        vec![TabletDescriptor::new(
+            t0_id,
+            p0_id,
+            0,
+            vec![r0_id],
+            u64::MAX,
+        )],
+        vec![ReplicaDescriptor::new(
+            r0_id,
+            t0_id,
+            NodeId::new(1),
+            true,
+            true,
+            u64::MAX,
+        )],
+    );
+
+    let alt = PartitionAlteration::add(vec![RangePartitionDefinition::new(
+        "p1",
+        Value::Int64(100),
+        Value::Int64(200),
+    )]);
+    let err = snap.apply_partition_alteration("t", &alt).unwrap_err();
+    assert!(matches!(
+        err,
+        HtapError::CounterOverflow {
+            counter: "catalog_generation"
+        }
+    ));
+
+    // Now test partition_id overflow
+    snap.generation = 1;
+    snap.partitions[0].id = PartitionId::new(u64::MAX);
+    snap.tables[0].partitions = vec![PartitionId::new(u64::MAX)];
+    let err = snap.apply_partition_alteration("t", &alt).unwrap_err();
+    assert!(matches!(
+        err,
+        HtapError::CounterOverflow {
+            counter: "partition_id"
+        }
+    ));
+}
+
+#[test]
+fn test_partition_alteration_cas_and_reopen() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let p0_id = PartitionId::new(10);
+    let t0_id = TabletId::new(100);
+    let r0_id = ReplicaId::new(1000);
+
+    let table = TableDescriptor::new(TableId::new(1), "metrics", schema, vec![0], vec![p0_id], 1)
+        .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let p0 = PartitionDescriptor::new(
+        p0_id,
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![t0_id],
+        1,
+    )
+    .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100)));
+
+    let snap = CatalogSnapshot::new(
+        1,
+        vec![table],
+        vec![p0],
+        vec![TabletDescriptor::new(t0_id, p0_id, 0, vec![r0_id], 1)],
+        vec![ReplicaDescriptor::new(
+            r0_id,
+            t0_id,
+            NodeId::new(1),
+            true,
+            true,
+            1,
+        )],
+    );
+
+    store.compare_and_set(0, snap.clone()).unwrap();
+
+    // Add p1 via candidate and CAS
+    let alt = PartitionAlteration::add(vec![RangePartitionDefinition::new(
+        "p1",
+        Value::Int64(100),
+        Value::Int64(200),
+    )]);
+    let candidate = snap.apply_partition_alteration("metrics", &alt).unwrap();
+    store.compare_and_set(1, candidate).unwrap();
+
+    // Reopen store from disk
+    let reopened = LocalCatalogStore::open(temp.path()).unwrap();
+    let recovered = reopened.load().unwrap().unwrap();
+    assert_eq!(recovered.generation, 2);
+    let rec_t = recovered.table_by_name("metrics").unwrap();
+    assert_eq!(rec_t.partitions.len(), 2);
+    let p1_id = rec_t.partitions[1];
+    assert_eq!(
+        recovered
+            .route_partition_value("metrics", &Value::Int64(150))
+            .unwrap(),
+        p1_id
+    );
+}

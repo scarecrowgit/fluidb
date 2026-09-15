@@ -235,6 +235,190 @@ impl RangeBound {
     }
 }
 
+/// Definition of a single range partition with half-open bound `[lower, upper)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangePartitionDefinition {
+    /// Partition name (unique within table).
+    pub name: String,
+    /// Inclusive lower bound value.
+    pub lower: Value,
+    /// Exclusive upper bound value (or MAXVALUE if None).
+    pub upper: Value,
+    /// Optional lower bound (for unbounded/MAXVALUE representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lower_opt: Option<Value>,
+    /// Optional upper bound (for unbounded/MAXVALUE representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upper_opt: Option<Value>,
+}
+
+impl RangePartitionDefinition {
+    /// Creates a new range partition definition with bounded endpoints.
+    pub fn new(name: impl Into<String>, lower: Value, upper: Value) -> Self {
+        Self {
+            name: name.into(),
+            lower: lower.clone(),
+            upper: upper.clone(),
+            lower_opt: Some(lower),
+            upper_opt: Some(upper),
+        }
+    }
+
+    /// Creates a range partition definition with optional endpoints.
+    pub fn new_opt(name: impl Into<String>, lower: Option<Value>, upper: Option<Value>) -> Self {
+        let l = lower.clone().unwrap_or(Value::Null);
+        let u = upper.clone().unwrap_or(Value::Null);
+        Self {
+            name: name.into(),
+            lower: l,
+            upper: u,
+            lower_opt: lower,
+            upper_opt: upper,
+        }
+    }
+
+    /// Converts this range partition definition into a [`RangeBound`].
+    pub fn range_bound(&self) -> RangeBound {
+        if self.lower_opt.is_some() || self.upper_opt.is_some() {
+            RangeBound::new_opt(self.lower_opt.clone(), self.upper_opt.clone())
+        } else if !self.lower.is_null() || !self.upper.is_null() {
+            RangeBound::new(self.lower.clone(), self.upper.clone())
+        } else {
+            RangeBound::new_opt(None, None)
+        }
+    }
+}
+
+/// Definition of a single list partition with explicit values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListPartitionDefinition {
+    /// Partition name (unique within table).
+    pub name: String,
+    /// Disjoint set of values belonging to this partition.
+    pub values: Vec<Value>,
+}
+
+impl ListPartitionDefinition {
+    /// Creates a new list partition definition.
+    pub fn new(name: impl Into<String>, values: impl Into<Vec<Value>>) -> Self {
+        Self {
+            name: name.into(),
+            values: values.into(),
+        }
+    }
+}
+
+/// Definition of a single partition (Range or List).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionDefinition {
+    /// Range partition definition.
+    Range(RangePartitionDefinition),
+    /// List partition definition.
+    List(ListPartitionDefinition),
+}
+
+impl PartitionDefinition {
+    /// Returns the partition name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Range(r) => &r.name,
+            Self::List(l) => &l.name,
+        }
+    }
+
+    /// Returns a reference to the inner [`RangePartitionDefinition`], if Range.
+    pub fn range(&self) -> Option<&RangePartitionDefinition> {
+        match self {
+            Self::Range(r) => Some(r),
+            Self::List(_) => None,
+        }
+    }
+
+    /// Returns a reference to the inner [`ListPartitionDefinition`], if List.
+    pub fn list(&self) -> Option<&ListPartitionDefinition> {
+        match self {
+            Self::Range(_) => None,
+            Self::List(l) => Some(l),
+        }
+    }
+}
+
+impl From<RangePartitionDefinition> for PartitionDefinition {
+    fn from(r: RangePartitionDefinition) -> Self {
+        Self::Range(r)
+    }
+}
+
+impl From<ListPartitionDefinition> for PartitionDefinition {
+    fn from(l: ListPartitionDefinition) -> Self {
+        Self::List(l)
+    }
+}
+
+/// Specification of an alteration to a table's partition topology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionAlteration {
+    /// Add one or more partitions to the table.
+    Add {
+        /// Definitions of new partitions to add.
+        partitions: Vec<PartitionDefinition>,
+    },
+    /// Drop one or more partitions from the table.
+    Drop {
+        /// Names of partitions to drop.
+        partitions: Vec<String>,
+    },
+    /// Reorganize one or more existing contiguous partitions into new partitions.
+    Reorganize {
+        /// Names of existing contiguous source partitions to replace.
+        sources: Vec<String>,
+        /// Definitions of target partitions replacing the sources.
+        targets: Vec<PartitionDefinition>,
+    },
+}
+
+impl PartitionAlteration {
+    /// Constructs an `Add` partition alteration.
+    pub fn add(partitions: impl IntoIterator<Item = impl Into<PartitionDefinition>>) -> Self {
+        Self::Add {
+            partitions: partitions.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Constructs a `Drop` partition alteration.
+    pub fn drop(partitions: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::Drop {
+            partitions: partitions.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Constructs a `Reorganize` partition alteration.
+    pub fn reorganize(
+        sources: impl IntoIterator<Item = impl Into<String>>,
+        targets: impl IntoIterator<Item = impl Into<PartitionDefinition>>,
+    ) -> Self {
+        Self::Reorganize {
+            sources: sources.into_iter().map(Into::into).collect(),
+            targets: targets.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Returns the source partition names affected by this alteration (for Drop and Reorganize).
+    pub fn source_partition_names(&self) -> &[String] {
+        match self {
+            Self::Add { .. } => &[],
+            Self::Drop { partitions } => partitions,
+            Self::Reorganize { sources, .. } => sources,
+        }
+    }
+}
+
+impl From<&PartitionAlteration> for PartitionAlteration {
+    fn from(alteration: &PartitionAlteration) -> Self {
+        alteration.clone()
+    }
+}
+
 /// Metadata descriptor for a relational table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableDescriptor {
@@ -610,6 +794,20 @@ impl<'a> TableSelector<'a> for &'a TableDescriptor {
     }
 }
 
+impl<'a> TableSelector<'a> for &'a str {
+    fn resolve_table(self, snapshot: &'a CatalogSnapshot) -> Result<&'a TableDescriptor> {
+        snapshot
+            .table_by_name(self)
+            .ok_or_else(|| HtapError::NotFound(format!("table '{}' not found", self)))
+    }
+}
+
+impl<'a> TableSelector<'a> for &'a String {
+    fn resolve_table(self, snapshot: &'a CatalogSnapshot) -> Result<&'a TableDescriptor> {
+        self.as_str().resolve_table(snapshot)
+    }
+}
+
 fn validate_manifest_path(path_str: &str) -> Result<()> {
     let trimmed = path_str.trim();
     if trimmed.is_empty() {
@@ -739,6 +937,646 @@ impl CatalogSnapshot {
     ) -> Result<PartitionId> {
         let table_desc = table.resolve_table(self)?;
         table_desc.route_partition_value(self, value)
+    }
+
+    /// Identifies the existing source partition descriptors affected by an alteration.
+    ///
+    /// Returns an empty vector for [`PartitionAlteration::Add`].
+    /// Validates that the table is partitioned, that all named source partitions exist,
+    /// and that there are no duplicate names in the source list.
+    pub fn source_partitions_for_alteration<'a>(
+        &'a self,
+        table: impl TableSelector<'a>,
+        alteration: &PartitionAlteration,
+    ) -> Result<Vec<&'a PartitionDescriptor>> {
+        let table_desc = table.resolve_table(self)?;
+        if table_desc.partitioning.is_none() {
+            return Err(HtapError::InvalidArgument(format!(
+                "table '{}' is not partitioned",
+                table_desc.name
+            )));
+        }
+
+        let names = alteration.source_partition_names();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = HashSet::with_capacity(names.len());
+        let mut result = Vec::with_capacity(names.len());
+
+        for name in names {
+            if !seen.insert(name.as_str()) {
+                return Err(HtapError::InvalidArgument(format!(
+                    "duplicate source partition name '{name}' for table '{}'",
+                    table_desc.name
+                )));
+            }
+
+            let part = table_desc
+                .partitions
+                .iter()
+                .filter_map(|&pid| self.partition(pid))
+                .find(|p| p.name == *name)
+                .ok_or_else(|| {
+                    HtapError::NotFound(format!(
+                        "partition '{name}' not found in table '{}'",
+                        table_desc.name
+                    ))
+                })?;
+            result.push(part);
+        }
+
+        Ok(result)
+    }
+
+    /// Pure candidate snapshot transformation applying a [`PartitionAlteration`] to a table.
+    ///
+    /// Validates:
+    /// - Table exists and is partitioned.
+    /// - New partition definitions match the table's partitioning method.
+    /// - Partition names are non-empty and unique within table.
+    /// - Overlaps and duplicate list values are rejected.
+    /// - Source partition list for Reorganize is contiguous in the table's partition sequence.
+    /// - Alteration does not drop all partitions from the table.
+    /// - IDs and generation are checked against overflow.
+    /// - Each new partition preserves single-tablet bucket-0 / healthy node 1 topology.
+    /// - Full candidate snapshot validation via [`CatalogSnapshot::validate`].
+    pub fn apply_partition_alteration<'a>(
+        &'a self,
+        table: impl TableSelector<'a>,
+        alteration: &PartitionAlteration,
+    ) -> Result<CatalogSnapshot> {
+        let table_desc = table.resolve_table(self)?;
+        let partitioning = table_desc.partitioning.as_ref().ok_or_else(|| {
+            HtapError::InvalidArgument(format!("table '{}' is not partitioned", table_desc.name))
+        })?;
+
+        if partitioning.key_column >= table_desc.schema.len() {
+            return Err(HtapError::InvalidArgument(format!(
+                "partition key column index {} out of bounds for table '{}' (schema length {})",
+                partitioning.key_column,
+                table_desc.name,
+                table_desc.schema.len()
+            )));
+        }
+        let key_col = &table_desc.schema.columns()[partitioning.key_column];
+        let expected_type = key_col.data_type;
+
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "catalog_generation",
+            })?;
+
+        let mut cur_partition_id = self
+            .partitions
+            .iter()
+            .map(|p| p.id.as_u64())
+            .max()
+            .unwrap_or(0);
+        let mut cur_tablet_id = self
+            .tablets
+            .iter()
+            .map(|t| t.id.as_u64())
+            .max()
+            .unwrap_or(0);
+        let mut cur_replica_id = self
+            .replicas
+            .iter()
+            .map(|r| r.id.as_u64())
+            .max()
+            .unwrap_or(0);
+
+        let validate_part_def = |def: &PartitionDefinition,
+                                 table_name: &str|
+         -> Result<(String, Option<RangeBound>, Vec<Value>)> {
+            let name = def.name().trim();
+            if name.is_empty() {
+                return Err(HtapError::InvalidArgument(format!(
+                    "partition name cannot be empty in table '{table_name}'"
+                )));
+            }
+
+            match (partitioning.method, def) {
+                    (PartitioningMethod::Range, PartitionDefinition::Range(r)) => {
+                        let bound = r.range_bound();
+                        if let Some(l) = &bound.lower {
+                            if l.is_null() || l.data_type() != Some(expected_type) {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "range partition '{}' in table '{}' lower bound has invalid type: expected {:?}, got {:?}",
+                                    name, table_name, expected_type, l.data_type()
+                                )));
+                            }
+                        }
+                        if let Some(u) = &bound.upper {
+                            if u.is_null() || u.data_type() != Some(expected_type) {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "range partition '{}' in table '{}' upper bound has invalid type: expected {:?}, got {:?}",
+                                    name, table_name, expected_type, u.data_type()
+                                )));
+                            }
+                        }
+                        if let (Some(l), Some(u)) = (&bound.lower, &bound.upper) {
+                            if l >= u {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "range partition '{}' in table '{}' has invalid bounds: lower ({}) must be strictly less than upper ({})",
+                                    name, table_name, l, u
+                                )));
+                            }
+                        }
+                        Ok((name.to_string(), Some(bound), Vec::new()))
+                    }
+                    (PartitioningMethod::List, PartitionDefinition::List(l)) => {
+                        if l.values.is_empty() {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "list partition '{}' in table '{}' has empty list values",
+                                name, table_name
+                            )));
+                        }
+                        let mut seen_vals = HashSet::with_capacity(l.values.len());
+                        for val in &l.values {
+                            if val.is_null() || val.data_type() != Some(expected_type) {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "list partition value '{}' in partition '{}' (table '{}') has invalid type: expected {:?}, got {:?}",
+                                    val, name, table_name, expected_type, val.data_type()
+                                )));
+                            }
+                            if !seen_vals.insert(val) {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "partition '{}' in table '{}' contains duplicate list value '{}'",
+                                    name, table_name, val
+                                )));
+                            }
+                        }
+                        Ok((name.to_string(), None, l.values.clone()))
+                    }
+                    (PartitioningMethod::Range, PartitionDefinition::List(_)) => {
+                        Err(HtapError::InvalidArgument(format!(
+                            "cannot apply list partition definition to range-partitioned table '{table_name}'"
+                        )))
+                    }
+                    (PartitioningMethod::List, PartitionDefinition::Range(_)) => {
+                        Err(HtapError::InvalidArgument(format!(
+                            "cannot apply range partition definition to list-partitioned table '{table_name}'"
+                        )))
+                    }
+                }
+        };
+
+        match alteration {
+            PartitionAlteration::Add { partitions } => {
+                if partitions.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "add partition requires at least one partition definition for table '{}'",
+                        table_desc.name
+                    )));
+                }
+
+                let mut seen_names: HashSet<&str> = table_desc
+                    .partitions
+                    .iter()
+                    .filter_map(|&pid| self.partition(pid))
+                    .map(|p| p.name.as_str())
+                    .collect();
+
+                let mut validated_items = Vec::with_capacity(partitions.len());
+                for def in partitions {
+                    let (name, range_opt, list_vals) = validate_part_def(def, &table_desc.name)?;
+                    if !seen_names.insert(def.name()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "duplicate partition name '{}' in table '{}'",
+                            def.name(),
+                            table_desc.name
+                        )));
+                    }
+                    validated_items.push((name, range_opt, list_vals));
+                }
+
+                let mut new_partitions = Vec::with_capacity(validated_items.len());
+                let mut new_tablets = Vec::with_capacity(validated_items.len());
+                let mut new_replicas = Vec::with_capacity(validated_items.len());
+                let mut new_partition_ids = Vec::with_capacity(validated_items.len());
+
+                for (part_name, range_opt, list_values) in validated_items {
+                    cur_partition_id =
+                        cur_partition_id
+                            .checked_add(1)
+                            .ok_or(HtapError::CounterOverflow {
+                                counter: "partition_id",
+                            })?;
+                    let partition_id = PartitionId::new(cur_partition_id);
+
+                    cur_tablet_id =
+                        cur_tablet_id
+                            .checked_add(1)
+                            .ok_or(HtapError::CounterOverflow {
+                                counter: "tablet_id",
+                            })?;
+                    let tablet_id = TabletId::new(cur_tablet_id);
+
+                    cur_replica_id =
+                        cur_replica_id
+                            .checked_add(1)
+                            .ok_or(HtapError::CounterOverflow {
+                                counter: "replica_id",
+                            })?;
+                    let replica_id = ReplicaId::new(cur_replica_id);
+
+                    let replica_desc = ReplicaDescriptor::new(
+                        replica_id,
+                        tablet_id,
+                        NodeId::new(1),
+                        true,
+                        true,
+                        next_generation,
+                    );
+                    let tablet_desc = TabletDescriptor::new(
+                        tablet_id,
+                        partition_id,
+                        0,
+                        vec![replica_id],
+                        next_generation,
+                    );
+                    let mut partition_desc = PartitionDescriptor::new(
+                        partition_id,
+                        table_desc.id,
+                        part_name,
+                        StorageDescriptor::Row,
+                        vec![tablet_id],
+                        next_generation,
+                    );
+                    if let Some(range) = range_opt {
+                        partition_desc = partition_desc.with_range(range);
+                    }
+                    if !list_values.is_empty() {
+                        partition_desc = partition_desc.with_list_values(list_values);
+                    }
+
+                    new_partition_ids.push(partition_id);
+                    new_partitions.push(partition_desc);
+                    new_tablets.push(tablet_desc);
+                    new_replicas.push(replica_desc);
+                }
+
+                let mut updated_table = table_desc.clone();
+                updated_table.partitions.extend(new_partition_ids);
+                updated_table.generation = next_generation;
+
+                let tables: Vec<TableDescriptor> = self
+                    .tables
+                    .iter()
+                    .map(|t| {
+                        if t.id == updated_table.id {
+                            updated_table.clone()
+                        } else {
+                            t.clone()
+                        }
+                    })
+                    .collect();
+
+                let mut partitions = self.partitions.clone();
+                partitions.extend(new_partitions);
+
+                let mut tablets = self.tablets.clone();
+                tablets.extend(new_tablets);
+
+                let mut replicas = self.replicas.clone();
+                replicas.extend(new_replicas);
+
+                let candidate =
+                    CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas);
+                candidate.validate()?;
+                Ok(candidate)
+            }
+            PartitionAlteration::Drop { partitions } => {
+                if partitions.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "drop partition requires at least one partition name for table '{}'",
+                        table_desc.name
+                    )));
+                }
+
+                let mut seen_drop = HashSet::with_capacity(partitions.len());
+                let mut drop_pids = Vec::with_capacity(partitions.len());
+
+                for name in partitions {
+                    if !seen_drop.insert(name.as_str()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "duplicate partition name '{name}' in drop list for table '{}'",
+                            table_desc.name
+                        )));
+                    }
+                    let pid = table_desc
+                        .partitions
+                        .iter()
+                        .copied()
+                        .find(|&pid| {
+                            self.partition(pid)
+                                .map(|p| p.name == *name)
+                                .unwrap_or(false)
+                        })
+                        .ok_or_else(|| {
+                            HtapError::NotFound(format!(
+                                "partition '{name}' not found in table '{}'",
+                                table_desc.name
+                            ))
+                        })?;
+                    drop_pids.push(pid);
+                }
+
+                if drop_pids.len() >= table_desc.partitions.len() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "cannot drop all partitions of table '{}'",
+                        table_desc.name
+                    )));
+                }
+
+                let drop_pid_set: HashSet<PartitionId> = drop_pids.into_iter().collect();
+
+                let mut dropped_tablet_ids = HashSet::new();
+                let mut dropped_replica_ids = HashSet::new();
+                for pid in &drop_pid_set {
+                    if let Some(part) = self.partition(*pid) {
+                        for tid in &part.tablets {
+                            dropped_tablet_ids.insert(*tid);
+                            if let Some(tab) = self.tablet(*tid) {
+                                for rid in &tab.replicas {
+                                    dropped_replica_ids.insert(*rid);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut updated_table = table_desc.clone();
+                updated_table
+                    .partitions
+                    .retain(|pid| !drop_pid_set.contains(pid));
+                updated_table.generation = next_generation;
+
+                let tables: Vec<TableDescriptor> = self
+                    .tables
+                    .iter()
+                    .map(|t| {
+                        if t.id == updated_table.id {
+                            updated_table.clone()
+                        } else {
+                            t.clone()
+                        }
+                    })
+                    .collect();
+
+                let remaining_partitions: Vec<PartitionDescriptor> = self
+                    .partitions
+                    .iter()
+                    .filter(|p| !drop_pid_set.contains(&p.id))
+                    .cloned()
+                    .collect();
+
+                let remaining_tablets: Vec<TabletDescriptor> = self
+                    .tablets
+                    .iter()
+                    .filter(|t| !dropped_tablet_ids.contains(&t.id))
+                    .cloned()
+                    .collect();
+
+                let remaining_replicas: Vec<ReplicaDescriptor> = self
+                    .replicas
+                    .iter()
+                    .filter(|r| !dropped_replica_ids.contains(&r.id))
+                    .cloned()
+                    .collect();
+
+                let candidate = CatalogSnapshot::new(
+                    next_generation,
+                    tables,
+                    remaining_partitions,
+                    remaining_tablets,
+                    remaining_replicas,
+                );
+                candidate.validate()?;
+                Ok(candidate)
+            }
+            PartitionAlteration::Reorganize { sources, targets } => {
+                if sources.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "reorganize partition requires at least one source partition for table '{}'",
+                        table_desc.name
+                    )));
+                }
+                if targets.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "reorganize partition requires at least one target partition for table '{}'",
+                        table_desc.name
+                    )));
+                }
+
+                let mut seen_source_names = HashSet::with_capacity(sources.len());
+                let mut source_indices = Vec::with_capacity(sources.len());
+                let mut source_pids = HashSet::with_capacity(sources.len());
+
+                for name in sources {
+                    if !seen_source_names.insert(name.as_str()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "duplicate source partition name '{name}' in reorganize for table '{}'",
+                            table_desc.name
+                        )));
+                    }
+                    let pos = table_desc
+                        .partitions
+                        .iter()
+                        .position(|&pid| {
+                            self.partition(pid)
+                                .map(|p| p.name == *name)
+                                .unwrap_or(false)
+                        })
+                        .ok_or_else(|| {
+                            HtapError::NotFound(format!(
+                                "source partition '{name}' not found in table '{}'",
+                                table_desc.name
+                            ))
+                        })?;
+                    source_indices.push(pos);
+                    source_pids.insert(table_desc.partitions[pos]);
+                }
+
+                source_indices.sort_unstable();
+                let min_idx = source_indices[0];
+                let max_idx = *source_indices.last().unwrap();
+                if max_idx - min_idx + 1 != source_indices.len() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "reorganize partition sources must be contiguous in table '{}', got non-contiguous positions {:?}",
+                        table_desc.name, source_indices
+                    )));
+                }
+
+                // Names of remaining partitions (partitions not in sources)
+                let remaining_names: HashSet<&str> = table_desc
+                    .partitions
+                    .iter()
+                    .filter(|pid| !source_pids.contains(pid))
+                    .filter_map(|&pid| self.partition(pid))
+                    .map(|p| p.name.as_str())
+                    .collect();
+
+                let mut seen_target_names = HashSet::with_capacity(targets.len());
+                let mut validated_targets = Vec::with_capacity(targets.len());
+
+                for def in targets {
+                    let (name, range_opt, list_vals) = validate_part_def(def, &table_desc.name)?;
+                    if !seen_target_names.insert(def.name()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "duplicate target partition name '{}' in reorganize for table '{}'",
+                            def.name(),
+                            table_desc.name
+                        )));
+                    }
+                    if remaining_names.contains(def.name()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "target partition name '{}' already exists in table '{}'",
+                            def.name(),
+                            table_desc.name
+                        )));
+                    }
+                    validated_targets.push((name, range_opt, list_vals));
+                }
+
+                let mut new_partitions = Vec::with_capacity(validated_targets.len());
+                let mut new_tablets = Vec::with_capacity(validated_targets.len());
+                let mut new_replicas = Vec::with_capacity(validated_targets.len());
+                let mut target_partition_ids = Vec::with_capacity(validated_targets.len());
+
+                for (part_name, range_opt, list_values) in validated_targets {
+                    cur_partition_id =
+                        cur_partition_id
+                            .checked_add(1)
+                            .ok_or(HtapError::CounterOverflow {
+                                counter: "partition_id",
+                            })?;
+                    let partition_id = PartitionId::new(cur_partition_id);
+
+                    cur_tablet_id =
+                        cur_tablet_id
+                            .checked_add(1)
+                            .ok_or(HtapError::CounterOverflow {
+                                counter: "tablet_id",
+                            })?;
+                    let tablet_id = TabletId::new(cur_tablet_id);
+
+                    cur_replica_id =
+                        cur_replica_id
+                            .checked_add(1)
+                            .ok_or(HtapError::CounterOverflow {
+                                counter: "replica_id",
+                            })?;
+                    let replica_id = ReplicaId::new(cur_replica_id);
+
+                    let replica_desc = ReplicaDescriptor::new(
+                        replica_id,
+                        tablet_id,
+                        NodeId::new(1),
+                        true,
+                        true,
+                        next_generation,
+                    );
+                    let tablet_desc = TabletDescriptor::new(
+                        tablet_id,
+                        partition_id,
+                        0,
+                        vec![replica_id],
+                        next_generation,
+                    );
+                    let mut partition_desc = PartitionDescriptor::new(
+                        partition_id,
+                        table_desc.id,
+                        part_name,
+                        StorageDescriptor::Row,
+                        vec![tablet_id],
+                        next_generation,
+                    );
+                    if let Some(range) = range_opt {
+                        partition_desc = partition_desc.with_range(range);
+                    }
+                    if !list_values.is_empty() {
+                        partition_desc = partition_desc.with_list_values(list_values);
+                    }
+
+                    target_partition_ids.push(partition_id);
+                    new_partitions.push(partition_desc);
+                    new_tablets.push(tablet_desc);
+                    new_replicas.push(replica_desc);
+                }
+
+                let mut updated_partitions = Vec::with_capacity(
+                    table_desc.partitions.len() - source_indices.len() + target_partition_ids.len(),
+                );
+                updated_partitions.extend_from_slice(&table_desc.partitions[..min_idx]);
+                updated_partitions.extend(target_partition_ids);
+                updated_partitions.extend_from_slice(&table_desc.partitions[(max_idx + 1)..]);
+
+                let mut updated_table = table_desc.clone();
+                updated_table.partitions = updated_partitions;
+                updated_table.generation = next_generation;
+
+                let mut dropped_tablet_ids = HashSet::new();
+                let mut dropped_replica_ids = HashSet::new();
+                for pid in &source_pids {
+                    if let Some(part) = self.partition(*pid) {
+                        for tid in &part.tablets {
+                            dropped_tablet_ids.insert(*tid);
+                            if let Some(tab) = self.tablet(*tid) {
+                                for rid in &tab.replicas {
+                                    dropped_replica_ids.insert(*rid);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let tables: Vec<TableDescriptor> = self
+                    .tables
+                    .iter()
+                    .map(|t| {
+                        if t.id == updated_table.id {
+                            updated_table.clone()
+                        } else {
+                            t.clone()
+                        }
+                    })
+                    .collect();
+
+                let mut partitions: Vec<PartitionDescriptor> = self
+                    .partitions
+                    .iter()
+                    .filter(|p| !source_pids.contains(&p.id))
+                    .cloned()
+                    .collect();
+                partitions.extend(new_partitions);
+
+                let mut tablets: Vec<TabletDescriptor> = self
+                    .tablets
+                    .iter()
+                    .filter(|t| !dropped_tablet_ids.contains(&t.id))
+                    .cloned()
+                    .collect();
+                tablets.extend(new_tablets);
+
+                let mut replicas: Vec<ReplicaDescriptor> = self
+                    .replicas
+                    .iter()
+                    .filter(|r| !dropped_replica_ids.contains(&r.id))
+                    .cloned()
+                    .collect();
+                replicas.extend(new_replicas);
+
+                let candidate =
+                    CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas);
+                candidate.validate()?;
+                Ok(candidate)
+            }
+        }
     }
 
     /// Validate the catalog snapshot for semantic correctness.

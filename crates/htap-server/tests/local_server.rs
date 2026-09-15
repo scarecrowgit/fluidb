@@ -12,8 +12,8 @@ use htap_common::version::Version;
 use htap_common::HtapError;
 use htap_movement::{CopyOptions, DataFormat, MovementJobPhase, TabletCloneOptions};
 use htap_server::{
-    ListPartitionDefinition, LocalServer, PartitionTopology, PartitionedTableDefinition,
-    RangePartitionDefinition,
+    ListPartitionDefinition, LocalServer, PartitionAlteration, PartitionTopology,
+    PartitionedTableDefinition, RangePartitionDefinition,
 };
 use htap_sql::result::{CommandResult, StatementResult};
 use tempfile::TempDir;
@@ -3864,5 +3864,572 @@ fn test_sql_list_partitioning_ddl_and_routing() {
             );
         }
         other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_server_alter_partitions_add_and_routing() {
+    let temp = TempDir::new().unwrap();
+    let server = LocalServer::open(temp.path()).unwrap();
+
+    // 1. Create range table with p0 [0, 100)
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "balance".to_string(),
+            data_type: DataType::Float64,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "accounts",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![RangePartitionDefinition::new(
+                "p0",
+                Value::Int64(0),
+                Value::Int64(100),
+            )],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // Insert row into p0
+    server
+        .execute("INSERT INTO accounts (id, balance) VALUES (50, 1000.0);")
+        .unwrap();
+
+    // 2. Alter partition: ADD p1 [100, 200)
+    let add_res = server
+        .alter_partitions(
+            "accounts",
+            PartitionAlteration::add(vec![RangePartitionDefinition::new(
+                "p1",
+                Value::Int64(100),
+                Value::Int64(200),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(add_res, StatementResult::ddl(1));
+
+    // Insert row into p1
+    server
+        .execute("INSERT INTO accounts (id, balance) VALUES (150, 2000.0);")
+        .unwrap();
+
+    // Point queries for both
+    let q50 = server
+        .execute("SELECT balance FROM accounts WHERE id = 50;")
+        .unwrap();
+    match q50 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Float64(1000.0)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let q150 = server
+        .execute("SELECT balance FROM accounts WHERE id = 150;")
+        .unwrap();
+    match q150 {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Float64(2000.0)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // OLAP query across both partitions
+    let q_all = server
+        .execute("SELECT id, balance FROM accounts WHERE id >= 0 ORDER BY id;")
+        .unwrap();
+    match q_all {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 2);
+            assert_eq!(qr.rows()[0].get(0), Some(&Value::Int64(50)));
+            assert_eq!(qr.rows()[1].get(0), Some(&Value::Int64(150)));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 3. List table ADD
+    let list_schema = Schema::new(vec![
+        ColumnDef {
+            name: "code".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "name".to_string(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let list_def = PartitionedTableDefinition::new(
+        "tenants",
+        list_schema,
+        vec![0],
+        PartitionTopology::List {
+            key_column: 0,
+            partitions: vec![ListPartitionDefinition::new(
+                "p_east",
+                vec![Value::Int32(1), Value::Int32(2)],
+            )],
+        },
+    );
+    server.create_partitioned_table(list_def).unwrap();
+
+    server
+        .execute("INSERT INTO tenants (code, name) VALUES (1, 'Acme East');")
+        .unwrap();
+
+    server
+        .alter_partitions(
+            "tenants",
+            PartitionAlteration::add(vec![ListPartitionDefinition::new(
+                "p_west",
+                vec![Value::Int32(3), Value::Int32(4)],
+            )]),
+        )
+        .unwrap();
+
+    server
+        .execute("INSERT INTO tenants (code, name) VALUES (3, 'Acme West');")
+        .unwrap();
+
+    let q_list = server
+        .execute("SELECT name FROM tenants WHERE code = 3;")
+        .unwrap();
+    match q_list {
+        StatementResult::Query(qr) => {
+            assert_eq!(qr.num_rows(), 1);
+            assert_eq!(
+                qr.rows()[0].get(0),
+                Some(&Value::String("Acme West".into()))
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_server_alter_partitions_drop_empty_and_populated_guard() {
+    let temp = TempDir::new().unwrap();
+    let server = LocalServer::open(temp.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "val".to_string(),
+            data_type: DataType::Float64,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "metrics",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // Insert row into p1
+    server
+        .execute("INSERT INTO metrics (id, val) VALUES (120, 42.0);")
+        .unwrap();
+
+    // 1. Attempt to DROP populated partition p1 -> MUST FAIL
+    let err = server
+        .alter_partitions("metrics", PartitionAlteration::drop(vec!["p1"]))
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("populated"));
+
+    // Verify catalog was NOT mutated
+    let cat_store = LocalCatalogStore::open(temp.path().join("catalog")).unwrap();
+    let catalog = cat_store.load().unwrap().unwrap();
+    assert_eq!(catalog.generation, 1);
+    let table = catalog.table_by_name("metrics").unwrap();
+    assert_eq!(table.partitions.len(), 2);
+
+    // Row is still queryable
+    let q = server
+        .execute("SELECT val FROM metrics WHERE id = 120;")
+        .unwrap();
+    match q {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 1),
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 2. Insert into p0 and delete from p1
+    server
+        .execute("INSERT INTO metrics (id, val) VALUES (50, 10.0);")
+        .unwrap();
+    server
+        .execute("DELETE FROM metrics WHERE id = 120;")
+        .unwrap();
+
+    // 3. Now p1 has tombstone, collapsed rowstore entries is empty -> DROP SUCCEEDS
+    let drop_res = server
+        .alter_partitions("metrics", PartitionAlteration::drop(vec!["p1"]))
+        .unwrap();
+    assert_eq!(drop_res, StatementResult::ddl(1));
+
+    // Catalog mutated to generation 2
+    let catalog2 = cat_store.load().unwrap().unwrap();
+    assert_eq!(catalog2.generation, 2);
+    let table2 = catalog2.table_by_name("metrics").unwrap();
+    assert_eq!(table2.partitions.len(), 1);
+
+    // Routing for 120 fails (no partition)
+    let err_insert = server
+        .execute("INSERT INTO metrics (id, val) VALUES (120, 99.0);")
+        .unwrap_err();
+    assert!(matches!(err_insert, HtapError::InvalidArgument(_)));
+
+    // Row 50 in p0 still readable
+    let q50 = server
+        .execute("SELECT val FROM metrics WHERE id = 50;")
+        .unwrap();
+    match q50 {
+        StatementResult::Query(qr) => assert_eq!(qr.num_rows(), 1),
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // 4. Attempt to drop last partition p0
+    // First, when populated, fails with populated error
+    let err_pop = server
+        .alter_partitions("metrics", PartitionAlteration::drop(vec!["p0"]))
+        .unwrap_err();
+    assert!(matches!(err_pop, HtapError::InvalidArgument(_)));
+    assert!(err_pop.to_string().contains("populated"));
+
+    // Then delete row 50 so p0 is empty, and attempt again -> FAILS with no-last rule
+    server
+        .execute("DELETE FROM metrics WHERE id = 50;")
+        .unwrap();
+    let err_last = server
+        .alter_partitions("metrics", PartitionAlteration::drop(vec!["p0"]))
+        .unwrap_err();
+    assert!(matches!(err_last, HtapError::InvalidArgument(_)));
+    assert!(err_last.to_string().contains("cannot drop all partitions"));
+}
+
+#[test]
+fn test_server_alter_partitions_reorganize_empty_and_populated_guard() {
+    let temp = TempDir::new().unwrap();
+    let server = LocalServer::open(temp.path()).unwrap();
+
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "msg".to_string(),
+            data_type: DataType::String,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "logs",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+                RangePartitionDefinition::new("p2", Value::Int64(200), Value::Int64(300)),
+                RangePartitionDefinition::new("p3", Value::Int64(300), Value::Int64(400)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // Insert row into p2
+    server
+        .execute("INSERT INTO logs (id, msg) VALUES (250, 'important log');")
+        .unwrap();
+
+    // 1. Attempt reorganize on [p1, p2] where p2 is populated -> MUST FAIL
+    let alt = PartitionAlteration::reorganize(
+        vec!["p1", "p2"],
+        vec![RangePartitionDefinition::new(
+            "p12",
+            Value::Int64(100),
+            Value::Int64(300),
+        )],
+    );
+    let err = server.alter_partitions("logs", alt.clone()).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("populated"));
+
+    // Verify catalog not mutated
+    let cat_store = LocalCatalogStore::open(temp.path().join("catalog")).unwrap();
+    assert_eq!(cat_store.load().unwrap().unwrap().generation, 1);
+
+    // 2. Delete row from p2 -> collapsed entries empty
+    server.execute("DELETE FROM logs WHERE id = 250;").unwrap();
+
+    // 3. Reorganize now SUCCEEDS
+    let alt_new = PartitionAlteration::reorganize(
+        vec!["p1", "p2"],
+        vec![
+            RangePartitionDefinition::new("p1_new", Value::Int64(100), Value::Int64(250)),
+            RangePartitionDefinition::new("p2_new", Value::Int64(250), Value::Int64(300)),
+        ],
+    );
+    let res = server.alter_partitions("logs", alt_new).unwrap();
+    assert_eq!(res, StatementResult::ddl(1));
+
+    // Verify catalog generation 2 and partition ordering preserved
+    let cat = cat_store.load().unwrap().unwrap();
+    assert_eq!(cat.generation, 2);
+    let t = cat.table_by_name("logs").unwrap();
+    let part_names: Vec<&str> = t
+        .partitions
+        .iter()
+        .map(|&pid| cat.partition(pid).unwrap().name.as_str())
+        .collect();
+    assert_eq!(part_names, vec!["p0", "p1_new", "p2_new", "p3"]);
+
+    // Insert into p1_new and p2_new
+    server
+        .execute("INSERT INTO logs (id, msg) VALUES (150, 'log in p1_new');")
+        .unwrap();
+    server
+        .execute("INSERT INTO logs (id, msg) VALUES (275, 'log in p2_new');")
+        .unwrap();
+
+    let q150 = server
+        .execute("SELECT msg FROM logs WHERE id = 150;")
+        .unwrap();
+    match q150 {
+        StatementResult::Query(qr) => {
+            assert_eq!(
+                qr.rows()[0].get(0),
+                Some(&Value::String("log in p1_new".into()))
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let q275 = server
+        .execute("SELECT msg FROM logs WHERE id = 275;")
+        .unwrap();
+    match q275 {
+        StatementResult::Query(qr) => {
+            assert_eq!(
+                qr.rows()[0].get(0),
+                Some(&Value::String("log in p2_new".into()))
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_server_alter_partitions_contiguous_and_negative_rules() {
+    let temp = TempDir::new().unwrap();
+    let server = LocalServer::open(temp.path()).unwrap();
+
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let def = PartitionedTableDefinition::new(
+        "p_table",
+        schema,
+        vec![0],
+        PartitionTopology::Range {
+            key_column: 0,
+            partitions: vec![
+                RangePartitionDefinition::new("p0", Value::Int64(0), Value::Int64(100)),
+                RangePartitionDefinition::new("p1", Value::Int64(100), Value::Int64(200)),
+                RangePartitionDefinition::new("p2", Value::Int64(200), Value::Int64(300)),
+            ],
+        },
+    );
+    server.create_partitioned_table(def).unwrap();
+
+    // 1. Non-contiguous reorganize: p0 and p2 (skipping p1)
+    let alt_non_contig = PartitionAlteration::reorganize(
+        vec!["p0", "p2"],
+        vec![RangePartitionDefinition::new(
+            "p02",
+            Value::Int64(0),
+            Value::Int64(100),
+        )],
+    );
+    let err = server
+        .alter_partitions("p_table", alt_non_contig)
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("must be contiguous"));
+
+    // 2. Unpartitioned table guard
+    server
+        .execute("CREATE TABLE unpart (id BIGINT PRIMARY KEY);")
+        .unwrap();
+    let err_unpart = server
+        .alter_partitions("unpart", PartitionAlteration::drop(vec!["p0"]))
+        .unwrap_err();
+    assert!(matches!(err_unpart, HtapError::InvalidArgument(_)));
+    assert!(err_unpart.to_string().contains("not partitioned"));
+
+    // 3. Nonexistent table guard
+    let err_ghost = server
+        .alter_partitions("ghost_table", PartitionAlteration::drop(vec!["p0"]))
+        .unwrap_err();
+    assert!(matches!(err_ghost, HtapError::NotFound(_)));
+}
+
+#[test]
+fn test_server_alter_partitions_reopen_continuation() {
+    let temp = TempDir::new().unwrap();
+
+    {
+        let server = LocalServer::open(temp.path()).unwrap();
+
+        let schema = Schema::new(vec![
+            ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnDef {
+                name: "val".to_string(),
+                data_type: DataType::String,
+                nullable: false,
+                primary_key: false,
+            },
+        ])
+        .unwrap();
+
+        let def = PartitionedTableDefinition::new(
+            "events",
+            schema,
+            vec![0],
+            PartitionTopology::Range {
+                key_column: 0,
+                partitions: vec![RangePartitionDefinition::new(
+                    "p0",
+                    Value::Int64(0),
+                    Value::Int64(100),
+                )],
+            },
+        );
+        server.create_partitioned_table(def).unwrap();
+
+        server
+            .execute("INSERT INTO events (id, val) VALUES (42, 'event0');")
+            .unwrap();
+
+        // ADD p1
+        server
+            .alter_partitions(
+                "events",
+                PartitionAlteration::add(vec![RangePartitionDefinition::new(
+                    "p1",
+                    Value::Int64(100),
+                    Value::Int64(200),
+                )]),
+            )
+            .unwrap();
+
+        server
+            .execute("INSERT INTO events (id, val) VALUES (142, 'event1');")
+            .unwrap();
+    }
+
+    // Reopen server from disk
+    {
+        let reopened = LocalServer::open(temp.path()).unwrap();
+
+        let q0 = reopened
+            .execute("SELECT val FROM events WHERE id = 42;")
+            .unwrap();
+        match q0 {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("event0".into())));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        let q1 = reopened
+            .execute("SELECT val FROM events WHERE id = 142;")
+            .unwrap();
+        match q1 {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("event1".into())));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        // ADD p2 on reopened server
+        reopened
+            .alter_partitions(
+                "events",
+                PartitionAlteration::add(vec![RangePartitionDefinition::new(
+                    "p2",
+                    Value::Int64(200),
+                    Value::Int64(300),
+                )]),
+            )
+            .unwrap();
+
+        reopened
+            .execute("INSERT INTO events (id, val) VALUES (242, 'event2');")
+            .unwrap();
+
+        let q2 = reopened
+            .execute("SELECT val FROM events WHERE id = 242;")
+            .unwrap();
+        match q2 {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("event2".into())));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
     }
 }

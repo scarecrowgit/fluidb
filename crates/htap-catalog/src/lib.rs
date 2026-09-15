@@ -10,9 +10,11 @@ pub mod store;
 
 pub use local::LocalCatalogStore;
 pub use model::{
-    CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase, NodeId,
-    PartitionDescriptor, PartitionId, PartitionSource, PartitioningDescriptor, PartitioningMethod,
-    RangeBound, ReplicaDescriptor, ReplicaId, StorageDescriptor, StorageFormat, TableDescriptor,
-    TableId, TableSelector, TabletDescriptor, TabletId, MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS,
+    CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase,
+    ListPartitionDefinition, NodeId, PartitionAlteration, PartitionDefinition, PartitionDescriptor,
+    PartitionId, PartitionSource, PartitioningDescriptor, PartitioningMethod, RangeBound,
+    RangePartitionDefinition, ReplicaDescriptor, ReplicaId, StorageDescriptor, StorageFormat,
+    TableDescriptor, TableId, TableSelector, TabletDescriptor, TabletId, MAX_MANIFEST_ROWS,
+    MAX_MANIFEST_SEGMENTS,
 };
 pub use store::CatalogStore;
