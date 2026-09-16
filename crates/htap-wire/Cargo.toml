@@ -1,5 +1,5 @@
 [package]
-name = "htap-client"
+name = "htap-wire"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,9 @@ license.workspace = true
 htap-common = { path = "../htap-common" }
 htap-server = { path = "../htap-server" }
 htap-sql = { path = "../htap-sql" }
-htap-wire = { path = "../htap-wire" }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
 tempfile = { workspace = true }

@@ -17,11 +17,15 @@
 //! - Complete-PK `SELECT`: Point lookups projecting expressions or all columns matching the complete primary key in the `WHERE` clause, routed to the target partition while strictly preserving the rowstore fast path.
 //! - Analytic `SELECT`: Narrow OLAP scans projecting columns or aggregates (`COUNT`, `SUM`, `MIN`, `MAX`) with AND-only filters and optional `GROUP BY`, scanning all partitions of the table at a single visible snapshot and combining results.
 //!
+//! # Network access
+//!
+//! [`RemoteClient`] connects to an `htapd` daemon (or an embedded [`htap_wire::WireServer`])
+//! over TCP using the MySQL text protocol and returns the same [`StatementResult`] shape.
+//!
 //! # Explicit Scope Limitations & Non-Features
 //!
 //! This embedded client explicitly does **not** provide:
-//! - **No network transport**: No host, port, socket binding, or remote connection handling.
-//! - **No MySQL wire protocol**: No wire protocol framing, handshake negotiation, or MySQL client/driver compatibility.
+//! - **No network transport in `EmbeddedClient`**: it executes in-process; use [`RemoteClient`] for TCP.
 //! - **No session state**: Each statement executes independently without connection-level state, session variables, or multi-statement transaction handles.
 //! - **No prepared statements**: Queries are parsed and planned synchronously on each call without prepared statement handles or binary parameter binding.
 //! - **Deferred partition & storage capabilities**: Physical data migration for populated partition reorganization, physical storage reclamation for dropped partitions, delete vectors, compaction, autonomous background conversion scheduling, hash/multiple tablets, distributed/remote movement, consensus/HA, and full MySQL compatibility remain deferred.
@@ -34,7 +38,11 @@ use std::path::PathBuf;
 use htap_common::Result;
 use htap_server::LocalServer;
 
+pub mod remote;
+
 pub use htap_sql::{CommandResult, QueryResult, StatementResult};
+pub use htap_wire::ClientOptions;
+pub use remote::RemoteClient;
 
 /// Synchronous in-process embedded database client.
 ///

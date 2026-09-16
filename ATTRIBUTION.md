@@ -40,6 +40,7 @@ record of what was adopted and what was rejected.
 | Adaptive page compression on a space-saving threshold | Compress only if saving exceeds a threshold; infer compression from stored size vs. recorded uncompressed size, with no explicit flag. | `htap-colstore` (planned) |
 | Two-phase commit/publish visibility with version-density gating | Commit assigns a version and journals one record; a separate idempotent publish makes it visible once the version is exactly `visibleVersion + 1`. | `htap-txn` (planned) |
 | Layered epoch + lease fencing | Term fence (compare-and-set epoch claim) and session fence (epoch-keyed lease with a generation counter) exposed through the `Coordinator` trait. | `htap-coord` (planned) |
+| MySQL client/server protocol mechanisms | Handshake/capability negotiation state machine, native-password scramble, column type mapping, and packet framing as implemented by the StarRocks FE (`fe/fe-core/src/main/java/com/starrocks/mysql/`). Used as a mechanism reference only; `htap-wire` was written from the public protocol description and verified against a real driver (see `docs/RESEARCH.md` finding 13, ADR-016). | `htap-wire` |
 
 ---
 

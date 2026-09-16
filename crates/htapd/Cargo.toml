@@ -1,14 +1,11 @@
 [package]
-name = "htap-client"
+name = "htapd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-htap-common = { path = "../htap-common" }
 htap-server = { path = "../htap-server" }
-htap-sql = { path = "../htap-sql" }
 htap-wire = { path = "../htap-wire" }
-
-[dev-dependencies]
-tempfile = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

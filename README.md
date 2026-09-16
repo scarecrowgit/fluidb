@@ -14,14 +14,17 @@ This repository implements a modular local MVP covering LSM row storage, columna
 
 ## Important Scope Exclusions & Architectural Boundaries
 
-This project is delivered as a verified in-process local library and test suite. The following components are **deliberately not implemented** and are out of scope for this local MVP:
+This project is delivered as a verified local library, a network daemon, and a test suite. The following
+components are **deliberately not implemented** and are out of scope for this local MVP:
 
-- **No `htapd` or application daemon:** There is no background server daemon, process supervisor, or service entrypoint. The engine runs strictly in-process via `LocalServer` or `EmbeddedClient`.
-- **No MySQL wire server or client compatibility:** There is no MySQL binary wire protocol listener, packet framing, handshake protocol, authentication layer, or compatibility with standard MySQL client libraries.
-- **No Docker image or Docker Compose deployment:** No `Dockerfile`, `docker-compose.yml`, or container images are provided or required. All execution is local and filesystem-based.
-- **No network endpoint:** There are no network listeners, TCP/IP sockets, Unix domain sockets, or HTTP/gRPC endpoints.
-- **No interactive sessions or session state:** Each statement executes independently without connection-level state, session variables, or transaction handles.
-- **No prepared statements:** Statements are parsed, validated, and planned synchronously on every execution call without prepared statement handles or binary parameter binding.
+- **No MySQL binary/prepared-statement protocol:** `htapd`/`htap-wire` implement the MySQL *text* protocol
+  only (`COM_QUERY`, `COM_PING`, `COM_INIT_DB`, `COM_QUIT`). Prepared statements and the binary protocol
+  (`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`), `COM_RESET_CONNECTION`, and `COM_CHANGE_USER` are answered with an
+  error rather than implemented.
+- **No TLS, compression, or per-user ACL:** The wire server has no TLS, no protocol compression, and a
+  single shared password with no per-user accounts or RBAC; see "Network server (`htapd`)" below.
+- **No Docker image or Docker Compose deployment:** No `Dockerfile`, `docker-compose.yml`, or container images are provided or required.
+- **No interactive sessions or session state:** Each statement executes independently without connection-level state, session variables, or explicit transaction handles (`BEGIN`/`COMMIT`/`ROLLBACK`), whether reached in-process via `EmbeddedClient` or over the network via `RemoteClient`.
 - **No TPC-C or TPC-H compliance:** The system does not implement the TPC-C or TPC-H benchmark specifications, relational transaction models, or analytical query profiles. Microbenchmarks evaluate isolated internal subsystem performance only.
 - **Exclusive Process Ownership (No Concurrent Multiprocess Operation):** `LocalServer` and `LocalCoordinator` enforce exclusive ownership of their root directory using an OS-level advisory lock (`<root>/LOCK` via `flock`). Concurrent access or duplicate opens by multiple processes against the same root directory (or its symlink aliases) are strictly rejected with `HtapError::Conflict`. This is single-process exclusive ownership, not concurrent shared-root operation; concurrent multiprocess writers are not supported. Low-level standalone subsystem instances (`htap_rowstore::Engine::open`, `htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) do not acquire this lock and remain unsafe for concurrent shared-root use.
 
@@ -100,9 +103,48 @@ fn main() -> Result<()> {
 
 ---
 
+## Network server (`htapd`)
+
+`htapd` exposes a `LocalServer` root over the MySQL text protocol, so the same engine `EmbeddedClient` drives
+in-process can also be reached over TCP, from any MySQL client or from `htap-client::RemoteClient`.
+
+```bash
+# Build and run the daemon (default bind: 127.0.0.1:3307, loopback only)
+cargo run -p htapd -- --root /tmp/htap_demo
+
+# Optional flags
+cargo run -p htapd -- --root /tmp/htap_demo --listen 127.0.0.1:3307 --max-connections 64 --password secret
+```
+
+The password may also come from the `HTAPD_PASSWORD` environment variable; `--password` wins if both are
+set, and with neither set no password is required.
+
+Connect with any MySQL client, e.g. the `mysql` CLI (if installed):
+
+```bash
+mysql -h 127.0.0.1 -P 3307 -u root
+```
+
+Or from Rust, with `htap_client::RemoteClient` (same result shape as `EmbeddedClient`):
+
+```rust
+use htap_client::RemoteClient;
+
+let mut client = RemoteClient::connect("127.0.0.1:3307", Some("secret"))?;
+let result = client.execute("SELECT name, age FROM users WHERE id = 1;")?;
+```
+
+**Security caveat:** there is no TLS. The password exchange (`mysql_native_password`) is hashed, but query
+text and result rows travel in cleartext, so binding a non-loopback address requires a trusted network or an
+SSH tunnel. See the "Network layer" and "Security model" sections of
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md), ADR-016, and [`docs/OPERATIONS.md`](./docs/OPERATIONS.md)
+for the full protocol scope and operational lifecycle.
+
+---
+
 ## Workspace Architecture
 
-The workspace consists of modular crates separated by architectural boundaries:
+The workspace consists of 14 modular crates (plus the vendored `vendor/sqlparser`) separated by architectural boundaries:
 
 | Crate | Role & Status |
 | ----- | ------------- |
@@ -116,7 +158,9 @@ The workspace consists of modular crates separated by architectural boundaries:
 | `crates/htap-coord` | Local coordination and placement engine (`LocalCoordinator`, `HTAPCRD1` state envelope, monotonic fencing tokens, and deterministic placement planner). |
 | `crates/htap-sql` | SQL front-end using `sqlparser` (MySQL dialect), strict catalog schema binder (typed `PointSelect` and `AnalyticSelect`), and structural query router (`Route::RowstorePointRead`, `Route::OlapScan`). |
 | `crates/htap-server` | Durable synchronous in-process engine façade (`LocalServer`) integrating catalog, rowstore, transactions, data movement, and narrow analytical scan execution (`<root>/colstore`). |
-| `crates/htap-client` | Synchronous in-process embedded client (`EmbeddedClient`) providing an ergonomic SQL execution interface over `LocalServer`. |
+| `crates/htap-client` | Synchronous in-process embedded client (`EmbeddedClient`) and network client (`RemoteClient`) providing an ergonomic SQL execution interface over `LocalServer`, in-process or over TCP. |
+| `crates/htap-wire` | Hand-written, synchronous MySQL text-protocol server (`WireServer`) exposing `LocalServer` over TCP, and the `WireClient` used by `RemoteClient`. |
+| `crates/htapd` | Network daemon binary: opens a `LocalServer` root and serves it via `htap-wire::WireServer`. |
 | `crates/htap-bench` | Criterion microbenchmark suite (`benches/local_mvp.rs`) measuring rowstore point lookups, columnar zone-map scans, conversion, CSV import, and coordination. |
 
 ---
@@ -203,7 +247,7 @@ Direct `SegmentReader` pushdown optimization is implemented for the compact base
   - Supported SQL lifecycle DDL: `ALTER TABLE <table> ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` for strict finite range and list forms and final `MAXVALUE` where supported, gated by empty-source rowstore checks before catalog mutation.
   - Native lifecycle API: `LocalServer::alter_partitions` provides programmatic partition management with candidate catalog validation, atomic CAS, empty safety, and checked ID allocation without ID burn.
   - Unsupported partitioning forms: Partition options (`ENGINE`, `COMMENT`, `TABLESPACE`, `DATA DIRECTORY`), `SUBPARTITION`, `LIST DEFAULT`, expressions in partition keys, multi-column `COLUMNS`, and non-final/malformed `MAXVALUE` are strictly rejected with parse or binder errors.
-  - Deferred partition & conversion capabilities: Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), delete vectors, background compaction, autonomous background conversion scheduler, hash tablets / multiple tablets per partition, distributed/remote partition movement, replica consensus/HA, and network wire protocol remain deferred.
+  - Deferred partition & conversion capabilities: Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), delete vectors, background compaction, autonomous background conversion scheduler, hash tablets / multiple tablets per partition, distributed/remote partition movement, replica consensus/HA, and an inter-node replication/movement network protocol remain deferred (the client-facing MySQL wire protocol is implemented; see "Network server (`htapd`)" above).
 
 ### Verification & Test Evidence
 

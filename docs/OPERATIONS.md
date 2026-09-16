@@ -8,7 +8,7 @@ This document describes the on-disk storage layout, crash-recovery boundaries, a
 
 **The HTAP database engine is a hardened local embedded MVP, not a production-ready standalone database.**
 
-The codebase operates strictly as an in-process, synchronous Rust library (`LocalServer` / `LocalCoordinator`). Core storage, transaction, and persistence paths have received critical hardening, but **production readiness is not claimed**.
+The core engine (`LocalServer` / `LocalCoordinator`) is an in-process, synchronous Rust library; as of Phase 8 it can also be reached over the network via the `htapd` daemon and the `htap-wire` MySQL text-protocol server, itself a plain synchronous process with no supervisor integration (see section 6, "Running `htapd`"). Core storage, transaction, and persistence paths have received critical hardening, but **production readiness is not claimed**.
 
 ### Completed Hardening Units
 
@@ -25,9 +25,14 @@ The codebase operates strictly as an in-process, synchronous Rust library (`Loca
 
 The following operational facilities and production features are **explicitly not implemented or open**:
 
-- **No Daemon Lifecycle or Supervisor Management:** No `systemd` units, init scripts, background daemon processes (`htapd`), or signal-handling shutdown infrastructure.
-- **No Network Ports, Sockets, or MySQL Wire Protocol:** No TCP/IP listeners, Unix domain sockets, or MySQL client wire protocol support. All interaction is via synchronous in-process Rust method calls.
-- **No Authentication, TLS, or Security Boundary:** No user credentials, authentication handshakes, TLS encryption certificates, or role-based access control (RBAC).
+- **No Daemon Supervisor Management:** No `systemd` units or init scripts are provided; `htapd` (below) is a
+  plain foreground process with no signal handler beyond the OS default (Ctrl-C/SIGTERM stop it hard).
+- **No TLS or Per-User Security Boundary on the Network Server:** `htapd`/`htap-wire` has no TLS, no
+  per-user credentials, and no role-based access control (RBAC); see "Running `htapd`" below for the full
+  security contract.
+- **No Authentication or Security Boundary for In-Process Use:** `LocalServer`/`EmbeddedClient` calls have no
+  user credentials, authentication handshakes, or RBAC — the caller is trusted the way any embedded library
+  is trusted.
 - **Narrow OLAP SQL, No Full SQL Analytics:** `LocalServer` executes narrow single-table analytical scans (plain projections, AND-only typed filters, `COUNT(*)`, `COUNT(col)`, `SUM(Int32/Int64/Float64)`, `MIN/MAX`, deterministic `GROUP BY` with SQL NULL grouping, and simple unqualified source/projected column `ORDER BY` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break) over logical rowstore and base-plus-delta rows using server-root `<root>/colstore` for materialized `Column`/`Converting` partitions. For `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads (PK + requested column union), safely pushing down one eligible predicate leaf directly into `SegmentReader::scan`, suppressing stale base rows via post-base rowstore deltas, and evaluating residual SQL logic. ScanStats/pruning is available as internal execution evidence, but SQL still uses materialized logical rows and vectorized aggregation is not implemented. Complete-PK `RowstorePointRead` remains separate and unchanged. Direct `SegmentReader` pushdown optimization is implemented for the compact base path; compound `AND` pushdown beyond one leaf, `!=` pushdown, joins, CTEs, windows, expressions, aliases if rejected, aggregate ordering in `ORDER BY`, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, broad MySQL ordering, vectorized operator pipelines, multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow, and full MySQL breadth remain unsupported.
 - **No High Availability (HA) or Distributed Consensus:** No Raft (`openraft`), ZooKeeper ensemble backend, network heartbeats, ephemeral sessions, remote RPC replica serving, or active failover exists.
 - **One-Owner Multiprocess-Exclusive Mode (Not Concurrent Shared-Root Writers):** Root locking (`<root>/LOCK`) enforces that only one operating system process may open a server or coordinator root. Concurrent multiprocess shared-root operations and concurrent writers are strictly unsupported. Standalone subsystem opens (`Engine::open`, `LocalCatalogStore::open`, `LocalDataMover::new`) do not acquire this lock and remain unsafe for direct concurrent use.
@@ -191,3 +196,53 @@ When reopening an existing directory via `LocalServer::open(path)`:
    - Treats committed records as irrevocable (`88cc314`).
    - Matches prepared and committed states, re-applies committed operations across participants idempotently via the external ledger (`f7a4975`), and completes unpublished transactions.
 4. **Fencing Token Monotonicity:** On reopening `LocalCoordinator`, persisted high-water tokens are restored, ensuring subsequent leadership acquisitions yield strictly greater fencing tokens than any token issued prior to restart.
+
+---
+
+## 6. Running `htapd`
+
+`htapd` (`crates/htapd`) is a thin binary that opens a `LocalServer` root and serves it over the MySQL text
+protocol via `htap-wire::WireServer` (see ADR-016 and the "Network layer" section of
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the protocol implementation itself).
+
+```text
+htapd --root <dir> [--listen 127.0.0.1:3307] [--max-connections 64] [--password <pw>]
+```
+
+### Lifecycle
+
+1. **Startup:** `htapd` parses arguments, opens `LocalServer::open(root)` (identical root layout and
+   recovery guarantees to any other `LocalServer` — see sections 1-5 above), starts a `WireServer` bound to
+   `--listen`, logs `"htapd ready"` (via `tracing`, controlled by `RUST_LOG`), and then parks the main thread
+   until the process is killed. There is no signal handler; Ctrl-C or SIGTERM stops the process
+   unconditionally.
+2. **Root lock is exclusive:** `LocalServer::open` acquires the same `<root>/LOCK` advisory lock as any other
+   caller (section 3.0 above). A second `htapd` (or `EmbeddedClient`) pointed at the same root fails to start
+   with `HtapError::Conflict` — this is the existing one-owner-per-root invariant, not a network-specific
+   one.
+3. **Shutdown:** There is no graceful drain API exposed by the binary. Stop the process (Ctrl-C / SIGTERM);
+   in-flight statements are not drained, but storage is crash-safe by construction (ADR-004/008/009), so
+   committed state is recovered on the next start exactly as after a `SIGKILL` of any other `LocalServer`
+   host process. `WireServer::shutdown` (used by tests, not by the `htapd` binary itself) performs an orderly
+   stop: it sets a flag, stops accepting, and joins every connection thread, observing the stop flag only at
+   packet boundaries so no packet is torn.
+4. **Logging:** Structured logs via `tracing-subscriber`, controlled by the `RUST_LOG` environment variable
+   (defaults to `info`). `htapd` logs the listen address, root path, whether a password is required, and
+   warns if bound to a non-loopback address.
+
+### Security contract
+
+Identical to the "Security model" subsection of `docs/ARCHITECTURE.md`:
+
+- Default bind is `127.0.0.1:3307` (loopback only); binding elsewhere is an explicit `--listen` opt-in and
+  triggers a startup warning.
+- One implicit user: the client-supplied username is logged but never checked.
+- Credential precedence: `--password` overrides `HTAPD_PASSWORD`; with neither set, no password is required.
+- No TLS: the `mysql_native_password` handshake hashes the password exchange, but query text and result rows
+  are cleartext. Do not bind a non-loopback address without a trusted network or an SSH tunnel.
+- The handshake scramble uses a non-cryptographic xorshift RNG (clock + counter seeded), not a CSPRNG.
+
+Verified in `crates/htap-wire/tests/wire_server.rs` (`test_handshake_empty_password_ok`,
+`test_handshake_wrong_password_rejected_1045`, `test_handshake_correct_password_ok`,
+`test_shutdown_joins_and_frees_port`) and `crates/htap-wire/src/server.rs`
+(`config_defaults_are_loopback_only`).

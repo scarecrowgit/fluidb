@@ -34,14 +34,19 @@ coordinator placement planning, and coordinator leadership fenced CAS; and synch
 client (`htap-client`, `EmbeddedClient`) providing an ergonomic SQL execution interface over `LocalServer`
 with full test coverage in `crates/htap-client/tests/embedded_client.rs`. Root `README.md`, `docs/BENCHMARKS.md`,
 and `docs/OPERATIONS.md` define the operational model, and `ci.sh` runs `cargo bench --workspace --no-run`.
+Phase 8 has a completed local network server MVP: a hand-written, synchronous MySQL text-protocol server
+(`htap-wire`, `WireServer`), a standalone daemon binary (`htapd`) exposing a `LocalServer` root over TCP, and
+`htap-client::RemoteClient` speaking the same protocol as a client, returning the same `StatementResult` shape
+as `EmbeddedClient`. See the "Network layer (`htap-wire`, `htapd`)" section below.
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
 remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
 physical data migration for populated partition reorganization, physical rowstore reclamation, delete vectors, compaction,
 autonomous background conversion scheduling, compound AND pushdown beyond one leaf, != pushdown, vectorized aggregation / operator pipelines, joins/CTEs/windows/ORDER/LIMIT/HAVING/OR/expressions/AVG/distinct,
-multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow integration, MySQL wire protocol/`htapd` daemon,
-sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, `UPDATE`/non-partition `ALTER`/`DROP TABLE`, Docker image/Compose deployment, and broad MySQL compatibility;
+multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow integration,
+sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, prepared statements/binary protocol, TLS, compression, multi-statements,
+`UPDATE`/non-partition `ALTER`/`DROP TABLE`, Docker image/Compose deployment, and broad MySQL compatibility;
 note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation remain deferred).
 See [`PROGRESS.md`](./PROGRESS.md).
 
@@ -56,7 +61,9 @@ The following diagram illustrates the current active local MVP execution paths a
 ```mermaid
 flowchart TD
     subgraph ActiveMVP ["Current Active Local MVP"]
-        client["EmbeddedClient"] --> server["LocalServer"]
+        remote_client["RemoteClient"] --> wire_srv["htap-wire WireServer"]
+        wire_srv --> server["LocalServer"]
+        client["EmbeddedClient"] --> server
         server --> sql_pb["htap-sql parse/bind"]
         sql_pb --> catalog_bind["CatalogStore load/bind"]
         catalog_bind --> route_class["Route classifier"]
@@ -77,23 +84,21 @@ flowchart TD
     end
 
     subgraph PlannedTarget ["Planned / Deferred Target Architecture"]
-        plan_wire["htapd/MySQL wire"]
         plan_df["DataFusion/Arrow"]
         plan_coord["distributed Coordinator Raft/ZooKeeper"]
         plan_remote["multi-tablet/remote serving"]
         plan_compact["delete vectors/compaction"]
 
-        plan_wire -.->|"planned wire service"| plan_df
         plan_coord -.->|"planned cluster consensus"| plan_remote
         plan_df -.->|"planned distributed scan"| plan_remote
         plan_remote -.->|"planned maintenance"| plan_compact
     end
 
     classDef planned stroke-dasharray: 5 5;
-    class plan_wire,plan_df,plan_coord,plan_remote,plan_compact planned;
+    class plan_df,plan_coord,plan_remote,plan_compact planned;
 ```
 
-The current active path operates entirely in-process within `LocalServer` without network overhead or distributed dependencies: queries submitted via `EmbeddedClient` are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and `SnapshotPinned` manifest-less partitions). In contrast, the planned target architecture—including the `htapd` MySQL wire protocol listener, DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with background compaction—is deferred and strictly separated from active execution paths.
+The current active path operates entirely in-process within `LocalServer` for `EmbeddedClient`, and over a loopback-by-default synchronous MySQL text-protocol connection (`htap-wire` `WireServer`, `htapd`) for `RemoteClient`, without distributed dependencies: queries are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and `SnapshotPinned` manifest-less partitions). In contrast, the planned target architecture—including DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with background compaction—is deferred and strictly separated from active execution paths.
 
 ### Current In-Process Execution Call Flow (Implemented Local Slice)
 
@@ -102,7 +107,9 @@ In the implemented local slice, all SQL execution is synchronous and in-process.
 ```mermaid
 flowchart TD
     subgraph CurrentDirectCalls ["Direct Current In-Process Execution"]
-        EC["EmbeddedClient.execute(sql)"] --> LS["LocalServer.execute(sql)"]
+        RC["RemoteClient (htap-wire WireClient)"] -->|"MySQL text protocol,<br/>loopback by default"| WS["htap-wire WireServer<br/>(thread-per-connection)"]
+        WS --> LS["LocalServer.execute(sql)"]
+        EC["EmbeddedClient.execute(sql)"] --> LS
         LS --> Lock["Acquire execution_lock<br/>(parking_lot::Mutex)"]
         Lock --> SQL["htap_sql::parse_one(sql)<br/>htap_catalog::LocalCatalogStore.load()<br/>htap_sql::bind(stmt, snapshot)"]
         SQL --> Route["htap_sql::classify_route(bound, storage)"]
@@ -120,12 +127,11 @@ flowchart TD
     end
 
     subgraph PlannedDeferred ["Planned / Deferred Integration (Not in Direct SQL Path)"]
-        Daemon["htapd daemon / MySQL wire listener"] -.->|"planned wire service"| LS
         DataFusion["DataFusion / Arrow query engine integration<br/>(planned vectorized engine)"] -.->|"planned engine integration"| ColEngine
     end
 
     classDef planned stroke-dasharray: 5 5;
-    class Daemon,DataFusion planned;
+    class DataFusion planned;
 ```
 
 ### DML Transaction Execution Sequence
@@ -192,14 +198,18 @@ Neither persistent converter background workers nor coordinator lease managers a
 
 ## Process and role model
 
-**Status: `implemented (local MVP)`** (synchronous `LocalServer` in-process execution façade and `EmbeddedClient` implemented for the narrow local slice; `htapd` daemon, network listeners, and MySQL wire protocol are planned/deferred).
+**Status: `implemented (local MVP)`** (synchronous `LocalServer` in-process execution façade, `EmbeddedClient`, and the network daemon `htapd`/`htap-wire`/`RemoteClient` are implemented for the narrow local slice; sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, prepared statements/binary protocol, TLS, compression, and multi-statements remain planned/deferred).
 
-The system architecture envisions a future **single binary, `htapd`** (planned), which can be run as:
+The system now ships **a single binary, `htapd`** (ADR-007), which runs `LocalServer` behind a MySQL
+text-protocol listener (`htap-wire`). `htapd` does not implement a selectable frontend/backend role split;
+it is a single process exposing the same execution engine `EmbeddedClient` uses in-process, over the network
+instead. The role split envisioned by ADR-007 remains:
 
 - the **frontend role** — SQL surface, catalog, planner, transaction
   coordinator;
 - the **backend role** — storage, execution, compaction;
-- **both roles in one process**, planned for single-node development and deployments.
+- **both roles in one process** — implemented by `htapd`, which always runs both roles together; a
+  selectable single-role mode remains planned.
 
 For the completed narrow local slice, `htap-server` provides `LocalServer` and `htap-client` provides `EmbeddedClient`,
 synchronous in-process façades composing the durable catalog (`LocalCatalogStore`),
@@ -210,10 +220,62 @@ The current README demo and test suite use the `EmbeddedClient -> LocalServer` i
 `CREATE TABLE` (deterministic one-partition row topology), literal `INSERT`, PK `DELETE`,
 and complete-PK `SELECT` with reopen recovery and error mapping, without networking or wire protocol overhead
 (covered in `crates/htap-server/tests/local_server.rs` and `crates/htap-client/tests/embedded_client.rs`).
+The same `LocalServer` is also reachable over the network via `htapd` and `htap-wire::WireServer`, with
+`htap-client::RemoteClient` (or any MySQL client) as the caller instead of `EmbeddedClient`, verified in
+`crates/htap-wire/tests/wire_server.rs` and `crates/htap-client/tests/remote_client.rs`.
 
 The frontend/backend boundary is preserved as an internal module boundary,
 policed by crate dependencies. Splitting the two into separate processes is
 therefore a **deployment choice, not a rewrite**.
+
+---
+
+## Network layer (`htap-wire`, `htapd`)
+
+**Status: `implemented (local MVP)`** (hand-written synchronous MySQL text-protocol server and daemon; TLS,
+compression, prepared statements/binary protocol, multi-statements, sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, and
+Docker packaging are planned/deferred).
+
+`htap-wire` implements a hand-written, synchronous MySQL text protocol on top of `Arc<LocalServer>`: one
+accept thread plus one thread per connection (std::net, no async runtime), statements serialized by the
+server's own `execution_lock`, every statement auto-committed. It supports handshake v10 with
+`mysql_native_password` (clients proposing another plugin get an `AuthSwitchRequest`), `COM_QUERY` (text
+result sets), `COM_PING`, `COM_INIT_DB`, and `COM_QUIT`. `COM_STMT_PREPARE`/`COM_STMT_EXECUTE` (binary
+protocol), `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, and every other command return `ERR 1047`. A small
+start-up compatibility shim (`htap_wire::shim`) answers `SET ...` as a no-op OK, `USE <db>`, `SELECT 1`,
+`SELECT VERSION()`, `SELECT DATABASE()`, and `SELECT @@<sysvar>[, ...]` for a fixed table of system variables
+without touching the engine; everything else passes through to `LocalServer::execute` unchanged. Result-set
+terminators always use header `0xFE` (legacy EOF, or an OK-shaped packet when `CLIENT_DEPRECATE_EOF` is
+negotiated); OK-packet `info` carries a private convention (empty for DDL, `version=<n>`/`version=none` for
+DML) that lets `RemoteClient` recover the exact `CommandResult`. Payloads of 16 MB or more (multi-packet
+messages) are unsupported and close the connection.
+
+`htapd` (`crates/htapd`) is a thin binary: `htapd --root <dir> [--listen 127.0.0.1:3307]
+[--max-connections 64] [--password <pw>]`, opens `LocalServer::open(root)`, starts a `WireServer`, and parks
+until killed (Ctrl-C/SIGTERM; there is no signal handler, so shutdown is a hard process stop and storage
+recovers on next start per ADR-004/008/009). `htap-client::RemoteClient` is the Rust-side counterpart,
+returning the same `StatementResult` that `EmbeddedClient` returns and mapping server error codes back to
+`HtapError` categories.
+
+### Security model
+
+- **Loopback by default.** `WireServerConfig::listen` defaults to `127.0.0.1:3307`; binding a non-loopback
+  address is an explicit opt-in and `htapd` logs a warning when it happens.
+- **One implicit user.** The username sent by the client is logged but never checked; there is no per-user
+  ACL or RBAC.
+- **Single shared credential.** `--password` overrides `HTAPD_PASSWORD`; with neither set, no password is
+  required. `WireServerConfig::password = None` accepts any client.
+- **No TLS.** The password exchange is a `mysql_native_password` challenge/response hash, but query text and
+  result rows travel in cleartext. Binding a non-loopback address without a trusted network or an SSH tunnel
+  exposes both.
+- **Non-cryptographic scramble RNG.** The handshake scramble is generated with a xorshift generator seeded
+  from the clock and a counter, not a CSPRNG; it is sufficient to make replay of a captured hash
+  infeasible within a session but is not a general-purpose cryptographic primitive.
+
+Verified in `crates/htap-wire/src/*.rs` (unit tests, including `config_defaults_are_loopback_only`) and
+`crates/htap-wire/tests/wire_server.rs` (`test_handshake_empty_password_ok`,
+`test_handshake_wrong_password_rejected_1045`, `test_handshake_correct_password_ok`,
+`test_auth_switch_to_native_password`, `test_ssl_request_rejected_and_pre41_rejected`).
 
 ---
 
@@ -292,7 +354,7 @@ A router inspects the **bound** statement and the partition's **storage descript
   - **Fast-path point lookups:** Complete-PK `SELECT` extracts the partition key value from the primary key, routes directly to the partition's row tablet, and takes the `Route::RowstorePointRead` path to invoke `Engine::get`. It strictly bypasses analytical planning and conversion.
   - **Multi-partition OLAP scans:** `AnalyticSelect` (`Route::OlapScan`) scans partitions of the table at a single visible snapshot and evaluates global or grouped projections, filters, and aggregates: conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented for narrow local OLAP; distributed fanout, disk spilling, query cancellation, and resource quotas remain deferred.
   - **Storage conversion & demotion:** `LocalServer::convert_table` performs conversion on single-partition tables. Table-wide conversion is available via `LocalServer::convert_table_to_column(table_name)` returning a `TableConversionReport`. Metadata demotion from Column back to Row storage is supported via `LocalServer::convert_table_to_row(table_name)`, which clears catalog `column_manifest` references via CAS while retaining rowstore data (authoritative throughout) and existing column segment files on disk. Explicit policy ticks (`conversion_tick`, `tick`) execute synchronously, resuming persisted jobs only without autonomous background scheduling. Startup validation on `LocalServer::open` fails closed (returning `HtapError::Corruption` or `HtapError::Io` depending on the cause) if catalog metadata and `<root>/colstore` manifests conflict.
-  - **Deferred capabilities:** Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), delete vectors, background compaction, autonomous background conversion scheduler, hash tablets, distributed/remote partition serving across network nodes, replica failover, and network wire protocol remain deferred.
+  - **Deferred capabilities:** Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), delete vectors, background compaction, autonomous background conversion scheduler, hash tablets, distributed/remote partition serving across network nodes, replica failover, and an inter-node distributed-serving network protocol remain deferred (the client-facing MySQL wire protocol is implemented; see the "Network layer" section above).
   - **Test evidence:** Verified by server partition tests in `crates/htap-server/tests/local_server.rs` (`test_sql_range_partitioning_ddl_and_maxvalue_routing`, `test_sql_list_partitioning_ddl_and_routing`, `test_server_sql_alter_partition_lifecycle`, `test_server_alter_partitions_drop_empty_and_populated_guard`, `test_server_alter_partitions_reorganize_empty_and_populated_guard`, `test_server_convert_table_multi_partition_reports_and_demotion_equivalence`, `test_server_conversion_tick_idempotent_and_resume_snapshot_pinned`, `test_server_open_fail_closed_missing_or_corrupt_manifest`, `test_partitioned_native_range_topology_catalog_reopen_continuation`, `test_partitioned_native_list_topology_catalog_reopen_continuation`, `test_partitioned_boundary_unmatched_null_type_errors`, `test_partitioned_multi_row_insert_spanning_partitions_one_version_point_delete`, `test_partitioned_composite_pk_partition_key_not_first`, `test_partitioned_olap_across_partitions_and_empty_aggregate`, `test_convert_table_multi_partition_guard`, `test_partitioned_empty_topology_rejection_no_catalog_mutation`), catalog recovery tests in `crates/htap-catalog/tests/catalog_recovery.rs` (`test_partitioning_legacy_decode_and_reopen`, `test_range_partitioning_routing_and_boundaries`, `test_list_partitioning_routing`, `test_partitioning_duplicate_violations`, `test_range_overlap_and_order_violations`, `test_partitioning_type_and_null_violations`, `test_partitioning_ownership_and_method_consistency`, `test_partitioning_cas_and_reopen_lifecycle`, `test_partition_alteration_add_range_and_list`, `test_partition_alteration_drop_range_and_list`, `test_partition_alteration_reorganize_contiguous`, `test_partition_alteration_cas_and_reopen`), parser tests in `crates/htap-sql/tests/parse_bind.rs` (`test_mysql_partition_ddl_parsed_and_bound`, `test_mysql_partition_ddl_negative_parser_and_binder`, `test_mysql_alter_partition_parsed_and_bound`, `test_mysql_alter_partition_negative`, `test_negative_create_table`), and conversion tests in `crates/htap-convert/tests/materialization.rs` (`test_demote_partition_to_row_clearing_manifest_and_retained_data`, `test_conversion_tick_resumes_snapshot_pinned`).
 - **Explicitly Deferred OLAP & SQL Capabilities:** Direct SegmentReader pushdown optimization is implemented for the compact base path (single leaf pushdown). Simple unqualified source/projected column `ORDER BY` is implemented for `AnalyticSelect` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break. Joins, CTEs (`WITH`), window functions (`OVER`), expressions, aliases if rejected, aggregate ordering in `ORDER BY`, broad MySQL ordering, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates, compound AND pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, multi-tablet or distributed partition scans, resource quotas/spill/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth remain deferred.
 

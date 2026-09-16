@@ -13,6 +13,8 @@ members = [
     "crates/htap-movement",
     "crates/htap-bench",
     "crates/htap-client",
+    "crates/htap-wire",
+    "crates/htapd",
     "vendor/sqlparser",
 ]
 

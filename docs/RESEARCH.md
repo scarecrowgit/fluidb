@@ -235,6 +235,33 @@ contract rather than leaving it an implementation detail.
 A partition that has never been loaded — its version is still the initial
 version — is pruned for free, before any predicate work is done.
 
+### 13. MySQL wire protocol mechanism reference (Phase 8, `htap-wire`)
+
+`examples/starrocks/fe/fe-core/src/main/java/com/starrocks/mysql/` was read as a **mechanism reference
+only** for the Phase 8 MySQL text-protocol server (`htap-wire`): `MysqlProto.java` (the connection
+negotiate/handshake state machine — send handshake, read response, optional auth-switch, send OK/ERR),
+`MysqlPassword.java` (the `mysql_native_password` scramble construction:
+`SHA1(password) XOR SHA1(scramble || SHA1(SHA1(password)))`), `MysqlCapability.java` (the client/server
+capability flag bit layout, including `CLIENT_SSL`, `CLIENT_SECURE_CONNECTION`, `CLIENT_DEPRECATE_EOF`), and
+`MysqlColType.java` (the MySQL column type code table used to pick a wire type per `htap_common::DataType`).
+`MysqlChannel.java` was read for the packet framing shape (3-byte little-endian length + 1-byte sequence
+number, 16 MB max payload) that `htap-wire`'s own reader/writer (`crates/htap-wire/src/codec.rs`)
+independently implements.
+
+**No code was copied, transliterated, or closely paraphrased** from any of these files; see
+[`../ATTRIBUTION.md`](../ATTRIBUTION.md). The implementation was written from the public MySQL Client/Server
+protocol description (the wire format itself is a third-party public specification, not StarRocks'
+intellectual property) and independently verified against a real driver, the `mysql` crate v28, which caught
+two behavioral details the protocol manual states ambiguously or incorrectly — see ADR-016 for both
+(the result-set terminator header, and the OK-packet `info` field's actual on-the-wire encoding).
+
+**Why we read it, and what we did differently.** StarRocks' server is a Netty-based async state machine
+(`NegotiateState`) integrated with its own connection scheduler; `htap-wire` is a synchronous,
+thread-per-connection server matching this engine's own synchronous, self-serializing execution model
+(ADR-016). We did not adopt StarRocks' capability negotiation defaults, error-code mapping, or session/
+variable handling verbatim — those were derived independently from this engine's own `HtapError` taxonomy
+and narrow SQL scope (`htap_wire::shim`, `htap_wire::error_map`).
+
 ---
 
 ## StarRocks: what we deliberately rejected

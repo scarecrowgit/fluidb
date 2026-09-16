@@ -279,7 +279,10 @@ Option **(a)**.
 
 ### Consequences
 
-- Future demo can expose unified frontend/backend roles. Note: `htapd` daemon binary, network listeners, and Docker/Compose deployments are deferred future work; current MVP provides in-process `LocalServer` and `EmbeddedClient`.
+- Future demo can expose unified frontend/backend roles. Update (Phase 8, ADR-016): the `htapd` daemon binary
+  and network listener (`htap-wire`) are now implemented as a single process always running both roles
+  together; a selectable single-role mode and Docker/Compose packaging remain deferred future work. The
+  in-process `LocalServer`/`EmbeddedClient` façade is unchanged and still has no daemon or network dependency.
 - The module boundary must be **policed by crate dependencies**, so that
   splitting into separate processes remains possible.
 
@@ -432,7 +435,7 @@ Option **(b)**.
 3. **Embedded client façade (`htap-client`):**
    - Synchronous, direct in-process façade (`EmbeddedClient`) over `LocalServer` executing single-partition `CREATE TABLE`, literal `INSERT`, PK `DELETE`, complete-PK `SELECT`, and narrow analytical scans (`AnalyticSelect` / `Route::OlapScan`) with structured error mapping and recovery across reopen.
 4. **Operational documentation:**
-   - Created root `README.md`, `docs/BENCHMARKS.md`, and `docs/OPERATIONS.md` documenting filesystem layouts (`catalog`, `rowstore`, `txn.journal`, `movement`, `COORDINATOR`), recovery boundaries, and explicit non-features (no daemon, no MySQL wire protocol, no network sockets, no Docker/Compose, no TPC-C/TPC-H compliance).
+   - Created root `README.md`, `docs/BENCHMARKS.md`, and `docs/OPERATIONS.md` documenting filesystem layouts (`catalog`, `rowstore`, `txn.journal`, `movement`, `COORDINATOR`), recovery boundaries, and explicit non-features at the time (no daemon, no MySQL wire protocol, no network sockets, no Docker/Compose, no TPC-C/TPC-H compliance). Update (Phase 8, ADR-016): the daemon, MySQL wire protocol, and network sockets have since been implemented (`htapd`, `htap-wire`); Docker/Compose and TPC-C/TPC-H compliance remain non-features.
 
 ### Consequences
 
@@ -442,7 +445,7 @@ Option **(b)**.
 
 ### How to reverse it
 
-Extend the benchmark harness into multi-process client/server benchmarks when network transports and analytical SQL engines are implemented.
+Extend the benchmark harness into multi-process client/server benchmarks when network transports and analytical SQL engines are implemented. Update (Phase 8): a network transport now exists (`htap-wire`/`htapd`), but `htap-bench` has not yet been extended to a client/server benchmark mode; the Criterion suite remains in-process only.
 
 ---
 
@@ -529,7 +532,7 @@ Option **(c)**.
 7. **Single-partition format conversion guard:**
    - `LocalServer::convert_table` explicitly verifies that the target table has exactly one partition and rejects multi-partition tables with `HtapError::Unsupported`. (Historical context: `convert_table` remains single-partition, while table-wide multi-partition conversion and demotion are subsequently introduced in ADR-015 via `convert_table_to_column` and `convert_table_to_row`.)
 8. **Deferred capabilities:**
-   - Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION` — historical context; subsequently implemented on empty sources in ADR-014), partition split/merge/drop, multi-partition conversion (subsequently implemented via table-wide conversion reports in ADR-015) and movement, hash tablets, distributed/remote partition serving across network nodes, replica failover, and network wire protocol remain deferred.
+   - Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION` — historical context; subsequently implemented on empty sources in ADR-014), partition split/merge/drop, multi-partition conversion (subsequently implemented via table-wide conversion reports in ADR-015) and movement, hash tablets, distributed/remote partition serving across network nodes, replica failover, and an inter-node distributed-serving network protocol remain deferred. (Historical context: the client-facing MySQL wire protocol was subsequently implemented in Phase 8/ADR-016; this item refers to inter-node/distributed partition serving, which remains deferred.)
 
 ### Consequences
 
@@ -704,3 +707,110 @@ Phase 4 introduced partition-scoped row-to-column conversion via `LocalConverter
   - `test_server_convert_table_multi_partition_reports_and_demotion_equivalence`
   - `test_server_conversion_tick_idempotent_and_resume_snapshot_pinned`
   - `test_server_open_fail_closed_missing_or_corrupt_manifest`
+
+---
+
+## ADR-016: Hand-written synchronous MySQL text protocol server (thread-per-connection, no TLS, native password only, loopback default)
+
+`Status: Accepted`
+`Date: 2026-09-16`
+
+### Context
+
+Phase 8 needed a way to reach `LocalServer` from outside the host process, ideally with existing MySQL
+client tooling (`mysql` CLI, drivers). The engine's execution model is already synchronous and
+self-serializing (`LocalServer::execution_lock`), and the local MVP explicitly excludes sessions,
+distributed transport, and TLS elsewhere, so the network layer needed to match that scope rather than
+introduce new concurrency or dependency surface.
+
+### Options considered
+
+- **(a) tokio/async server.** Rejected: `LocalServer` is synchronous and already serializes execution under
+  a single lock, so an async runtime buys no concurrency the engine can use, while adding a large dependency
+  and a second concurrency model (async cancellation, `Send`/`'static` bounds) to reason about for no
+  measurable benefit in a thread-per-connection, lock-serialized design.
+- **(b) Third-party MySQL protocol crate (server side).** Rejected: available crates target client-side
+  connections (driving a real MySQL server), not implementing a server; adopting one would still require
+  hand-writing the server half of the protocol while inheriting an external parsing/dependency surface for
+  the parts that do exist. A dev-dependency on the `mysql` crate (client side, `minimal-rust` feature) is
+  used only for an interop test, never in the shipped server or client.
+- **(c) Custom binary RPC protocol.** Rejected: loses compatibility with the `mysql` CLI and every existing
+  MySQL driver, which was the whole point of exposing a network endpoint; the engine's own SQL surface is
+  MySQL-dialect already (`sqlparser::dialect::MySqlDialect`), so a MySQL-compatible wire protocol is the
+  natural fit.
+- **(d) Hand-written synchronous MySQL text protocol, thread-per-connection.** One accept thread plus one
+  thread per connection over `std::net`, `Arc<LocalServer>` shared across connections, statements serialized
+  by the server's own `execution_lock` so the wire layer holds no additional global lock. Handshake v10 with
+  `mysql_native_password` only; no TLS; default bind loopback-only; text protocol only (no prepared
+  statements/binary protocol); no session state (every statement auto-commits).
+
+### Decision
+
+Option **(d)**. Implemented in `crates/htap-wire` (`WireServer`, `WireServerConfig`) and exposed as a binary
+via `crates/htapd`, with `htap-client::RemoteClient` as the Rust-side client.
+
+Two protocol pitfalls were found and fixed by checking behavior against the `mysql` crate v28 (a real
+driver) rather than trusting the MySQL manual text alone:
+
+1. **Result-set terminator header.** The MySQL manual describes `CLIENT_DEPRECATE_EOF` as replacing the
+   legacy EOF packet with an OK packet, which reads as "header `0x00`". In practice, and as required by the
+   `mysql` crate's packet reader, the terminator must keep header `0xFE` even in deprecated-EOF mode (an
+   "OK-shaped" packet, not a literal OK packet); only the body layout changes. `build_resultset_terminator`
+   always emits `0xFE`, verified by `terminator_header_is_always_0xfe_legacy_and_deprecated` and
+   `test_resultset_packets_modern_vs_legacy`.
+2. **OK-packet `info` field encoding.** The manual documents `info` as `string<EOF>` (read-to-end-of-packet).
+   Real MySQL servers, and the `mysql` crate's parser, actually send and expect it length-encoded
+   (`string<lenenc>`). `build_command_ok` writes `info` length-encoded when non-empty, verified by
+   `command_ok_header_is_always_0x00_and_never_in_trans` (`ok[7] == 9, "info must be length-encoded"`) and
+   exercised end-to-end by `test_mysql_crate_driver_interop`.
+
+### Consequences
+
+- The server works with the real `mysql` CLI and MySQL drivers over the text protocol, verified by a dev-only
+  interop test against the `mysql` crate (`test_mysql_crate_driver_interop`); no such dependency ships in the
+  server or client binaries.
+- Because the wire layer adds no locking of its own, its concurrency ceiling is exactly `LocalServer`'s: one
+  statement executing at a time regardless of connection count. This matches the existing single-lock
+  execution model and does not regress it.
+- Scope is intentionally narrow: no TLS, no prepared statements/binary protocol, no sessions or explicit
+  transactions, no multi-statements/multi-results, no compression, and payloads ≥16 MB close the connection.
+  Binding a non-loopback address without a tunnel exposes query text and result rows in cleartext.
+- The handshake scramble uses a non-cryptographic xorshift RNG (seeded from the clock and a counter), which
+  is acceptable for a challenge that is single-use per connection but is not a general-purpose cryptographic
+  primitive; a future hardening pass could swap in a CSPRNG without changing the wire format.
+
+### How to reverse it
+
+Replace `WireServer`'s std::net accept/connection loop with an async runtime, or swap the hand-written codec
+for a protocol crate, without changing `htap-client::RemoteClient`'s public API, since both are internal to
+`htap-wire`.
+
+### Test Evidence
+
+- `crates/htap-wire/src/*.rs` (unit tests): `sha1_empty_string`, `sha1_abc`, `sha1_multi_block`,
+  `native_password_scramble_matches_test_vector`, `packet_round_trip`, `oversize_packet_rejected`,
+  `lenenc_int_round_trip`, `lenenc_str_and_nul_str_round_trip`, `seq_counter_wraps_and_resets`,
+  `read_fully_handles_partial_reads_and_stop_at_boundary_only`, `handshake_v10_round_trip`,
+  `handshake_response41_round_trip_with_and_without_db`, `auth_switch_round_trip`,
+  `error_map_all_htap_variants`, `err_packet_round_trip`, `shim_set_returns_ok`,
+  `shim_version_comment_single_row`, `shim_multi_sysvar_with_aliases`, `shim_use_db`,
+  `shim_passthrough_for_normal_sql`, `column_def_round_trip_all_types`,
+  `text_row_null_and_bytes_are_raw_not_hex`, `text_row_numeric_and_timestamp_round_trip`,
+  `datetime_text_conversions`, `command_ok_header_is_always_0x00_and_never_in_trans`,
+  `terminator_header_is_always_0xfe_legacy_and_deprecated`, `config_defaults_are_loopback_only`,
+  `command_info_convention`.
+- `crates/htap-wire/tests/wire_server.rs` (23 tests): `test_handshake_empty_password_ok`,
+  `test_handshake_wrong_password_rejected_1045`, `test_handshake_correct_password_ok`,
+  `test_auth_switch_to_native_password`, `test_ssl_request_rejected_and_pre41_rejected`,
+  `test_ddl_insert_point_select_round_trip`, `test_analytic_select_round_trip`,
+  `test_typed_values_null_bytes_float_timestamp_round_trip`, `test_syntax_error_maps_to_1064`,
+  `test_missing_table_maps_to_1146`, `test_too_many_connections_returns_1040`,
+  `test_concurrent_connections_dense_versions`, `test_com_ping`,
+  `test_com_init_db_known_and_unknown_db`, `test_shim_set_and_version_comment`,
+  `test_shutdown_joins_and_frees_port`, `test_unknown_command_returns_1047`,
+  `test_prepared_statement_command_rejected_cleanly`, `test_oversized_packet_closes_connection`,
+  `test_legacy_eof_terminator_used_when_client_does_not_negotiate_deprecate_eof`,
+  `test_resultset_packets_modern_vs_legacy`, `test_dml_versions_are_reported`,
+  `test_mysql_crate_driver_interop`.
+- `crates/htap-client/tests/remote_client.rs::test_remote_client_matches_embedded_client_ddl_dml_select`.
+- `crates/htap-client/src/remote.rs::decode_command_convention`.
