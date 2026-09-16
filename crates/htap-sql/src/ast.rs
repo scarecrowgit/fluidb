@@ -1,5 +1,6 @@
 //! SQL Abstract Syntax Tree and bound statement definitions.
 
+use htap_catalog::PartitionAlteration;
 use htap_common::error::{HtapError, Result};
 use htap_common::types::{ColumnDef, DataType, Row, Schema, Value};
 use sqlparser::ast::Statement;
@@ -42,6 +43,27 @@ pub enum BoundStatement {
     Select(PointSelect),
     /// Analytical SELECT statement with column/aggregate projections, filters, and optional grouping.
     AnalyticSelect(AnalyticSelect),
+    /// ALTER TABLE partition statement (ADD, DROP, REORGANIZE).
+    AlterPartitions(AlterPartitions),
+}
+
+/// Bound representation of an ALTER TABLE partition statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterPartitions {
+    /// Target table name.
+    pub table: String,
+    /// Partition alteration specification reusing catalog PartitionAlteration types.
+    pub alteration: PartitionAlteration,
+}
+
+impl AlterPartitions {
+    /// Create a new [`AlterPartitions`] statement.
+    pub fn new(table: impl Into<String>, alteration: PartitionAlteration) -> Self {
+        Self {
+            table: table.into(),
+            alteration,
+        }
+    }
 }
 
 /// Bound representation of a CREATE TABLE statement.

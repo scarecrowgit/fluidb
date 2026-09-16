@@ -609,3 +609,45 @@ To support typed grammar-backed MySQL `CREATE TABLE ... PARTITION BY RANGE/LIST`
 ### How to reverse it
 
 When an upstream SQL parser AST natively supports MySQL partition DDL, replace the vendored crate with upstream dependency and align AST mapping.
+
+---
+
+## ADR-014: SQL ALTER Partition Lifecycle Support
+
+`Status: Accepted`
+`Date: 2026-09-16`
+
+### Context
+
+ADR-013 introduced vendored `sqlparser` with typed MySQL partition DDL for `CREATE TABLE`.
+However, partition lifecycle mutations (`ALTER TABLE ... ADD PARTITION`, `DROP PARTITION`, `REORGANIZE PARTITION`) were previously only accessible via programmatic catalog/server APIs (`LocalServer::alter_partitions`).
+To enable declarative partition management through standard SQL while preventing data loss and upholding strict structural guarantees, the SQL front-end and server must support typed MySQL ALTER partition statements without ad-hoc regex parsing.
+
+### Decision
+
+1. Extend vendored `sqlparser` AST (`AlterTableOperation`) with typed variants `AddPartition`, `DropPartition`, and `ReorganizePartition`, and extend the MySQL grammar in `parse_alter_table_operation` to parse:
+   - `ALTER TABLE t ADD PARTITION (PARTITION p VALUES LESS THAN (literal|MAXVALUE))` or LIST `VALUES IN (literals)`
+   - `ALTER TABLE t DROP PARTITION p[, ...]`
+   - `ALTER TABLE t REORGANIZE PARTITION p[, ...] INTO (PARTITION ... definitions...)`
+2. Enforce strict rejection of `IF EXISTS` / `IF NOT EXISTS`, partition options (`ENGINE`/`COMMENT`/`TABLESPACE`/`DATA DIRECTORY`), subpartitioning, `HASH`/`KEY`, expressions in bounds, multi-column definitions, and unrelated ALTER operations.
+3. Bind typed ALTER statements in `htap-sql` into `BoundStatement::AlterPartitions` by validating against catalog metadata and converting into catalog `PartitionAlteration` types (`Add`, `Drop`, `Reorganize`).
+4. Route `BoundStatement::AlterPartitions` as `CatalogDdl` across all storage formats.
+5. In `LocalServer`, dispatch `BoundStatement::AlterPartitions` through safe `alter_partitions_internal`, preserving empty-source rowstore collapse guards for `Drop` and `Reorganize` and atomic catalog CAS generation updates.
+
+### Consequences
+
+- Standard MySQL ALTER partition commands are supported end-to-end via SQL interfaces (`LocalServer::execute` and `EmbeddedClient::execute`).
+- Populated partitions cannot be dropped or reorganized via SQL, preventing accidental data loss without explicit data migration.
+- Data migration for populated partition reorganization, automatic split/merge, hash partitions, and distributed lifecycle coordination remain deferred.
+
+### Test Evidence
+
+- `vendor/sqlparser/src/parser/mod.rs`:
+  - `test_mysql_alter_partition`
+- `crates/htap-sql/tests/parse_bind.rs`:
+  - `test_mysql_alter_partition_parsed_and_bound`
+  - `test_mysql_alter_partition_negative`
+- `crates/htap-sql/tests/route.rs`:
+  - `test_route_classification` (verifies `AlterPartitions` routes to `CatalogDdl`)
+- `crates/htap-server/tests/local_server.rs`:
+  - `test_server_sql_alter_partition_lifecycle`

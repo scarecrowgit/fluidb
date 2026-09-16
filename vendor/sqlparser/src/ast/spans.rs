@@ -1175,10 +1175,25 @@ impl Spanned for AlterTableOperation {
                 if_not_exists: _,
                 new_partitions,
             } => union_spans(new_partitions.iter().map(|i| i.span())),
+            AlterTableOperation::AddPartition { partitions } => {
+                union_spans(partitions.iter().map(|p| p.name.span))
+            }
             AlterTableOperation::DropPartitions {
                 partitions,
                 if_exists: _,
             } => union_spans(partitions.iter().map(|i| i.span())),
+            AlterTableOperation::DropPartition { partitions } => {
+                union_spans(partitions.iter().map(|p| p.span))
+            }
+            AlterTableOperation::ReorganizePartition {
+                partitions,
+                into_partitions,
+            } => union_spans(
+                partitions
+                    .iter()
+                    .map(|p| p.span)
+                    .chain(into_partitions.iter().map(|p| p.name.span)),
+            ),
             AlterTableOperation::RenameColumn {
                 old_column_name,
                 new_column_name,

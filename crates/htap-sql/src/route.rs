@@ -54,7 +54,8 @@ pub enum Route {
 /// Classifies a catalog-bound statement into an execution route given the target storage descriptor.
 ///
 /// # Semantics
-/// - [`BoundStatement::CreateTable`] always routes to [`Route::CatalogDdl`], regardless of storage descriptor.
+/// - [`BoundStatement::CreateTable`] and [`BoundStatement::AlterPartitions`] always route to
+///   [`Route::CatalogDdl`], regardless of storage descriptor.
 /// - [`BoundStatement::Insert`] and [`BoundStatement::Delete`] route to [`Route::RowstoreWrite`] for
 ///   [`StorageDescriptor::Row`], [`StorageDescriptor::Column`], and [`StorageDescriptor::Converting`],
 ///   as the rowstore remains authoritative for mutations during and after conversion.
@@ -70,7 +71,9 @@ pub enum Route {
 /// Returns [`HtapError`] if primary key encoding fails.
 pub fn classify_route(statement: &BoundStatement, storage: &StorageDescriptor) -> Result<Route> {
     match statement {
-        BoundStatement::CreateTable(_) => Ok(Route::CatalogDdl),
+        BoundStatement::CreateTable(_) | BoundStatement::AlterPartitions(_) => {
+            Ok(Route::CatalogDdl)
+        }
         BoundStatement::Insert(_) | BoundStatement::Delete(_) => match storage {
             StorageDescriptor::Row
             | StorageDescriptor::Column

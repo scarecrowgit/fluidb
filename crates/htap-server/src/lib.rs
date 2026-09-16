@@ -275,6 +275,13 @@ impl LocalServer {
                 }
                 self.execute_analytic_select(select, table_desc, &partitions, &catalog)
             }
+            BoundStatement::AlterPartitions(alter) => {
+                let _route = classify_route(
+                    &BoundStatement::AlterPartitions(alter.clone()),
+                    &StorageDescriptor::Row,
+                )?;
+                self.alter_partitions_internal(&alter.table, &alter.alteration)
+            }
         }
     }
 
@@ -529,10 +536,17 @@ impl LocalServer {
     ) -> Result<StatementResult> {
         let alteration = alteration.into();
         let _guard = self.execution_lock.lock();
+        self.alter_partitions_internal(table_name, &alteration)
+    }
+
+    fn alter_partitions_internal(
+        &self,
+        table_name: &str,
+        alteration: &PartitionAlteration,
+    ) -> Result<StatementResult> {
         let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
 
-        let source_partitions =
-            catalog.source_partitions_for_alteration(table_name, &alteration)?;
+        let source_partitions = catalog.source_partitions_for_alteration(table_name, alteration)?;
 
         if !source_partitions.is_empty() {
             let snapshot = Snapshot::new(self.txn_manager.visible_version());
@@ -549,7 +563,7 @@ impl LocalServer {
             }
         }
 
-        let candidate = catalog.apply_partition_alteration(table_name, &alteration)?;
+        let candidate = catalog.apply_partition_alteration(table_name, alteration)?;
 
         self.catalog
             .compare_and_set(catalog.generation, candidate)?;

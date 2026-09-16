@@ -867,6 +867,7 @@ define_keywords!(
     REMOVEQUOTES,
     RENAME,
     REORG,
+    REORGANIZE,
     REPAIR,
     REPEATABLE,
     REPLACE,

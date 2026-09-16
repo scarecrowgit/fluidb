@@ -1887,3 +1887,430 @@ fn test_bind_analytic_select_negative() {
         );
     }
 }
+
+fn make_partitioned_test_catalog() -> CatalogSnapshot {
+    use htap_catalog::*;
+    let schema = Schema::new(vec![
+        CommonColumnDef {
+            name: "id".to_string(),
+            data_type: CommonDataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        CommonColumnDef {
+            name: "val".to_string(),
+            data_type: CommonDataType::Int64,
+            nullable: true,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let p0 = PartitionDescriptor::new(
+        PartitionId::new(1),
+        TableId(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![],
+        1,
+    )
+    .with_range(RangeBound::new_opt(None, Some(CommonValue::Int64(10))));
+    let p1 = PartitionDescriptor::new(
+        PartitionId::new(2),
+        TableId(1),
+        "p1",
+        StorageDescriptor::Row,
+        vec![],
+        1,
+    )
+    .with_range(RangeBound::new_opt(
+        Some(CommonValue::Int64(10)),
+        Some(CommonValue::Int64(20)),
+    ));
+    let p2 = PartitionDescriptor::new(
+        PartitionId::new(3),
+        TableId(1),
+        "p2",
+        StorageDescriptor::Row,
+        vec![],
+        1,
+    )
+    .with_range(RangeBound::new_opt(
+        Some(CommonValue::Int64(20)),
+        Some(CommonValue::Int64(30)),
+    ));
+    let range_table = TableDescriptor::new(
+        TableId(1),
+        "t_range",
+        schema.clone(),
+        vec![0],
+        vec![
+            PartitionId::new(1),
+            PartitionId::new(2),
+            PartitionId::new(3),
+        ],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let lp0 = PartitionDescriptor::new(
+        PartitionId::new(4),
+        TableId(2),
+        "p0",
+        StorageDescriptor::Row,
+        vec![],
+        1,
+    )
+    .with_list_values(vec![CommonValue::Int64(1), CommonValue::Int64(2)]);
+    let lp1 = PartitionDescriptor::new(
+        PartitionId::new(5),
+        TableId(2),
+        "p1",
+        StorageDescriptor::Row,
+        vec![],
+        1,
+    )
+    .with_list_values(vec![CommonValue::Int64(3), CommonValue::Int64(4)]);
+    let list_table = TableDescriptor::new(
+        TableId(2),
+        "t_list",
+        schema.clone(),
+        vec![0],
+        vec![PartitionId::new(4), PartitionId::new(5)],
+        1,
+    )
+    .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::List));
+
+    let unpart_table = TableDescriptor::new(TableId(3), "t_unpart", schema, vec![0], vec![], 1);
+
+    CatalogSnapshot::new(
+        1,
+        vec![range_table, list_table, unpart_table],
+        vec![p0, p1, p2, lp0, lp1],
+        vec![],
+        vec![],
+    )
+}
+
+#[test]
+fn test_mysql_alter_partition_parsed_and_bound() {
+    let catalog = make_partitioned_test_catalog();
+
+    // 1. ADD PARTITION with LESS THAN bound
+    let sql_add_range = "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (40))";
+    let stmt = parse_one(sql_add_range).expect("should parse ADD PARTITION range");
+    let bound = bind(&stmt, &catalog).expect("should bind ADD PARTITION range");
+    match bound {
+        BoundStatement::AlterPartitions(alter) => {
+            assert_eq!(alter.table, "t_range");
+            match alter.alteration {
+                htap_catalog::PartitionAlteration::Add { partitions } => {
+                    assert_eq!(partitions.len(), 1);
+                    assert_eq!(partitions[0].name(), "p3");
+                    let r = partitions[0].range().expect("range partition");
+                    assert_eq!(r.lower_opt, Some(CommonValue::Int64(30)));
+                    assert_eq!(r.upper_opt, Some(CommonValue::Int64(40)));
+                }
+                other => panic!("expected Alteration::Add, got {other:?}"),
+            }
+        }
+        other => panic!("expected BoundStatement::AlterPartitions, got {other:?}"),
+    }
+
+    // 2. ADD PARTITION with MAXVALUE bound
+    let sql_add_max =
+        "ALTER TABLE t_range ADD PARTITION (PARTITION p_max VALUES LESS THAN MAXVALUE)";
+    let stmt = parse_one(sql_add_max).expect("should parse ADD PARTITION maxvalue");
+    let bound = bind(&stmt, &catalog).expect("should bind ADD PARTITION maxvalue");
+    match bound {
+        BoundStatement::AlterPartitions(alter) => {
+            assert_eq!(alter.table, "t_range");
+            match alter.alteration {
+                htap_catalog::PartitionAlteration::Add { partitions } => {
+                    assert_eq!(partitions.len(), 1);
+                    assert_eq!(partitions[0].name(), "p_max");
+                    let r = partitions[0].range().expect("range partition");
+                    assert_eq!(r.lower_opt, Some(CommonValue::Int64(30)));
+                    assert_eq!(r.upper_opt, None);
+                }
+                other => panic!("expected Alteration::Add, got {other:?}"),
+            }
+        }
+        other => panic!("expected BoundStatement::AlterPartitions, got {other:?}"),
+    }
+
+    // 3. ADD PARTITION with LIST VALUES IN
+    let sql_add_list = "ALTER TABLE t_list ADD PARTITION (PARTITION p2 VALUES IN (5, 6))";
+    let stmt = parse_one(sql_add_list).expect("should parse ADD PARTITION list");
+    let bound = bind(&stmt, &catalog).expect("should bind ADD PARTITION list");
+    match bound {
+        BoundStatement::AlterPartitions(alter) => {
+            assert_eq!(alter.table, "t_list");
+            match alter.alteration {
+                htap_catalog::PartitionAlteration::Add { partitions } => {
+                    assert_eq!(partitions.len(), 1);
+                    assert_eq!(partitions[0].name(), "p2");
+                    let l = partitions[0].list().expect("list partition");
+                    assert_eq!(l.values, vec![CommonValue::Int64(5), CommonValue::Int64(6)]);
+                }
+                other => panic!("expected Alteration::Add, got {other:?}"),
+            }
+        }
+        other => panic!("expected BoundStatement::AlterPartitions, got {other:?}"),
+    }
+
+    // 4. DROP PARTITION single
+    let sql_drop_single = "ALTER TABLE t_range DROP PARTITION p2";
+    let stmt = parse_one(sql_drop_single).expect("should parse DROP PARTITION single");
+    let bound = bind(&stmt, &catalog).expect("should bind DROP PARTITION single");
+    match bound {
+        BoundStatement::AlterPartitions(alter) => {
+            assert_eq!(alter.table, "t_range");
+            match alter.alteration {
+                htap_catalog::PartitionAlteration::Drop { partitions } => {
+                    assert_eq!(partitions, vec!["p2".to_string()]);
+                }
+                other => panic!("expected Alteration::Drop, got {other:?}"),
+            }
+        }
+        other => panic!("expected BoundStatement::AlterPartitions, got {other:?}"),
+    }
+
+    // 5. DROP PARTITION multiple
+    let sql_drop_multi = "ALTER TABLE t_range DROP PARTITION p1, p2";
+    let stmt = parse_one(sql_drop_multi).expect("should parse DROP PARTITION multi");
+    let bound = bind(&stmt, &catalog).expect("should bind DROP PARTITION multi");
+    match bound {
+        BoundStatement::AlterPartitions(alter) => {
+            assert_eq!(alter.table, "t_range");
+            match alter.alteration {
+                htap_catalog::PartitionAlteration::Drop { partitions } => {
+                    assert_eq!(partitions, vec!["p1".to_string(), "p2".to_string()]);
+                }
+                other => panic!("expected Alteration::Drop, got {other:?}"),
+            }
+        }
+        other => panic!("expected BoundStatement::AlterPartitions, got {other:?}"),
+    }
+
+    // 6. REORGANIZE PARTITION range
+    let sql_reorg_range = "ALTER TABLE t_range REORGANIZE PARTITION p0, p1 INTO (PARTITION p01a VALUES LESS THAN (15), PARTITION p01b VALUES LESS THAN (20))";
+    let stmt = parse_one(sql_reorg_range).expect("should parse REORGANIZE range");
+    let bound = bind(&stmt, &catalog).expect("should bind REORGANIZE range");
+    match bound {
+        BoundStatement::AlterPartitions(alter) => {
+            assert_eq!(alter.table, "t_range");
+            match alter.alteration {
+                htap_catalog::PartitionAlteration::Reorganize { sources, targets } => {
+                    assert_eq!(sources, vec!["p0".to_string(), "p1".to_string()]);
+                    assert_eq!(targets.len(), 2);
+                    assert_eq!(targets[0].name(), "p01a");
+                    assert_eq!(targets[0].range().unwrap().lower_opt, None);
+                    assert_eq!(
+                        targets[0].range().unwrap().upper_opt,
+                        Some(CommonValue::Int64(15))
+                    );
+                    assert_eq!(targets[1].name(), "p01b");
+                    assert_eq!(
+                        targets[1].range().unwrap().lower_opt,
+                        Some(CommonValue::Int64(15))
+                    );
+                    assert_eq!(
+                        targets[1].range().unwrap().upper_opt,
+                        Some(CommonValue::Int64(20))
+                    );
+                }
+                other => panic!("expected Alteration::Reorganize, got {other:?}"),
+            }
+        }
+        other => panic!("expected BoundStatement::AlterPartitions, got {other:?}"),
+    }
+
+    // 7. REORGANIZE PARTITION list
+    let sql_reorg_list = "ALTER TABLE t_list REORGANIZE PARTITION p0, p1 INTO (PARTITION p01a VALUES IN (1, 3), PARTITION p01b VALUES IN (2, 4))";
+    let stmt = parse_one(sql_reorg_list).expect("should parse REORGANIZE list");
+    let bound = bind(&stmt, &catalog).expect("should bind REORGANIZE list");
+    match bound {
+        BoundStatement::AlterPartitions(alter) => {
+            assert_eq!(alter.table, "t_list");
+            match alter.alteration {
+                htap_catalog::PartitionAlteration::Reorganize { sources, targets } => {
+                    assert_eq!(sources, vec!["p0".to_string(), "p1".to_string()]);
+                    assert_eq!(targets.len(), 2);
+                    assert_eq!(targets[0].name(), "p01a");
+                    assert_eq!(
+                        targets[0].list().unwrap().values,
+                        vec![CommonValue::Int64(1), CommonValue::Int64(3)]
+                    );
+                    assert_eq!(targets[1].name(), "p01b");
+                    assert_eq!(
+                        targets[1].list().unwrap().values,
+                        vec![CommonValue::Int64(2), CommonValue::Int64(4)]
+                    );
+                }
+                other => panic!("expected Alteration::Reorganize, got {other:?}"),
+            }
+        }
+        other => panic!("expected BoundStatement::AlterPartitions, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_mysql_alter_partition_negative() {
+    let catalog = make_partitioned_test_catalog();
+
+    // 1. IF EXISTS on ALTER TABLE
+    let if_exists =
+        "ALTER TABLE IF EXISTS t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (40))";
+    let stmt = parse_one(if_exists).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("IF EXISTS is not supported")),
+        "expected InvalidArgument for IF EXISTS, got {res:?}"
+    );
+
+    // 2. IF NOT EXISTS on ADD PARTITION (rejected at parse time)
+    let add_if_not_exists = [
+        "ALTER TABLE t_range ADD PARTITION IF NOT EXISTS (PARTITION p3 VALUES LESS THAN (40))",
+        "ALTER TABLE t_range ADD IF NOT EXISTS PARTITION (PARTITION p3 VALUES LESS THAN (40))",
+    ];
+    for case in add_if_not_exists {
+        let res = parse_one(case);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected parse error for ADD IF NOT EXISTS, got {res:?}"
+        );
+    }
+
+    // 3. IF EXISTS on DROP PARTITION (rejected at parse time)
+    let drop_if_exists = [
+        "ALTER TABLE t_range DROP PARTITION IF EXISTS p1",
+        "ALTER TABLE t_range DROP IF EXISTS PARTITION p1",
+    ];
+    for case in drop_if_exists {
+        let res = parse_one(case);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected parse error for DROP IF EXISTS, got {res:?}"
+        );
+    }
+
+    // 4. Options: ENGINE, COMMENT, TABLESPACE
+    let option_cases = [
+        "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (40) ENGINE = InnoDB)",
+        "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (40) COMMENT = 'test')",
+        "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (40) TABLESPACE = ts1)",
+    ];
+    for case in option_cases {
+        let res = parse_one(case);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected parse error for partition options, got {res:?}"
+        );
+    }
+
+    // 5. Subpartitioning
+    let subpart =
+        "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (40) (SUBPARTITION s0))";
+    let res = parse_one(subpart);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(_))),
+        "expected parse error for subpartition, got {res:?}"
+    );
+
+    // 6. Expressions in bound
+    let expr_bound = "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (30 + 10))";
+    let stmt = parse_one(expr_bound).expect("should parse expression");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(_))),
+        "expected binder error for expr in bound, got {res:?}"
+    );
+
+    // 7. Multi-column in bounds
+    let multi_col = "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (35, 40))";
+    let res = parse_one(multi_col);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(_))),
+        "expected parse error for multi-column bound, got {res:?}"
+    );
+
+    // 8. Unrelated ALTER operations
+    let unrelated = [
+        "ALTER TABLE t_range ADD COLUMN c INT",
+        "ALTER TABLE t_range DROP COLUMN val",
+        "ALTER TABLE t_range RENAME TO t_renamed",
+    ];
+    for case in unrelated {
+        let stmt = parse_one(case).expect("should parse unrelated ALTER");
+        let res = bind(&stmt, &catalog);
+        assert!(
+            matches!(res, Err(HtapError::Unsupported(_))),
+            "expected Unsupported for unrelated ALTER {case:?}, got {res:?}"
+        );
+    }
+
+    // 9. Non-partitioned table
+    let unpart = "ALTER TABLE t_unpart ADD PARTITION (PARTITION p1 VALUES LESS THAN (10))";
+    let stmt = parse_one(unpart).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("is not partitioned")),
+        "expected InvalidArgument for unpartitioned table, got {res:?}"
+    );
+
+    // 10. Non-existent table
+    let ghost = "ALTER TABLE t_ghost ADD PARTITION (PARTITION p1 VALUES LESS THAN (10))";
+    let stmt = parse_one(ghost).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::NotFound(_))),
+        "expected NotFound for non-existent table, got {res:?}"
+    );
+
+    // 11. Range table with VALUES IN
+    let range_with_in = "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES IN (1, 2))";
+    let stmt = parse_one(range_with_in).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("must use VALUES LESS THAN")),
+        "expected InvalidArgument for RANGE with VALUES IN, got {res:?}"
+    );
+
+    // 12. List table with VALUES LESS THAN
+    let list_with_less_than =
+        "ALTER TABLE t_list ADD PARTITION (PARTITION p2 VALUES LESS THAN (10))";
+    let stmt = parse_one(list_with_less_than).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("must use VALUES IN")),
+        "expected InvalidArgument for LIST with VALUES LESS THAN, got {res:?}"
+    );
+
+    // 13. Non-increasing range bound
+    let non_increasing = "ALTER TABLE t_range ADD PARTITION (PARTITION p3 VALUES LESS THAN (25))";
+    let stmt = parse_one(non_increasing).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("strictly increasing")),
+        "expected InvalidArgument for non-increasing bound, got {res:?}"
+    );
+
+    // 14. Duplicate partition name
+    let dup_name = "ALTER TABLE t_range ADD PARTITION (PARTITION p1 VALUES LESS THAN (40))";
+    let stmt = parse_one(dup_name).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("duplicate partition name")),
+        "expected InvalidArgument for duplicate name, got {res:?}"
+    );
+
+    // 15. Non-contiguous sources in REORGANIZE
+    let non_contiguous = "ALTER TABLE t_range REORGANIZE PARTITION p0, p2 INTO (PARTITION p02 VALUES LESS THAN (30))";
+    let stmt = parse_one(non_contiguous).expect("should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("contiguous")),
+        "expected InvalidArgument for non-contiguous sources, got {res:?}"
+    );
+}

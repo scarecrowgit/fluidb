@@ -52,6 +52,18 @@ fn test_route_classification() {
         Route::CatalogDdl
     );
 
+    // 2b. Assert ALTER PARTITIONS route under Row/Column/Converting -> CatalogDdl
+    let bound_alter = BoundStatement::AlterPartitions(htap_sql::AlterPartitions::new(
+        "orders",
+        htap_catalog::PartitionAlteration::drop(vec!["p1"]),
+    ));
+    for storage in [&row_storage, &col_storage, &conv_storage] {
+        assert_eq!(
+            classify_route(&bound_alter, storage).expect("ALTER under storage"),
+            Route::CatalogDdl
+        );
+    }
+
     // 3. Assert INSERT / DELETE RowstoreWrite under Row, Column, Converting
     let insert_sql = "INSERT INTO orders (tenant_id, order_id, amount) VALUES (42, 1000, 99.5)";
     let parsed_insert = parse_one(insert_sql).expect("parse INSERT");

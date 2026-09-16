@@ -367,12 +367,29 @@ pub enum AlterTableOperation {
         /// New partitions to add.
         new_partitions: Vec<Partition>,
     },
+    /// MySQL `ALTER TABLE ... ADD PARTITION (partition_def, ...)`
+    AddPartition {
+        /// Partitions to add.
+        partitions: Vec<MysqlPartitionDef>,
+    },
     /// `DROP PARTITIONS ...` / drop partitions from the table.
     DropPartitions {
         /// Partitions to drop (expressions).
         partitions: Vec<Expr>,
         /// Whether `IF EXISTS` was specified for dropping partitions.
         if_exists: bool,
+    },
+    /// MySQL `ALTER TABLE ... DROP PARTITION partition_name, ...`
+    DropPartition {
+        /// Partitions to drop (identifiers).
+        partitions: Vec<Ident>,
+    },
+    /// MySQL `ALTER TABLE ... REORGANIZE PARTITION partition_name, ... INTO (partition_def, ...)`
+    ReorganizePartition {
+        /// Existing partitions to reorganize.
+        partitions: Vec<Ident>,
+        /// Replacement target partitions.
+        into_partitions: Vec<MysqlPartitionDef>,
     },
     /// `RENAME [ COLUMN ] <old_column_name> TO <new_column_name>`
     RenameColumn {
@@ -713,6 +730,9 @@ impl fmt::Display for AlterTableOperation {
                 display_separated(new_partitions, " "),
                 ine = if *if_not_exists { " IF NOT EXISTS" } else { "" }
             ),
+            AlterTableOperation::AddPartition { partitions } => {
+                write!(f, "ADD PARTITION ({})", display_comma_separated(partitions))
+            }
             AlterTableOperation::AddConstraint {
                 not_valid,
                 constraint,
@@ -820,6 +840,18 @@ impl fmt::Display for AlterTableOperation {
                 "DROP{ie} PARTITION ({})",
                 display_comma_separated(partitions),
                 ie = if *if_exists { " IF EXISTS" } else { "" }
+            ),
+            AlterTableOperation::DropPartition { partitions } => {
+                write!(f, "DROP PARTITION {}", display_comma_separated(partitions))
+            }
+            AlterTableOperation::ReorganizePartition {
+                partitions,
+                into_partitions,
+            } => write!(
+                f,
+                "REORGANIZE PARTITION {} INTO ({})",
+                display_comma_separated(partitions),
+                display_comma_separated(into_partitions)
             ),
             AlterTableOperation::DropConstraint {
                 if_exists,

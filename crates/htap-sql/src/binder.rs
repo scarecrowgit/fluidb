@@ -1,23 +1,26 @@
 //! SQL statement binder and semantic validation against the catalog.
 
-use htap_catalog::{CatalogSnapshot, TableDescriptor};
+use htap_catalog::{
+    CatalogSnapshot, ListPartitionDefinition, PartitionAlteration, PartitionDefinition,
+    PartitioningMethod, RangePartitionDefinition, TableDescriptor,
+};
 use htap_common::error::{HtapError, Result};
 use htap_common::types::{
     ColumnDef as CommonColumnDef, DataType as CommonDataType, Row, Schema, Value,
 };
 use sqlparser::ast::{
-    BinaryOperator, ColumnOption, CreateTable as SqlCreateTable, CreateTableOptions,
-    Delete as SqlDelete, DuplicateTreatment, Expr, FromTable, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, IndexColumn, Insert as SqlInsert, MysqlLessThanBound,
-    MysqlPartitionBy, MysqlPartitionValues, ObjectName, ObjectNamePart, OrderByExpr,
-    PrimaryKeyConstraint, Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, UnaryOperator,
+    AlterTable as SqlAlterTable, AlterTableOperation, BinaryOperator, ColumnOption,
+    CreateTable as SqlCreateTable, CreateTableOptions, Delete as SqlDelete, DuplicateTreatment,
+    Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    IndexColumn, Insert as SqlInsert, MysqlLessThanBound, MysqlPartitionBy, MysqlPartitionDef,
+    MysqlPartitionValues, ObjectName, ObjectNamePart, OrderByExpr, PrimaryKeyConstraint, Query,
+    SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject, UnaryOperator,
 };
 
 use crate::ast::{
-    AggregateFunction, AnalyticExpr, AnalyticFilter, AnalyticOrderBy, AnalyticSelect,
-    BoundListPartition, BoundPartitioning, BoundRangePartition, BoundStatement, ComparisonOp,
-    CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
+    AggregateFunction, AlterPartitions, AnalyticExpr, AnalyticFilter, AnalyticOrderBy,
+    AnalyticSelect, BoundListPartition, BoundPartitioning, BoundRangePartition, BoundStatement,
+    ComparisonOp, CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
 };
 
 /// Binds an AST [`Statement`] against the [`CatalogSnapshot`], performing strict semantic
@@ -37,6 +40,7 @@ pub fn bind(statement: &Statement, catalog: &CatalogSnapshot) -> Result<BoundSta
         Statement::Insert(insert) => bind_insert(insert, catalog),
         Statement::Delete(delete) => bind_delete(delete, catalog),
         Statement::Query(query) => bind_select(query, catalog),
+        Statement::AlterTable(alter_table) => bind_alter_table(alter_table, catalog),
         other => Err(HtapError::Unsupported(format!(
             "unsupported statement: {other}"
         ))),
@@ -711,6 +715,522 @@ fn resolve_partition_key_column(
     }
 
     Ok(col_idx)
+}
+
+fn bind_alter_table(stmt: &SqlAlterTable, catalog: &CatalogSnapshot) -> Result<BoundStatement> {
+    if stmt.if_exists {
+        return Err(HtapError::InvalidArgument(
+            "IF EXISTS is not supported for ALTER TABLE".into(),
+        ));
+    }
+    if stmt.only {
+        return Err(HtapError::Unsupported("ONLY is not supported".into()));
+    }
+    if stmt.on_cluster.is_some() {
+        return Err(HtapError::Unsupported("ON CLUSTER is not supported".into()));
+    }
+    if stmt.location.is_some() {
+        return Err(HtapError::Unsupported("LOCATION is not supported".into()));
+    }
+    if stmt.table_type.is_some() {
+        return Err(HtapError::Unsupported("unsupported table type".into()));
+    }
+
+    let table_name = extract_unqualified_name(&stmt.name)?;
+    let table_desc = catalog
+        .table_by_name(&table_name)
+        .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' does not exist")))?;
+
+    if stmt.operations.is_empty() {
+        return Err(HtapError::Unsupported(
+            "ALTER TABLE requires an operation".into(),
+        ));
+    }
+    if stmt.operations.len() != 1 {
+        return Err(HtapError::Unsupported(
+            "ALTER TABLE supports exactly one operation".into(),
+        ));
+    }
+
+    let alteration = match &stmt.operations[0] {
+        AlterTableOperation::AddPartition { partitions } => {
+            bind_alter_add_partition(partitions, table_desc, catalog)?
+        }
+        AlterTableOperation::DropPartition { partitions } => {
+            bind_alter_drop_partition(partitions, table_desc)?
+        }
+        AlterTableOperation::ReorganizePartition {
+            partitions,
+            into_partitions,
+        } => bind_alter_reorganize_partition(partitions, into_partitions, table_desc, catalog)?,
+        other => {
+            return Err(HtapError::Unsupported(format!(
+                "unsupported ALTER TABLE operation: {other}"
+            )));
+        }
+    };
+
+    Ok(BoundStatement::AlterPartitions(AlterPartitions::new(
+        table_name, alteration,
+    )))
+}
+
+fn bind_alter_add_partition(
+    partitions: &[MysqlPartitionDef],
+    table_desc: &TableDescriptor,
+    catalog: &CatalogSnapshot,
+) -> Result<PartitionAlteration> {
+    let partitioning = table_desc.partitioning.as_ref().ok_or_else(|| {
+        HtapError::InvalidArgument(format!("table '{}' is not partitioned", table_desc.name))
+    })?;
+
+    if partitions.is_empty() {
+        return Err(HtapError::InvalidArgument(
+            "ADD PARTITION requires at least one partition definition".into(),
+        ));
+    }
+
+    let key_col = &table_desc.schema.columns()[partitioning.key_column];
+    let mut part_defs = Vec::with_capacity(partitions.len());
+    let mut seen_names = std::collections::HashSet::new();
+
+    for &pid in &table_desc.partitions {
+        if let Some(p) = catalog.partition(pid) {
+            seen_names.insert(p.name.clone());
+        }
+    }
+
+    match partitioning.method {
+        PartitioningMethod::Range => {
+            let mut cur_lower: Option<Value> = None;
+            let mut had_maxvalue = false;
+
+            for &pid in &table_desc.partitions {
+                if let Some(part) = catalog.partition(pid) {
+                    if let Some(range) = &part.range {
+                        match &range.upper {
+                            None => had_maxvalue = true,
+                            Some(u) => {
+                                if let Some(ref cur) = cur_lower {
+                                    if u > cur {
+                                        cur_lower = Some(u.clone());
+                                    }
+                                } else {
+                                    cur_lower = Some(u.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if had_maxvalue {
+                return Err(HtapError::InvalidArgument(format!(
+                    "cannot add partition to table '{}': a MAXVALUE partition already exists",
+                    table_desc.name
+                )));
+            }
+
+            for part_def in partitions {
+                let part_name = part_def.name.value.clone();
+                if part_name.is_empty() {
+                    return Err(HtapError::InvalidArgument(
+                        "partition name cannot be empty".into(),
+                    ));
+                }
+                if !seen_names.insert(part_name.clone()) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate partition name '{part_name}'"
+                    )));
+                }
+
+                if had_maxvalue {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition '{part_name}' defined after MAXVALUE partition"
+                    )));
+                }
+
+                let bound = match &part_def.values {
+                    MysqlPartitionValues::LessThan(b) => b,
+                    MysqlPartitionValues::In(_) => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' in table '{}' with RANGE partitioning must use VALUES LESS THAN",
+                            table_desc.name
+                        )));
+                    }
+                };
+
+                let cur_upper = match bound {
+                    MysqlLessThanBound::MaxValue => {
+                        had_maxvalue = true;
+                        None
+                    }
+                    MysqlLessThanBound::Expr(bound_expr) => {
+                        let val = parse_literal_value(bound_expr, key_col)?;
+                        if val.is_null() {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "range partition '{part_name}' bound cannot be NULL"
+                            )));
+                        }
+                        if let Some(ref prev_val) = cur_lower {
+                            if &val <= prev_val {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "VALUES LESS THAN value must be strictly increasing: {val} <= {prev_val}"
+                                )));
+                            }
+                        }
+                        Some(val)
+                    }
+                };
+
+                part_defs.push(PartitionDefinition::Range(
+                    RangePartitionDefinition::new_opt(
+                        part_name,
+                        cur_lower.clone(),
+                        cur_upper.clone(),
+                    ),
+                ));
+
+                cur_lower = cur_upper;
+            }
+        }
+        PartitioningMethod::List => {
+            let mut seen_values = std::collections::HashSet::new();
+            for &pid in &table_desc.partitions {
+                if let Some(part) = catalog.partition(pid) {
+                    for v in &part.list_values {
+                        seen_values.insert(v.clone());
+                    }
+                }
+            }
+
+            for part_def in partitions {
+                let part_name = part_def.name.value.clone();
+                if part_name.is_empty() {
+                    return Err(HtapError::InvalidArgument(
+                        "partition name cannot be empty".into(),
+                    ));
+                }
+                if !seen_names.insert(part_name.clone()) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate partition name '{part_name}'"
+                    )));
+                }
+
+                let exprs = match &part_def.values {
+                    MysqlPartitionValues::In(exprs) => exprs,
+                    MysqlPartitionValues::LessThan(_) => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' in table '{}' with LIST partitioning must use VALUES IN",
+                            table_desc.name
+                        )));
+                    }
+                };
+
+                if exprs.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition '{part_name}' has empty VALUES IN list"
+                    )));
+                }
+
+                let mut part_values = Vec::with_capacity(exprs.len());
+                let mut seen_in_part = std::collections::HashSet::new();
+                for e in exprs {
+                    let val = parse_literal_value(e, key_col)?;
+                    if val.is_null() {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "list partition '{part_name}' value cannot be NULL"
+                        )));
+                    }
+                    if !seen_in_part.insert(val.clone()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' contains duplicate list value '{val}'"
+                        )));
+                    }
+                    if !seen_values.insert(val.clone()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "duplicate list value '{val}' across partitions (found in partition '{part_name}')"
+                        )));
+                    }
+                    part_values.push(val);
+                }
+
+                part_defs.push(PartitionDefinition::List(ListPartitionDefinition::new(
+                    part_name,
+                    part_values,
+                )));
+            }
+        }
+    }
+
+    Ok(PartitionAlteration::Add {
+        partitions: part_defs,
+    })
+}
+
+fn bind_alter_drop_partition(
+    partitions: &[Ident],
+    table_desc: &TableDescriptor,
+) -> Result<PartitionAlteration> {
+    let _partitioning = table_desc.partitioning.as_ref().ok_or_else(|| {
+        HtapError::InvalidArgument(format!("table '{}' is not partitioned", table_desc.name))
+    })?;
+
+    if partitions.is_empty() {
+        return Err(HtapError::InvalidArgument(
+            "DROP PARTITION requires at least one partition name".into(),
+        ));
+    }
+
+    let mut names = Vec::with_capacity(partitions.len());
+    let mut seen = std::collections::HashSet::new();
+    for ident in partitions {
+        let name = ident.value.clone();
+        if name.is_empty() {
+            return Err(HtapError::InvalidArgument(
+                "partition name cannot be empty".into(),
+            ));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(HtapError::InvalidArgument(format!(
+                "duplicate partition name '{name}' in DROP PARTITION"
+            )));
+        }
+        names.push(name);
+    }
+
+    Ok(PartitionAlteration::Drop { partitions: names })
+}
+
+fn bind_alter_reorganize_partition(
+    sources: &[Ident],
+    targets: &[MysqlPartitionDef],
+    table_desc: &TableDescriptor,
+    catalog: &CatalogSnapshot,
+) -> Result<PartitionAlteration> {
+    let partitioning = table_desc.partitioning.as_ref().ok_or_else(|| {
+        HtapError::InvalidArgument(format!("table '{}' is not partitioned", table_desc.name))
+    })?;
+
+    if sources.is_empty() {
+        return Err(HtapError::InvalidArgument(
+            "REORGANIZE PARTITION requires at least one source partition".into(),
+        ));
+    }
+    if targets.is_empty() {
+        return Err(HtapError::InvalidArgument(
+            "REORGANIZE PARTITION requires at least one target partition definition".into(),
+        ));
+    }
+
+    let key_col = &table_desc.schema.columns()[partitioning.key_column];
+
+    let mut source_names = Vec::with_capacity(sources.len());
+    let mut seen_source_names = std::collections::HashSet::new();
+    for ident in sources {
+        let name = ident.value.clone();
+        if name.is_empty() {
+            return Err(HtapError::InvalidArgument(
+                "source partition name cannot be empty".into(),
+            ));
+        }
+        if !seen_source_names.insert(name.clone()) {
+            return Err(HtapError::InvalidArgument(format!(
+                "duplicate source partition name '{name}' in REORGANIZE PARTITION"
+            )));
+        }
+        source_names.push(name);
+    }
+
+    let mut source_positions: Vec<usize> = Vec::with_capacity(source_names.len());
+    for s in &source_names {
+        let pos = table_desc
+            .partitions
+            .iter()
+            .position(|&pid| {
+                catalog
+                    .partition(pid)
+                    .map(|p| p.name == *s)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                HtapError::NotFound(format!(
+                    "source partition '{s}' not found in table '{}'",
+                    table_desc.name
+                ))
+            })?;
+        source_positions.push(pos);
+    }
+
+    source_positions.sort_unstable();
+    let min_pos = source_positions[0];
+    let max_pos = *source_positions.last().unwrap();
+    if max_pos - min_pos + 1 != source_positions.len() {
+        return Err(HtapError::InvalidArgument(format!(
+            "reorganize partition sources must be contiguous in table '{}', got non-contiguous positions {:?}",
+            table_desc.name, source_positions
+        )));
+    }
+
+    let mut target_defs = Vec::with_capacity(targets.len());
+    let mut seen_target_names = std::collections::HashSet::new();
+
+    for &pid in &table_desc.partitions {
+        if let Some(p) = catalog.partition(pid) {
+            if !seen_source_names.contains(&p.name) {
+                seen_target_names.insert(p.name.clone());
+            }
+        }
+    }
+
+    match partitioning.method {
+        PartitioningMethod::Range => {
+            let first_pos = source_positions[0];
+            let first_pid = table_desc.partitions[first_pos];
+            let first_part = catalog.partition(first_pid).unwrap();
+            let initial_lower = first_part.range.as_ref().and_then(|r| r.lower.clone());
+
+            let mut cur_lower = initial_lower;
+            let mut had_maxvalue = false;
+
+            for part_def in targets {
+                let part_name = part_def.name.value.clone();
+                if part_name.is_empty() {
+                    return Err(HtapError::InvalidArgument(
+                        "target partition name cannot be empty".into(),
+                    ));
+                }
+                if !seen_target_names.insert(part_name.clone()) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate target partition name '{part_name}'"
+                    )));
+                }
+
+                if had_maxvalue {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition '{part_name}' defined after MAXVALUE partition"
+                    )));
+                }
+
+                let bound = match &part_def.values {
+                    MysqlPartitionValues::LessThan(b) => b,
+                    MysqlPartitionValues::In(_) => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' in table '{}' with RANGE partitioning must use VALUES LESS THAN",
+                            table_desc.name
+                        )));
+                    }
+                };
+
+                let cur_upper = match bound {
+                    MysqlLessThanBound::MaxValue => {
+                        had_maxvalue = true;
+                        None
+                    }
+                    MysqlLessThanBound::Expr(bound_expr) => {
+                        let val = parse_literal_value(bound_expr, key_col)?;
+                        if val.is_null() {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "range partition '{part_name}' bound cannot be NULL"
+                            )));
+                        }
+                        if let Some(ref prev_val) = cur_lower {
+                            if &val <= prev_val {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "VALUES LESS THAN value must be strictly increasing: {val} <= {prev_val}"
+                                )));
+                            }
+                        }
+                        Some(val)
+                    }
+                };
+
+                target_defs.push(PartitionDefinition::Range(
+                    RangePartitionDefinition::new_opt(
+                        part_name,
+                        cur_lower.clone(),
+                        cur_upper.clone(),
+                    ),
+                ));
+
+                cur_lower = cur_upper;
+            }
+        }
+        PartitioningMethod::List => {
+            let mut seen_values = std::collections::HashSet::new();
+            for &pid in &table_desc.partitions {
+                if let Some(part) = catalog.partition(pid) {
+                    if !seen_source_names.contains(&part.name) {
+                        for v in &part.list_values {
+                            seen_values.insert(v.clone());
+                        }
+                    }
+                }
+            }
+
+            for part_def in targets {
+                let part_name = part_def.name.value.clone();
+                if part_name.is_empty() {
+                    return Err(HtapError::InvalidArgument(
+                        "target partition name cannot be empty".into(),
+                    ));
+                }
+                if !seen_target_names.insert(part_name.clone()) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate target partition name '{part_name}'"
+                    )));
+                }
+
+                let exprs = match &part_def.values {
+                    MysqlPartitionValues::In(exprs) => exprs,
+                    MysqlPartitionValues::LessThan(_) => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' in table '{}' with LIST partitioning must use VALUES IN",
+                            table_desc.name
+                        )));
+                    }
+                };
+
+                if exprs.is_empty() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "partition '{part_name}' has empty VALUES IN list"
+                    )));
+                }
+
+                let mut part_values = Vec::with_capacity(exprs.len());
+                let mut seen_in_part = std::collections::HashSet::new();
+                for e in exprs {
+                    let val = parse_literal_value(e, key_col)?;
+                    if val.is_null() {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "list partition '{part_name}' value cannot be NULL"
+                        )));
+                    }
+                    if !seen_in_part.insert(val.clone()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "partition '{part_name}' contains duplicate list value '{val}'"
+                        )));
+                    }
+                    if !seen_values.insert(val.clone()) {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "duplicate list value '{val}' across partitions (found in partition '{part_name}')"
+                        )));
+                    }
+                    part_values.push(val);
+                }
+
+                target_defs.push(PartitionDefinition::List(ListPartitionDefinition::new(
+                    part_name,
+                    part_values,
+                )));
+            }
+        }
+    }
+
+    Ok(PartitionAlteration::Reorganize {
+        sources: source_names,
+        targets: target_defs,
+    })
 }
 
 fn expr_to_primary_key_constraint(expr: &Expr) -> Result<PrimaryKeyConstraint> {

@@ -10320,15 +10320,38 @@ impl<'a> Parser<'a> {
             } else {
                 let if_not_exists =
                     self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-                let mut new_partitions = vec![];
-                loop {
-                    if self.parse_keyword(Keyword::PARTITION) {
-                        new_partitions.push(self.parse_partition()?);
-                    } else {
-                        break;
+                if self.parse_keyword(Keyword::PARTITION) {
+                    if self.peek_token_ref().token == Token::LParen {
+                        let is_mysql = match &self.peek_tokens::<2>()[1] {
+                            Token::Word(w) => w.keyword == Keyword::PARTITION,
+                            _ => false,
+                        };
+                        if is_mysql {
+                            if if_not_exists {
+                                return Err(ParserError::ParserError(
+                                    "IF NOT EXISTS is not supported for ADD PARTITION".into(),
+                                ));
+                            }
+                            self.expect_token(&Token::LParen)?;
+                            let partitions =
+                                self.parse_comma_separated(Parser::parse_mysql_partition_def)?;
+                            self.expect_token(&Token::RParen)?;
+                            return Ok(AlterTableOperation::AddPartition { partitions });
+                        }
                     }
-                }
-                if !new_partitions.is_empty() {
+                    if self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]) {
+                        return Err(ParserError::ParserError(
+                            "IF NOT EXISTS is not supported for ADD PARTITION".into(),
+                        ));
+                    }
+                    let mut new_partitions = vec![self.parse_partition()?];
+                    loop {
+                        if self.parse_keyword(Keyword::PARTITION) {
+                            new_partitions.push(self.parse_partition()?);
+                        } else {
+                            break;
+                        }
+                    }
                     AlterTableOperation::AddPartitions {
                         if_not_exists,
                         new_partitions,
@@ -10471,20 +10494,36 @@ impl<'a> Parser<'a> {
             }
         } else if self.parse_keyword(Keyword::DROP) {
             if self.parse_keywords(&[Keyword::IF, Keyword::EXISTS, Keyword::PARTITION]) {
-                self.expect_token(&Token::LParen)?;
-                let partitions = self.parse_comma_separated(Parser::parse_expr)?;
-                self.expect_token(&Token::RParen)?;
-                AlterTableOperation::DropPartitions {
-                    partitions,
-                    if_exists: true,
+                if self.peek_token_ref().token == Token::LParen {
+                    self.expect_token(&Token::LParen)?;
+                    let partitions = self.parse_comma_separated(Parser::parse_expr)?;
+                    self.expect_token(&Token::RParen)?;
+                    AlterTableOperation::DropPartitions {
+                        partitions,
+                        if_exists: true,
+                    }
+                } else {
+                    return Err(ParserError::ParserError(
+                        "IF EXISTS is not supported for DROP PARTITION".into(),
+                    ));
                 }
             } else if self.parse_keyword(Keyword::PARTITION) {
-                self.expect_token(&Token::LParen)?;
-                let partitions = self.parse_comma_separated(Parser::parse_expr)?;
-                self.expect_token(&Token::RParen)?;
-                AlterTableOperation::DropPartitions {
-                    partitions,
-                    if_exists: false,
+                if self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]) {
+                    return Err(ParserError::ParserError(
+                        "IF EXISTS is not supported for DROP PARTITION".into(),
+                    ));
+                }
+                if self.peek_token_ref().token == Token::LParen {
+                    self.expect_token(&Token::LParen)?;
+                    let partitions = self.parse_comma_separated(Parser::parse_expr)?;
+                    self.expect_token(&Token::RParen)?;
+                    AlterTableOperation::DropPartitions {
+                        partitions,
+                        if_exists: false,
+                    }
+                } else {
+                    let partitions = self.parse_comma_separated(Parser::parse_identifier)?;
+                    AlterTableOperation::DropPartition { partitions }
                 }
             } else if self.parse_keyword(Keyword::CONSTRAINT) {
                 let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
@@ -10531,6 +10570,17 @@ impl<'a> Parser<'a> {
                     if_exists,
                     drop_behavior,
                 }
+            }
+        } else if self.parse_keyword(Keyword::REORGANIZE) {
+            self.expect_keyword_is(Keyword::PARTITION)?;
+            let partitions = self.parse_comma_separated(Parser::parse_identifier)?;
+            self.expect_keyword_is(Keyword::INTO)?;
+            self.expect_token(&Token::LParen)?;
+            let into_partitions = self.parse_comma_separated(Parser::parse_mysql_partition_def)?;
+            self.expect_token(&Token::RParen)?;
+            AlterTableOperation::ReorganizePartition {
+                partitions,
+                into_partitions,
             }
         } else if self.parse_keyword(Keyword::PARTITION) {
             self.expect_token(&Token::LParen)?;
@@ -21466,6 +21516,63 @@ mod tests {
         for w in ["  ", "/*invalid*/"] {
             let sql = format!("\nSELECT\n  :{w}fooBar");
             assert!(Parser::parse_sql(&GenericDialect, &sql).is_err());
+        }
+    }
+
+    #[test]
+    fn test_mysql_alter_partition() {
+        let sql = "ALTER TABLE t ADD PARTITION (PARTITION p1 VALUES LESS THAN (100))";
+        let ast = Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
+        assert_eq!(ast.len(), 1);
+        match &ast[0] {
+            Statement::AlterTable(at) => {
+                assert_eq!(at.name.to_string(), "t");
+                assert_eq!(at.operations.len(), 1);
+                match &at.operations[0] {
+                    AlterTableOperation::AddPartition { partitions } => {
+                        assert_eq!(partitions.len(), 1);
+                        assert_eq!(partitions[0].name.value, "p1");
+                    }
+                    other => panic!("expected AddPartition, got {other:?}"),
+                }
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+
+        let sql_drop = "ALTER TABLE t DROP PARTITION p0, p1";
+        let ast_drop = Parser::parse_sql(&MySqlDialect {}, sql_drop).unwrap();
+        assert_eq!(ast_drop.len(), 1);
+        match &ast_drop[0] {
+            Statement::AlterTable(at) => match &at.operations[0] {
+                AlterTableOperation::DropPartition { partitions } => {
+                    assert_eq!(partitions.len(), 2);
+                    assert_eq!(partitions[0].value, "p0");
+                    assert_eq!(partitions[1].value, "p1");
+                }
+                other => panic!("expected DropPartition, got {other:?}"),
+            },
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+
+        let sql_reorg =
+            "ALTER TABLE t REORGANIZE PARTITION p0, p1 INTO (PARTITION p01 VALUES LESS THAN (200))";
+        let ast_reorg = Parser::parse_sql(&MySqlDialect {}, sql_reorg).unwrap();
+        assert_eq!(ast_reorg.len(), 1);
+        match &ast_reorg[0] {
+            Statement::AlterTable(at) => match &at.operations[0] {
+                AlterTableOperation::ReorganizePartition {
+                    partitions,
+                    into_partitions,
+                } => {
+                    assert_eq!(partitions.len(), 2);
+                    assert_eq!(partitions[0].value, "p0");
+                    assert_eq!(partitions[1].value, "p1");
+                    assert_eq!(into_partitions.len(), 1);
+                    assert_eq!(into_partitions[0].name.value, "p01");
+                }
+                other => panic!("expected ReorganizePartition, got {other:?}"),
+            },
+            other => panic!("expected AlterTable, got {other:?}"),
         }
     }
 }

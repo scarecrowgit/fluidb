@@ -4760,3 +4760,224 @@ fn test_server_open_fail_closed_missing_or_corrupt_manifest() {
         "expected open failure, got {err2:?}"
     );
 }
+
+#[test]
+fn test_server_sql_alter_partition_lifecycle() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().to_path_buf();
+
+    {
+        let server = LocalServer::open(&db_path).unwrap();
+
+        // 1. Create RANGE partitioned table via SQL DDL
+        server
+            .execute(
+                "CREATE TABLE events (id BIGINT PRIMARY KEY, val VARCHAR) \
+                 PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (200));",
+            )
+            .unwrap();
+
+        // 2. ADD PARTITION via SQL
+        server
+            .execute("ALTER TABLE events ADD PARTITION (PARTITION p2 VALUES LESS THAN (300));")
+            .unwrap();
+
+        // Insert across p0, p1, p2
+        server
+            .execute("INSERT INTO events (id, val) VALUES (50, 'val_p0'), (150, 'val_p1'), (250, 'val_p2');")
+            .unwrap();
+
+        // Point queries verify data routing
+        let q0 = server
+            .execute("SELECT val FROM events WHERE id = 50;")
+            .unwrap();
+        match q0 {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("val_p0".into())))
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+        let q2 = server
+            .execute("SELECT val FROM events WHERE id = 250;")
+            .unwrap();
+        match q2 {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("val_p2".into())))
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        // 3. ADD PARTITION with MAXVALUE via SQL
+        server
+            .execute(
+                "ALTER TABLE events ADD PARTITION (PARTITION p_max VALUES LESS THAN MAXVALUE);",
+            )
+            .unwrap();
+
+        server
+            .execute("INSERT INTO events (id, val) VALUES (999, 'val_max');")
+            .unwrap();
+
+        let q_max = server
+            .execute("SELECT val FROM events WHERE id = 999;")
+            .unwrap();
+        match q_max {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("val_max".into())))
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        // 4. Adding partition after MAXVALUE must fail
+        let err_after_max = server
+            .execute(
+                "ALTER TABLE events ADD PARTITION (PARTITION p_overflow VALUES LESS THAN (2000));",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err_after_max, HtapError::InvalidArgument(ref msg) if msg.contains("MAXVALUE partition already exists")),
+            "expected MAXVALUE partition already exists error, got {err_after_max:?}"
+        );
+
+        // 5. DROP PARTITION: empty vs populated guard
+        server
+            .execute(
+                "CREATE TABLE metrics (id BIGINT PRIMARY KEY, v INT) \
+                 PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20), PARTITION p2 VALUES LESS THAN (30));",
+            )
+            .unwrap();
+
+        server
+            .execute("INSERT INTO metrics (id, v) VALUES (5, 50), (15, 150);")
+            .unwrap();
+
+        // Attempt to drop populated p1 -> must fail closed with rowstore guard
+        let err_drop_pop = server
+            .execute("ALTER TABLE metrics DROP PARTITION p1;")
+            .unwrap_err();
+        assert!(
+            matches!(err_drop_pop, HtapError::InvalidArgument(ref msg) if msg.contains("is populated with 1 row(s)")),
+            "expected populated partition error, got {err_drop_pop:?}"
+        );
+
+        // Drop empty p2 -> must succeed
+        server
+            .execute("ALTER TABLE metrics DROP PARTITION p2;")
+            .unwrap();
+
+        // 6. REORGANIZE PARTITION: empty vs populated guard
+        server
+            .execute(
+                "CREATE TABLE data (id BIGINT PRIMARY KEY, v INT) \
+                 PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20), PARTITION p2 VALUES LESS THAN (30));",
+            )
+            .unwrap();
+
+        server
+            .execute("INSERT INTO data (id, v) VALUES (5, 500);")
+            .unwrap();
+
+        // Attempt to reorganize populated p0, p1 -> must fail
+        let err_reorg_pop = server
+            .execute("ALTER TABLE data REORGANIZE PARTITION p0, p1 INTO (PARTITION p01 VALUES LESS THAN (20));")
+            .unwrap_err();
+        assert!(
+            matches!(err_reorg_pop, HtapError::InvalidArgument(ref msg) if msg.contains("is populated with 1 row(s)")),
+            "expected populated partition error on reorg, got {err_reorg_pop:?}"
+        );
+
+        // Reorganize empty contiguous p1, p2 -> must succeed
+        server
+            .execute(
+                "ALTER TABLE data REORGANIZE PARTITION p1, p2 \
+                 INTO (PARTITION p12a VALUES LESS THAN (25), PARTITION p12b VALUES LESS THAN (30));",
+            )
+            .unwrap();
+
+        // Insert into reorganized partitions
+        server
+            .execute("INSERT INTO data (id, v) VALUES (22, 220), (28, 280);")
+            .unwrap();
+        let q_reorg = server.execute("SELECT v FROM data WHERE id = 22;").unwrap();
+        match q_reorg {
+            StatementResult::Query(qr) => assert_eq!(qr.rows()[0].get(0), Some(&Value::Int32(220))),
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        // 7. LIST partitioning SQL ALTER
+        server
+            .execute(
+                "CREATE TABLE items (id BIGINT PRIMARY KEY, name VARCHAR) \
+                 PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (3, 4));",
+            )
+            .unwrap();
+
+        // ADD PARTITION LIST
+        server
+            .execute("ALTER TABLE items ADD PARTITION (PARTITION p2 VALUES IN (5, 6));")
+            .unwrap();
+
+        server
+            .execute("INSERT INTO items (id, name) VALUES (5, 'item5');")
+            .unwrap();
+        let q_item = server
+            .execute("SELECT name FROM items WHERE id = 5;")
+            .unwrap();
+        match q_item {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("item5".into())))
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        // DROP empty LIST partition p0
+        server
+            .execute("ALTER TABLE items DROP PARTITION p0;")
+            .unwrap();
+    }
+
+    // 8. Reopen continuation and durability check
+    {
+        let reopened = LocalServer::open(&db_path).unwrap();
+
+        // Events: check p0, p1, p2, p_max data still readable
+        let q0 = reopened
+            .execute("SELECT val FROM events WHERE id = 50;")
+            .unwrap();
+        match q0 {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("val_p0".into())))
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+        let q_max = reopened
+            .execute("SELECT val FROM events WHERE id = 999;")
+            .unwrap();
+        match q_max {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("val_max".into())))
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        // Data: check reorganized partition 22
+        let q_reorg = reopened
+            .execute("SELECT v FROM data WHERE id = 22;")
+            .unwrap();
+        match q_reorg {
+            StatementResult::Query(qr) => assert_eq!(qr.rows()[0].get(0), Some(&Value::Int32(220))),
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        // Items: check list partition item 5
+        let q_item = reopened
+            .execute("SELECT name FROM items WHERE id = 5;")
+            .unwrap();
+        match q_item {
+            StatementResult::Query(qr) => {
+                assert_eq!(qr.rows()[0].get(0), Some(&Value::String("item5".into())))
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+}

@@ -104,14 +104,16 @@ licensed under Apache-2.0.
 - **Release / Source Artifact:** Tag `0.62.0` (crates.io crate `sqlparser-0.62.0.crate`)
 - **License:** Apache License, Version 2.0 (preserved in `vendor/sqlparser/LICENSE.TXT`)
 - **Local Patch Scope and Files:**
-  - `vendor/sqlparser/src/ast/ddl.rs`: Adds AST types `MysqlPartitionBy`, `MysqlPartitionDef`, `MysqlPartitionValues`, and `MysqlLessThanBound`; adds `pub mysql_partition_by: Option<MysqlPartitionBy>` to `CreateTable`.
+  - `vendor/sqlparser/src/keywords.rs`: Adds `REORGANIZE` keyword.
+  - `vendor/sqlparser/src/ast/ddl.rs`: Adds AST types `MysqlPartitionBy`, `MysqlPartitionDef`, `MysqlPartitionValues`, and `MysqlLessThanBound`; adds `pub mysql_partition_by: Option<MysqlPartitionBy>` to `CreateTable`; adds `AddPartition`, `DropPartition`, and `ReorganizePartition` operations to `AlterTableOperation` with `Display` implementations.
+  - `vendor/sqlparser/src/ast/spans.rs`: Implements `Spanned` for `AddPartition`, `DropPartition`, and `ReorganizePartition`.
   - `vendor/sqlparser/src/ast/mod.rs`: Re-exports `MysqlPartitionBy`, `MysqlPartitionDef`, `MysqlPartitionValues`, `MysqlLessThanBound`.
   - `vendor/sqlparser/src/ast/helpers/stmt_create_table.rs`: Adds `pub mysql_partition_by: Option<MysqlPartitionBy>` and builder method `mysql_partition_by` to `CreateTableBuilder`.
-  - `vendor/sqlparser/src/parser/mod.rs`: Implements `maybe_parse_mysql_partition_by` and `parse_mysql_partition_def` to parse MySQL `PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` with `VALUES LESS THAN (...)` / `MAXVALUE` and `VALUES IN (...)`, invoked during table creation parsing.
+  - `vendor/sqlparser/src/parser/mod.rs`: Implements `maybe_parse_mysql_partition_by` and `parse_mysql_partition_def` to parse MySQL `PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` with `VALUES LESS THAN (...)` / `MAXVALUE` and `VALUES IN (...)`, invoked during table creation parsing; adds support in `parse_alter_table_operation` for MySQL `ALTER TABLE ... ADD PARTITION (...)`, `DROP PARTITION ...`, and `REORGANIZE PARTITION ... INTO (...)`.
 - **How to Refresh / Rebase:**
   1. Obtain target upstream release or commit from `https://github.com/apache/datafusion-sqlparser-rs`.
   2. Extract files into `vendor/sqlparser`, ensuring no nested `.git` metadata is preserved.
-  3. Re-apply the MySQL partition AST definitions in `src/ast/ddl.rs`, builder integration in `src/ast/helpers/stmt_create_table.rs`, module exports in `src/ast/mod.rs`, and parser hooks in `src/parser/mod.rs`.
+  3. Re-apply keyword definition in `src/keywords.rs`, MySQL partition AST definitions and ALTER partition operations in `src/ast/ddl.rs`, span implementations in `src/ast/spans.rs`, builder integration in `src/ast/helpers/stmt_create_table.rs`, module exports in `src/ast/mod.rs`, and parser hooks in `src/parser/mod.rs`.
   4. Ensure `vendor/sqlparser/LICENSE.TXT` and `vendor/sqlparser/Cargo.toml` are intact.
   5. Run `cargo check -p sqlparser` and workspace tests (`cargo test --workspace`) to verify compatibility.
 
