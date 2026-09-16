@@ -43,8 +43,8 @@ The following operational facilities and production features are **explicitly no
   - Local topology invariant: Each partition currently consists of exactly one bucket-0 row tablet and one healthy local leader replica on node 1 (`NodeId(1)`). Hash buckets, tablet sharding, dynamic rebalancing, and physical multi-node sharding are not implemented.
   - Multi-row `INSERT` routes rows by partition key and commits all mutations across partitions in a single transaction payload and version step. Complete-PK `DELETE` and `SELECT` route by partition-key position; complete-PK `SELECT` strictly preserves the rowstore `Engine::get` fast path.
   - Analytic `SELECT` evaluates queries across partitions at one visible snapshot: conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented for narrow local OLAP; distributed fanout, disk spilling, query cancellation, and resource quotas remain deferred.
-  - Format conversion (`convert_table`) is guarded to single-partition tables and strictly rejects multi-partition tables (`HtapError::Unsupported`).
-  - Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), split/merge/drop, cross-partition movement, hash tablets, distributed serving, and replica failover remain deferred.
+  - Format conversion & demotion: `convert_table` is guarded to single-partition tables. Table-wide conversion is available via `convert_table_to_column` (Row->Column) and metadata demotion via `convert_table_to_row` (Column->Row, which clears catalog `column_manifest` references via CAS while retaining rowstore data and column segment files on disk). Synchronous explicit ticks (`conversion_tick`, `tick`) execute policy steps; `tick` resumes persisted jobs only, with no autonomous background scheduler daemon implemented.
+  - Partition lifecycle DDL: Supported via SQL `ALTER TABLE <table> ADD/DROP/REORGANIZE PARTITION` and native `LocalServer::alter_partitions` on empty sources with rowstore collapse verification. Populated DROP/REORGANIZE partitions are rejected. Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), hash tablets, distributed serving, and replica failover remain deferred.
 
 ---
 
@@ -66,7 +66,8 @@ flowchart TD
     Part1 --> Recov["Recover TransactionManager<br/>txn_manager.recover() (replay journal & complete commits)"]
     Recov --> Move["Initialize LocalDataMover at &lt;canonical_root&gt;/movement<br/>movement/jobs, movement/tablets"]
     Move --> Colstore["Initialize Columnar Storage Root at &lt;canonical_root&gt;/colstore<br/>std::fs::create_dir_all(&amp;colstore_dir)"]
-    Colstore --> Ready["Return ready LocalServer instance"]
+    Colstore --> ValStor["Validate Storage State on Open<br/>validate_storage_state_on_open (fail-closed catalog/colstore check)"]
+    ValStor --> Ready["Return ready LocalServer instance"]
 ```
 
 ### Filesystem Layout
@@ -137,7 +138,7 @@ flowchart TD
 5. **`colstore/` (`<root>/colstore` — `b62c705`):**
    - Columnar storage root for materialized partitions.
    - Houses per-tablet directories (`colstore/<tablet_id>/`) containing immutable columnar segments (`*.seg`) and tablet manifests (`MANIFEST` in `HTAPTBM1` envelope format with CRC32C checksums).
-   - Used by `LocalServer::convert_table` and `LocalServer` analytical scans (`Route::OlapScan`) over `Column` and `Converting` partitions, utilizing projection-aware compact reads with safe single-leaf predicate pushdown into `SegmentReader::scan` and rowstore base-plus-delta overlay. Manifest generation on disk is validated against catalog metadata before execution.
+   - Used by `LocalServer::convert_table`, `LocalServer::convert_table_to_column`, `convert_table_to_row` (which retains columnar segment files on disk during demotion), and `LocalServer` analytical scans (`Route::OlapScan`) over `Column` and `Converting` partitions, utilizing projection-aware compact reads with safe single-leaf predicate pushdown into `SegmentReader::scan` and rowstore base-plus-delta overlay. Manifest generation on disk is validated against catalog metadata before execution, and startup validation (`validate_storage_state_on_open`) fails closed (returning `HtapError::Corruption` or `HtapError::Io` depending on the cause) if catalog and disk states diverge.
 
 ---
 

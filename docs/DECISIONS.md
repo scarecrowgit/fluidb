@@ -340,9 +340,10 @@ Option **(c)**.
   stale base rows using rowstore deltas, and evaluate residual SQL logic.
 - **Scope boundaries:** Direct SegmentReader pushdown optimization is now implemented for the compact
   base path. Compound `AND` pushdown remains limited to one leaf, and `!=` remains residual.
-  Reverse `Column -> Row` conversion is not implemented and not claimed. Columnar bitmap delete vectors,
-  physical rowstore reclamation, delta-to-base background compaction, vectorized aggregation, vectorized
-  operator pipelines, joins/CTEs/windows, and distributed multi-tablet conversion are explicitly deferred.
+  Metadata-only `Column -> Row` demotion is implemented via catalog CAS (see ADR-015), while physical
+  reverse transcoding is not implemented. Columnar bitmap delete vectors, physical rowstore reclamation,
+  delta-to-base background compaction, autonomous background conversion scheduling, vectorized aggregation,
+  vectorized operator pipelines, joins/CTEs/windows, and distributed multi-tablet conversion are explicitly deferred.
 
 ### Consequences
 
@@ -351,7 +352,7 @@ Option **(c)**.
   pinned snapshot without duplicate manifest generation or orphaned segment leaks.
 - Storage footprint temporarily retains rowstore data post-conversion because physical rowstore
   reclamation is deferred.
-- Reverse conversion is unsupported and returns `HtapError::Unsupported`.
+- Physical reverse transcoding is unsupported (metadata demotion back to Row is supported via ADR-015).
 
 ### How to reverse it
 
@@ -467,10 +468,10 @@ However, upstream `sqlparser 0.62` with `MySqlDialect` did not retain MySQL part
 Option **(c)** (initially adopted; superseded by ADR-013).
 
 1. **Strict parser-level rejection (superseded by ADR-013):** Upstream MySQL `CREATE TABLE ... PARTITION BY RANGE ...` and `PARTITION BY LIST ...` syntax initially failed during `parse_one`, returning `HtapError::InvalidArgument`. ADR-013 replaced upstream `sqlparser` with a vendored copy adding typed AST support.
-2. **Strict binder rejection & no lossy AST reinterpretation:** Generic/unrelated `partition_by` AST clauses continue to be rejected by `htap-sql::bind` with `HtapError::Unsupported`. Unsupported partition options, subpartitioning, expressions, multi-column COLUMNS, and partition lifecycle DDL remain strictly rejected.
+2. **Strict binder rejection & no lossy AST reinterpretation:** Generic/unrelated `partition_by` AST clauses continue to be rejected by `htap-sql::bind` with `HtapError::Unsupported`. Unsupported partition options, subpartitioning, expressions, and multi-column COLUMNS remain strictly rejected (with partition lifecycle DDL subsequently supported for empty sources in ADR-014).
 3. **Preservation of catalog metadata:** The catalog maintains its validated finite range/list descriptors and routing helpers.
 4. **SQL-created tables:** Unpartitioned SQL DDL creates a default single partition `p0`; partitioned SQL DDL creates validated range/list topologies as defined in ADR-013.
-5. **Deferred capabilities:** Hash buckets / tablet sharding, partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), cross-partition UPDATE row movement, and distributed multi-partition execution remain deferred.
+5. **Deferred capabilities:** Hash buckets / tablet sharding, partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION` — historical context; subsequently implemented on empty sources in ADR-014), cross-partition UPDATE row movement, and distributed multi-partition execution remain deferred.
 
 ### Consequences
 
@@ -526,9 +527,9 @@ Option **(c)**.
 6. **SQL boundary alignment (updated by ADR-013):**
    - Tables created via standard SQL DDL without partitioning clauses remain unpartitioned with a default single partition `p0`. With ADR-013, MySQL `PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` DDL is parsed via vendored `sqlparser` and creates partitioned topologies through unified catalog publication.
 7. **Single-partition format conversion guard:**
-   - `LocalServer::convert_table` explicitly verifies that the target table has exactly one partition and rejects multi-partition tables with `HtapError::Unsupported`.
+   - `LocalServer::convert_table` explicitly verifies that the target table has exactly one partition and rejects multi-partition tables with `HtapError::Unsupported`. (Historical context: `convert_table` remains single-partition, while table-wide multi-partition conversion and demotion are subsequently introduced in ADR-015 via `convert_table_to_column` and `convert_table_to_row`.)
 8. **Deferred capabilities:**
-   - Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), partition split/merge/drop, multi-partition conversion and movement, hash tablets, distributed/remote partition serving across network nodes, replica failover, and network wire protocol remain deferred.
+   - Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION` — historical context; subsequently implemented on empty sources in ADR-014), partition split/merge/drop, multi-partition conversion (subsequently implemented via table-wide conversion reports in ADR-015) and movement, hash tablets, distributed/remote partition serving across network nodes, replica failover, and network wire protocol remain deferred.
 
 ### Consequences
 
@@ -590,7 +591,7 @@ To support typed grammar-backed MySQL `CREATE TABLE ... PARTITION BY RANGE/LIST`
 
 - Typed MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` (including `VALUES LESS THAN MAXVALUE`) are supported directly via SQL DDL.
 - Unsupported partition forms (partition options such as `ENGINE`/`COMMENT`/`TABLESPACE`, `SUBPARTITION`, `LIST DEFAULT`, expressions in partition key, multi-column `COLUMNS`, non-final `MAXVALUE`) are strictly rejected with clear errors.
-- Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`), partition split/merge/drop, cross-partition row movement on UPDATE, hash tablets, distributed serving, and replica failover remain deferred.
+- Partition lifecycle DDL (`ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION` — historical context; subsequently implemented on empty sources in ADR-014), partition split/merge/drop, cross-partition row movement on UPDATE, hash tablets, distributed serving, and replica failover remain deferred.
 
 ### Test Evidence
 
@@ -637,8 +638,9 @@ To enable declarative partition management through standard SQL while preventing
 ### Consequences
 
 - Standard MySQL ALTER partition commands are supported end-to-end via SQL interfaces (`LocalServer::execute` and `EmbeddedClient::execute`).
-- Populated partitions cannot be dropped or reorganized via SQL, preventing accidental data loss without explicit data migration.
-- Data migration for populated partition reorganization, automatic split/merge, hash partitions, and distributed lifecycle coordination remain deferred.
+- The native `LocalServer::alter_partitions` API remains available alongside SQL ALTER, providing candidate catalog validation, atomic catalog CAS, empty-source safety, and checked ID allocation without ID burn.
+- Populated partitions cannot be dropped or reorganized via SQL or native APIs, preventing accidental data loss without explicit data migration.
+- Data migration for populated partition reorganization, physical storage reclamation (space of dropped partitions), automatic split/merge, hash partitions, and distributed lifecycle coordination remain deferred.
 
 ### Test Evidence
 
@@ -651,3 +653,54 @@ To enable declarative partition management through standard SQL while preventing
   - `test_route_classification` (verifies `AlterPartitions` routes to `CatalogDdl`)
 - `crates/htap-server/tests/local_server.rs`:
   - `test_server_sql_alter_partition_lifecycle`
+  - `test_server_alter_partitions_drop_empty_and_populated_guard`
+  - `test_server_alter_partitions_reorganize_empty_and_populated_guard`
+- `crates/htap-catalog/tests/catalog_recovery.rs`:
+  - `test_partition_alteration_add_range_and_list`
+  - `test_partition_alteration_drop_range_and_list`
+  - `test_partition_alteration_reorganize_contiguous`
+  - `test_partition_alteration_cas_and_reopen`
+  - `test_partition_alteration_negative_rules`
+  - `test_partition_alteration_overflow_rejections`
+
+---
+
+## ADR-015: Table-Wide Conversion Reports, Column-to-Row Metadata Demotion, and Synchronous Policy Ticks
+
+`Status: Accepted`
+`Date: 2026-09-16`
+
+### Context
+
+Phase 4 introduced partition-scoped row-to-column conversion via `LocalConverter`. However, operating on multi-partition tables required coordinated table-wide operations, safe reversal when needed, explicit execution policy control, and fail-closed validation on startup to detect catalog and disk manifest divergence.
+
+### Options considered
+
+- **(a) Autonomous background conversion daemon:** Spawn a background worker thread that monitors conversion policies and executes conversions continuously. Rejected to maintain strict local determinism, test repeatability, and avoid background concurrency/scheduling complexity in the local MVP.
+- **(b) Full physical reverse data transcoding and file deletion on demotion:** Transcode columnar data back to rowstore format and physically delete `.seg` files on demotion. Rejected as redundant and risky: the rowstore was authoritative for all writes throughout, so rowstore data is already complete; physically deleting columnar files introduces unnecessary I/O and potential data-loss bugs.
+- **(c) Synchronous explicit policy ticks, metadata-only Column-to-Row demotion, and fail-closed open validation:** Provide deterministic table conversion reports (`TableConversionReport`), metadata-only demotion via catalog CAS (clearing `column_manifest` while keeping rowstore and column files intact), explicit policy-driven `conversion_tick` / `tick` APIs, and fail-closed storage validation on `LocalServer::open`.
+
+### Decision
+
+1. **Table-wide conversion reports:** Implement `TableConversionReport` and `PartitionConversionReport` providing deterministic per-partition action, error, and manifest results. Expose `convert_table_to_column(table_name)` to convert all partitions of a table.
+2. **Metadata demotion (`convert_table_to_row` / `demote_partition_to_row`):** Demote columnar partitions back to `StorageDescriptor::Row` via a single atomic catalog CAS that clears the tablet's `column_manifest` reference. Retain all rowstore data (which remained authoritative throughout) and leave existing columnar files on disk without physical deletion or reverse transcoding. Block demotion if a partition has an active in-flight conversion.
+3. **Explicit synchronous policy ticks:** Provide `conversion_tick(policy)` and `tick()` to evaluate explicit target policies (`ConversionTarget::Table`, `ConversionTarget::Partition`) and resume in-flight `Converting` jobs (`ConversionPolicy::manual()`). No autonomous background scheduler is introduced; `tick` resumes persisted jobs only.
+4. **Fail-closed startup storage validation:** In `LocalServer::open`, inspect all partitions: verify that `Column` and `Converting` partitions have valid matching manifests and segment files in `<root>/colstore`, and that `Row` partitions have no active catalog manifest. Reject inconsistent states with `HtapError::Corruption` or `HtapError::Io` depending on the cause.
+
+### Consequences
+
+- Multi-partition tables can be converted to columnar format or demoted back to row storage deterministically.
+- Demotion is fast and non-destructive: rowstore data is already complete, and columnar files remain on disk but unreachable from the catalog.
+- Fail-closed validation prevents silent divergence or corruption between catalog metadata and disk state.
+- Physical reverse data transcoding, physical storage reclamation (space of demoted column files or purged rows), delete vectors, background compaction, autonomous background scheduling, and distributed conversion remain deferred.
+
+### Test Evidence
+
+- `crates/htap-convert/tests/materialization.rs`:
+  - `test_demote_partition_to_row_clearing_manifest_and_retained_data`
+  - `test_demote_partition_rejections_active_converting_and_missing_and_corrupt`
+  - `test_conversion_tick_resumes_snapshot_pinned`
+- `crates/htap-server/tests/local_server.rs`:
+  - `test_server_convert_table_multi_partition_reports_and_demotion_equivalence`
+  - `test_server_conversion_tick_idempotent_and_resume_snapshot_pinned`
+  - `test_server_open_fail_closed_missing_or_corrupt_manifest`

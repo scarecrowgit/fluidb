@@ -14,6 +14,7 @@ Partitioning in the local HTAP engine is accessible both through typed SQL DDL a
 │                                                                        │
 │   CREATE TABLE ...                 --> Unpartitioned table (p0)        │
 │   CREATE TABLE ... PARTITION BY .. --> Supported typed RANGE/LIST DDL   │
+│   ALTER TABLE ... ADD/DROP/REORG   --> Typed partition lifecycle DDL   │
 └──────────────────────────────────┬─────────────────────────────────────┘
                                    │
 ┌──────────────────────────────────▼─────────────────────────────────────┐
@@ -22,6 +23,10 @@ Partitioning in the local HTAP engine is accessible both through typed SQL DDL a
 │   LocalServer::create_partitioned_table(PartitionedTableDefinition)    │
 │     ├── PartitionTopology::Range (finite [lower, upper) intervals)    │
 │     └── PartitionTopology::List  (finite disjoint value sets)          │
+│   LocalServer::alter_partitions(table_name, PartitionAlteration)       │
+│     ├── PartitionAlteration::Add (checked bounds & ID allocation)      │
+│     ├── PartitionAlteration::Drop (empty-source rowstore check)        │
+│     └── PartitionAlteration::Reorganize (contiguous empty reorg)       │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -43,6 +48,60 @@ MySQL partitioning syntax is supported for finite RANGE and LIST partitioning:
 - **Partition Key Constraints:**
   The partition key must be a single column, must exist in the schema, must be non-null, and must be included in the primary key (`table.primary_key.contains(&key_column)`).
 
+### Supported SQL Partition Lifecycle DDL Grammar and Restrictions
+
+Typed MySQL `ALTER TABLE` partition lifecycle operations are supported:
+- **`ALTER TABLE <table> ADD PARTITION (PARTITION <name> VALUES LESS THAN (<val> | MAXVALUE))`:**
+  Appends a new range partition. The bound must be strictly greater than all existing partition bounds. If the table already contains a `MAXVALUE` partition, `ADD PARTITION` is rejected; `REORGANIZE PARTITION` must be used instead.
+- **`ALTER TABLE <table> ADD PARTITION (PARTITION <name> VALUES IN (<val1>, <val2>, ...))`:**
+  Appends a new list partition with non-empty, non-null values that must be disjoint from all existing list partitions.
+- **`ALTER TABLE <table> DROP PARTITION <name> [, <name> ...]`:**
+  Drops one or more named partitions.
+- **`ALTER TABLE <table> REORGANIZE PARTITION <source1> [, <source2> ...] INTO (PARTITION <target1> ... [, ...])`:**
+  Replaces a contiguous range or subset of list partitions with replacement definitions covering the exact same span.
+
+#### Strict Lifecycle Safety Rules & Rejections
+1. **Empty-Source Safety Check:** Dropping or reorganizing partitions is gated by rowstore snapshot collapse checks (`alter_partitions_internal`). If any source partition contains one or more visible rows, the operation fails immediately with `HtapError::InvalidArgument` without mutating the catalog or allocating IDs. Populated data migration is not performed.
+2. **No-Last-Partition Guard:** Dropping all partitions of a table is rejected; at least one partition must remain.
+3. **Contiguity Invariant for REORGANIZE:** For RANGE tables, reorganized source partitions must form a contiguous sequence in the table's partition order, and replacement target partitions must strictly preserve the combined lower bound of the first source partition and upper bound of the last source partition. For LIST tables, the replacement partitions must cover exactly the union of values from the source partitions without gaps or new values.
+4. **Unsupported Syntax Rejections:**
+   - Partition options (`ENGINE`, `COMMENT`, `TABLESPACE`, `DATA DIRECTORY`) are rejected at parse time.
+   - Subpartitioning (`SUBPARTITION BY ...`, `SUBPARTITION ...`) is rejected at parse time.
+   - `IF EXISTS` / `IF NOT EXISTS` on ALTER operations are rejected at parse time.
+   - Hash/key partitioning, expressions in partition keys or bounds, and multi-column definitions are rejected.
+   - Unrelated ALTER statements (`ADD COLUMN`, `DROP COLUMN`, `RENAME TABLE`, etc.) are rejected with `HtapError::Unsupported`.
+
+### Native Administrative API: Partition Creation and Alteration
+
+Partitioned tables can also be created and altered via the native in-process API:
+```rust
+pub fn create_partitioned_table(
+    &self,
+    definition: PartitionedTableDefinition,
+) -> Result<StatementResult>
+
+pub fn alter_partitions(
+    &self,
+    table_name: &str,
+    alteration: impl Into<PartitionAlteration>,
+) -> Result<StatementResult>
+```
+
+1. **Creation (`create_partitioned_table`):**
+   `PartitionedTableDefinition` (`crates/htap-server/src/lib.rs`) requires `name`, `schema`, `primary_key`, and `topology`:
+   - `PartitionTopology::Range { key_column: usize, partitions: Vec<RangePartitionDefinition> }`: ordered half-open intervals `[lower, upper)`.
+   - `PartitionTopology::List { key_column: usize, partitions: Vec<ListPartitionDefinition> }`: disjoint explicit value sets.
+   Attempting to create an empty topology is rejected with `HtapError::InvalidArgument` before lock acquisition or catalog mutation (`test_partitioned_empty_topology_rejection_no_catalog_mutation`).
+
+2. **Alteration (`alter_partitions`):**
+   Accepts [`PartitionAlteration`](crates/htap-catalog/src/model.rs):
+   - `PartitionAlteration::Add { partitions }`
+   - `PartitionAlteration::Drop { partitions }`
+   - `PartitionAlteration::Reorganize { sources, targets }`
+   - **Candidate Validation & No ID Burn:** Candidate validation runs on an in-memory candidate snapshot before ID generation or state mutation. If validation fails, no IDs or generations are allocated.
+   - **Empty-Source Validation:** Prior to applying catalog mutations for DROP or REORGANIZE, `LocalServer` scans each source partition at the current visible snapshot, collapsing rowstore entries. If populated, it returns `HtapError::InvalidArgument`.
+   - **Atomic Catalog CAS:** On successful validation, the new `CatalogSnapshot` is committed atomically via `catalog.compare_and_set`.
+
 ### Strict Rejection of Unsupported Partitioning Forms
 
 To maintain data integrity and avoid lossy dialect workarounds, non-supported partition syntax is strictly rejected:
@@ -53,30 +112,7 @@ To maintain data integrity and avoid lossy dialect workarounds, non-supported pa
 - **Multi-column COLUMNS:** Multi-column keys like `RANGE COLUMNS (a, b)` or `LIST COLUMNS (a, b)` are rejected by the binder with `HtapError::Unsupported("multi-column partitioning is not supported")`.
 - **Malformed / Non-Final MAXVALUE:** Non-final `MAXVALUE` partitions are rejected by the binder with `HtapError::InvalidArgument`. Malformed MAXVALUE syntax (e.g. within compound tuples) fails at parse time.
 - **Generic AST partition_by:** Generic non-MySQL AST `partition_by` is rejected by the binder with `HtapError::Unsupported`.
-- **Partition Lifecycle DDL:** `ALTER TABLE ... ADD/DROP/REORGANIZE PARTITION`, partition split/merge/drop, cross-partition row movement on UPDATE, and hash/key partitioning remain deferred.
-
-### Native Administrative API: Finite Range and List Partitioning
-
-Partitioned tables may also be defined via the native in-process API:
-```rust
-pub fn create_partitioned_table(
-    &self,
-    definition: PartitionedTableDefinition,
-) -> Result<StatementResult>
-```
-
-`PartitionedTableDefinition` (`crates/htap-server/src/lib.rs`) requires:
-- `name: String`: Unique logical table name.
-- `schema: Schema`: Non-empty schema column definitions.
-- `primary_key: Vec<usize>`: Column indices forming the primary key.
-- `topology: PartitionTopology`: Explicit topology definition, supporting two finite variants:
-  1. `PartitionTopology::Range { key_column: usize, partitions: Vec<RangePartitionDefinition> }`:
-     Each `RangePartitionDefinition` defines a partition name and a half-open interval `[lower, upper)`.
-  2. `PartitionTopology::List { key_column: usize, partitions: Vec<ListPartitionDefinition> }`:
-     Each `ListPartitionDefinition` defines a partition name and a non-empty set of explicit values.
-
-**Empty Topology Rejection:**
-Attempting to create a partitioned table with an empty partition vector (`partitions.is_empty()`) is rejected before acquiring the execution lock, mutating the catalog, or allocating IDs, returning `HtapError::InvalidArgument` (`test_partitioned_empty_topology_rejection_no_catalog_mutation` in `crates/htap-server/tests/local_server.rs`).
+- **Deferred Lifecycle & Physical Capabilities:** Physical data migration for populated partition reorganization, physical storage reclamation (space of dropped partitions or demoted column files), delete vectors, background compaction, autonomous background conversion scheduler, hash/key partitioning, and distributed lifecycle coordination remain deferred.
 
 ---
 
@@ -424,24 +460,37 @@ StorageDescriptor
    - If manifest is absent and phase is `ConversionPhase::SnapshotPinned`: Safely falls back to full rowstore scan (`engine.scan_partition`).
    - If manifest is absent in any later phase: Returns `HtapError::InvalidArgument`.
 
-### Single-Partition Format Conversion Guard
+### Table-Wide Conversion, Demotion, and Explicit Policy Ticks
 
-Row-to-column format conversion is performed partition-by-partition. However, the table-level conversion API `LocalServer::convert_table` enforces a single-partition guard:
-```rust
-pub fn convert_table(&self, table_name: &str) -> Result<TabletColumnManifest> {
-    let _guard = self.execution_lock.lock();
-    let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
-    let (_, partition) = self.resolve_single_partition_table(table_name, &catalog)?;
-    ...
-}
-```
-
-If `convert_table` is called on a multi-partition table, `resolve_single_partition_table` detects `partitions.len() != 1` and rejects the operation with `HtapError::Unsupported("table '<name>' must have exactly one partition, found <n>")`. Coordinated conversion across multi-partition tables is explicitly deferred.
+Storage format conversion can be driven per partition or across all partitions of a table:
+1. **Single-Partition Conversion (`LocalServer::convert_table`):**
+   Converts a single-partition table from `Row` to `Column` format, returning the published [`TabletColumnManifest`]. Enforces that `partitions.len() == 1` and returns `HtapError::Unsupported` if called on a multi-partition table.
+2. **Table-Wide Conversion (`LocalServer::convert_table_to_column`):**
+   Converts all partitions of a table to columnar storage, returning a [`TableConversionReport`]. Each partition transitions through the four-phase state machine (`SnapshotPinned -> SegmentsWritten -> ReadyToPublish -> Column`) and receives an individual [`PartitionConversionReport`] recording the outcome (`ConversionAction::Converted`, `AlreadyAtTarget`, `Resumed`, `Blocked`, or `Failed`).
+3. **Column-to-Row Metadata Demotion (`LocalServer::convert_table_to_row`):**
+   Demotes all partitions of a table from `Column` back to `Row` storage.
+   - **Catalog CAS Demotion:** Executes a single catalog CAS update setting `StorageDescriptor::Row`, clearing the tablet `column_manifest` reference, and incrementing catalog generation.
+   - **Artifact Retention:** Demotion retains all rowstore data (which remained authoritative for all writes throughout) and leaves existing columnar segment files on disk; no physical deletion, garbage collection, or reverse data transcoding occurs.
+   - **Safety:** In-flight `Converting` partitions cannot be demoted; demotion is blocked with `ConversionAction::Blocked` and `ConversionErrorCategory::Conflict`.
+4. **Explicit Policy Ticks (`LocalServer::conversion_tick` / `LocalServer::tick`):**
+   Synchronously evaluates a [`ConversionPolicy`] containing explicit table or partition targets (`ConversionTarget::Table`, `ConversionTarget::Partition`).
+   - `LocalServer::tick()` executes `ConversionPolicy::manual()`, which discovers and resumes existing in-flight `Converting` partitions without initiating new conversions; `tick` resumes persisted jobs only, with no autonomous background scheduling.
+   - **No Background Scheduler:** There is no autonomous background worker, periodic thread, or scheduler daemon running conversions. Conversion advances solely through explicit synchronous method calls.
+5. **Fail-Closed Storage Validation on Reopen:**
+   During `LocalServer::open`, `validate_storage_state_on_open` inspects all catalog partitions:
+   - For `Column` partitions, verifies that `<root>/colstore/tablet-<id>/MANIFEST` exists, matches the catalog manifest reference (generation, base version, segment count, row count), and that segments exist.
+   - For `Converting` partitions, validates phase and disk manifest consistency.
+   - For `Row` partitions, verifies no lingering `column_manifest` reference exists.
+   Any mismatch or corrupted manifest immediately halts startup with `HtapError::Corruption` or `HtapError::Io` (depending on the cause, such as missing files vs malformed data).
 
 ### Test Coverage
 
 - `test_partition_storage_format_row_column_converting_equivalence`: Proves query equivalence across partitions with mixed storage formats (`Row`, `Column`, `Converting`).
 - `test_convert_table_multi_partition_guard`: Verifies rejection of `convert_table` on multi-partition tables.
+- `test_server_convert_table_multi_partition_reports_and_demotion_equivalence`: Verifies table-wide Row->Column conversion, Column->Row metadata demotion, and query results.
+- `test_server_conversion_tick_idempotent_and_resume_snapshot_pinned`: Verifies manual conversion ticks and resuming in-flight snapshot-pinned conversions.
+- `test_server_open_fail_closed_missing_or_corrupt_manifest`: Verifies fail-closed storage validation on reopen when manifests are missing or corrupted.
+- `test_demote_partition_to_row_clearing_manifest_and_retained_data`: Verifies catalog CAS clearing, rowstore authority retention, and colstore file retention during demotion.
 
 ---
 
@@ -477,7 +526,7 @@ To maintain rigorous production invariants, HTAP explicitly delineates implement
 | Capability / Area | Status in Local Server | Architectural / Deferred Status |
 |---|---|---|
 | **SQL Partition DDL** | Supported for finite `RANGE [COLUMNS]` (including `MAXVALUE`) and `LIST [COLUMNS]`; unpartitioned creates `p0` | Options, subpartitioning, expressions, multi-column COLUMNS, and non-final MAXVALUE rejected |
-| **Partition Lifecycle DDL** | None | `ALTER TABLE ADD/DROP/REORGANIZE PARTITION` deferred |
+| **Partition Lifecycle DDL** | Supported via SQL `ALTER TABLE <table> ADD/DROP/REORGANIZE PARTITION` and native `LocalServer::alter_partitions` on empty sources | Data migration for populated reorganization, physical storage reclamation, and automatic split/merge deferred |
 | **Topology Specification** | Finite `PartitionTopology::Range` (with optional unbounded upper) and `List` via SQL DDL or `LocalServer::create_partitioned_table` | Catch-all `DEFAULT` options deferred |
 | **Tablet Sharding / Hashing** | Exactly 1 bucket-0 tablet per partition | Hash bucket rings, sub-partitioning, and dynamic tablet splitting deferred |
 | **Replica Topology** | Exactly 1 local leader replica on `NodeId(1)` | Multi-node replica placement, Raft consensus groups, and failover deferred |
@@ -485,7 +534,7 @@ To maintain rigorous production invariants, HTAP explicitly delineates implement
 | **Point Reads / Deletes** | Partition-routed point read (`Engine::get`) and delete | Distributed point lookup RPC fanout deferred |
 | **OLAP Execution** | Conservative range/list pruning; bounded local workers; deterministic merge | Distributed scan fanout across remote nodes deferred |
 | **OLAP Resource Controls** | Bounded in-process worker pool (`scan_workers`) | Disk spilling, query cancellation tokens, and CPU/memory quotas deferred |
-| **Storage Conversion** | Partition-scoped row-to-column conversion; `convert_table` guarded to single-partition | Coordinated multi-partition conversion and reverse Column-to-Row conversion deferred |
+| **Storage Conversion** | Partition-scoped Row->Column conversion (`convert_table_to_column`); Column->Row metadata demotion (`convert_table_to_row`) retaining rowstore and column files; explicit ticks; fail-closed validation | Background compaction, autonomous scheduler, delete vectors, physical storage reclamation, and distributed conversion deferred |
 
 ### Catalog Metadata vs. Physical Serving
 

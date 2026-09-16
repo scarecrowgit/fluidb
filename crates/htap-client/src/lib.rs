@@ -9,9 +9,9 @@
 //! # Supported SQL Subset
 //!
 //! The client supports the synchronous SQL subset implemented by the engine across
-//! unpartitioned tables (created via SQL DDL) and partitioned tables (created via the native
-//! [`LocalServer::create_partitioned_table`] API):
-//! - `CREATE TABLE`: Schema definitions specifying typed columns and primary keys. Tables created via SQL DDL are unpartitioned (default single partition); MySQL `PARTITION BY RANGE/LIST` syntax is rejected at the parser level due to `sqlparser 0.62` AST limitations.
+//! unpartitioned and partitioned tables:
+//! - `CREATE TABLE`: Schema definitions specifying typed columns and primary keys. Supports unpartitioned tables (default single partition `"p0"`) as well as partitioned tables via MySQL `PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` (including final `VALUES LESS THAN MAXVALUE`). Partition options, subpartitioning, expressions, multi-column COLUMNS, and non-final MAXVALUE are strictly rejected.
+//! - `ALTER TABLE`: Typed partition lifecycle operations: `ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` for strict finite range and list forms and final `MAXVALUE` where supported. Enforces empty-partition safety gates: dropping or reorganizing populated source partitions is strictly rejected with `HtapError::InvalidArgument` to prevent data loss. Other ALTER statements, partition options, subpartitioning, and hash partitioning are rejected.
 //! - Literal `INSERT`: Single- or multi-row inserts with literal value lists. On partitioned tables, rows are routed by partition key and committed atomically in a single transaction payload and version.
 //! - Complete-PK `DELETE`: Point deletes matching the complete primary key in the `WHERE` clause, routed to the target partition.
 //! - Complete-PK `SELECT`: Point lookups projecting expressions or all columns matching the complete primary key in the `WHERE` clause, routed to the target partition while strictly preserving the rowstore fast path.
@@ -24,6 +24,7 @@
 //! - **No MySQL wire protocol**: No wire protocol framing, handshake negotiation, or MySQL client/driver compatibility.
 //! - **No session state**: Each statement executes independently without connection-level state, session variables, or multi-statement transaction handles.
 //! - **No prepared statements**: Queries are parsed and planned synchronously on each call without prepared statement handles or binary parameter binding.
+//! - **Deferred partition & storage capabilities**: Physical data migration for populated partition reorganization, physical storage reclamation for dropped partitions, delete vectors, compaction, autonomous background conversion scheduling, hash/multiple tablets, distributed/remote movement, consensus/HA, and full MySQL compatibility remain deferred.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -41,7 +42,8 @@ pub use htap_sql::{CommandResult, QueryResult, StatementResult};
 /// the current process memory.
 ///
 /// # Supported SQL Operations
-/// - `CREATE TABLE` (creates unpartitioned table; MySQL `PARTITION BY` rejected at parse time)
+/// - `CREATE TABLE` (unpartitioned or partitioned via MySQL `PARTITION BY RANGE/LIST`)
+/// - `ALTER TABLE` (typed partition lifecycle: `ADD PARTITION`, `DROP PARTITION`, `REORGANIZE PARTITION` on empty sources)
 /// - Literal `INSERT` (routes by partition key on partitioned tables, atomic multi-row commit)
 /// - Complete-PK `DELETE` (routes by partition key)
 /// - Complete-PK `SELECT` (routes by partition key, preserving rowstore fast path)
@@ -72,7 +74,8 @@ impl EmbeddedClient {
     /// Synchronously executes a single SQL statement against the embedded server.
     ///
     /// # Supported Subset
-    /// - `CREATE TABLE` (creates unpartitioned table; MySQL partition DDL rejected at parser level)
+    /// - `CREATE TABLE` (unpartitioned or partitioned via MySQL `PARTITION BY RANGE/LIST`)
+    /// - `ALTER TABLE` (typed partition lifecycle: `ADD PARTITION`, `DROP PARTITION`, `REORGANIZE PARTITION` on empty sources)
     /// - Literal `INSERT` (routes by partition key on partitioned tables, single transaction version)
     /// - Complete-PK `DELETE` (routed by partition key)
     /// - Complete-PK `SELECT` (routed by partition key, takes rowstore fast path)
