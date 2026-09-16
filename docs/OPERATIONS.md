@@ -41,6 +41,25 @@ The following operational facilities and production features are **explicitly no
 - **No Power-Loss Proof:** Integration crash tests prove recovery across process `SIGKILL` termination, not physical machine power loss, host kernel panics, or write cache invalidation.
 - **Whole-Dataset Materialization in Conversion, Export, and Clone:** HTAP conversion (`htap-convert`), data export (`htap-movement`, where exports materialize the full logical partition before writing), and tablet snapshot cloning materialize entire datasets into memory or intermediate files without streaming.
 - **External CopyOptions Paths Remain Caller-Controlled by Design:** While internal persistence files and paths are bounded and validated (`b7ff200`), external import/export paths specified via `CopyOptions` are caller-controlled by design and must be validated by the host application.
+- **Catalog Format Version 2 (Phase 9) — `DROP TABLE` Does Not Free Disk Space:** `DROP TABLE` removes a
+  table and its partitions/tablets/replicas from the catalog in one CAS, but does not physically reclaim the
+  rowstore data or columnar segment files belonging to those tablets — they stay on disk, unreachable. To
+  guarantee a dropped identifier is never reissued (which would otherwise let a new table alias that
+  unreachable data), `CatalogSnapshot` now persists an identifier high-water mark
+  (`IdHighWater { table, partition, tablet, replica }`), and the `HTAPCAT1` catalog envelope
+  `FORMAT_VERSION` bumped from 1 to 2 to carry it. A version-1 catalog still decodes (counters fall back to
+  the live maximum id present in the snapshot) and is rewritten as version 2 on the next CAS; a
+  version-1-only binary refuses to open a version-2 catalog rather than misinterpreting it — operators
+  downgrading `htapd`/`LocalServer` to a pre-Phase-9 binary against a root that has been opened by a Phase-9
+  binary will see that refusal, not silent corruption. Operators who need to reclaim disk space after
+  `DROP TABLE` must currently do so out of band (e.g. by not reusing the root, or by a future physical
+  reclamation feature); there is no built-in vacuum/reclaim operation. Opening a genuinely unmigrated
+  version-1 root performs a one-time migration write (one extra catalog CAS / generation bump, while the
+  process still holds `<root>/LOCK`) that seeds the tablet high-water counter from the `colstore/` on-disk
+  inventory — see section 3 below for the exact contract. **Known gap:** that migration does not recover
+  replica ids removed by a pre-Phase-9 `ALTER TABLE ... DROP PARTITION`; a reissued replica id could in
+  principle collide with a stale movement snapshot package directory under `movement/tablets/`, though this
+  requires also reusing the same movement job id and is narrow in practice.
 - **Table Partitioning & Multi-Partition Execution Operational Boundary:**
   - `LocalServer` supports partitioned tables defined via SQL DDL (`CREATE TABLE ... PARTITION BY RANGE/LIST`) or through the native non-SQL API (`LocalServer::create_partitioned_table`) using `PartitionedTableDefinition` with finite `PartitionTopology::Range` (half-open `[lower, upper)` intervals with optional `MAXVALUE`) or `PartitionTopology::List` (disjoint value sets).
   - Unpartitioned SQL DDL (`CREATE TABLE`) creates tables with a default single partition `p0`. Typed MySQL partition DDL is supported via vendored `sqlparser`, while unsupported forms (options, subpartitions, expressions, multi-column COLUMNS, non-final MAXVALUE) are rejected.
@@ -120,6 +139,22 @@ flowchart TD
    - Tracks table definitions, schema, partition descriptors, tablets, and replica topologies.
    - Enforces optimistic concurrency control using integer generations (`compare_and_set`).
    - Mutations stage to `catalog/CATALOG.tmp`, call `sync_all()`, and atomically rename to `catalog/CATALOG`, followed by directory `sync_all()`. Read via bounded exact reader.
+   - **Format version 2 (Phase 9):** The `HTAPCAT1` envelope persists `id_high_water` (highest allocated
+     table/partition/tablet/replica id) so identifiers of tables removed via `DROP TABLE` are never reissued.
+     A version-1 file still decodes (counters fall back to the live maximum) and is rewritten as version 2 on
+     the next CAS; a version-1-only binary refuses to open a version-2 file. See "Important Operational
+     Boundaries & Non-Features" above.
+   - **One-time legacy migration on first open of a version-1 root:** If `LocalServer::open` finds a
+     genuinely unmigrated version-1 catalog (persisted `id_high_water` still all zeros), it performs one
+     extra catalog CAS during startup — after storage validation, while still holding `<root>/LOCK` — that
+     raises the tablet high-water counter to the highest `colstore/tablet-*` directory actually present on
+     disk (to account for tablets whose partitions were removed by a pre-Phase-9 `ALTER TABLE ... DROP
+     PARTITION`) and rewrites the catalog file as version 2. This is a one-time write: the catalog generation
+     advances by one, and subsequent opens of the same root are no-ops for this step because the mark is no
+     longer all zeros. A caller that snapshots or backs up a root immediately after this first Phase-9 open
+     will see one extra generation bump compared to the last version-1-binary write. Known gap: this
+     migration recovers tablet ids from disk but not replica ids removed the same way — see "Important
+     Operational Boundaries & Non-Features" above and `docs/LIMITATIONS.md`.
 
 2. **`rowstore/` (`htap_rowstore::Engine` — `f7a4975`, `c5ee281`, `b7ff200`):**
    - **`rowstore/wal/{20-digit}.wal`:** Framed write-ahead log files recording transactional row mutations (`Put` and `Delete`). Files are named using 20-digit zero-padded sequence numbers (e.g. `00000000000000000001.wal`). Each entry is framed with magic, length, sequence, payload, and CRC32C checksum.

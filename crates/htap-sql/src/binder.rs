@@ -41,6 +41,12 @@ pub fn bind(statement: &Statement, catalog: &CatalogSnapshot) -> Result<BoundSta
         Statement::Delete(delete) => bind_delete(delete, catalog),
         Statement::Query(query) => bind_select(query, catalog),
         Statement::AlterTable(alter_table) => bind_alter_table(alter_table, catalog),
+        Statement::Update(update) => crate::binder_query::bind_update(update, catalog),
+        Statement::Drop { .. } => crate::binder_query::bind_drop(statement),
+        Statement::ShowTables { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ExplainTable { .. } => crate::binder_query::bind_show(statement, catalog),
         other => Err(HtapError::Unsupported(format!(
             "unsupported statement: {other}"
         ))),
@@ -86,7 +92,7 @@ fn map_sql_data_type(data_type: &sqlparser::ast::DataType) -> Result<CommonDataT
     }
 }
 
-fn validate_table_descriptor_primary_key(table_desc: &TableDescriptor) -> Result<()> {
+pub(crate) fn validate_table_descriptor_primary_key(table_desc: &TableDescriptor) -> Result<()> {
     if table_desc.primary_key.is_empty() {
         return Err(HtapError::Internal(format!(
             "table '{}' has empty primary key in catalog",
@@ -1361,7 +1367,7 @@ fn parse_float_string(prefix: &str, num_str: &str, col_name: &str) -> Result<f64
     Ok(val)
 }
 
-fn parse_hex_bytes(s: &str, col_name: &str) -> Result<Vec<u8>> {
+pub(crate) fn parse_hex_bytes(s: &str, col_name: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(HtapError::InvalidArgument(format!(
             "hex literal for column '{col_name}' must have an even number of digits, got length {}",
@@ -1673,7 +1679,7 @@ fn collect_and_leaves<'a>(expr: &'a Expr, leaves: &mut Vec<&'a Expr>) -> Result<
     }
 }
 
-fn bind_pk_where_predicate(
+pub(crate) fn bind_pk_where_predicate(
     table_desc: &TableDescriptor,
     selection: Option<&Expr>,
 ) -> Result<Vec<Value>> {
@@ -1889,7 +1895,184 @@ fn bind_delete(delete: &SqlDelete, catalog: &CatalogSnapshot) -> Result<BoundSta
     )))
 }
 
+/// Binds a `SELECT`.
+///
+/// Statements whose shape fits the narrow single-table slice (see
+/// [`is_narrow_select_shape`]) keep using the strict point/analytic binders, so complete-PK
+/// point reads still bind to [`PointSelect`] and narrow scans to [`AnalyticSelect`] with
+/// partition pruning and predicate pushdown. Everything else binds through the general
+/// query binder. The shape test is purely syntactic and evaluated before any deep binding;
+/// a narrow-shaped statement that fails deep binding reports that error rather than
+/// falling through.
 fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatement> {
+    if is_narrow_select_shape(query) {
+        return bind_narrow_select(query, catalog);
+    }
+    crate::binder_query::bind_query(query, catalog).map(BoundStatement::Query)
+}
+
+/// Whether a query has the shape handled by the narrow point/analytic binders:
+/// one unaliased table, no joins/CTEs/subqueries/set operations, no LIMIT/HAVING/DISTINCT,
+/// a projection of plain columns or `COUNT/SUM/MIN/MAX` over a plain column, an AND-only
+/// filter of `column op literal` / `IS [NOT] NULL` leaves, and GROUP BY / ORDER BY of plain
+/// unqualified columns.
+pub fn is_narrow_select_shape(query: &Query) -> bool {
+    if query.with.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return false;
+    }
+    let select = match &*query.body {
+        SetExpr::Select(s) => s,
+        _ => return false,
+    };
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.exclude.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.connect_by.is_empty()
+    {
+        return false;
+    }
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return false;
+    }
+    match &select.from[0].relation {
+        TableFactor::Table { alias: None, .. } => {}
+        _ => return false,
+    }
+    let is_ident = |e: &Expr| matches!(unnest(e), Expr::Identifier(_));
+    let is_literal = |e: &Expr| match unnest(e) {
+        Expr::Value(_) => true,
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr,
+        } => matches!(unnest(expr), Expr::Value(_)),
+        _ => false,
+    };
+    if select.projection.is_empty() {
+        return false;
+    }
+    for item in &select.projection {
+        let ok = match item {
+            SelectItem::Wildcard(_) => true,
+            SelectItem::UnnamedExpr(expr) => match unnest(expr) {
+                Expr::Identifier(_) => true,
+                Expr::Function(func) => {
+                    let name = match func.name.0.as_slice() {
+                        [ObjectNamePart::Identifier(ident)] => ident.value.to_ascii_uppercase(),
+                        _ => return false,
+                    };
+                    let list = match &func.args {
+                        FunctionArguments::List(list) => list,
+                        _ => return false,
+                    };
+                    func.over.is_none()
+                        && func.filter.is_none()
+                        && list.duplicate_treatment.is_none()
+                        && list.clauses.is_empty()
+                        && list.args.len() == 1
+                        && match (&list.args[0], name.as_str()) {
+                            (FunctionArg::Unnamed(FunctionArgExpr::Wildcard), "COUNT") => true,
+                            (
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)),
+                                "COUNT" | "SUM" | "MIN" | "MAX",
+                            ) => is_ident(arg),
+                            _ => false,
+                        }
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    fn unnest(e: &Expr) -> &Expr {
+        let mut cur = e;
+        while let Expr::Nested(inner) = cur {
+            cur = inner;
+        }
+        cur
+    }
+    fn is_narrow_filter(
+        e: &Expr,
+        is_ident: &dyn Fn(&Expr) -> bool,
+        is_literal: &dyn Fn(&Expr) -> bool,
+    ) -> bool {
+        match unnest(e) {
+            Expr::BinaryOp {
+                left,
+                op: sqlparser::ast::BinaryOperator::And,
+                right,
+            } => {
+                is_narrow_filter(left, is_ident, is_literal)
+                    && is_narrow_filter(right, is_ident, is_literal)
+            }
+            Expr::BinaryOp { left, op, right } => {
+                matches!(
+                    op,
+                    sqlparser::ast::BinaryOperator::Eq
+                        | sqlparser::ast::BinaryOperator::NotEq
+                        | sqlparser::ast::BinaryOperator::Lt
+                        | sqlparser::ast::BinaryOperator::LtEq
+                        | sqlparser::ast::BinaryOperator::Gt
+                        | sqlparser::ast::BinaryOperator::GtEq
+                ) && is_ident(left)
+                    && is_literal(right)
+            }
+            Expr::IsNull(inner) | Expr::IsNotNull(inner) => is_ident(inner),
+            _ => false,
+        }
+    }
+    if let Some(sel) = &select.selection {
+        if !is_narrow_filter(sel, &is_ident, &is_literal) {
+            return false;
+        }
+    }
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() || !exprs.iter().all(&is_ident) {
+                return false;
+            }
+        }
+        GroupByExpr::All(_) => return false,
+    }
+    if let Some(order_by) = &query.order_by {
+        if order_by.interpolate.is_some() {
+            return false;
+        }
+        match &order_by.kind {
+            sqlparser::ast::OrderByKind::Expressions(items) => {
+                if !items
+                    .iter()
+                    .all(|i| i.with_fill.is_none() && is_ident(&i.expr))
+                {
+                    return false;
+                }
+            }
+            sqlparser::ast::OrderByKind::All(_) => return false,
+        }
+    }
+    true
+}
+
+fn bind_narrow_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatement> {
     if query.with.is_some() {
         return Err(HtapError::Unsupported(
             "CTEs (WITH clause) not supported".into(),
@@ -2164,7 +2347,7 @@ fn is_simple_or_wildcard_projection(projection: &[SelectItem]) -> bool {
     true
 }
 
-fn is_pk_equality_where(expr: &Expr, table_desc: &TableDescriptor) -> bool {
+pub(crate) fn is_pk_equality_where(expr: &Expr, table_desc: &TableDescriptor) -> bool {
     let mut leaves = Vec::new();
     if collect_and_leaves(expr, &mut leaves).is_err() {
         return false;

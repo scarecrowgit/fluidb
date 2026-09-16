@@ -16,8 +16,14 @@ pub const CATALOG_FILE_NAME: &str = "CATALOG";
 pub const CATALOG_TMP_FILE_NAME: &str = "CATALOG.tmp";
 /// Header magic bytes ("HTAPCAT1").
 pub const HEADER_MAGIC: &[u8; 8] = b"HTAPCAT1";
-/// Supported catalog binary envelope format version.
-pub const FORMAT_VERSION: u16 = 1;
+/// Catalog binary envelope format version written by this build.
+///
+/// Version 2 added the persisted identifier high-water mark (`id_high_water`) to the JSON
+/// payload. Version 1 payloads are still decoded (the counters default to zero and the
+/// live maximum is used); a build that only knows version 1 refuses version 2 files.
+pub const FORMAT_VERSION: u16 = 2;
+/// Oldest catalog envelope format version this build still decodes.
+pub const LEGACY_FORMAT_VERSION: u16 = 1;
 /// Fixed header length (8 magic + 2 version + 4 payload_len + 4 crc32c = 18 bytes).
 pub const HEADER_LEN: usize = 18;
 /// Maximum allowed catalog payload size (64 MiB) to guard against unbounded allocations.
@@ -96,6 +102,21 @@ impl CatalogStore for LocalCatalogStore {
         // Validate snapshot semantics before touching disk
         next.validate()?;
 
+        // The identifier high-water mark must never regress: a successor that lowered it
+        // would let a later allocation reissue an id whose data may still exist on disk.
+        if let Some(cur) = &current {
+            let (before, after) = (cur.id_high_water(), next.id_high_water());
+            if after.table < before.table
+                || after.partition < before.partition
+                || after.tablet < before.tablet
+                || after.replica < before.replica
+            {
+                return Err(HtapError::InvalidArgument(format!(
+                    "catalog id high-water mark regressed: current {before:?}, next {after:?}"
+                )));
+            }
+        }
+
         // Persist atomically to disk
         atomic_publish(&self.dir, &next)?;
 
@@ -144,7 +165,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<CatalogSnapshot> {
     }
 
     let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION {
         return Err(HtapError::Corruption(format!(
             "unsupported catalog format version: {version}"
         )));
@@ -184,8 +205,18 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<CatalogSnapshot> {
         )));
     }
 
-    let snapshot: CatalogSnapshot = serde_json::from_slice(payload).map_err(|e| {
-        HtapError::Corruption(format!("failed to parse catalog snapshot JSON: {e}"))
+    let probe: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
+        HtapError::Corruption(format!("failed to deserialize catalog snapshot: {e}"))
+    })?;
+    // Version 2 payloads must carry the identifier high-water mark explicitly; only legacy
+    // version 1 payloads may omit it (they fall back to the live maximum).
+    if version == FORMAT_VERSION && probe.get("id_high_water").is_none() {
+        return Err(HtapError::Corruption(
+            "catalog format version 2 payload is missing id_high_water".into(),
+        ));
+    }
+    let snapshot: CatalogSnapshot = serde_json::from_value(probe).map_err(|e| {
+        HtapError::Corruption(format!("failed to deserialize catalog snapshot: {e}"))
     })?;
 
     // Validate the snapshot invariants

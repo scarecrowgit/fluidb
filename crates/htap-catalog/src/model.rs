@@ -716,6 +716,67 @@ pub struct CatalogSnapshot {
     pub tablets: Vec<TabletDescriptor>,
     /// All replicas across tablets.
     pub replicas: Vec<ReplicaDescriptor>,
+    /// Highest identifiers ever allocated, persisted so that identifiers of dropped objects
+    /// are never reissued (rowstore and columnar data are keyed by these ids and are not
+    /// physically reclaimed on drop). Catalogs written before this field existed decode
+    /// with zeros; [`CatalogSnapshot::id_high_water`] then falls back to the live maximum.
+    #[serde(default)]
+    pub id_high_water: IdHighWater,
+}
+
+/// Highest identifier ever allocated per identifier space.
+///
+/// Allocation must always start above `max(persisted counter, highest live id)`; see
+/// [`CatalogSnapshot::id_high_water`] and [`IdHighWater::allocate`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdHighWater {
+    /// Highest table id ever allocated.
+    pub table: u64,
+    /// Highest partition id ever allocated.
+    pub partition: u64,
+    /// Highest tablet id ever allocated.
+    pub tablet: u64,
+    /// Highest replica id ever allocated.
+    pub replica: u64,
+}
+
+impl IdHighWater {
+    /// Merges two high-water marks by taking the maximum of each counter.
+    pub fn max(self, other: IdHighWater) -> IdHighWater {
+        IdHighWater {
+            table: self.table.max(other.table),
+            partition: self.partition.max(other.partition),
+            tablet: self.tablet.max(other.tablet),
+            replica: self.replica.max(other.replica),
+        }
+    }
+
+    fn bump(counter: &mut u64, name: &'static str) -> Result<u64> {
+        *counter = counter
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow { counter: name })?;
+        Ok(*counter)
+    }
+
+    /// Allocates the next table id.
+    pub fn allocate_table(&mut self) -> Result<TableId> {
+        Self::bump(&mut self.table, "table_id").map(TableId::new)
+    }
+
+    /// Allocates the next partition id.
+    pub fn allocate_partition(&mut self) -> Result<PartitionId> {
+        Self::bump(&mut self.partition, "partition_id").map(PartitionId::new)
+    }
+
+    /// Allocates the next tablet id.
+    pub fn allocate_tablet(&mut self) -> Result<TabletId> {
+        Self::bump(&mut self.tablet, "tablet_id").map(TabletId::new)
+    }
+
+    /// Allocates the next replica id.
+    pub fn allocate_replica(&mut self) -> Result<ReplicaId> {
+        Self::bump(&mut self.replica, "replica_id").map(ReplicaId::new)
+    }
 }
 
 /// Trait for partition lookup sources used during partition value routing.
@@ -853,6 +914,7 @@ impl CatalogSnapshot {
             partitions: Vec::new(),
             tablets: Vec::new(),
             replicas: Vec::new(),
+            id_high_water: IdHighWater::default(),
         }
     }
 
@@ -870,7 +932,42 @@ impl CatalogSnapshot {
             partitions,
             tablets,
             replicas,
+            id_high_water: IdHighWater::default(),
         }
+    }
+
+    /// Sets the persisted identifier high-water mark (see [`CatalogSnapshot::id_high_water`]).
+    pub fn with_id_high_water(mut self, high_water: IdHighWater) -> Self {
+        self.id_high_water = high_water;
+        self
+    }
+
+    /// Effective identifier high-water mark: the maximum of the persisted counters and the
+    /// highest id of every live table, partition, tablet, and replica. New identifiers must be
+    /// allocated above this mark so that ids of dropped objects are never reused.
+    pub fn id_high_water(&self) -> IdHighWater {
+        let live = IdHighWater {
+            table: self.tables.iter().map(|t| t.id.as_u64()).max().unwrap_or(0),
+            partition: self
+                .partitions
+                .iter()
+                .map(|p| p.id.as_u64())
+                .max()
+                .unwrap_or(0),
+            tablet: self
+                .tablets
+                .iter()
+                .map(|t| t.id.as_u64())
+                .max()
+                .unwrap_or(0),
+            replica: self
+                .replicas
+                .iter()
+                .map(|r| r.id.as_u64())
+                .max()
+                .unwrap_or(0),
+        };
+        self.id_high_water.max(live)
     }
 
     /// Find a table descriptor by table ID.
@@ -1030,24 +1127,7 @@ impl CatalogSnapshot {
                 counter: "catalog_generation",
             })?;
 
-        let mut cur_partition_id = self
-            .partitions
-            .iter()
-            .map(|p| p.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let mut cur_tablet_id = self
-            .tablets
-            .iter()
-            .map(|t| t.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let mut cur_replica_id = self
-            .replicas
-            .iter()
-            .map(|r| r.id.as_u64())
-            .max()
-            .unwrap_or(0);
+        let mut high_water = self.id_high_water();
 
         let validate_part_def = |def: &PartitionDefinition,
                                  table_name: &str|
@@ -1160,29 +1240,9 @@ impl CatalogSnapshot {
                 let mut new_partition_ids = Vec::with_capacity(validated_items.len());
 
                 for (part_name, range_opt, list_values) in validated_items {
-                    cur_partition_id =
-                        cur_partition_id
-                            .checked_add(1)
-                            .ok_or(HtapError::CounterOverflow {
-                                counter: "partition_id",
-                            })?;
-                    let partition_id = PartitionId::new(cur_partition_id);
-
-                    cur_tablet_id =
-                        cur_tablet_id
-                            .checked_add(1)
-                            .ok_or(HtapError::CounterOverflow {
-                                counter: "tablet_id",
-                            })?;
-                    let tablet_id = TabletId::new(cur_tablet_id);
-
-                    cur_replica_id =
-                        cur_replica_id
-                            .checked_add(1)
-                            .ok_or(HtapError::CounterOverflow {
-                                counter: "replica_id",
-                            })?;
-                    let replica_id = ReplicaId::new(cur_replica_id);
+                    let partition_id = high_water.allocate_partition()?;
+                    let tablet_id = high_water.allocate_tablet()?;
+                    let replica_id = high_water.allocate_replica()?;
 
                     let replica_desc = ReplicaDescriptor::new(
                         replica_id,
@@ -1246,7 +1306,8 @@ impl CatalogSnapshot {
                 replicas.extend(new_replicas);
 
                 let candidate =
-                    CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas);
+                    CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas)
+                        .with_id_high_water(high_water);
                 candidate.validate()?;
                 Ok(candidate)
             }
@@ -1355,7 +1416,8 @@ impl CatalogSnapshot {
                     remaining_partitions,
                     remaining_tablets,
                     remaining_replicas,
-                );
+                )
+                .with_id_high_water(high_water);
                 candidate.validate()?;
                 Ok(candidate)
             }
@@ -1449,29 +1511,9 @@ impl CatalogSnapshot {
                 let mut target_partition_ids = Vec::with_capacity(validated_targets.len());
 
                 for (part_name, range_opt, list_values) in validated_targets {
-                    cur_partition_id =
-                        cur_partition_id
-                            .checked_add(1)
-                            .ok_or(HtapError::CounterOverflow {
-                                counter: "partition_id",
-                            })?;
-                    let partition_id = PartitionId::new(cur_partition_id);
-
-                    cur_tablet_id =
-                        cur_tablet_id
-                            .checked_add(1)
-                            .ok_or(HtapError::CounterOverflow {
-                                counter: "tablet_id",
-                            })?;
-                    let tablet_id = TabletId::new(cur_tablet_id);
-
-                    cur_replica_id =
-                        cur_replica_id
-                            .checked_add(1)
-                            .ok_or(HtapError::CounterOverflow {
-                                counter: "replica_id",
-                            })?;
-                    let replica_id = ReplicaId::new(cur_replica_id);
+                    let partition_id = high_water.allocate_partition()?;
+                    let tablet_id = high_water.allocate_tablet()?;
+                    let replica_id = high_water.allocate_replica()?;
 
                     let replica_desc = ReplicaDescriptor::new(
                         replica_id,
@@ -1572,7 +1614,8 @@ impl CatalogSnapshot {
                 replicas.extend(new_replicas);
 
                 let candidate =
-                    CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas);
+                    CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas)
+                        .with_id_high_water(high_water);
                 candidate.validate()?;
                 Ok(candidate)
             }

@@ -814,3 +814,231 @@ for a protocol crate, without changing `htap-client::RemoteClient`'s public API,
   `test_mysql_crate_driver_interop`.
 - `crates/htap-client/tests/remote_client.rs::test_remote_client_matches_embedded_client_ddl_dml_select`.
 - `crates/htap-client/src/remote.rs::decode_command_convention`.
+
+---
+
+## ADR-017: General query executor over materialized logical rows with one snapshot per statement; UPDATE as versioned Put; DROP TABLE metadata-only with persisted identifier high-water mark (catalog format v2)
+
+`Status: Accepted`
+`Date: 2026-09-16`
+
+### Context
+
+Phases 3-8 deliberately kept SQL to a narrow single-table slice (`PointSelect`/`AnalyticSelect`) so R5 (point
+lookups structurally bypass the analytical engine) could be enforced by construction rather than by a
+runtime cost heuristic. Phase 9 needed to add the SQL breadth users actually need on an HTAP engine — joins
+across storage engines, expressions, subqueries, set operations, `UPDATE`, `DROP TABLE`, `SHOW` — without
+weakening that guarantee, without a new query planner/optimizer investment out of scope for a local MVP, and
+without regressing durability invariants (one MVCC version domain, rowstore-authoritative writes, atomic
+catalog publication; see ADR-004/008/009).
+
+### Options considered
+
+**Execution model for joins/general queries:**
+- **(a) Vectorized / pipelined execution engine (Arrow-style operators over `RecordBatch`).** Rejected for
+  this phase: `htap-colstore` already has a vectorized scan primitive (`SegmentReader::scan`), but building a
+  vectorized join/aggregate/sort operator pipeline on top of it is a multi-week investment disproportionate
+  to a local MVP, and none of the existing SQL paths (including the narrow `AnalyticSelect` path) are
+  vectorized above the scan primitive either — introducing it only for joins would create two execution
+  models to maintain.
+- **(b) Unify the narrow `AnalyticSelect` path into the general executor (single code path for all SELECTs).**
+  Rejected: it would remove the purely structural separation R5 depends on — a single binder/executor for
+  every `SELECT` shape makes "point lookups never touch analytical code" a runtime property (which shape did
+  this statement take?) instead of a compile-time one (this route variant never calls that function). Keeping
+  two binders and two routes, gated by a syntactic pre-check, preserves the stronger guarantee.
+- **(c) General query executor over materialized logical rows (`Vec<Row>` in memory), reusing the existing
+  per-partition storage path (`scan_partition_compact`) for every base table side, hash-joining and
+  evaluating expressions/aggregates/ordering in memory, gated in front of the narrow binders by a purely
+  syntactic shape test.** Chosen.
+
+**UPDATE implementation:**
+- **(d) Delete-then-insert (represent UPDATE as a `Mutation::Delete` plus a `Mutation::Put`).** Rejected: it
+  would create a visible gap in the MVCC version chain — a reader whose snapshot lands between the two
+  mutations would see the row disappear and reappear, which correctness-sensitive callers should never
+  observe for a value that only changed, not disappeared. It also complicates the "no resurrection" tombstone
+  invariant the rowstore already guarantees for real deletes.
+- **(e) A new `Mutation::Update` variant with in-place value patching in the rowstore.** Rejected: it would
+  touch the rowstore's core mutation representation and WAL format for a single SQL-layer feature, when the
+  same effect is already expressible as a versioned `Put` under the existing key — no new on-disk format or
+  WAL record type needed.
+- **(f) A single new-version `Mutation::Put` under the existing key, computed by reading the current row at
+  the statement's snapshot and applying assignments in the SQL layer.** Chosen: reuses the existing MVCC
+  version chain, WAL record, and 2PC path unchanged; a reader's snapshot sees either the old value or the new
+  value, never a gap.
+- **(g) Chunk a large scan-form `UPDATE` across multiple transactions to avoid the 2PC payload cap.**
+  Rejected for this phase: chunking would mean a scan-form `UPDATE` is no longer atomic (a crash mid-chunk
+  leaves some rows updated and others not), which is a correctness regression relative to today's INSERT/
+  DELETE, which always commit as one transaction. Keeping `UPDATE` as one transaction bounded by the existing
+  16 MiB payload cap (documented as a limitation, not silently chunked) preserves atomicity; a future streaming/
+  chunked-with-explicit-multi-statement-semantics design is deferred.
+
+**DROP TABLE and identifier reuse:**
+- **(h) Physical reclamation on DROP TABLE (delete rowstore SSTs/WAL entries and columnar segment files for
+  the dropped tablets).** Rejected for this phase: physical reclamation of rowstore history and columnar
+  segments is already deferred project-wide (compaction, demotion file cleanup — see ADR-015); scoping it
+  narrowly to DROP TABLE would be inconsistent with that existing deferral and adds nontrivial risk (deleting
+  live files referenced by a catalog CAS that could still be rolled back by a concurrent reader of the old
+  snapshot) for a local MVP.
+- **(i) Metadata-only DROP TABLE (single catalog CAS removing table/partition/tablet/replica records) with no
+  identifier reuse guarantee.** Rejected alone: without a reuse guarantee, a new table created after a drop
+  could be assigned a recycled tablet id whose rowstore/columnar files still exist on disk from the dropped
+  table, aliasing unrelated historical data into the new table's storage paths.
+- **(j) Metadata-only DROP TABLE plus a persisted identifier high-water mark (`IdHighWater`) so every
+  allocator draws from `max(persisted, live max) + 1`, closing the reuse hazard without doing physical I/O.**
+  Chosen.
+- **(k) Stay at catalog format version 1 and add the high-water counters as additive/optional fields without
+  bumping the version.** Rejected: CLAUDE.md's durability rule is explicit — a layout change bumps the format
+  version and keeps or explicitly rejects old versions with a recovery test; treating a new persisted field
+  as "free" because `serde(default)` makes old files parse would hide the compatibility decision (should a
+  reader silently default the counters, and is that safe?) instead of recording it. Bumping to version 2,
+  defining the version-1 fallback explicitly (fall back to the live maximum id), and adding a recovery test
+  makes the compatibility contract visible and testable.
+
+### Decision
+
+1. **General query executor (`htap-sql::{query, expr, binder_query}`, `htap-server::query_exec`).** Every
+   statement shape the narrow binders don't handle binds to `BoundStatement::Query(BoundQuery)` and routes to
+   the new `Route::Query`. Execution materializes every base table side of a join through the *same*
+   `scan_partition_compact` storage path the narrow `Route::OlapScan` executor already uses, at **one** MVCC
+   `Snapshot` per statement, then evaluates joins (hash join on equi-conjuncts, nested loop for residual `ON`
+   predicates), `WHERE`, `GROUP BY`/aggregation, projection, `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT`/
+   `OFFSET`, and `UNION` as sequential in-memory stages over `Vec<Row>`. Per-slot partition pruning and
+   single-leaf predicate pushdown are derived exactly as on the narrow path, except on the null-supplying
+   side of an outer join, where a would-be-pushed conjunct is kept as a residual filter instead.
+2. **R5 preserved structurally by a syntactic pre-check.** `bind_select` calls `is_narrow_select_shape`
+   (`crates/htap-sql/src/binder.rs`) — a check over the raw AST, with no catalog lookups or type checking —
+   *before* any deep binding. A statement matching the narrow shape (one unaliased table, no joins/CTEs/
+   subqueries/set operations, no `LIMIT`/`HAVING`/`DISTINCT`, a plain-column or single-aggregate projection,
+   an AND-only filter of `column op literal`/`IS [NOT] NULL` leaves, plain unqualified `GROUP BY`/`ORDER BY`)
+   still binds through the strict `PointSelect`/`AnalyticSelect` binders unchanged; everything else binds
+   through the general query binder. A narrow-shaped statement that fails deep binding (e.g. an unknown
+   column) reports that binder's error rather than silently falling through to the general path, so the
+   error surface for the narrow shapes is unchanged too.
+3. **`UPDATE` as a single new-version `Mutation::Put` under the existing key.** Both the point form
+   (complete-PK `WHERE`) and the scan form (general `WHERE` or none) read the current row(s) at the
+   statement's snapshot, apply assignments left to right in the SQL layer, and commit the result as
+   `Mutation::Put`(s) through the existing `TransactionManager`/`RowstoreParticipant` 2PC path — no new
+   mutation kind, WAL record, or on-disk format. The scan form commits all rewritten rows in **one**
+   transaction, bounded by the existing 16 MiB 2PC payload cap with no chunking.
+4. **`DROP TABLE` is metadata-only, with a persisted identifier high-water mark closing the reuse hazard.**
+   `CatalogSnapshot.id_high_water: IdHighWater { table, partition, tablet, replica }`
+   (`crates/htap-catalog/src/model.rs`) is persisted, and every allocator (`CREATE TABLE`, `ALTER TABLE ADD/
+   REORGANIZE PARTITION`) draws the next id from `max(persisted, live max) + 1`. The catalog envelope
+   (`HTAPCAT1`) `FORMAT_VERSION` bumps 1 -> 2 (`crates/htap-catalog/src/local.rs`); a version-1 catalog still
+   decodes (`LEGACY_FORMAT_VERSION = 1`), with counters defaulting to zero and `id_high_water()` falling back
+   to the live maximum id present in the snapshot, and is rewritten as version 2 on the next CAS. A
+   version-1-only binary refuses a version-2 (or any other unrecognized) catalog rather than misinterpreting
+   it; conversely, a version-2 payload that omits the `id_high_water` key is rejected as corruption, so a
+   version-2 file always carries the field explicitly. Physical reclamation of the dropped table's
+   rowstore/columnar data remains deferred, consistent with the rest of the project's deferred-reclamation
+   scope (see ADR-015).
+5. **Closing three follow-on gaps found by storage review before this ADR's diff checkpoint, all fixed and
+   covered by tests before merge:**
+   - **Legacy tablet directories are invisible to the live-max fallback.** A version-1 catalog could have
+     removed empty partitions via `ALTER TABLE ... DROP PARTITION` (a Phase 3 feature, pre-dating this ADR),
+     whose `colstore/tablet-*` directories can remain on disk with no partition left in the catalog
+     referencing them — the live in-catalog maximum tablet id cannot see them, so the version-1 fallback
+     described in decision 4 was not enough on its own to prevent a later allocation from reissuing one of
+     those ids. `LocalServer::open` now calls `migrate_legacy_id_high_water`
+     (`crates/htap-server/src/lib.rs`) after storage validation, while still holding the root `ProcessLock`:
+     if the persisted mark is exactly all zeros (a genuine unmigrated version-1 catalog), it raises the
+     tablet counter to the highest `colstore/tablet-N`/`tablet_N` directory found on disk, merges it with the
+     live maximum, and persists the result via one catalog CAS (a one-time write, bumping the generation and
+     rewriting the file as version 2, on first open of a legacy root). Partition ids do not need this
+     treatment, because rowstore data of a partition dropped under version 1 is always logically empty
+     (`DROP PARTITION` requires it). This migration seeds only the tablet counter, not replica ids removed
+     along with those tablets — see the remaining gap noted under decision 4's cross-reference in
+     `docs/LIMITATIONS.md` and `docs/ARCHITECTURE.md`; it was scoped out as narrow (requires reusing both a
+     replica id and a job id) rather than fixed in this ADR.
+   - **Nothing prevented a future code path from regressing the mark.** A successor snapshot built with
+     `CatalogSnapshot::new` (bypassing the high-water-aware constructors) could omit or lower
+     `id_high_water`, silently reopening the reuse hazard on the next CAS. `LocalCatalogStore::compare_and_set`
+     (`crates/htap-catalog/src/local.rs`) now rejects, with `HtapError::InvalidArgument` and the file left
+     untouched, any successor whose effective `id_high_water()` is lower, component-wise, than the current
+     file's.
+   - **Replica ids were still allocated from the live maximum, not the persisted mark.** A `ReplicaId` names
+     a movement snapshot package directory on disk (see "Sharding and placement" in
+     `docs/ARCHITECTURE.md`), so it has the same reuse hazard as a tablet id. `plan_placement`
+     (`crates/htap-coord/src/placement.rs`) now allocates new replica ids from
+     `snapshot.id_high_water().replica + 1`, and `stage_placement_addition` raises the persisted mark in the
+     snapshot it stages, so a removed-and-recreated replica id is never reissued either.
+
+### Consequences
+
+- Joins, expressions, aggregates, subqueries, and set operations work across `Row`, `Column`, and
+  `Converting` storage formats in one query, at one consistent snapshot, without weakening R5: the point-
+  lookup and narrow-scan code paths are exactly as isolated as before, verified by a pin test that checks
+  near-miss shapes (PK predicate plus `LIMIT`/alias/`OR`/join) fail the gate and route through `Route::Query`
+  instead of silently keeping — or silently losing — the extra clause.
+- `UPDATE`'s correctness rides entirely on rowstore MVCC semantics that already exist; no new durability
+  surface was introduced, but `UPDATE`'s two-step read-then-write shape is the first SQL path to make visible
+  a pre-existing gap: `LocalServerDataMover`'s methods (`import`, `repair_tablet`) do not take
+  `execution_lock`, so a caller sharing one `LocalServer` across threads can race an `UPDATE` against a
+  concurrent import/repair on the same table. This is documented as a known limitation, not fixed in this
+  phase.
+- `DROP TABLE` is fast (one catalog CAS) and safe against identifier aliasing, but does not reclaim disk
+  space; operators must account for that when sizing storage (see `docs/OPERATIONS.md`).
+- The general query executor has no cost-based planning, no spilling, and no worker-pool parallelism above
+  the per-slot scan (each slot's own partition scan still uses the narrow path's scan workers internally);
+  it is sized for correctness and breadth on a local MVP, not for large analytical workloads.
+- Catalog readers/writers must handle two format versions going forward; the fail-loud version-2-refusal
+  behavior in a version-1-only binary is a deliberate compatibility boundary, not a bug, per the format-
+  version rule in `CLAUDE.md` (bump + explicit old-version handling + recovery test).
+
+### How to reverse it
+
+The general query executor is additive: removing `Route::Query`/`query_exec` and reverting `bind_select` to
+always use the narrow binders would restore the Phase 3-8 SQL surface without touching the rowstore, colstore,
+or catalog formats (the catalog format bump is not reversible without another format-version bump, since
+`IdHighWater` is now persisted). `UPDATE` and `DROP TABLE` could be removed independently of the general query
+executor, since `UPDATE`'s scan form is the only part that depends on `query_exec` (via `scan_base_table`).
+
+### Test Evidence
+
+- `crates/htap-sql/src/expr.rs` unit tests: `three_valued_logic_tables`, `numeric_promotion_and_overflow`,
+  `like_in_between_case_cast`, `scalar_functions`, `subquery_and_aggregate_context`, `expr_type_inference`.
+- `crates/htap-sql/tests/query_bind.rs`: `test_join_binding_kinds_aliases_and_wildcards`,
+  `test_join_binding_errors`, `test_expressions_functions_and_type_checks`,
+  `test_aggregates_group_by_having_and_grouping_rules`, `test_order_by_limit_distinct`,
+  `test_subqueries_ctes_derived_tables_and_union`, `test_update_drop_show_binding`,
+  `test_bound_predicate_evaluation_with_joined_rows`.
+- `crates/htap-sql/tests/route.rs`: `test_route_classification`,
+  `test_point_read_fast_path_pinned_against_general_query_path` (R5 pin test).
+- `crates/htap-sql/tests/parse_bind.rs`: `test_negative_select_and_delete`,
+  `test_bind_analytic_select_negative`.
+- `crates/htap-server/tests/query_exec.rs`: `test_joins_across_row_column_and_converting_tables`,
+  `test_outer_joins_null_padding_residual_on_and_null_keys`,
+  `test_expressions_aggregates_having_order_limit_distinct`,
+  `test_union_derived_tables_ctes_and_subqueries`, `test_partition_pruning_and_pushdown_through_general_path`,
+  `test_single_snapshot_across_engines_and_freshness`, `test_general_query_over_reopened_server`,
+  `test_update_by_primary_key_and_reopen_recovery`,
+  `test_update_by_filter_across_partitions_and_storage_formats_with_reopen`,
+  `test_update_by_primary_key_on_column_and_converting_partitions` (point `UPDATE` against a `Column`
+  partition plus reopen, and against a partition mid-conversion, verifying the delta survives a subsequent
+  `conversion_tick`), `test_show_tables_databases_columns_and_describe`,
+  `test_drop_table_reopen_and_no_id_reuse`,
+  `test_legacy_catalog_seeds_tablet_high_water_from_colstore_inventory` (decision 5, legacy migration).
+- `crates/htap-server/tests/local_server.rs`: `test_analytic_unsupported_clauses`,
+  `test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point`.
+- `crates/htap-catalog/tests/catalog_recovery.rs`:
+  `test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max` (format-version fallback),
+  `test_catalog_id_high_water_prevents_reuse_after_removal` (no-reuse guarantee),
+  `test_catalog_cas_rejects_regressing_id_high_water` (decision 5, CAS regression guard),
+  `test_catalog_v2_payload_without_id_high_water_is_rejected` (decision 4, fail-loud missing field),
+  `test_corruption_and_truncation` (updated to use format version 3 as the unsupported/future version,
+  proving the fail-loud refusal path).
+- `crates/htap-coord/tests/placement_movement.rs::test_plan_placement_allocates_above_id_high_water`
+  (decision 5, replica id allocation from the persisted mark).
+- `crates/htap-client/tests/embedded_client.rs::test_embedded_client_unsupported_sql_preserves_error_categories`,
+  `crates/htap-client/tests/remote_client.rs::test_remote_client_matches_embedded_client_ddl_dml_select`.
+- `crates/htap-wire/tests/wire_server.rs::test_general_sql_over_wire` (`LEFT JOIN` + `GROUP BY` + `LIMIT`,
+  `UPDATE`, `SHOW TABLES`, `DESCRIBE`, `DROP TABLE` reachable unchanged over the MySQL wire protocol, since
+  `htap-wire` passes every non-shim statement through to `LocalServer::execute` — see ADR-016).
+
+Cross-references: ADR-004 (unified MVCC version domain, rowstore-authoritative writes — preserved: `UPDATE`
+still commits exclusively through `RowstoreParticipant`), ADR-008 (partition-scoped conversion state machine
+— unaffected: the general executor reads converted partitions through the same compact-read path, never
+mutates conversion state), ADR-009 (durable synchronous local coordinator — unaffected: `DROP TABLE` and
+`UPDATE` go through the same unfenced `CatalogStore::compare_and_set` / `TransactionManager` paths as other
+non-coordinator-mediated local operations), and ADR-001 (structural R5 separation, extended rather than
+weakened by the syntactic shape gate in decision 2 above).

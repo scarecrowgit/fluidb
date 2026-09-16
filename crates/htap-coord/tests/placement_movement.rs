@@ -871,3 +871,40 @@ fn test_placement_overflow_boundaries_no_catalog_mutation() {
     // Verify catalog generation was not mutated
     assert_eq!(catalog3.current_generation().unwrap(), 1);
 }
+
+/// Replica ids are allocated above the persisted identifier high-water mark, so ids of
+/// replicas removed earlier (e.g. by `DROP TABLE`) are never reissued even when the live
+/// maximum is lower. Staging carries the raised mark into the catalog.
+#[test]
+fn test_plan_placement_allocates_above_id_high_water() {
+    use htap_catalog::IdHighWater;
+    let (snapshot, _schema) = create_single_tablet_fixture(
+        TableId::new(1),
+        PartitionId::new(11),
+        TabletId::new(101),
+        ReplicaId::new(1001),
+        NodeId::new(1),
+    );
+    let live_max = snapshot.replicas.iter().map(|r| r.id.get()).max().unwrap();
+    assert_eq!(live_max, 1001);
+    let snapshot = snapshot.with_id_high_water(IdHighWater {
+        replica: 1005,
+        ..IdHighWater::default()
+    });
+    let candidates = [NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+    let plan = plan_placement(&snapshot, &candidates, 3).unwrap();
+    assert_eq!(plan.additions.len(), 2);
+    assert_eq!(plan.additions[0].replica_id, ReplicaId::new(1006));
+    assert_eq!(plan.additions[1].replica_id, ReplicaId::new(1007));
+
+    // Without a persisted mark the allocation still starts above the live maximum.
+    let (plain, _) = create_single_tablet_fixture(
+        TableId::new(1),
+        PartitionId::new(11),
+        TabletId::new(101),
+        ReplicaId::new(1001),
+        NodeId::new(1),
+    );
+    let plan = plan_placement(&plain, &candidates, 2).unwrap();
+    assert_eq!(plan.additions[0].replica_id, ReplicaId::new(1002));
+}

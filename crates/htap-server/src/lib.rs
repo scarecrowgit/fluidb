@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 pub mod olap;
+mod query_exec;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
 pub use htap_catalog::{
-    CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase,
+    CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase, IdHighWater,
     ListPartitionDefinition, NodeId, PartitionAlteration, PartitionDefinition, PartitionDescriptor,
     PartitionId, PartitioningDescriptor, PartitioningMethod, RangeBound, RangePartitionDefinition,
     ReplicaDescriptor, ReplicaId, StorageDescriptor, StorageFormat, TableDescriptor, TableId,
@@ -36,8 +37,9 @@ use htap_movement::{
 use htap_rowstore::{Engine, EngineOptions, Snapshot};
 use htap_sql::ast::{
     AnalyticSelect, BoundPartitioning, BoundStatement, CreateTable, DeleteByPrimaryKey, Insert,
-    PointSelect,
+    PointSelect, UpdateStatement, UpdateTarget,
 };
+use htap_sql::ast::{DropTableStatement, ShowStatement};
 use htap_sql::result::StatementResult;
 use htap_sql::route::{classify_route, Route};
 use htap_txn::{
@@ -173,6 +175,7 @@ impl LocalServer {
         std::fs::create_dir_all(&colstore_dir)?;
 
         Self::validate_storage_state_on_open(&catalog, &colstore_dir)?;
+        Self::migrate_legacy_id_high_water(&catalog, &colstore_dir)?;
 
         Ok(Self {
             _lock: lock_guard,
@@ -282,7 +285,100 @@ impl LocalServer {
                 )?;
                 self.alter_partitions_internal(&alter.table, &alter.alteration)
             }
+            BoundStatement::Query(query) => {
+                // Every base slot must be a known table; storage descriptors of all
+                // partitions are accepted (rowstore, columnar, converting).
+                for slot in Self::general_base_tables(&query) {
+                    let (_, partitions) = self.resolve_table_and_all_partitions(&slot, &catalog)?;
+                    for partition in partitions {
+                        let _route = classify_route(
+                            &BoundStatement::Query(query.clone()),
+                            &partition.storage,
+                        )?;
+                    }
+                }
+                query_exec::execute_query(self, &query, &catalog)
+            }
+            BoundStatement::Update(update) => {
+                let table_desc = self.resolve_table(&update.table, &catalog)?;
+                match &update.target {
+                    UpdateTarget::PrimaryKey(key_values) => {
+                        let partition_id =
+                            self.route_pk_to_partition(table_desc, key_values, &catalog)?;
+                        let partition =
+                            self.validate_partition(table_desc, partition_id, &catalog)?;
+                        let route = classify_route(
+                            &BoundStatement::Update(update.clone()),
+                            &partition.storage,
+                        )?;
+                        let key = match route {
+                            Route::RowstoreUpdate { key: Some(key) } => key,
+                            _ => unreachable!(),
+                        };
+                        self.execute_update_by_key(&update, table_desc, partition.id, key)
+                    }
+                    UpdateTarget::Filter(filter) => {
+                        let (_, partitions) =
+                            self.resolve_table_and_all_partitions(&update.table, &catalog)?;
+                        for partition in &partitions {
+                            let _route = classify_route(
+                                &BoundStatement::Update(update.clone()),
+                                &partition.storage,
+                            )?;
+                        }
+                        self.execute_update_by_filter(
+                            &update,
+                            table_desc,
+                            filter.as_ref(),
+                            &catalog,
+                        )
+                    }
+                }
+            }
+            BoundStatement::DropTable(drop) => {
+                let _route = classify_route(
+                    &BoundStatement::DropTable(drop.clone()),
+                    &StorageDescriptor::Row,
+                )?;
+                self.execute_drop_table(&drop, &catalog)
+            }
+            BoundStatement::Show(show) => {
+                let _route =
+                    classify_route(&BoundStatement::Show(show.clone()), &StorageDescriptor::Row)?;
+                Self::execute_show(&show, &catalog)
+            }
         }
+    }
+
+    /// Names of every base table referenced anywhere in a bound query (including derived
+    /// tables, CTEs, subqueries, and set-operation branches).
+    fn general_base_tables(query: &htap_sql::BoundQuery) -> Vec<String> {
+        fn walk(query: &htap_sql::BoundQuery, out: &mut Vec<String>) {
+            for sub in &query.subqueries {
+                walk(sub, out);
+            }
+            match &query.body {
+                htap_sql::QueryBody::Select(sel) => {
+                    for slot in &sel.slots {
+                        match slot {
+                            htap_sql::TableSlot::Base { table, .. } => {
+                                if !out.contains(table) {
+                                    out.push(table.clone());
+                                }
+                            }
+                            htap_sql::TableSlot::Derived { query, .. } => walk(query, out),
+                        }
+                    }
+                }
+                htap_sql::QueryBody::SetOp { left, right, .. } => {
+                    walk(left, out);
+                    walk(right, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(query, &mut out);
+        out
     }
 
     /// Internal lock-safe helper for table creation (unpartitioned and partitioned).
@@ -301,37 +397,8 @@ impl LocalServer {
             )));
         }
 
-        let max_table_id = catalog
-            .tables
-            .iter()
-            .map(|t| t.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let next_table_id = max_table_id
-            .checked_add(1)
-            .ok_or(HtapError::CounterOverflow {
-                counter: "table_id",
-            })?;
-        let table_id = TableId::new(next_table_id);
-
-        let mut cur_partition_id = catalog
-            .partitions
-            .iter()
-            .map(|p| p.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let mut cur_tablet_id = catalog
-            .tablets
-            .iter()
-            .map(|t| t.id.as_u64())
-            .max()
-            .unwrap_or(0);
-        let mut cur_replica_id = catalog
-            .replicas
-            .iter()
-            .map(|r| r.id.as_u64())
-            .max()
-            .unwrap_or(0);
+        let mut high_water = catalog.id_high_water();
+        let table_id = high_water.allocate_table()?;
 
         let next_generation =
             catalog
@@ -347,27 +414,9 @@ impl LocalServer {
         let mut new_replicas = Vec::with_capacity(partition_items.len());
 
         for (part_name, range_opt, list_values) in partition_items {
-            cur_partition_id =
-                cur_partition_id
-                    .checked_add(1)
-                    .ok_or(HtapError::CounterOverflow {
-                        counter: "partition_id",
-                    })?;
-            let partition_id = PartitionId::new(cur_partition_id);
-
-            cur_tablet_id = cur_tablet_id
-                .checked_add(1)
-                .ok_or(HtapError::CounterOverflow {
-                    counter: "tablet_id",
-                })?;
-            let tablet_id = TabletId::new(cur_tablet_id);
-
-            cur_replica_id = cur_replica_id
-                .checked_add(1)
-                .ok_or(HtapError::CounterOverflow {
-                    counter: "replica_id",
-                })?;
-            let replica_id = ReplicaId::new(cur_replica_id);
+            let partition_id = high_water.allocate_partition()?;
+            let tablet_id = high_water.allocate_tablet()?;
+            let replica_id = high_water.allocate_replica()?;
 
             let replica_desc = ReplicaDescriptor::new(
                 replica_id,
@@ -432,7 +481,8 @@ impl LocalServer {
         replicas.extend(new_replicas);
 
         let next_snapshot =
-            CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas);
+            CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas)
+                .with_id_high_water(high_water);
 
         self.catalog
             .compare_and_set(catalog.generation, next_snapshot)?;
@@ -841,6 +891,274 @@ impl LocalServer {
         Ok(StatementResult::dml(1, Some(committed.version)))
     }
 
+    /// `DROP TABLE`: removes the table and its partitions, tablets, and replicas from the
+    /// catalog in one CAS. Storage is not reclaimed: rowstore data and columnar segments of
+    /// the dropped partitions stay on disk, unreachable because their identifiers are never
+    /// reissued (see [`IdHighWater`]). Tables with a partition in `Converting` state cannot be
+    /// dropped until the conversion finishes.
+    fn execute_drop_table(
+        &self,
+        drop: &DropTableStatement,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        let Some(table_desc) = catalog.table_by_name(&drop.table) else {
+            if drop.if_exists {
+                return Ok(StatementResult::ddl(0));
+            }
+            return Err(HtapError::NotFound(format!(
+                "table '{}' not found",
+                drop.table
+            )));
+        };
+        let table_id = table_desc.id;
+        let dropped_partitions: Vec<&PartitionDescriptor> = catalog
+            .partitions
+            .iter()
+            .filter(|p| p.table_id == table_id)
+            .collect();
+        if let Some(converting) = dropped_partitions
+            .iter()
+            .find(|p| matches!(p.storage, StorageDescriptor::Converting { .. }))
+        {
+            return Err(HtapError::Conflict(format!(
+                "table '{}' cannot be dropped while partition '{}' is converting",
+                drop.table, converting.name
+            )));
+        }
+        let tablet_ids: std::collections::HashSet<TabletId> = dropped_partitions
+            .iter()
+            .flat_map(|p| p.tablets.iter().copied())
+            .collect();
+        let replica_ids: std::collections::HashSet<ReplicaId> = catalog
+            .tablets
+            .iter()
+            .filter(|t| tablet_ids.contains(&t.id))
+            .flat_map(|t| t.replicas.iter().copied())
+            .collect();
+        let next_generation =
+            catalog
+                .generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
+        let next = CatalogSnapshot::new(
+            next_generation,
+            catalog
+                .tables
+                .iter()
+                .filter(|t| t.id != table_id)
+                .cloned()
+                .collect(),
+            catalog
+                .partitions
+                .iter()
+                .filter(|p| p.table_id != table_id)
+                .cloned()
+                .collect(),
+            catalog
+                .tablets
+                .iter()
+                .filter(|t| !tablet_ids.contains(&t.id))
+                .cloned()
+                .collect(),
+            catalog
+                .replicas
+                .iter()
+                .filter(|r| !replica_ids.contains(&r.id))
+                .cloned()
+                .collect(),
+        )
+        .with_id_high_water(catalog.id_high_water());
+        self.catalog.compare_and_set(catalog.generation, next)?;
+        Ok(StatementResult::ddl(1))
+    }
+
+    /// `SHOW TABLES / DATABASES / COLUMNS` and `DESCRIBE`, answered from the catalog.
+    fn execute_show(show: &ShowStatement, catalog: &CatalogSnapshot) -> Result<StatementResult> {
+        let string_col = |name: &str, nullable: bool| ColumnDef {
+            name: name.to_string(),
+            data_type: htap_common::types::DataType::String,
+            nullable,
+            primary_key: false,
+        };
+        match show {
+            ShowStatement::Tables { like } => {
+                let mut names: Vec<&str> = catalog
+                    .tables
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .filter(|n| {
+                        like.as_deref()
+                            .is_none_or(|p| htap_sql::expr::like_match(n, p))
+                    })
+                    .collect();
+                names.sort_unstable();
+                let rows = names
+                    .into_iter()
+                    .map(|n| Row::new(vec![Value::String(n.to_string())]))
+                    .collect();
+                Ok(StatementResult::query(
+                    vec![string_col("Tables_in_htap", false)],
+                    rows,
+                ))
+            }
+            ShowStatement::Databases => Ok(StatementResult::query(
+                vec![string_col("Database", false)],
+                vec![Row::new(vec![Value::String("htap".into())])],
+            )),
+            ShowStatement::Columns { table } | ShowStatement::Describe { table } => {
+                let table_desc = catalog
+                    .table_by_name(table)
+                    .ok_or_else(|| HtapError::NotFound(format!("table '{table}' not found")))?;
+                let columns = vec![
+                    string_col("Field", false),
+                    string_col("Type", false),
+                    string_col("Null", false),
+                    string_col("Key", false),
+                    string_col("Default", true),
+                    string_col("Extra", false),
+                ];
+                let rows = table_desc
+                    .schema
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, c)| {
+                        Row::new(vec![
+                            Value::String(c.name.clone()),
+                            Value::String(c.data_type.name().to_string()),
+                            Value::String(if c.nullable { "YES" } else { "NO" }.into()),
+                            Value::String(
+                                if table_desc.primary_key.contains(&idx) {
+                                    "PRI"
+                                } else {
+                                    ""
+                                }
+                                .into(),
+                            ),
+                            Value::Null,
+                            Value::String(String::new()),
+                        ])
+                    })
+                    .collect();
+                Ok(StatementResult::query(columns, rows))
+            }
+        }
+    }
+
+    /// Applies UPDATE assignments left to right against the progressively updated row and
+    /// enforces NOT NULL constraints on the result.
+    fn apply_assignments(
+        update: &UpdateStatement,
+        table_desc: &TableDescriptor,
+        row: &Row,
+    ) -> Result<Row> {
+        let mut values = row.values().to_vec();
+        for (col_idx, expr) in &update.assignments {
+            let value = expr.eval(&htap_sql::EvalContext::row_only(&values))?;
+            let col = table_desc.schema.column(*col_idx).ok_or_else(|| {
+                HtapError::Internal(format!("assignment column index {col_idx} out of bounds"))
+            })?;
+            if value.is_null() && !col.nullable {
+                return Err(HtapError::InvalidArgument(format!(
+                    "column '{}' is NOT NULL",
+                    col.name
+                )));
+            }
+            if let Some(dt) = value.data_type() {
+                if dt != col.data_type {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "type mismatch for column '{}': expected {}, found {}",
+                        col.name,
+                        col.data_type.name(),
+                        dt.name()
+                    )));
+                }
+            }
+            values[*col_idx] = value;
+        }
+        Ok(Row::new(values))
+    }
+
+    /// Commits a batch of `Put` mutations as one transaction.
+    fn commit_puts(&self, mutations: Vec<Mutation>) -> Result<StatementResult> {
+        if mutations.is_empty() {
+            return Ok(StatementResult::dml(0, None));
+        }
+        let affected = mutations.len() as u64;
+        let payload = RowstoreParticipant::encode_payload(&mutations)?;
+        let work = ParticipantWork::new(ParticipantId::new(1), payload);
+        let req = TransactionRequest::new(vec![work])?;
+        let committed = self.txn_manager.commit_request(req)?;
+        Ok(StatementResult::dml(affected, Some(committed.version)))
+    }
+
+    /// Point UPDATE: read the row at the current snapshot, apply the assignments, and write
+    /// the new version of the row under the same key.
+    fn execute_update_by_key(
+        &self,
+        update: &UpdateStatement,
+        table_desc: &TableDescriptor,
+        partition_id: PartitionId,
+        key: Vec<u8>,
+    ) -> Result<StatementResult> {
+        let snapshot = Snapshot::new(self.txn_manager.visible_version());
+        let Some(row) = self.engine.get(partition_id.as_u64(), &key, snapshot)? else {
+            return Ok(StatementResult::dml(0, None));
+        };
+        let updated = Self::apply_assignments(update, table_desc, &row)?;
+        self.commit_puts(vec![Mutation::Put {
+            partition_id: partition_id.as_u64(),
+            key,
+            row: updated,
+        }])
+    }
+
+    /// Scan UPDATE: read every partition at one snapshot, evaluate the filter, and commit
+    /// all rewritten rows in a single transaction (bounded by the transaction payload cap).
+    fn execute_update_by_filter(
+        &self,
+        update: &UpdateStatement,
+        table_desc: &TableDescriptor,
+        filter: Option<&htap_sql::Expr>,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        let ctx = query_exec::ExecContext {
+            server: self,
+            catalog,
+            snapshot: Snapshot::new(self.txn_manager.visible_version()),
+        };
+        let all_columns: std::collections::BTreeSet<usize> = (0..table_desc.schema.len()).collect();
+        let rows = query_exec::scan_base_table(&ctx, &update.table, &all_columns, 0, &[])?;
+        let mut mutations = Vec::new();
+        for values in rows {
+            if let Some(f) = filter {
+                if !f.eval_predicate(&htap_sql::EvalContext::row_only(&values))? {
+                    continue;
+                }
+            }
+            let row = Row::new(values);
+            let updated = Self::apply_assignments(update, table_desc, &row)?;
+            let pk_values: Vec<Value> = table_desc
+                .primary_key
+                .iter()
+                .map(|&idx| {
+                    updated.get(idx).cloned().ok_or_else(|| {
+                        HtapError::Internal(format!("row missing primary key column index {idx}"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let partition_id = self.route_pk_to_partition(table_desc, &pk_values, catalog)?;
+            mutations.push(Mutation::Put {
+                partition_id: partition_id.as_u64(),
+                key: encode_key(&pk_values)?,
+                row: updated,
+            });
+        }
+        self.commit_puts(mutations)
+    }
+
     fn execute_select(
         &self,
         select: PointSelect,
@@ -976,7 +1294,7 @@ impl LocalServer {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_partition_compact(
+pub(crate) fn scan_partition_compact(
     engine: &Engine,
     colstore_dir: &Path,
     catalog: &CatalogSnapshot,
@@ -1147,6 +1465,59 @@ impl LocalServer {
     /// Synchronously executes a conversion tick using default manual policy (resuming in-flight converting jobs only).
     pub fn tick(&self) -> Result<ConversionTickReport> {
         self.conversion_tick(ConversionPolicy::manual())
+    }
+
+    /// Seeds the identifier high-water mark of a catalog written before the mark existed
+    /// (format version 1, mark all zeros). Such catalogs may already have removed partitions
+    /// (`ALTER TABLE ... DROP PARTITION`) whose tablet directories still exist under
+    /// `colstore/`, so the live maximum is not enough: the tablet counter is raised to the
+    /// highest tablet directory found on disk. Rowstore data of partitions dropped under
+    /// version 1 is always logically empty (DROP PARTITION requires it), so partition ids
+    /// only need the live maximum. The result is persisted with a CAS so the next
+    /// allocation starts above every id that has ever been used.
+    fn migrate_legacy_id_high_water(
+        catalog: &LocalCatalogStore,
+        colstore_dir: &Path,
+    ) -> Result<()> {
+        let Some(snapshot) = catalog.load()? else {
+            return Ok(());
+        };
+        if snapshot.id_high_water != IdHighWater::default() {
+            return Ok(());
+        }
+        let mut physical_tablet_max = 0u64;
+        for entry in std::fs::read_dir(colstore_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let id = name
+                .strip_prefix("tablet-")
+                .or_else(|| name.strip_prefix("tablet_"))
+                .unwrap_or(name);
+            if let Ok(id) = id.parse::<u64>() {
+                physical_tablet_max = physical_tablet_max.max(id);
+            }
+        }
+        let mut mark = snapshot.id_high_water();
+        mark.tablet = mark.tablet.max(physical_tablet_max);
+        if mark == IdHighWater::default() {
+            return Ok(());
+        }
+        let next_generation =
+            snapshot
+                .generation
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow {
+                    counter: "catalog_generation",
+                })?;
+        let mut next = snapshot.clone();
+        next.generation = next_generation;
+        next.id_high_water = mark;
+        catalog.compare_and_set(snapshot.generation, next)?;
+        Ok(())
     }
 
     fn validate_storage_state_on_open(

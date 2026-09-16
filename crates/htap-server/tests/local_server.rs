@@ -7,7 +7,7 @@ use htap_catalog::{
     PartitioningMethod, RangeBound, ReplicaDescriptor, ReplicaId, StorageDescriptor, StorageFormat,
     TableId, TabletId,
 };
-use htap_common::types::{ColumnDef, DataType, Schema, Value};
+use htap_common::types::{ColumnDef, DataType, Row, Schema, Value};
 use htap_common::version::Version;
 use htap_common::HtapError;
 use htap_movement::{CopyOptions, DataFormat, MovementJobPhase, TabletCloneOptions};
@@ -458,10 +458,18 @@ fn test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point() {
     assert!(matches!(err_scan, HtapError::InvalidArgument(_)));
     assert!(err_scan.to_string().contains("has no column manifest"));
 
-    let err_unsupported = server
-        .execute("SELECT val FROM c_table WHERE id = 1 ORDER BY val + 1;")
+    // The general query path reads the same partitions and fails the same way.
+    let err_general = server
+        .execute("SELECT val FROM c_table WHERE id = 1 ORDER BY id + 1;")
         .unwrap_err();
-    assert!(matches!(err_unsupported, HtapError::Unsupported(_)));
+    assert!(
+        matches!(err_general, HtapError::InvalidArgument(_)),
+        "{err_general}"
+    );
+    assert!(
+        err_general.to_string().contains("has no column manifest"),
+        "unexpected error text: {err_general}"
+    );
 
     // Modify to Converting storage with valid conversion metadata
     let mut snap2 = catalog_store.load().unwrap().unwrap();
@@ -536,10 +544,11 @@ fn test_storage_descriptors_dml_and_point_reads_and_unsupported_non_point() {
         other => panic!("expected query result, got {other:?}"),
     }
 
-    let err_unsupported2 = server
-        .execute("SELECT val FROM c_table WHERE id = 2 ORDER BY val + 1;")
-        .unwrap_err();
-    assert!(matches!(err_unsupported2, HtapError::Unsupported(_)));
+    // With a valid manifest the general query path reads the converting partition too.
+    let general2 = server
+        .execute("SELECT val FROM c_table WHERE id = 2 ORDER BY id + 1;")
+        .unwrap();
+    assert!(matches!(general2, StatementResult::Query(_)));
 }
 
 #[test]
@@ -1445,33 +1454,51 @@ fn test_analytic_unsupported_clauses() {
     server
         .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, age INT);")
         .unwrap();
+    server
+        .execute("INSERT INTO users (id, age) VALUES (1, 30), (2, 10), (3, NULL);")
+        .unwrap();
 
-    // ORDER BY expression is unsupported
-    let err_order = server
-        .execute("SELECT * FROM users ORDER BY age + 1;")
-        .unwrap_err();
-    assert!(matches!(err_order, HtapError::Unsupported(_)));
+    let rows = |sql: &str| match server.execute(sql).unwrap() {
+        StatementResult::Query(q) => q.rows,
+        other => panic!("expected query result, got {other:?}"),
+    };
 
-    // LIMIT is unsupported
-    let err_limit = server.execute("SELECT * FROM users LIMIT 10;").unwrap_err();
-    assert!(matches!(err_limit, HtapError::Unsupported(_)));
-
-    // JOIN is unsupported
-    let err_join = server
-        .execute("SELECT * FROM users u1 JOIN users u2 ON u1.id = u2.id;")
-        .unwrap_err();
-    assert!(
-        matches!(err_join, HtapError::Unsupported(_))
-            || matches!(err_join, HtapError::InvalidArgument(_))
+    // Clauses outside the narrow analytic slice run through the general query executor.
+    assert_eq!(
+        rows("SELECT id FROM users ORDER BY age + 1 DESC;"),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+            Row::new(vec![Value::Int64(3)]),
+        ]
+    );
+    assert_eq!(rows("SELECT id FROM users ORDER BY id LIMIT 2;").len(), 2);
+    assert_eq!(
+        rows("SELECT u1.id, u2.age FROM users u1 JOIN users u2 ON u1.id = u2.id WHERE u1.id = 2;"),
+        vec![Row::new(vec![Value::Int64(2), Value::Int32(10)])]
+    );
+    assert_eq!(
+        rows("SELECT AVG(age) FROM users;"),
+        vec![Row::new(vec![Value::Float64(20.0)])]
+    );
+    assert_eq!(
+        rows("SELECT age + 1 FROM users ORDER BY id;"),
+        vec![
+            Row::new(vec![Value::Int64(31)]),
+            Row::new(vec![Value::Int64(11)]),
+            Row::new(vec![Value::Null]),
+        ]
     );
 
-    // AVG is unsupported
-    let err_avg = server.execute("SELECT AVG(age) FROM users;").unwrap_err();
-    assert!(matches!(err_avg, HtapError::Unsupported(_)));
-
-    // Arithmetic expressions in projection unsupported
-    let err_expr = server.execute("SELECT age + 1 FROM users;").unwrap_err();
-    assert!(matches!(err_expr, HtapError::Unsupported(_)));
+    // Still unsupported: window functions, FULL OUTER JOIN, correlated subqueries.
+    for sql in [
+        "SELECT id, SUM(age) OVER () FROM users;",
+        "SELECT * FROM users a FULL OUTER JOIN users b ON a.id = b.id;",
+        "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM users v WHERE v.id = u.id);",
+    ] {
+        let err = server.execute(sql).unwrap_err();
+        assert!(matches!(err, HtapError::Unsupported(_)), "{sql}: {err}");
+    }
 }
 
 #[test]

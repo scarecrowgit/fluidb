@@ -305,30 +305,30 @@ fn test_embedded_client_unsupported_sql_preserves_error_categories() {
         other => panic!("expected Query, got {other:?}"),
     }
 
-    // 6. Unsupported statement type UPDATE -> Unsupported
-    let err_update = client
+    // 6. UPDATE on a missing row affects nothing; ORDER BY expressions and HAVING run
+    //    through the general query path.
+    let update_res = client
         .execute("UPDATE products SET price = 99 WHERE id = 1;")
-        .unwrap_err();
-    assert!(
-        matches!(err_update, HtapError::Unsupported(_)),
-        "expected Unsupported for UPDATE, got {err_update:?}"
-    );
-
-    // 7. Unsupported query modifier ORDER BY expression -> Unsupported
-    let err_order = client
+        .unwrap();
+    match update_res {
+        StatementResult::Command(cmd) => assert_eq!(cmd.affected(), 0),
+        other => panic!("expected command result, got {other:?}"),
+    }
+    let order_res = client
         .execute("SELECT name FROM products WHERE id = 1 ORDER BY price + 1;")
-        .unwrap_err();
-    assert!(
-        matches!(err_order, HtapError::Unsupported(_)),
-        "expected Unsupported for ORDER BY, got {err_order:?}"
-    );
-
-    // 8. Unsupported query modifier HAVING -> Unsupported
-    let err_having = client
+        .unwrap();
+    assert!(matches!(order_res, StatementResult::Query(_)));
+    let having_res = client
         .execute("SELECT name FROM products GROUP BY name HAVING count(*) > 1;")
+        .unwrap();
+    assert!(matches!(having_res, StatementResult::Query(_)));
+
+    // 7. Still unsupported: window functions.
+    let err_window = client
+        .execute("SELECT name, COUNT(*) OVER () FROM products;")
         .unwrap_err();
     assert!(
-        matches!(err_having, HtapError::Unsupported(_)),
-        "expected Unsupported for HAVING, got {err_having:?}"
+        matches!(err_window, HtapError::Unsupported(_)),
+        "expected Unsupported for window function, got {err_window:?}"
     );
 }

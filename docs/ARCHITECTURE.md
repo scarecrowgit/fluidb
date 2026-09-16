@@ -38,15 +38,34 @@ Phase 8 has a completed local network server MVP: a hand-written, synchronous My
 (`htap-wire`, `WireServer`), a standalone daemon binary (`htapd`) exposing a `LocalServer` root over TCP, and
 `htap-client::RemoteClient` speaking the same protocol as a client, returning the same `StatementResult` shape
 as `EmbeddedClient`. See the "Network layer (`htap-wire`, `htapd`)" section below.
+Phase 9 has a completed local MVP for SQL breadth and cross-engine joins: a general query executor
+(`htap-sql::query`/`expr`/`binder_query`, `htap-server::query_exec`) handling `INNER`/`LEFT`/`RIGHT`/`CROSS`
+joins (left-deep chains, comma joins), aliases, qualified names, arithmetic/comparison/`AND`/`OR`/`NOT`/`IS
+[NOT] NULL`/`IS [NOT] TRUE`/`FALSE`/`LIKE`/`IN`/`BETWEEN`/`CASE`/`CAST`, scalar functions, aggregates with
+`DISTINCT`, `GROUP BY`/`HAVING`, `SELECT DISTINCT`, `ORDER BY`/`LIMIT`/`OFFSET`, `UNION`/`UNION ALL`, derived
+tables, non-recursive CTEs, and uncorrelated scalar/`IN`/`EXISTS` subqueries, materializing every base table
+side through the existing `scan_partition_compact` storage path at one MVCC snapshot per statement and
+hash-joining in memory; a purely syntactic shape gate (`is_narrow_select_shape`) keeps complete-PK `SELECT`
+on `Route::RowstorePointRead` and narrow single-table scans on `Route::OlapScan` unchanged, everything else
+routes to the new `Route::Query`. `UPDATE` (point and filtered-scan forms, `Route::RowstoreUpdate`), `DROP
+TABLE` (metadata-only, `Route::CatalogDdl`), and `SHOW TABLES`/`SHOW DATABASES`/`SHOW COLUMNS`/`DESCRIBE`
+(`Route::CatalogRead`) are also implemented. The catalog envelope (`HTAPCAT1`) bumped to format version 2 to
+persist an identifier high-water mark (`IdHighWater`) so dropped table/partition/tablet/replica ids are never
+reissued; version-1 catalogs still decode. See the "Query routing" and "OLAP execution paths" sections below
+and [`PROGRESS.md`](./PROGRESS.md).
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
 remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
 physical data migration for populated partition reorganization, physical rowstore reclamation, delete vectors, compaction,
-autonomous background conversion scheduling, compound AND pushdown beyond one leaf, != pushdown, vectorized aggregation / operator pipelines, joins/CTEs/windows/ORDER/LIMIT/HAVING/OR/expressions/AVG/distinct,
+autonomous background conversion scheduling, compound AND pushdown beyond one leaf, != pushdown, vectorized aggregation / operator pipelines,
+window functions, correlated subqueries, FULL OUTER/NATURAL/USING joins, parenthesized nested join trees, recursive CTEs, EXCEPT/INTERSECT,
+GROUP BY ordinals, LIMIT BY, INSERT ... SELECT, UPDATE with joins/subqueries, DELETE by filter (still complete-PK only), TRUNCATE, non-partition ALTER,
+cost-based optimization, vectorized/pipelined execution, worker-pool parallelism for the general query path, memory bounds/spilling for the general path,
+physical reclamation on DROP TABLE, semi-join rewrites of IN/EXISTS, integer DIV, broader string/date function coverage,
 multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow integration,
 sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, prepared statements/binary protocol, TLS, compression, multi-statements,
-`UPDATE`/non-partition `ALTER`/`DROP TABLE`, Docker image/Compose deployment, and broad MySQL compatibility;
+Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors);
 note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation remain deferred).
 See [`PROGRESS.md`](./PROGRESS.md).
 
@@ -81,6 +100,13 @@ flowchart TD
         delta_merge --> logical_rows["logical rows/aggregates"]
         olap_exec -->|"Row & SnapshotPinned manifest-less Converting fallback"| row_scan["htap-rowstore logical scan / collapse"]
         row_scan --> logical_rows
+        route_class -->|"Route::Query"| query_exec["htap-server query_exec (general executor)"]
+        query_exec -->|"per slot, one snapshot per statement"| compact_read
+        query_exec -->|"per slot"| row_scan
+        query_exec --> joins_ops["hash join, filter, group/aggregate,<br/>order/limit, union in memory"]
+        route_class -->|"Route::RowstoreUpdate"| rs_update["point Get + rewrite, or query_exec scan +<br/>rewrite, then one Put transaction"]
+        rs_update --> txn_mgr
+        route_class -->|"Route::CatalogRead"| catalog_read["SHOW / DESCRIBE from CatalogSnapshot"]
     end
 
     subgraph PlannedTarget ["Planned / Deferred Target Architecture"]
@@ -118,12 +144,21 @@ flowchart TD
         Route -->|"Route::RowstoreWrite<br/>(INSERT / DELETE)"| DML["TransactionManager.commit_request<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
         Route -->|"Route::RowstorePointRead<br/>(complete-PK SELECT)"| PointRead["Snapshot(visible_version)<br/>htap_rowstore::Engine.get(key)"]
         Route -->|"Route::OlapScan<br/>(AnalyticSelect)"| OlapScan["execute_analytic_select"]
+        Route -->|"Route::Query<br/>(joins/expressions/subqueries/UNION)"| GenQuery["query_exec::execute_query<br/>one Snapshot per statement"]
+        Route -->|"Route::RowstoreUpdate<br/>(UPDATE)"| Update["execute_update_by_key /<br/>execute_update_by_filter"]
+        Route -->|"Route::CatalogRead<br/>(SHOW / DESCRIBE)"| CatalogRead["execute_show (CatalogSnapshot only)"]
 
         OlapScan -->|"Row & SnapshotPinned<br/>manifest-less fallback"| RowScan["htap_rowstore logical scan &amp; collapse<br/>(scan_partition + collapse_entries_to_rows)"]
         OlapScan -->|"materialized Column &amp;<br/>manifest-bearing Converting"| ColCompact["htap-convert read_column_partition_compact_core<br/>at &lt;root&gt;/colstore (PK+requested union, 1 leaf pushdown)"]
         ColCompact -->|"invokes"| ColEngine["htap-colstore SegmentReader.scan<br/>(vectorized scan primitive with ScanStats)"]
         ColEngine -->|"then performs"| ConvertOverlay["htap-convert delta suppression/overlay<br/>&amp; deterministic PK merge"]
         ConvertOverlay --> ResidualEval["Evaluate residual SQL filters,<br/>aggregates &amp; groups (Vec&lt;Row&gt;/BTreeMap)"]
+        GenQuery -->|"per base table slot<br/>(same storage path as OlapScan)"| ColCompact
+        GenQuery -->|"per base table slot"| RowScan
+        GenQuery --> HashJoin["hash join / nested loop,<br/>WHERE, GROUP BY/HAVING,<br/>DISTINCT, ORDER BY, LIMIT, UNION"]
+        Update -->|"point form"| PointRead
+        Update -->|"scan form, same snapshot"| GenQuery
+        Update --> DML
     end
 
     subgraph PlannedDeferred ["Planned / Deferred Integration (Not in Direct SQL Path)"]
@@ -248,7 +283,10 @@ without touching the engine; everything else passes through to `LocalServer::exe
 terminators always use header `0xFE` (legacy EOF, or an OK-shaped packet when `CLIENT_DEPRECATE_EOF` is
 negotiated); OK-packet `info` carries a private convention (empty for DDL, `version=<n>`/`version=none` for
 DML) that lets `RemoteClient` recover the exact `CommandResult`. Payloads of 16 MB or more (multi-packet
-messages) are unsupported and close the connection.
+messages) are unsupported and close the connection. Because the wire layer passes every non-shim statement
+through to `LocalServer::execute` unchanged, the Phase 9 SQL breadth (joins, `UPDATE`, `DROP TABLE`,
+`SHOW`/`DESCRIBE`) is available over the wire with no wire-layer changes, verified end-to-end by
+`crates/htap-wire/tests/wire_server.rs::test_general_sql_over_wire`.
 
 `htapd` (`crates/htapd`) is a thin binary: `htapd --root <dir> [--listen 127.0.0.1:3307]
 [--max-connections 64] [--password <pw>]`, opens `LocalServer::open(root)`, starts a `WireServer`, and parks
@@ -314,6 +352,74 @@ distributed two-phase commit between independent version spaces (see [ADR-004](.
 
 ---
 
+## Catalog identifier high-water mark (Phase 9)
+
+**Status: `implemented (local MVP)`** (`htap-catalog`).
+
+`DROP TABLE` (see "Query routing" above) removes a table and its partitions/tablets/replicas from the
+catalog, but does not physically reclaim the rowstore data or columnar segments that belonged to those
+partitions/tablets — they remain on disk, unreachable, keyed by the dropped identifiers. To guarantee a
+dropped identifier can never be reissued and accidentally alias that unreachable data, `CatalogSnapshot`
+persists `id_high_water: IdHighWater { table, partition, tablet, replica }` (`crates/htap-catalog/src/model.rs`):
+every allocator (`CREATE TABLE`, `ALTER TABLE ADD/REORGANIZE PARTITION`, and `DROP TABLE`'s own bookkeeping)
+allocates the next id from `max(persisted high-water, live maximum id currently in the catalog) + 1`, and
+persists the new high-water mark in the same catalog CAS as the mutation.
+
+- **Format version bump:** The catalog envelope (`HTAPCAT1`) `FORMAT_VERSION` bumped from 1 to 2
+  (`crates/htap-catalog/src/local.rs`) to carry this field.
+- **Backward read compatibility:** A version-1 catalog still decodes (`LEGACY_FORMAT_VERSION = 1`); its
+  counters default to zero and `CatalogSnapshot::id_high_water()` falls back to the live maximum id actually
+  present in the snapshot, so old catalogs remain safe to reopen. The next CAS rewrites the file as version 2.
+- **Fail-loud forward compatibility:** A version-1-only binary refuses to decode a version-2 (or any other
+  unrecognized) catalog envelope rather than silently truncating or misinterpreting the high-water field.
+  Conversely, `decode_snapshot` rejects a version-2 payload that omits the `id_high_water` JSON key as
+  `HtapError::Corruption` (`"catalog format version 2 payload is missing id_high_water"`) — only version-1
+  payloads may omit it; a version-2 file is expected to always carry it explicitly.
+- **One-time legacy migration on open:** `LocalServer::open` calls `migrate_legacy_id_high_water`
+  (`crates/htap-server/src/lib.rs`) after storage validation, while still holding the root `ProcessLock`. If
+  the persisted mark is exactly all zeros (a genuine format-v1 catalog that has never been through a v2 CAS),
+  the tablet counter is raised to the highest `colstore/tablet-N` (or `tablet_N`) directory actually present
+  on disk, merged with the live in-catalog maximum, and persisted via one catalog CAS (bumping the
+  generation, and rewriting the file as version 2). This is necessary because a v1 build allowed `ALTER TABLE
+  ... DROP PARTITION` (empty partitions only), whose tablet directories can remain under `colstore/`; the
+  live in-catalog maximum alone cannot see a tablet id that no partition currently references, so without
+  this migration a reissued tablet id could later collide with a stale on-disk manifest and trip fail-closed
+  startup validation. Partition ids only need the live maximum, because rowstore data of a partition dropped
+  under version 1 is always logically empty (`DROP PARTITION` requires it). A catalog with no data ever
+  written (mark stays all zeros) skips the CAS entirely. **Known remaining gap:** this migration seeds only
+  the *tablet* counter from disk; it does not recover *replica* ids removed along with a v1-era `DROP
+  PARTITION`'s tablets from any on-disk trace (there is no per-replica directory under `colstore/` to scan).
+  A movement snapshot package lives at `<root>/movement/tablets/<source_tablet_id>/<target_replica_id>/
+  <job_id>`, so a reissued replica id could in principle coincide with a stale package directory — narrow in
+  practice (it also requires reusing the same job id), and documented as an open gap in
+  `docs/LIMITATIONS.md`, not fixed here.
+- **CAS regression guard:** `LocalCatalogStore::compare_and_set` (`crates/htap-catalog/src/local.rs`) rejects
+  (`HtapError::InvalidArgument`, leaving the on-disk file untouched) any successor snapshot whose effective
+  `id_high_water()` is lower, component-wise, than the current file's — so a future code path that builds a
+  successor with `CatalogSnapshot::new` and forgets to carry the mark forward fails loudly instead of
+  silently reopening the reuse hazard.
+- **Replica ids in `htap-coord`:** Because a `ReplicaId` names a movement snapshot package directory on disk
+  (see "Sharding and placement"), it must never be reissued either. `plan_placement`
+  (`crates/htap-coord/src/placement.rs`) allocates new replica ids starting from
+  `snapshot.id_high_water().replica + 1` rather than the live maximum, and `stage_placement_addition` raises
+  the persisted mark in the snapshot it stages so the next allocation (local or via a future `plan_placement`
+  call) still starts above every replica id ever used.
+- **Scope:** This closes the identifier-reuse hazard for `DROP TABLE` and `ALTER TABLE ... DROP PARTITION`
+  (and, via `htap-coord`, for removed replicas); it does not perform physical reclamation of the dropped
+  rowstore, columnar, or movement-package data, which remains deferred (see `docs/LIMITATIONS.md`).
+
+Verified in `crates/htap-catalog/tests/catalog_recovery.rs`
+(`test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max`,
+`test_catalog_id_high_water_prevents_reuse_after_removal`,
+`test_catalog_cas_rejects_regressing_id_high_water`,
+`test_catalog_v2_payload_without_id_high_water_is_rejected`, and `test_corruption_and_truncation`, updated to
+use format version 3 as the unsupported/future version); `crates/htap-server/tests/query_exec.rs`
+(`test_drop_table_reopen_and_no_id_reuse`,
+`test_legacy_catalog_seeds_tablet_high_water_from_colstore_inventory`); and
+`crates/htap-coord/tests/placement_movement.rs::test_plan_placement_allocates_above_id_high_water`.
+
+---
+
 ## Freshness: delta store and merge-on-read
 
 **Status: `implemented (local MVP)`** (authoritative rowstore base-plus-delta freshness overlay implemented for local conversion; delete vectors and background base compaction are planned/deferred).
@@ -330,11 +436,14 @@ those writes land directly in the authoritative **row store**, which acts as the
 
 ## Query routing — the R5 guarantee, structurally enforced
 
-**Status: `implemented (local MVP)`** (structural route classifier implemented for point lookups, DDL/DML, and narrow OLAP scans with compact base scan pushdown; full SQL breadth, vectorized aggregation / operator pipelines, compound pushdown beyond one leaf, and multi-partition routing are planned/deferred).
+**Status: `implemented (local MVP)`** (structural route classifier implemented for point lookups, DDL/DML, narrow OLAP scans with compact base scan pushdown, and — as of Phase 9 — the general query path (`Route::Query`), `UPDATE` (`Route::RowstoreUpdate`), and catalog reads (`Route::CatalogRead`); vectorized aggregation / operator pipelines, compound pushdown beyond one leaf, worker-pool parallelism on the general path, and cost-based planning are planned/deferred).
 
 A router inspects the **bound** statement and the partition's **storage descriptor**:
 
-- **Point lookups and short transactions that resolve fully against a primary key** take a dedicated fast path: index probe → row fetch. There is no plan-fragment construction and no vectorized operator pipeline. In `htap-sql`, complete-PK `SELECT` queries strictly bind to `PointSelect` and route to `Route::RowstorePointRead { key }` across all three storage formats (`Row`, `Column`, `Converting`), serving point reads directly from the authoritative rowstore without invoking OLAP execution or the converter (verified in `crates/htap-sql/tests/route.rs`, `crates/htap-sql/tests/parse_bind.rs`, `crates/htap-server/tests/local_server.rs`, and `crates/htap-client/tests/embedded_client.rs`). Complete-PK point read execution remains separate and unchanged.
+- **Point lookups and short transactions that resolve fully against a primary key** take a dedicated fast path: index probe → row fetch. There is no plan-fragment construction and no vectorized operator pipeline. In `htap-sql`, complete-PK `SELECT` queries strictly bind to `PointSelect` and route to `Route::RowstorePointRead { key }` across all three storage formats (`Row`, `Column`, `Converting`), serving point reads directly from the authoritative rowstore without invoking OLAP execution or the converter (verified in `crates/htap-sql/tests/route.rs`, `crates/htap-sql/tests/parse_bind.rs`, `crates/htap-server/tests/local_server.rs`, and `crates/htap-client/tests/embedded_client.rs`). Complete-PK point read execution remains separate and unchanged. This guarantee is preserved structurally even with the general query path present: `bind_select` (`crates/htap-sql/src/binder.rs`) applies a purely syntactic shape test, `is_narrow_select_shape`, *before* any deep binding — one unaliased table, no joins/CTEs/subqueries/set operations, no `LIMIT`/`HAVING`/`DISTINCT`, a plain-column or single-aggregate projection, an AND-only filter of `column op literal` / `IS [NOT] NULL` leaves, and plain unqualified `GROUP BY`/`ORDER BY`. A statement matching that shape keeps binding through the strict `PointSelect`/`AnalyticSelect` binders (so a complete-PK lookup still routes to `Route::RowstorePointRead` and a narrow scan still routes to `Route::OlapScan`, pruning/pushdown/scan-worker behavior unchanged); a narrow-shaped statement that fails deep binding reports that binder's error rather than silently falling through to the general path. Anything with a join, alias, `LIMIT`, subquery, or an unsupported clause on what looks like a PK lookup fails the shape test up front and binds through the general query binder instead — clauses are never silently dropped. Pinned by `crates/htap-sql/tests/route.rs::test_point_read_fast_path_pinned_against_general_query_path`.
+- **The general query path (`Route::Query`, Phase 9):** Every statement that does not match `is_narrow_select_shape` binds to `BoundStatement::Query(BoundQuery)` (joins, aliases, qualified names, expressions, aggregates with `GROUP BY`/`HAVING`, `DISTINCT`, `ORDER BY`/`LIMIT`/`OFFSET`, `UNION`/`UNION ALL`, derived tables, non-recursive CTEs, uncorrelated scalar/`IN`/`EXISTS` subqueries) and routes to `Route::Query` for every storage descriptor. `htap-server::query_exec` executes it; see "General query executor" under "OLAP execution paths" below for the execution model, snapshot rule, determinism contract, and limits.
+- **`UPDATE` (`Route::RowstoreUpdate`, Phase 9):** `UPDATE t [alias] SET col = expr, ... [WHERE ...]` binds to `BoundStatement::Update` and routes to `Route::RowstoreUpdate { key }` for every storage descriptor (rowstore authoritative for mutations); `key` carries the encoded primary key for a complete-PK `WHERE`, `None` for the scan form. See "Transactional write execution path" below.
+- **`DROP TABLE` / `SHOW` (Phase 9):** `DROP TABLE [IF EXISTS] t` routes to `Route::CatalogDdl`; `SHOW TABLES`/`SHOW DATABASES`/`SHOW COLUMNS FROM t`/`DESCRIBE t`/`DESC t` route to `Route::CatalogRead` and are answered purely from the loaded `CatalogSnapshot`, with no rowstore or colstore access.
 - **Narrow OLAP Scans (`Route::OlapScan`):** `htap-sql` binds non-PK queries on a single unaliased table into typed `AnalyticSelect` structures routing to `Route::OlapScan`. `LocalServer` executes these narrow analytical scans over logical rowstore rows or the converter's rowstore-authoritative base-plus-delta view using server-root `<root>/colstore` for materialized `Column` and `Converting` partitions (validating catalog vs disk manifest generations).
   - **Supported OLAP SQL:** Exactly one unaliased table in `FROM`; plain projections (named columns or `*`, with optional aliases); AND-only typed filters (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) with SQL three-valued logic; aggregate functions `COUNT(*)`, `COUNT(column)`, `SUM(column)` (for `Int32`, `Int64`, and `Float64`), `MIN(column)`, and `MAX(column)`; deterministic `GROUP BY` with SQL NULL grouping; simple unqualified source/projected column `ORDER BY` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break; evaluated against the current visible snapshot (`visible_version`).
   - **Base scan pushdown optimization:** For materialized `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads (`read_column_partition_compact_core`) using the union of primary-key indices and requested source columns (from projections, `GROUP BY`, and filter leaves). It safely pushes down at most one eligible predicate leaf (`=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) directly into columnar `SegmentReader::scan`. Stale base rows are suppressed via newest post-base rowstore deltas, mutations (`Put`/`Delete`) are overlaid, and rows are ordered by primary key deterministically before complete residual SQL filter, aggregate, and group evaluation.
@@ -344,6 +453,7 @@ A router inspects the **bound** statement and the partition's **storage descript
   - Literal `INSERT` and PK `DELETE` route to `Route::RowstoreWrite` regardless of whether the partition is `Row`, `Column`, or `Converting`, preserving rowstore write-authority and zero mutation downtime.
   - Complete-PK `SELECT` routes to `Route::RowstorePointRead { key }` across all three storage formats, strictly bypassing analytical execution and the converter.
   - `AnalyticSelect` routes to `Route::OlapScan` across `Row`, `Column`, and `Converting` formats.
+  - The general `Query` (joins, expressions, subqueries, set operations) routes to `Route::Query`; `Update` routes to `Route::RowstoreUpdate { key }`; `DropTable` routes to `Route::CatalogDdl`; `Show` routes to `Route::CatalogRead` — all across `Row`, `Column`, and `Converting` formats (verified in `crates/htap-sql/tests/route.rs::test_route_classification`).
 - **SQL DDL, Partition Lifecycle ALTER, and Native Admin API:**
   - **SQL DDL partition support:** Tables created via SQL DDL (`CREATE TABLE`) without partitioning clauses receive a default single-partition `StorageDescriptor::Row` topology (`partitions.len() == 1`, `tablets.len() == 1`, `bucket = 0`, name `"p0"`). MySQL partition DDL (`CREATE TABLE ... PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)`, including `VALUES LESS THAN MAXVALUE` on the final range partition) is parsed into typed AST structures via vendored `sqlparser` and bound to validated catalog partition models. Unsupported partition forms (partition options, `ENGINE`/`COMMENT`/`TABLESPACE`, `SUBPARTITION`, `LIST DEFAULT`, expressions in partition keys, multi-column `COLUMNS`, and non-final `MAXVALUE`) are strictly rejected with parse or binder errors.
   - **SQL Partition Lifecycle ALTER:** `ALTER TABLE <table> ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` are parsed into typed operations and executed with empty-partition safety gates: dropping or reorganizing populated source partitions is strictly rejected with `HtapError::InvalidArgument` via rowstore snapshot collapse checks before catalog mutation. Reorganized range sources must be contiguous and preserve the replaced span.
@@ -356,7 +466,7 @@ A router inspects the **bound** statement and the partition's **storage descript
   - **Storage conversion & demotion:** `LocalServer::convert_table` performs conversion on single-partition tables. Table-wide conversion is available via `LocalServer::convert_table_to_column(table_name)` returning a `TableConversionReport`. Metadata demotion from Column back to Row storage is supported via `LocalServer::convert_table_to_row(table_name)`, which clears catalog `column_manifest` references via CAS while retaining rowstore data (authoritative throughout) and existing column segment files on disk. Explicit policy ticks (`conversion_tick`, `tick`) execute synchronously, resuming persisted jobs only without autonomous background scheduling. Startup validation on `LocalServer::open` fails closed (returning `HtapError::Corruption` or `HtapError::Io` depending on the cause) if catalog metadata and `<root>/colstore` manifests conflict.
   - **Deferred capabilities:** Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), delete vectors, background compaction, autonomous background conversion scheduler, hash tablets, distributed/remote partition serving across network nodes, replica failover, and an inter-node distributed-serving network protocol remain deferred (the client-facing MySQL wire protocol is implemented; see the "Network layer" section above).
   - **Test evidence:** Verified by server partition tests in `crates/htap-server/tests/local_server.rs` (`test_sql_range_partitioning_ddl_and_maxvalue_routing`, `test_sql_list_partitioning_ddl_and_routing`, `test_server_sql_alter_partition_lifecycle`, `test_server_alter_partitions_drop_empty_and_populated_guard`, `test_server_alter_partitions_reorganize_empty_and_populated_guard`, `test_server_convert_table_multi_partition_reports_and_demotion_equivalence`, `test_server_conversion_tick_idempotent_and_resume_snapshot_pinned`, `test_server_open_fail_closed_missing_or_corrupt_manifest`, `test_partitioned_native_range_topology_catalog_reopen_continuation`, `test_partitioned_native_list_topology_catalog_reopen_continuation`, `test_partitioned_boundary_unmatched_null_type_errors`, `test_partitioned_multi_row_insert_spanning_partitions_one_version_point_delete`, `test_partitioned_composite_pk_partition_key_not_first`, `test_partitioned_olap_across_partitions_and_empty_aggregate`, `test_convert_table_multi_partition_guard`, `test_partitioned_empty_topology_rejection_no_catalog_mutation`), catalog recovery tests in `crates/htap-catalog/tests/catalog_recovery.rs` (`test_partitioning_legacy_decode_and_reopen`, `test_range_partitioning_routing_and_boundaries`, `test_list_partitioning_routing`, `test_partitioning_duplicate_violations`, `test_range_overlap_and_order_violations`, `test_partitioning_type_and_null_violations`, `test_partitioning_ownership_and_method_consistency`, `test_partitioning_cas_and_reopen_lifecycle`, `test_partition_alteration_add_range_and_list`, `test_partition_alteration_drop_range_and_list`, `test_partition_alteration_reorganize_contiguous`, `test_partition_alteration_cas_and_reopen`), parser tests in `crates/htap-sql/tests/parse_bind.rs` (`test_mysql_partition_ddl_parsed_and_bound`, `test_mysql_partition_ddl_negative_parser_and_binder`, `test_mysql_alter_partition_parsed_and_bound`, `test_mysql_alter_partition_negative`, `test_negative_create_table`), and conversion tests in `crates/htap-convert/tests/materialization.rs` (`test_demote_partition_to_row_clearing_manifest_and_retained_data`, `test_conversion_tick_resumes_snapshot_pinned`).
-- **Explicitly Deferred OLAP & SQL Capabilities:** Direct SegmentReader pushdown optimization is implemented for the compact base path (single leaf pushdown). Simple unqualified source/projected column `ORDER BY` is implemented for `AnalyticSelect` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break. Joins, CTEs (`WITH`), window functions (`OVER`), expressions, aliases if rejected, aggregate ordering in `ORDER BY`, broad MySQL ordering, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates, compound AND pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, multi-tablet or distributed partition scans, resource quotas/spill/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth remain deferred.
+- **Explicitly Deferred OLAP & SQL Capabilities:** Direct SegmentReader pushdown optimization is implemented for the compact base path (single leaf pushdown), used by both `Route::OlapScan` and, per slot, by `Route::Query`. Simple unqualified source/projected column `ORDER BY` is implemented for the narrow `AnalyticSelect` path with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break; the general query path (`Route::Query`, Phase 9) additionally supports joins, CTEs (`WITH`), expressions, aliases, `ORDER BY` of expressions/aliases/ordinals, aggregate ordering, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates — see "General query executor" below. Still deferred on every path: window functions (`OVER`), correlated subqueries, `FULL OUTER`/`NATURAL`/`USING` joins, parenthesized nested join trees, recursive CTEs, `EXCEPT`/`INTERSECT`, `GROUP BY` ordinals, `LIMIT BY`, compound `AND` pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, worker-pool parallelism and memory bounds/spilling for the general query path, multi-tablet or distributed partition scans, resource quotas/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth.
 
 This separation is enforced **by construction, not by a runtime heuristic**:
 the route code path for point lookups (`Route::RowstorePointRead`) directly
@@ -410,6 +520,42 @@ The transactional rowstore path provides ACID point operations, durable MVCC ver
    - **Publish:** `RowstoreParticipant::publish` invokes `Engine::publish(version)`, persisting the new visible version to `VISIBLE` (`HTAPVIS1`) and advancing in-memory visibility.
    - **Watermark advance:** `TransactionManager` advances its internal `visible_version` watermark and returns `CommittedTransaction`.
 
+### `UPDATE` execution path (Phase 9, `Route::RowstoreUpdate` -> 2PC -> `RowstoreParticipant`)
+
+`UPDATE t [alias] SET col = expr, ... [WHERE ...]` binds to `BoundStatement::Update` and always commits
+through the same `TransactionManager` / `RowstoreParticipant (ID 1)` path as `INSERT`/`DELETE` — there is no
+separate write path for updated rows:
+
+- **Point form (complete-PK `WHERE`):** `execute_update_by_key` reads the row at the statement's snapshot
+  (`Engine::get`), applies the assignments left to right against the progressively updated row (so `SET a =
+  a + 1, b = a` observes the new `a`), enforces `NOT NULL` on the result, and commits a single
+  `Mutation::Put` under the same key through `commit_puts` (one `TransactionRequest`, one version). Zero
+  matches (row absent) return `affected 0, version None` without a transaction.
+- **Scan form (no complete-PK `WHERE`, or a non-PK filter):** `execute_update_by_filter` scans every
+  partition of the table at one snapshot via the general query executor's `scan_base_table` helper (same
+  `Row`/`Column`/`Converting` storage paths `Route::Query` uses), evaluates the filter (if any) per row,
+  applies assignments, re-encodes the primary key, and routes each rewritten row to its partition. All
+  rewritten rows commit as `Mutation::Put`s in **one** transaction (inherits the 2PC payload cap of 16 MiB —
+  `htap_txn::participant::MAX_PAYLOAD_SIZE` — with no chunking across multiple transactions); zero matches
+  commit no transaction (`affected 0, version None`).
+- **Value coercion and rejections:** Assignment values are coerced to the target column type at bind time
+  (numeric widening/narrowing, literal folding); `NOT NULL` is enforced. The binder rejects (as
+  `HtapError::Unsupported`) assigning a primary-key or partition-key column, subqueries in the `SET` list,
+  and `UPDATE ... FROM`/`JOIN`/`ORDER BY`/`LIMIT`.
+- **Known concurrency gap:** `LocalServer::execute` (and therefore `UPDATE`) serializes under
+  `execution_lock`, but the borrowing façade `LocalServerDataMover`'s methods (`import`, `repair_tablet`) do
+  **not** take `execution_lock` (see "Subsystem Boundaries" and "Movement and coordinator boundaries" above).
+  A caller that shares one `LocalServer` across threads and interleaves an `UPDATE`'s read-modify-write with
+  a concurrent `data_mover().import(...)` or `repair_tablet(...)` call on the same table can race; this is a
+  pre-existing asymmetry, not new to `UPDATE`, but `UPDATE`'s two-step read-then-write shape makes it visible
+  for the first time. No fix is in scope for Phase 9.
+
+Verified in `crates/htap-server/tests/query_exec.rs` (`test_update_by_primary_key_and_reopen_recovery`,
+`test_update_by_filter_across_partitions_and_storage_formats_with_reopen`,
+`test_update_by_primary_key_on_column_and_converting_partitions` — point `UPDATE` against a `Column`
+partition plus reopen, and against a partition mid-conversion (`Converting`/`SnapshotPinned`), verifying the
+delta survives a subsequent `conversion_tick` that resumes and completes the conversion).
+
 ### Concurrency, topology, and process lock boundaries
 
 - **Single execution lock:** `LocalServer` serializes all SQL execution (`execute`) and table conversion (`convert_table`) via an internal `execution_lock` (`parking_lot::Mutex<()>`).
@@ -427,6 +573,12 @@ The OLTP rowstore execution path is verified by the following test suites:
 - 2PC protocol, journal `INTENT`/`COMMIT` framing, and `RowstoreParticipant` (ID 1) lifecycle: `crates/htap-txn/tests/rowstore_adapter.rs` and `crates/htap-txn/tests/journal.rs`.
 - Server SQL binding, route classification, single-partition topology enforcement, process lock conflict rejection, and crash/reopen recovery: `crates/htap-server/tests/local_server.rs`.
 - End-to-end client SQL DML and complete-PK point reads: `crates/htap-client/tests/embedded_client.rs`.
+- `UPDATE` (point form via `Route::RowstorePointRead`-shaped snapshot Get + Put, and scan form via the
+  general query executor's `scan_base_table`), both committing through the same `RowstoreParticipant`, across
+  `Row`, `Column`, and mid-conversion `Converting` partitions: `crates/htap-server/tests/query_exec.rs`
+  (`test_update_by_primary_key_and_reopen_recovery`,
+  `test_update_by_filter_across_partitions_and_storage_formats_with_reopen`,
+  `test_update_by_primary_key_on_column_and_converting_partitions`).
 
 ---
 
@@ -434,7 +586,10 @@ The OLTP rowstore execution path is verified by the following test suites:
 
 **Status: `implemented (local MVP)`** (`htap-sql`, `htap-colstore`, `htap-convert`, and `htap-server`).
 
-Analytical queries execute via `Route::OlapScan` using two primary storage execution paths depending on the partition's storage format and conversion status:
+Analytical queries execute either via the narrow `Route::OlapScan` path (single unaliased table) using two
+primary storage execution paths depending on the partition's storage format and conversion status, or — as
+of Phase 9 — via the general `Route::Query` executor described in "General query executor" below, which
+reuses the same per-partition storage paths for every base table side of a join:
 
 ### Query binding and route classification
 
@@ -474,6 +629,64 @@ A critical architectural distinction exists between storage scanning and SQL exe
 - **Pre-base historical query fallback:** In `read_column_partition_compact_core` (and `read_column_partition`), if `target_snapshot.version < base_version`, the converter core directly falls back to scanning the rowstore and collapsing rows, because columnar segments only represent state at and after `base_version`.
 - **Manifest-bearing Converting defensive branch:** In normal operation, the conversion process publishes the tablet manifest to the catalog only upon final cutover to `StorageDescriptor::Column`. However, if a converting partition in the catalog already references a valid manifest, `LocalServer` contains a defensive branch executing the compact columnar path.
 
+### General query executor (Phase 9)
+
+**Status: `implemented (local MVP)`** (`htap-sql::{query, expr, binder_query}`, `htap-server::query_exec`).
+
+`BoundStatement::Query(BoundQuery)` — every statement that fails the narrow-shape gate described under
+"Query routing" above — routes to `Route::Query` and executes in `crates/htap-server/src/query_exec.rs`,
+whose module doc is the source of truth for this contract. Summary:
+
+- **Model:** Every base table side of a join is materialized as logical rows through the same storage path
+  the narrow `Route::OlapScan` executor uses (`scan_partition_compact`): `Row` partitions from the LSM
+  rowstore, `Column` and manifest-bearing `Converting` partitions from columnar segments with the rowstore
+  delta overlaid, `SnapshotPinned` manifest-less `Converting` partitions falling back to the rowstore path
+  (the same fallback rules as `Route::OlapScan`). Execution then runs as separate, sequential stages over
+  those materialized rows: (1) uncorrelated subqueries, executed once; (2) per-slot column projection,
+  partition pruning, and single-leaf predicate pushdown derived from that slot's own `WHERE` conjuncts; (3)
+  left-deep joins (hash join on equi-conjuncts — NULL keys never match — nested loop for residual `ON`
+  predicates, with per-row match tracking for `LEFT`/`RIGHT` null padding); (4) `WHERE`; (5) `GROUP BY` /
+  aggregation; (6) projection; (7) `HAVING`; (8) `DISTINCT`; (9) `ORDER BY`; (10) `LIMIT`/`OFFSET`; (11)
+  `UNION`.
+- **Snapshot:** One MVCC `Snapshot` (`Snapshot::new(txn_manager.visible_version())`) is taken per statement
+  and reused for every slot, every partition, and every subquery, so all sides of a cross-engine join observe
+  the same committed version — this is what makes the join correct across a `Row` table and a converted
+  `Column`/`Converting` table in the same query. Partition pruning only chooses which partitions are
+  scanned; it never suppresses the rowstore delta overlay inside a scanned partition.
+- **Pruning/pushdown and the outer-join exception:** Per-slot partition pruning and single-leaf predicate
+  pushdown are derived from single-table `WHERE` conjuncts exactly as in `Route::OlapScan`, except on the
+  null-supplying side of an outer join, where a conjunct that would incorrectly filter unmatched rows before
+  the join is kept as a residual filter instead of being pushed into the scan.
+- **Determinism:** Without `ORDER BY`, output order is slot-0 rows in scan order (partition order, then
+  primary-key order within a partition), each joined with its matching right rows in the right input's scan
+  order, with unmatched preserved rows of an outer join emitted after the matched output; groups are emitted
+  in ascending order of their `GROUP BY` key tuple.
+- **Limits:** Intermediate results (scanned rows, hash tables, groups) are held in memory without bounds;
+  there is no spilling, no cost-based planning, and — unlike `Route::OlapScan`, which uses bounded in-process
+  partition scan workers — no worker-pool parallelism on this path (each slot's own partition scan still uses
+  the narrow path's scan workers internally, but joins/grouping/ordering run single-threaded in memory).
+
+`UPDATE`'s scan form (`execute_update_by_filter`) reuses this executor's `scan_base_table` helper at the
+statement's snapshot to find matching rows before rewriting them; see "Transactional write execution path"
+below.
+
+Verified in `crates/htap-sql/src/expr.rs` unit tests (`three_valued_logic_tables`,
+`numeric_promotion_and_overflow`, `like_in_between_case_cast`, `scalar_functions`,
+`subquery_and_aggregate_context`, `expr_type_inference`); `crates/htap-sql/tests/query_bind.rs`
+(`test_join_binding_kinds_aliases_and_wildcards`, `test_join_binding_errors`,
+`test_expressions_functions_and_type_checks`, `test_aggregates_group_by_having_and_grouping_rules`,
+`test_order_by_limit_distinct`, `test_subqueries_ctes_derived_tables_and_union`,
+`test_update_drop_show_binding`, `test_bound_predicate_evaluation_with_joined_rows`);
+`crates/htap-sql/tests/route.rs` (`test_route_classification`,
+`test_point_read_fast_path_pinned_against_general_query_path`); `crates/htap-server/tests/query_exec.rs`
+(`test_joins_across_row_column_and_converting_tables`,
+`test_outer_joins_null_padding_residual_on_and_null_keys`,
+`test_expressions_aggregates_having_order_limit_distinct`,
+`test_union_derived_tables_ctes_and_subqueries`, `test_partition_pruning_and_pushdown_through_general_path`,
+`test_single_snapshot_across_engines_and_freshness`, `test_general_query_over_reopened_server`); and
+`crates/htap-server/tests/local_server.rs::test_analytic_unsupported_clauses` (rewritten to show which
+clauses now bind and execute, and which remain rejected).
+
 ### Verification and test coverage
 
 The OLAP execution paths are verified by:
@@ -481,6 +694,9 @@ The OLAP execution paths are verified by:
 - Analytical queries on row and column formats, base-plus-delta equivalence, and predicate pushdown pruning stats: `crates/htap-server/tests/local_server.rs`.
 - `AnalyticSelect` parsing, binding, and route classification: `crates/htap-sql/tests/parse_bind.rs` and `crates/htap-sql/tests/route.rs`.
 - Columnar segment scan decoding and zone-map skipping: `crates/htap-colstore/tests/scan.rs` and `crates/htap-colstore/tests/zone_map_skip.rs`.
+- The general query executor (joins, expressions, subqueries, set operations, cross-engine snapshot
+  consistency): `crates/htap-server/tests/query_exec.rs` (see "General query executor" above for the full
+  list of test names).
 
 ---
 
@@ -745,12 +961,17 @@ The placement planner computes pure, deterministic, colocation-free replica plac
 1. **Canonical sorting:** Sorts candidate nodes and tablets in ascending order of their IDs to ensure identical plans regardless of input order.
 2. **Colocation prevention:** Strictly validates that no node hosts multiple replicas of the same tablet.
 3. **Greedy load balancing:** Preserves existing healthy replicas and assigns new replicas to candidate nodes with the lowest current replica count, breaking ties deterministically by smallest `NodeId`.
-4. **Monotonic replica ID allocation:** Allocates new `ReplicaId` values starting from `max_existing_id + 1` with checked arithmetic overflow validation.
+4. **Monotonic replica ID allocation (Phase 9: high-water mark, not just live max):** Allocates new
+   `ReplicaId` values starting from `snapshot.id_high_water().replica + 1` (not merely the highest replica id
+   currently present in the catalog), with checked arithmetic overflow validation — because a `ReplicaId`
+   names a movement snapshot package directory on disk (see "Movement and coordinator boundaries" below), an
+   id belonging to a removed replica must never be reissued even if no live replica currently references it.
+   Verified in `crates/htap-coord/tests/placement_movement.rs::test_plan_placement_allocates_above_id_high_water`.
 
 ### Coordinator-mediated local replica activation
 
 Replica activation (`activate_placement_addition`, `activate_placement_plan`) proceeds through coordinator-fenced phases using a caller-supplied scope:
-1. **Staging (`stage_placement_addition`):** Under coordinator fence validation for the caller-supplied scope, registers target `ReplicaDescriptor` in the catalog with `is_leader = false` and `healthy = false` via `fenced_catalog_compare_and_set`.
+1. **Staging (`stage_placement_addition`):** Under coordinator fence validation for the caller-supplied scope, registers target `ReplicaDescriptor` in the catalog with `is_leader = false` and `healthy = false` via `fenced_catalog_compare_and_set`, and raises the staged snapshot's persisted `id_high_water.replica` to at least the new replica's id (see "Catalog identifier high-water mark" above), so a subsequently removed-and-recreated replica never reuses this id.
 2. **Logical clone & package verification:** Generates a logical snapshot clone package (an `HTAPMNF1` `MANIFEST` plus one `DATA` payload/checksum, never copying WAL/SST) via `htap_movement::clone_tablet` and verifies package checksums and metadata via `htap_movement::verify_package`.
 3. **Activation (`activate_placement_addition`):** Transitions the target replica to `healthy = true` via `fenced_catalog_compare_and_set` under the caller-supplied scope. If cloning, verification, or fencing fails at any step, the target replica remains unready (`healthy = false`) in the catalog.
 4. **Batch activation (`activate_placement_plan`):** Sequentially stages, clones, verifies, and activates all additions in a `PlacementPlan` using the caller-supplied scope.
@@ -785,6 +1006,7 @@ Data movement and cluster coordination operate as independent subsystems that in
 `LocalServer` integrates data movement via a non-owning borrowing façade:
 - Calling `server.data_mover()` returns a `LocalServerDataMover<'_>` borrowing `&self.data_mover`, `&self.catalog`, `&self.txn_manager`, and `&self.engine`.
 - Exposes high-level helper methods (`import`, `export`, `copy_to_csv*`, `copy_to_jsonl*`, `clone_tablet`, `verify_package`, `repair_tablet`) while keeping ownership and process locking under `LocalServer`.
+- **Does not take `execution_lock`:** unlike `LocalServer::execute` and `LocalServer::convert_table`, `LocalServerDataMover`'s methods do not acquire the server's `execution_lock`. A caller sharing one `LocalServer` across threads can therefore interleave `import`/`repair_tablet` with a concurrent `execute()` call (including `UPDATE`'s read-modify-write) on the same table without serialization from this facade; see the "`UPDATE` execution path" subsection of "OLTP rowstore execution path" above for the concrete hazard this creates.
 
 ### Local coordinator implementation (`htap-coord`)
 

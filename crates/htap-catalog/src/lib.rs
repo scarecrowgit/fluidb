@@ -10,7 +10,7 @@ pub mod store;
 
 pub use local::LocalCatalogStore;
 pub use model::{
-    CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase,
+    CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase, IdHighWater,
     ListPartitionDefinition, NodeId, PartitionAlteration, PartitionDefinition, PartitionDescriptor,
     PartitionId, PartitionSource, PartitioningDescriptor, PartitioningMethod, RangeBound,
     RangePartitionDefinition, ReplicaDescriptor, ReplicaId, StorageDescriptor, StorageFormat,

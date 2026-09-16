@@ -1358,12 +1358,8 @@ fn test_negative_select_and_delete() {
         "SELECT * FROM users WHERE nonexistent = 1",
         // Duplicate PK predicate
         "SELECT * FROM users WHERE id = 1 AND id = 2",
-        // OR in WHERE predicate
-        "SELECT * FROM users WHERE id = 1 OR id = 2",
         // NULL literal in WHERE
         "SELECT * FROM users WHERE id = NULL",
-        // Reversed operands (value = col)
-        "SELECT * FROM users WHERE 1 = id",
         "DELETE FROM users WHERE 1 = id",
         // Missing WHERE clause in DELETE
         "DELETE FROM users",
@@ -1377,8 +1373,6 @@ fn test_negative_select_and_delete() {
         "DELETE FROM users WHERE id > 1",
         "DELETE FROM users WHERE id != 1",
         "DELETE FROM users WHERE id IS NULL",
-        // Expression in WHERE value
-        "SELECT * FROM users WHERE id = 1 + 1",
         // Placeholder in WHERE value
         "SELECT * FROM users WHERE id = ?",
         // Type mismatch in WHERE value
@@ -1398,38 +1392,17 @@ fn test_negative_select_and_delete() {
     }
 
     let unsupported_cases = [
-        // Joins
-        "SELECT * FROM users JOIN orders ON users.id = orders.tenant_id WHERE users.id = 1",
-        "SELECT * FROM users, orders WHERE users.id = 1",
-        // Aliases
-        "SELECT * FROM users u WHERE id = 1",
-        "SELECT * FROM users AS u WHERE id = 1",
+        // DELETE aliases / qualified names / ORDER BY / LIMIT
         "DELETE FROM users u WHERE id = 1",
         "DELETE FROM users AS u WHERE id = 1",
-        "SELECT id AS my_id FROM users WHERE id = 1",
-        // Qualified names
-        "SELECT * FROM db.users WHERE id = 1",
         "DELETE FROM db.users WHERE id = 1",
-        "SELECT users.id FROM users WHERE id = 1",
-        "SELECT * FROM users WHERE users.id = 1",
-        // Unsupported ORDER BY expressions / aggregates / qualified names
-        "SELECT * FROM users WHERE id = 1 ORDER BY id + 1",
-        "SELECT * FROM users WHERE id = 1 ORDER BY users.id",
-        "SELECT id, COUNT(*) FROM users GROUP BY id ORDER BY COUNT(*)",
         "DELETE FROM users WHERE id = 1 ORDER BY id",
-        // LIMIT
-        "SELECT * FROM users WHERE id = 1 LIMIT 1",
         "DELETE FROM users WHERE id = 1 LIMIT 1",
-        // GROUP BY ALL / HAVING / DISTINCT
+        // Qualified (schema.table) names
+        "SELECT * FROM db.users WHERE id = 1",
+        // GROUP BY ALL
         "SELECT * FROM users GROUP BY ALL",
-        "SELECT * FROM users WHERE id = 1 HAVING id = 1",
-        "SELECT DISTINCT id FROM users WHERE id = 1",
-        // CTEs / Set ops
-        "WITH cte AS (SELECT 1) SELECT * FROM users WHERE id = 1",
-        "SELECT * FROM users WHERE id = 1 UNION SELECT * FROM users WHERE id = 2",
-        // Unsupported statement types
-        "UPDATE users SET name = 'bob' WHERE id = 1",
-        "DROP TABLE users",
+        // Non-partition ALTER
         "ALTER TABLE users ADD COLUMN foo INT",
     ];
 
@@ -1440,6 +1413,44 @@ fn test_negative_select_and_delete() {
             "expected Unsupported for {case:?}, got {res:?}"
         );
     }
+
+    // Formerly rejected shapes now bind through the general query path (never as a
+    // point read, so no clause is silently dropped).
+    let general_cases = [
+        "SELECT * FROM users WHERE id = 1 OR id = 2",
+        "SELECT * FROM users WHERE 1 = id",
+        "SELECT * FROM users WHERE id = 1 + 1",
+        "SELECT * FROM users JOIN orders ON users.id = orders.tenant_id WHERE users.id = 1",
+        "SELECT * FROM users, orders WHERE users.id = 1",
+        "SELECT * FROM users u WHERE id = 1",
+        "SELECT * FROM users AS u WHERE id = 1",
+        "SELECT id AS my_id FROM users WHERE id = 1",
+        "SELECT users.id FROM users WHERE id = 1",
+        "SELECT * FROM users WHERE users.id = 1",
+        "SELECT * FROM users WHERE id = 1 ORDER BY id + 1",
+        "SELECT * FROM users WHERE id = 1 ORDER BY users.id",
+        "SELECT id, COUNT(*) FROM users GROUP BY id ORDER BY COUNT(*)",
+        "SELECT * FROM users WHERE id = 1 LIMIT 1",
+        "SELECT * FROM users WHERE id = 1 HAVING id = 1",
+        "SELECT DISTINCT id FROM users WHERE id = 1",
+        "WITH cte AS (SELECT 1) SELECT * FROM users WHERE id = 1",
+        "SELECT * FROM users WHERE id = 1 UNION SELECT * FROM users WHERE id = 2",
+    ];
+    for case in general_cases {
+        let res = parse_and_bind(case, &catalog);
+        assert!(
+            matches!(res, Ok(BoundStatement::Query(_))),
+            "expected general Query for {case:?}, got {res:?}"
+        );
+    }
+    assert!(matches!(
+        parse_and_bind("UPDATE users SET name = 'bob' WHERE id = 1", &catalog),
+        Ok(BoundStatement::Update(_))
+    ));
+    assert!(matches!(
+        parse_and_bind("DROP TABLE users", &catalog),
+        Ok(BoundStatement::DropTable(_))
+    ));
 }
 
 #[test]
@@ -1830,8 +1841,6 @@ fn test_bind_analytic_select_negative() {
         "SELECT COUNT(*) FROM users GROUP BY nonexistent",
         // Duplicate column in GROUP BY
         "SELECT COUNT(*) FROM users GROUP BY id, id",
-        // Expression in GROUP BY
-        "SELECT COUNT(*) FROM users GROUP BY id + 1",
         // Duplicate output column names
         "SELECT id, id FROM users",
         // SUM on non-numeric column (String)
@@ -1840,14 +1849,6 @@ fn test_bind_analytic_select_negative() {
         "SELECT SUM(data) FROM bytes_table",
         // Aggregate with multiple arguments
         "SELECT COUNT(id, name) FROM users",
-        // NOT operator in WHERE
-        "SELECT * FROM users WHERE NOT (id = 1)",
-        // Cross-column comparison in WHERE
-        "SELECT * FROM users WHERE id = age",
-        // Reversed operands in inequality
-        "SELECT * FROM users WHERE 10 < age",
-        // Reversed operands in equality
-        "SELECT * FROM users WHERE 'alice' = name",
         // Unknown column in ORDER BY
         "SELECT * FROM users ORDER BY nonexistent",
         // Column not in GROUP BY in ORDER BY
@@ -1862,28 +1863,29 @@ fn test_bind_analytic_select_negative() {
         );
     }
 
-    let unsupported_cases = [
-        // AVG function
+    // Shapes outside the narrow analytic slice bind through the general query path.
+    let general_cases = [
+        "SELECT COUNT(*) FROM users GROUP BY id + 1",
+        "SELECT * FROM users WHERE NOT (id = 1)",
+        "SELECT * FROM users WHERE id = age",
+        "SELECT * FROM users WHERE 10 < age",
+        "SELECT * FROM users WHERE 'alice' = name",
         "SELECT AVG(age) FROM users",
         "SELECT AVG(amount) FROM orders",
-        // DISTINCT in aggregate
         "SELECT COUNT(DISTINCT id) FROM users",
         "SELECT SUM(DISTINCT amount) FROM orders",
-        // Column alias
         "SELECT id AS user_id FROM users",
-        // Aggregate alias
         "SELECT COUNT(*) AS total FROM users",
-        // Unsupported ORDER BY cases
         "SELECT * FROM users ORDER BY id + 1",
         "SELECT * FROM users ORDER BY users.id",
         "SELECT id, COUNT(*) FROM users GROUP BY id ORDER BY COUNT(*)",
     ];
 
-    for case in unsupported_cases {
+    for case in general_cases {
         let res = parse_and_bind(case, &catalog);
         assert!(
-            matches!(res, Err(HtapError::Unsupported(_))),
-            "expected Unsupported for {case:?}, got {res:?}"
+            matches!(res, Ok(BoundStatement::Query(_))),
+            "expected general Query for {case:?}, got {res:?}"
         );
     }
 }

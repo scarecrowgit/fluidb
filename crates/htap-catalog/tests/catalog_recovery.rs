@@ -462,9 +462,9 @@ fn test_corruption_and_truncation() {
     assert!(matches!(err, HtapError::Corruption(_)));
     assert!(err.to_string().contains("invalid catalog header magic"));
 
-    // 4. Unsupported version
+    // 4. Unsupported version (neither current nor legacy)
     let mut encoded = encode_snapshot(&snap).unwrap();
-    encoded[8..10].copy_from_slice(&2u16.to_le_bytes());
+    encoded[8..10].copy_from_slice(&3u16.to_le_bytes());
     fs::write(&catalog_path, &encoded).unwrap();
     let err = LocalCatalogStore::open(temp.path()).unwrap_err();
     assert!(matches!(err, HtapError::Corruption(_)));
@@ -2938,4 +2938,193 @@ fn test_partition_alteration_cas_and_reopen() {
             .unwrap(),
         p1_id
     );
+}
+
+/// A version-1 envelope (payload without `id_high_water`) still decodes, its counters
+/// default to zero, and allocation falls back to the live maximum + 1. After a
+/// CAS the file is rewritten as version 2.
+#[test]
+fn test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max() {
+    use htap_catalog::local::{decode_snapshot, LEGACY_FORMAT_VERSION};
+    use htap_catalog::IdHighWater;
+
+    let temp = TempDir::new().unwrap();
+    let legacy_json = r#"{
+        "generation": 1,
+        "tables": [{
+            "id": 3,
+            "name": "users",
+            "schema": {"columns": [
+                {"name": "id", "data_type": "Int64", "nullable": false, "primary_key": true}
+            ]},
+            "primary_key": [0],
+            "partitions": [10],
+            "generation": 1
+        }],
+        "partitions": [{"id": 10, "table_id": 3, "name": "p0", "storage": "Row",
+                        "tablets": [100], "generation": 1}],
+        "tablets": [{"id": 100, "partition_id": 10, "bucket": 0, "replicas": [1000],
+                     "generation": 1}],
+        "replicas": [{"id": 1000, "tablet_id": 100, "node_id": 1, "is_leader": true,
+                      "healthy": true, "generation": 1}]
+    }"#;
+    let payload = legacy_json.as_bytes();
+    let mut raw = Vec::new();
+    raw.extend_from_slice(HEADER_MAGIC);
+    raw.extend_from_slice(&LEGACY_FORMAT_VERSION.to_le_bytes());
+    raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&crc32c::crc32c(payload).to_le_bytes());
+    raw.extend_from_slice(payload);
+
+    let decoded = decode_snapshot(&raw).unwrap();
+    assert_eq!(decoded.id_high_water, IdHighWater::default());
+    assert_eq!(
+        decoded.id_high_water(),
+        IdHighWater {
+            table: 3,
+            partition: 10,
+            tablet: 100,
+            replica: 1000
+        }
+    );
+
+    fs::write(temp.path().join("CATALOG"), &raw).unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    let loaded = store.load().unwrap().unwrap();
+    assert_eq!(loaded, decoded);
+
+    // A successor snapshot persists an explicit high-water mark and the file becomes v2.
+    let mut hw = loaded.id_high_water();
+    let new_table = hw.allocate_table().unwrap();
+    assert_eq!(new_table, TableId::new(4));
+    let mut next = loaded.clone();
+    next.generation = 2;
+    next = next.with_id_high_water(hw);
+    store.compare_and_set(1, next.clone()).unwrap();
+    let bytes = fs::read(temp.path().join("CATALOG")).unwrap();
+    assert_eq!(&bytes[8..10], &FORMAT_VERSION.to_le_bytes());
+    assert_eq!(FORMAT_VERSION, 2);
+    let reloaded = LocalCatalogStore::open(temp.path())
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.id_high_water.table, 4);
+    assert_eq!(reloaded.id_high_water(), hw);
+}
+
+/// Identifiers of removed objects are never reissued: the persisted high-water mark wins
+/// over the live maximum, across CAS and reopen.
+#[test]
+fn test_catalog_id_high_water_prevents_reuse_after_removal() {
+    use htap_catalog::IdHighWater;
+
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    let snap = make_valid_snapshot(1).with_id_high_water(IdHighWater {
+        table: 1,
+        partition: 10,
+        tablet: 100,
+        replica: 1000,
+    });
+    store.compare_and_set(0, snap.clone()).unwrap();
+
+    // Remove everything (simulating DROP TABLE) but carry the high-water mark forward.
+    let emptied = CatalogSnapshot::new(2, vec![], vec![], vec![], vec![])
+        .with_id_high_water(snap.id_high_water());
+    store.compare_and_set(1, emptied).unwrap();
+
+    let reopened = LocalCatalogStore::open(temp.path()).unwrap();
+    let loaded = reopened.load().unwrap().unwrap();
+    assert!(loaded.tables.is_empty());
+    let mut hw = loaded.id_high_water();
+    assert_eq!(hw.allocate_table().unwrap(), TableId::new(2));
+    assert_eq!(hw.allocate_partition().unwrap(), PartitionId::new(11));
+    assert_eq!(hw.allocate_tablet().unwrap(), TabletId::new(101));
+    assert_eq!(hw.allocate_replica().unwrap(), ReplicaId::new(1001));
+
+    // Overflow is reported, not wrapped.
+    let mut saturated = IdHighWater {
+        table: u64::MAX,
+        ..IdHighWater::default()
+    };
+    assert!(matches!(
+        saturated.allocate_table(),
+        Err(HtapError::CounterOverflow {
+            counter: "table_id"
+        })
+    ));
+}
+
+/// `compare_and_set` refuses a successor whose identifier high-water mark regresses and
+/// leaves the published file untouched.
+#[test]
+fn test_catalog_cas_rejects_regressing_id_high_water() {
+    use htap_catalog::IdHighWater;
+
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    let snap = make_valid_snapshot(1).with_id_high_water(IdHighWater {
+        table: 7,
+        partition: 70,
+        tablet: 700,
+        replica: 7000,
+    });
+    store.compare_and_set(0, snap.clone()).unwrap();
+    let before = fs::read(temp.path().join("CATALOG")).unwrap();
+
+    // Built with `new()` and never carried forward: the mark falls back to the live max
+    // (1/10/100/1000), which is below the persisted 7/70/700/7000.
+    let regressed = CatalogSnapshot::new(
+        2,
+        snap.tables.clone(),
+        snap.partitions.clone(),
+        snap.tablets.clone(),
+        snap.replicas.clone(),
+    );
+    let err = store.compare_and_set(1, regressed).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)), "{err}");
+    assert!(err.to_string().contains("high-water mark regressed"));
+    assert_eq!(fs::read(temp.path().join("CATALOG")).unwrap(), before);
+
+    // Carrying the mark forward (or raising it) is accepted.
+    let ok = CatalogSnapshot::new(
+        2,
+        snap.tables.clone(),
+        snap.partitions.clone(),
+        snap.tablets.clone(),
+        snap.replicas.clone(),
+    )
+    .with_id_high_water(IdHighWater {
+        replica: 7001,
+        ..snap.id_high_water()
+    });
+    store.compare_and_set(1, ok).unwrap();
+    assert_eq!(store.load().unwrap().unwrap().id_high_water.replica, 7001);
+}
+
+/// A version-2 envelope must carry `id_high_water`; a CRC-valid v2 payload without it is
+/// rejected instead of silently decoding as zeros.
+#[test]
+fn test_catalog_v2_payload_without_id_high_water_is_rejected() {
+    use htap_catalog::local::decode_snapshot;
+
+    let snap = make_valid_snapshot(1);
+    let mut json: serde_json::Value = serde_json::to_value(&snap).unwrap();
+    json.as_object_mut().unwrap().remove("id_high_water");
+    let payload = serde_json::to_vec(&json).unwrap();
+    let mut raw = Vec::new();
+    raw.extend_from_slice(HEADER_MAGIC);
+    raw.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+    raw.extend_from_slice(&payload);
+    let err = decode_snapshot(&raw).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)), "{err}");
+    assert!(err.to_string().contains("missing id_high_water"));
+
+    // The same payload under the legacy version header decodes (counters default).
+    raw[8..10].copy_from_slice(&1u16.to_le_bytes());
+    let decoded = decode_snapshot(&raw).unwrap();
+    assert_eq!(decoded.id_high_water, htap_catalog::IdHighWater::default());
 }

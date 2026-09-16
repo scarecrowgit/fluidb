@@ -7,6 +7,9 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
+use crate::expr::Expr;
+use crate::query::BoundQuery;
+
 /// Parses a single SQL statement using [`MySqlDialect`].
 ///
 /// Rejects empty input or multi-statement input with [`HtapError::InvalidArgument`].
@@ -45,6 +48,69 @@ pub enum BoundStatement {
     AnalyticSelect(AnalyticSelect),
     /// ALTER TABLE partition statement (ADD, DROP, REORGANIZE).
     AlterPartitions(AlterPartitions),
+    /// General query (joins, expressions, subqueries, set operations, LIMIT, ...).
+    Query(BoundQuery),
+    /// UPDATE statement.
+    Update(UpdateStatement),
+    /// DROP TABLE statement.
+    DropTable(DropTableStatement),
+    /// SHOW / DESCRIBE statement (catalog metadata read).
+    Show(ShowStatement),
+}
+
+/// Bound representation of an UPDATE statement.
+///
+/// Assignment expressions and the filter reference the target table as slot 0.
+/// Assignments are applied left to right against the progressively updated row
+/// (`SET a = a + 1, b = a` uses the new `a` for `b`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStatement {
+    /// Target table name.
+    pub table: String,
+    /// `(column index, value expression)` pairs; values are already coerced to the column type.
+    pub assignments: Vec<(usize, Expr)>,
+    /// Which rows to update.
+    pub target: UpdateTarget,
+}
+
+/// Row selection of an UPDATE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateTarget {
+    /// The WHERE clause names the complete primary key: a single point read-modify-write.
+    PrimaryKey(Vec<Value>),
+    /// Scan-based update; `None` updates every row.
+    Filter(Option<Expr>),
+}
+
+/// Bound representation of a DROP TABLE statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTableStatement {
+    /// Table name.
+    pub table: String,
+    /// `IF EXISTS`.
+    pub if_exists: bool,
+}
+
+/// Bound representation of SHOW / DESCRIBE statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShowStatement {
+    /// `SHOW TABLES [LIKE pattern]`.
+    Tables {
+        /// Optional `LIKE` pattern.
+        like: Option<String>,
+    },
+    /// `SHOW DATABASES`.
+    Databases,
+    /// `SHOW COLUMNS FROM table`.
+    Columns {
+        /// Table name.
+        table: String,
+    },
+    /// `DESCRIBE table` / `DESC table`.
+    Describe {
+        /// Table name.
+        table: String,
+    },
 }
 
 /// Bound representation of an ALTER TABLE partition statement.

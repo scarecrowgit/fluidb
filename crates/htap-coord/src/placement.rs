@@ -218,13 +218,9 @@ pub fn plan_placement(
         }
     }
 
-    // Find highest existing replica ID for overflow-checked sequential allocation
-    let mut max_replica_id_u64 = snapshot
-        .replicas
-        .iter()
-        .map(|r| r.id.get())
-        .max()
-        .unwrap_or(0);
+    // Allocate replica ids above the persisted high-water mark (never reuse ids of
+    // removed replicas, whose movement packages may still exist on disk).
+    let mut max_replica_id_u64 = snapshot.id_high_water().replica;
 
     // Canonicalize tablets: sort by TabletId ascending
     let mut sorted_tablets = snapshot.tablets.clone();
@@ -369,6 +365,9 @@ pub fn stage_placement_addition(
             }
         }
         next_snapshot.replicas.push(staged.clone());
+        let mut high_water = next_snapshot.id_high_water();
+        high_water.replica = high_water.replica.max(staged.id.get());
+        next_snapshot.id_high_water = high_water;
         next_snapshot.generation =
             snapshot
                 .generation

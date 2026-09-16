@@ -656,3 +656,60 @@ fn test_mysql_crate_driver_interop() {
     }
     wire.shutdown();
 }
+
+/// Joins, UPDATE, SHOW/DESCRIBE and DROP TABLE round-trip through the wire protocol.
+#[test]
+fn test_general_sql_over_wire() {
+    let (_dir, wire) = start(None, 4);
+    let mut c = WireClient::connect(addr(&wire), None).unwrap();
+    c.query("CREATE TABLE u (id INT PRIMARY KEY, name VARCHAR(16))")
+        .unwrap();
+    c.query("CREATE TABLE o (oid BIGINT PRIMARY KEY, uid INT, amt DOUBLE)")
+        .unwrap();
+    c.query("INSERT INTO u (id, name) VALUES (1, 'ann'), (2, 'bob')")
+        .unwrap();
+    c.query("INSERT INTO o (oid, uid, amt) VALUES (10, 1, 2.5), (11, 1, 4.0), (12, 3, 1.0)")
+        .unwrap();
+    let rs = rows(
+        c.query(
+            "SELECT u.name, COUNT(o.oid) AS n, COALESCE(SUM(o.amt), 0) AS total \
+             FROM u LEFT JOIN o ON o.uid = u.id GROUP BY u.name ORDER BY total DESC LIMIT 5",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![
+            Row::new(vec![
+                Value::String("ann".into()),
+                Value::Int64(2),
+                Value::Float64(6.5)
+            ]),
+            Row::new(vec![
+                Value::String("bob".into()),
+                Value::Int64(0),
+                Value::Float64(0.0)
+            ]),
+        ]
+    );
+    let r = ok(c.query("UPDATE o SET amt = amt * 2 WHERE uid = 1").unwrap());
+    assert_eq!(r.affected_rows, 2);
+    assert!(r.info.starts_with("version="));
+    let names = rows(c.query("SHOW TABLES").unwrap());
+    assert_eq!(
+        names,
+        vec![
+            Row::new(vec![Value::String("o".into())]),
+            Row::new(vec![Value::String("u".into())])
+        ]
+    );
+    let desc = rows(c.query("DESCRIBE u").unwrap());
+    assert_eq!(desc.len(), 2);
+    assert_eq!(desc[0].get(0), Some(&Value::String("id".into())));
+    assert_eq!(desc[0].get(3), Some(&Value::String("PRI".into())));
+    let r = ok(c.query("DROP TABLE o").unwrap());
+    assert_eq!(r.affected_rows, 1);
+    let err = c.query("SELECT COUNT(*) FROM o").unwrap_err();
+    assert_eq!(server_code(err), 1146);
+    wire.shutdown();
+}

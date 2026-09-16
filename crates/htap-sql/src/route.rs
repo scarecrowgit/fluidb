@@ -47,8 +47,18 @@ pub enum Route {
         /// Encoded primary key bytes.
         key: Vec<u8>,
     },
-    /// Analytical scan query route.
+    /// Analytical scan query route (narrow single-table `AnalyticSelect`).
     OlapScan,
+    /// General query route (joins, expressions, subqueries, set operations); every base
+    /// table side is read through the storage path of its own partitions.
+    Query,
+    /// Transactional rowstore update; `key` is the encoded primary key for the point form.
+    RowstoreUpdate {
+        /// Encoded primary key bytes for a complete-PK update, `None` for the scan form.
+        key: Option<Vec<u8>>,
+    },
+    /// Catalog metadata read (`SHOW`, `DESCRIBE`).
+    CatalogRead,
 }
 
 /// Classifies a catalog-bound statement into an execution route given the target storage descriptor.
@@ -66,6 +76,11 @@ pub enum Route {
 /// - [`BoundStatement::AnalyticSelect`] routes to [`Route::OlapScan`] across [`StorageDescriptor::Row`],
 ///   [`StorageDescriptor::Column`], and [`StorageDescriptor::Converting`]. Storage descriptors are accepted
 ///   as local server capability (the server will validate columnar manifests or fallback paths during execution).
+/// - [`BoundStatement::Query`] routes to [`Route::Query`] for every storage descriptor.
+/// - [`BoundStatement::Update`] routes to [`Route::RowstoreUpdate`] for every storage descriptor
+///   (rowstore authoritative for mutations); the point form carries the encoded key.
+/// - [`BoundStatement::DropTable`] routes to [`Route::CatalogDdl`]; [`BoundStatement::Show`] to
+///   [`Route::CatalogRead`].
 ///
 /// # Errors
 /// Returns [`HtapError`] if primary key encoding fails.
@@ -92,6 +107,24 @@ pub fn classify_route(statement: &BoundStatement, storage: &StorageDescriptor) -
             | StorageDescriptor::Column
             | StorageDescriptor::Converting { .. } => Ok(Route::OlapScan),
         },
+        BoundStatement::Query(_) => match storage {
+            StorageDescriptor::Row
+            | StorageDescriptor::Column
+            | StorageDescriptor::Converting { .. } => Ok(Route::Query),
+        },
+        BoundStatement::Update(update) => match storage {
+            StorageDescriptor::Row
+            | StorageDescriptor::Column
+            | StorageDescriptor::Converting { .. } => {
+                let key = match &update.target {
+                    crate::ast::UpdateTarget::PrimaryKey(values) => Some(encode_key(values)?),
+                    crate::ast::UpdateTarget::Filter(_) => None,
+                };
+                Ok(Route::RowstoreUpdate { key })
+            }
+        },
+        BoundStatement::DropTable(_) => Ok(Route::CatalogDdl),
+        BoundStatement::Show(_) => Ok(Route::CatalogRead),
     }
 }
 
