@@ -80,6 +80,8 @@ DETAIL:
 - `gemini` (1M context) suits whole-doc consistency sweeps and reading large StarRocks sources.
 - `reasoner` suits alternative designs; `reviewer` suits independent diff reads.
 - `ag/claude-sonnet-4-6` (alias `coder`) is the code author behind `implementer`; Claude roles don't write implementation code.
+  Enforced by hooks in `.claude/settings.json` (`.claude/hooks/9router_guard.py`): edits to `crates/`, `vendor/`, `Cargo.toml`,
+  `ci.sh`, `*.rs` are denied unless the text came from a 9router response; start Claude with `FLUIDB_CLAUDE_EDITS=1` to bypass.
 - `architect` (heavy tier, rarely) is for ADR-level decisions that are costly to reverse. `heavy` (rarely) is for
   corruption or concurrency questions where other models disagree.
 - External answers are input, not truth: confirm every claim against the code before acting on it.

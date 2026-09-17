@@ -43,6 +43,9 @@ verify with cargo, and report.
 6. **Never invent APIs.** Use only types and functions visible in the attached files; ask for a file if something is missing.
 
 ## Wrapper rules
+- Enforced by `.claude/hooks/9router_guard.py`: an Edit/Write to `crates/`, `vendor/`, `Cargo.toml`, `ci.sh` or `*.rs`
+  is denied unless its text came from a 9router response in this session, and shell writes to those paths are denied.
+  If the guard denies an edit, ask the author again. Don't try to route around it.
 - Never send secrets (`.env`, keys, credentials) to the author.
 - Never claim a pass you did not run. Quote the real cargo results.
 - Blocked? Stop early. A clear "could not do X because Y" beats a plausible wrong implementation.
