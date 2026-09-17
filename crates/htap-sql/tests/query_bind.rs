@@ -5,7 +5,7 @@ use htap_catalog::{CatalogSnapshot, TableDescriptor, TableId};
 use htap_common::error::{HtapError, Result};
 use htap_common::types::{DataType, Row, Value};
 use htap_sql::{
-    bind, parse_one, BoundQuery, BoundStatement, EvalContext, Expr, JoinKind, QueryBody,
+    bind, parse_one, BinOp, BoundQuery, BoundStatement, EvalContext, Expr, JoinKind, QueryBody,
     ShowStatement, TableSlot, UpdateTarget, VariableLookup,
 };
 
@@ -15,6 +15,7 @@ fn catalog() -> CatalogSnapshot {
          score DOUBLE)",
         "CREATE TABLE orders (order_id BIGINT PRIMARY KEY, user_id INT NOT NULL, \
          amount DOUBLE, note VARCHAR(64))",
+        "CREATE TABLE docs (id INT PRIMARY KEY, data BLOB)",
     ];
     let mut tables = Vec::new();
     for (i, ddl) in ddls.iter().enumerate() {
@@ -266,6 +267,49 @@ fn test_expressions_functions_and_type_checks() {
     ] {
         assert!(matches!(bind_err(sql), HtapError::Unsupported(_)), "{sql}");
     }
+}
+
+#[test]
+fn test_where_bytes_column_compared_against_string_literal_coerces() {
+    // A String *literal* compared against a BYTES-typed expression coerces to a BYTES literal
+    // (encoded as UTF-8), matching the coercion already applied to INSERT/UPDATE assignment
+    // targets: a bound parameter whose bytes happen to be valid UTF-8 decodes as `Value::String`
+    // (see `htap_wire::binary_codec::decode_execute`), so `WHERE data = ?` must accept it too.
+    // An alias on the sole FROM table forces binding through the general query path
+    // (`binder_query.rs`), which is what this fix targets: an unaliased single-table filter binds
+    // through a separate fast path (`AnalyticSelect`) that already applied this coercion.
+    let q = bind_query("SELECT id FROM docs AS d WHERE data = 'abc'");
+    match select_body(&q).filter.clone().unwrap() {
+        Expr::BinaryOp { op, left, right } => {
+            assert_eq!(op, BinOp::Eq);
+            assert!(matches!(*left, Expr::ColumnRef { ref name, .. } if name == "data"));
+            assert_eq!(*right, Expr::Literal(Value::Bytes(b"abc".to_vec())));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // The literal may be on either side of the comparison.
+    let q2 = bind_query("SELECT id FROM docs AS d WHERE 'abc' = data");
+    match select_body(&q2).filter.clone().unwrap() {
+        Expr::BinaryOp { op, left, right } => {
+            assert_eq!(op, BinOp::Eq);
+            assert_eq!(*left, Expr::Literal(Value::Bytes(b"abc".to_vec())));
+            assert!(matches!(*right, Expr::ColumnRef { ref name, .. } if name == "data"));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Also works for other comparison operators, and a genuine type mismatch (BYTES vs a
+    // non-coercible type) is still rejected.
+    assert!(bind(
+        &parse_one("SELECT id FROM docs AS d WHERE data <> 'xyz'").unwrap(),
+        &catalog()
+    )
+    .is_ok());
+    assert!(matches!(
+        bind_err("SELECT id FROM docs AS d WHERE data = 1"),
+        HtapError::InvalidArgument(_)
+    ));
 }
 
 #[test]

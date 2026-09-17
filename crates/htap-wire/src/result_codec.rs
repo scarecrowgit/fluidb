@@ -109,14 +109,19 @@ pub fn parse_column_def41(payload: &[u8]) -> io::Result<ColumnDef> {
 
 /// Builds a command OK packet (header `0x00`).
 ///
-/// The status flags are always `SERVER_STATUS_AUTOCOMMIT`; `SERVER_STATUS_IN_TRANS` is never
-/// set because the engine has no multi-statement transactions.
-pub fn build_command_ok(affected: u64, info: &str) -> Vec<u8> {
+/// `status` is the full `SERVER_STATUS_*` bitmask to report (Phase 11 fix pass, finding 8):
+/// callers build it from the session's real state — `SERVER_STATUS_AUTOCOMMIT` when autocommit is
+/// on, `SERVER_STATUS_IN_TRANS` when a transaction is open — plus `SERVER_MORE_RESULTS_EXISTS`
+/// when this is not the last result of a `CLIENT_MULTI_STATEMENTS` batch (Phase 11 plan task 10);
+/// see `htap_wire::server`'s `session_status_flags`. Before finding 8's fix, this always hardcoded
+/// `SERVER_STATUS_AUTOCOMMIT` and never set `SERVER_STATUS_IN_TRANS`, so `SET autocommit = 0` and
+/// open transactions were never reflected on the wire.
+pub fn build_command_ok(affected: u64, info: &str, status: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(16 + info.len());
     buf.push(OK_HEADER);
     write_lenenc_int(&mut buf, affected);
     write_lenenc_int(&mut buf, 0);
-    buf.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+    buf.extend_from_slice(&status.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes());
     // The manual documents `info` as `string<EOF>`, but MySQL servers actually send it
     // length-encoded and drivers parse it that way; do the same.
@@ -129,20 +134,42 @@ pub fn build_command_ok(affected: u64, info: &str) -> Vec<u8> {
 /// Builds the packet that terminates a result set (and, in legacy mode, the column block).
 ///
 /// The header is always `0xFE`. When `deprecate_eof` is negotiated the body is OK-shaped and
-/// kept under 9 bytes in total; otherwise it is a legacy EOF body.
-pub fn build_resultset_terminator(deprecate_eof: bool) -> Vec<u8> {
+/// kept under 9 bytes in total; otherwise it is a legacy EOF body. `status` is the full
+/// `SERVER_STATUS_*` bitmask to report, exactly like [`build_command_ok`]'s `status` parameter;
+/// the legacy mid-resultset terminator between column definitions and rows always strips
+/// `SERVER_MORE_RESULTS_EXISTS` out of it before calling this (Phase 11 plan task 10: it marks the
+/// end of the column block, not the end of a result), only the terminator that ends a whole
+/// result set passes the batch's real status including that flag.
+pub fn build_resultset_terminator(deprecate_eof: bool, status: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8);
     buf.push(EOF_HEADER);
     if deprecate_eof {
         write_lenenc_int(&mut buf, 0);
         write_lenenc_int(&mut buf, 0);
-        buf.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+        buf.extend_from_slice(&status.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
     } else {
         buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+        buf.extend_from_slice(&status.to_le_bytes());
     }
     buf
+}
+
+/// Reads the status-flags word out of a resultset terminator payload built by
+/// [`build_resultset_terminator`] (client side; Phase 11 plan task 10, used to detect
+/// `SERVER_MORE_RESULTS_EXISTS` between the results of a `CLIENT_MULTI_STATEMENTS` batch).
+///
+/// The legacy EOF body's layout (`warnings` then `status`, no `affected_rows`/`last_insert_id`
+/// fields) differs from an OK packet's, so unlike the deprecated-EOF (OK-shaped) terminator this
+/// cannot go through [`parse_ok_payload`].
+pub fn parse_terminator_status(payload: &[u8], deprecate_eof: bool) -> io::Result<u16> {
+    if deprecate_eof {
+        Ok(parse_ok_payload(payload)?.status)
+    } else {
+        let mut pos = 1; // skip the 0xFE header byte
+        let _warnings = read_u16(payload, &mut pos)?;
+        read_u16(payload, &mut pos)
+    }
 }
 
 /// Decoded OK packet.
@@ -459,34 +486,80 @@ mod tests {
     }
 
     #[test]
-    fn command_ok_header_is_always_0x00_and_never_in_trans() {
-        let ok = build_command_ok(3, "version=9");
+    fn command_ok_reports_the_status_it_is_given() {
+        let ok = build_command_ok(3, "version=9", SERVER_STATUS_AUTOCOMMIT);
         assert_eq!(ok[0], OK_HEADER);
         let parsed = parse_ok_payload(&ok).unwrap();
         assert_eq!(parsed.affected_rows, 3);
         assert_eq!(
-            parsed.status & 0x0001,
+            parsed.status & SERVER_STATUS_IN_TRANS,
             0,
-            "SERVER_STATUS_IN_TRANS must never be set"
+            "SERVER_STATUS_IN_TRANS must not be set when not requested"
         );
         assert_eq!(parsed.status, SERVER_STATUS_AUTOCOMMIT);
         assert_eq!(parsed.info, "version=9");
         assert_eq!(ok[7], 9, "info must be length-encoded");
-        assert_eq!(parse_ok_payload(&build_command_ok(0, "")).unwrap().info, "");
+        assert_eq!(
+            parse_ok_payload(&build_command_ok(0, "", SERVER_STATUS_AUTOCOMMIT))
+                .unwrap()
+                .info,
+            ""
+        );
         assert!(parse_ok_payload(&[0xff, 0, 0]).is_err());
+
+        // SERVER_STATUS_IN_TRANS, with autocommit off (Phase 11 fix pass, finding 8): both bits
+        // are independently reportable, not tied together.
+        let in_trans_no_autocommit = build_command_ok(0, "", SERVER_STATUS_IN_TRANS);
+        assert_eq!(
+            parse_ok_payload(&in_trans_no_autocommit).unwrap().status,
+            SERVER_STATUS_IN_TRANS
+        );
     }
 
     #[test]
     fn terminator_header_is_always_0xfe_legacy_and_deprecated() {
-        let legacy = build_resultset_terminator(false);
+        let legacy = build_resultset_terminator(false, SERVER_STATUS_AUTOCOMMIT);
         assert_eq!(legacy, [EOF_HEADER, 0, 0, 2, 0]);
         assert!(is_resultset_terminator(&legacy));
-        let modern = build_resultset_terminator(true);
+        let modern = build_resultset_terminator(true, SERVER_STATUS_AUTOCOMMIT);
         assert_eq!(modern[0], EOF_HEADER);
         assert!(modern.len() < 9);
         assert!(is_resultset_terminator(&modern));
         let parsed = parse_ok_payload(&modern).unwrap();
         assert_eq!(parsed.status, SERVER_STATUS_AUTOCOMMIT);
-        assert!(!is_resultset_terminator(&build_command_ok(0, "")));
+        assert!(!is_resultset_terminator(&build_command_ok(
+            0,
+            "",
+            SERVER_STATUS_AUTOCOMMIT
+        )));
+    }
+
+    #[test]
+    fn more_results_flag_sets_server_more_results_exists() {
+        let status = SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS;
+        let ok = build_command_ok(1, "", status);
+        assert_eq!(parse_ok_payload(&ok).unwrap().status, status);
+        let legacy = build_resultset_terminator(false, status);
+        assert_eq!(parse_terminator_status(&legacy, false).unwrap(), status);
+        let modern = build_resultset_terminator(true, status);
+        assert_eq!(parse_terminator_status(&modern, true).unwrap(), status);
+        // `parse_terminator_status` also handles the no-more-results case for both layouts (used
+        // by every non-batch resultset today).
+        assert_eq!(
+            parse_terminator_status(
+                &build_resultset_terminator(false, SERVER_STATUS_AUTOCOMMIT),
+                false
+            )
+            .unwrap(),
+            SERVER_STATUS_AUTOCOMMIT
+        );
+        assert_eq!(
+            parse_terminator_status(
+                &build_resultset_terminator(true, SERVER_STATUS_AUTOCOMMIT),
+                true
+            )
+            .unwrap(),
+            SERVER_STATUS_AUTOCOMMIT
+        );
     }
 }

@@ -8,7 +8,7 @@ This document describes the on-disk storage layout, crash-recovery boundaries, a
 
 **The HTAP database engine is a hardened local embedded MVP, not a production-ready standalone database.**
 
-The core engine (`LocalServer` / `LocalCoordinator`) is an in-process, synchronous Rust library; as of Phase 8 it can also be reached over the network via the `htapd` daemon and the `htap-wire` MySQL text-protocol server, itself a plain synchronous process with no supervisor integration (see section 6, "Running `htapd`"). Core storage, transaction, and persistence paths have received critical hardening, but **production readiness is not claimed**.
+The core engine (`LocalServer` / `LocalCoordinator`) is an in-process, synchronous Rust library; as of Phase 8 it can also be reached over the network via the `htapd` daemon and the `htap-wire` MySQL text- and binary-protocol server (binary protocol/prepared statements added in Phase 11), itself a plain synchronous process with no supervisor integration (see section 6, "Running `htapd`"). Core storage, transaction, and persistence paths have received critical hardening, but **production readiness is not claimed**.
 
 ### Completed Hardening Units
 
@@ -310,18 +310,26 @@ When reopening an existing directory via `LocalServer::open(path)`:
 ## 6. Running `htapd`
 
 `htapd` (`crates/htapd`) is a thin binary that opens a `LocalServer` root and serves it over the MySQL text
-protocol via `htap-wire::WireServer` (see ADR-016 and the "Network layer" section of
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the protocol implementation itself). Since Phase 10, each
-authenticated connection owns one `htap_server::Session` for its lifetime (`BEGIN`/`COMMIT`/`ROLLBACK`,
-`autocommit`, session variables — see ADR-018), rolled back explicitly on `QUIT`/EOF/a framing error/server
-shutdown, with the session's own `Drop` as a safety net. The start-up compatibility shim
+and binary protocols via `htap-wire::WireServer` (see ADR-016, ADR-019, and the "Network layer" / "Prepared
+statements and binary protocol" sections of [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the protocol
+implementation itself). Since Phase 10, each authenticated connection owns one `htap_server::Session` for
+its lifetime (`BEGIN`/`COMMIT`/`ROLLBACK`, `autocommit`, session variables — see ADR-018), rolled back
+explicitly on `QUIT`/EOF/a framing error/server shutdown, with the session's own `Drop` as a safety net.
+Since Phase 11, `COM_RESET_CONNECTION` and `COM_CHANGE_USER` also route through that same session's
+`reset()`, respecting the ADR-018 `CommitOutcomePending` quarantine. The start-up compatibility shim
 (`htap_wire::shim`) now only answers `USE`/`SELECT 1`/`VERSION()`/`DATABASE()`/`SCHEMA()` and the two `SET
 CHARACTER SET`/`SET CHARSET` positional forms `vendor/sqlparser` cannot parse; every other `SET` and
 `SELECT @@sysvar`/`SELECT @uservar` now goes through the connection's real session.
 
 ```text
 htapd --root <dir> [--listen 127.0.0.1:3307] [--max-connections 64] [--password <pw>]
+       [--max-allowed-packet 67108864]
 ```
+
+`--max-allowed-packet` (default 64 MiB, MySQL's own default) bounds every protocol message — including a
+prepared statement's buffered `COM_STMT_SEND_LONG_DATA` bytes — and can also be set via
+`HTAPD_MAX_ALLOWED_PACKET`; the flag wins if both are set. It is reported dynamically to clients as
+`@@max_allowed_packet`.
 
 ### Lifecycle
 
@@ -334,12 +342,15 @@ htapd --root <dir> [--listen 127.0.0.1:3307] [--max-connections 64] [--password 
    caller (section 3.0 above). A second `htapd` (or `EmbeddedClient`) pointed at the same root fails to start
    with `HtapError::Conflict` — this is the existing one-owner-per-root invariant, not a network-specific
    one.
-3. **Shutdown:** There is no graceful drain API exposed by the binary. Stop the process (Ctrl-C / SIGTERM);
-   in-flight statements are not drained, but storage is crash-safe by construction (ADR-004/008/009), so
-   committed state is recovered on the next start exactly as after a `SIGKILL` of any other `LocalServer`
-   host process. `WireServer::shutdown` (used by tests, not by the `htapd` binary itself) performs an orderly
-   stop: it sets a flag, stops accepting, and joins every connection thread, observing the stop flag only at
-   packet boundaries so no packet is torn.
+3. **Shutdown:** There is no graceful drain API exposed by the binary itself. Stop the process (Ctrl-C /
+   SIGTERM); in-flight statements are not drained, but storage is crash-safe by construction
+   (ADR-004/008/009), so committed state is recovered on the next start exactly as after a `SIGKILL` of any
+   other `LocalServer` host process. `WireServer::shutdown` (used by tests, not by the `htapd` binary itself)
+   performs an orderly stop: it sets a flag, stops accepting, calls `Shutdown::Both` on every live connection
+   via a `live_connections` registry (Phase 11), and joins every connection thread — a connection thread
+   blocked mid-read on a partial packet is force-closed immediately rather than left waiting indefinitely for
+   the rest of that packet. A connection torn down this way has its open transaction rolled back the same as
+   any other disconnect.
 4. **Logging:** Structured logs via `tracing-subscriber`, controlled by the `RUST_LOG` environment variable
    (defaults to `info`). `htapd` logs the listen address, root path, whether a password is required, and
    warns if bound to a non-loopback address.
@@ -350,13 +361,23 @@ Identical to the "Security model" subsection of `docs/ARCHITECTURE.md`:
 
 - Default bind is `127.0.0.1:3307` (loopback only); binding elsewhere is an explicit `--listen` opt-in and
   triggers a startup warning.
-- One implicit user: the client-supplied username is logged but never checked.
+- One implicit user: the client-supplied username is logged but never checked. `COM_CHANGE_USER` (Phase 11)
+  re-authenticates against this same single shared password via a `verify_credentials` seam, not a per-user
+  credential store — per-user ACL remains Phase 12 scope.
 - Credential precedence: `--password` overrides `HTAPD_PASSWORD`; with neither set, no password is required.
 - No TLS: the `mysql_native_password` handshake hashes the password exchange, but query text and result rows
   are cleartext. Do not bind a non-loopback address without a trusted network or an SSH tunnel.
-- The handshake scramble uses a non-cryptographic xorshift RNG (clock + counter seeded), not a CSPRNG.
+- The handshake scramble now comes from the OS CSPRNG (`getrandom::fill`, no fallback; Phase 11), replacing
+  the previously seeded xorshift generator.
+- Every pre-authentication read (the handshake response, either side of an auth-plugin switch, and a
+  `COM_CHANGE_USER` auth-switch reply) is bounded by `min(max_allowed_packet, 64 KiB)`, checked against the
+  message's declared length before anything is allocated: an unauthenticated peer cannot make a connection
+  attempt allocate more than that merely by declaring a large length and never sending the bytes.
 
 Verified in `crates/htap-wire/tests/wire_server.rs` (`test_handshake_empty_password_ok`,
 `test_handshake_wrong_password_rejected_1045`, `test_handshake_correct_password_ok`,
-`test_shutdown_joins_and_frees_port`) and `crates/htap-wire/src/server.rs`
-(`config_defaults_are_loopback_only`).
+`test_shutdown_joins_and_frees_port`, `test_shutdown_force_closes_connection_blocked_mid_packet`,
+`test_shutdown_force_close_rolls_back_open_transaction`, `test_wire_change_user_reauth_and_reset`,
+`test_wire_reset_connection_clears_state_and_prepared_statements`,
+`test_pre_auth_oversize_handshake_rejected_before_allocation`) and `crates/htap-wire/src/server.rs`
+(`config_defaults_are_loopback_only`), and `crates/htap-wire/src/handshake.rs::scramble_is_printable_and_varies`.

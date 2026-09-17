@@ -62,7 +62,7 @@ use htap_sql::expr::{EvalContext, VariableLookup};
 use htap_sql::result::StatementResult;
 use htap_sql::{
     classify_set_target, parse_autocommit_value, system_variable_value, validate_isolation_level,
-    QueryBody, SessionVarsView, SetClass, SetScope,
+    QueryBody, SessionVarsView, SetClass, SetScope, DEFAULT_MAX_ALLOWED_PACKET,
 };
 use htap_txn::{
     intent_frame_size_bound, ParticipantId, ParticipantWork, RowstoreParticipant, Transaction,
@@ -456,6 +456,12 @@ pub struct Session {
     /// itself) for the *next* transaction only; consumed and cleared by the next explicit or
     /// implicit `BEGIN`.
     next_txn_read_only: Option<bool>,
+    /// Configured `@@max_allowed_packet` (Phase 11 plan task 8), reported dynamically via
+    /// [`SessionVarsView::max_allowed_packet`]. Set once by `htap_wire::server` right after
+    /// [`LocalServer::open_session`] to the wire server's configured value; embedded sessions
+    /// (`LocalServer::execute`, or a `Session` never given a wire connection) keep the
+    /// MySQL-compatible default.
+    max_allowed_packet: u64,
 }
 
 impl Session {
@@ -467,6 +473,44 @@ impl Session {
     /// Returns `true` if a transaction is currently open.
     pub fn in_transaction(&self) -> bool {
         matches!(self.state, SessionState::InTxn(_))
+    }
+
+    /// Returns `true` if autocommit is currently enabled (MySQL-compatible default: on). Used by
+    /// `htap-wire` to report `SERVER_STATUS_AUTOCOMMIT` accurately instead of hardcoding it.
+    pub fn autocommit(&self) -> bool {
+        self.autocommit
+    }
+
+    /// Returns a fresh catalog snapshot.
+    ///
+    /// Minimal accessor for callers outside this crate that need to resolve schema information
+    /// without dispatching a statement (Phase 11 plan task 4: `htap-wire`'s `COM_STMT_PREPARE`
+    /// handler resolves a prepared statement's output schema against a snapshot obtained this
+    /// way). Never reads this session's own in-flight transaction state; equivalent to what
+    /// [`Session::execute_statement`] loads for an ordinary statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on a catalog load I/O failure.
+    pub fn catalog_snapshot(&self) -> Result<CatalogSnapshot> {
+        Ok(self
+            .server
+            .catalog
+            .load()?
+            .unwrap_or_else(CatalogSnapshot::empty))
+    }
+
+    /// Sets this session's reported `@@max_allowed_packet` (Phase 11 plan task 8).
+    ///
+    /// Called once by `htap_wire::server` right after [`LocalServer::open_session`], with the
+    /// wire server's own configured `WireServerConfig::max_allowed_packet`; never changed again
+    /// for the life of the session (`SET max_allowed_packet = ...` stays a read-only no-op, per
+    /// amendment A2 Phase 10 semantics — see `htap_sql::classify_set_target`). Never fails and
+    /// never affects any in-flight or future statement's own execution limits (e.g. the rowstore
+    /// commit payload cap): it is purely the value this session reports back to `SELECT
+    /// @@max_allowed_packet`.
+    pub fn set_max_allowed_packet(&mut self, max_allowed_packet: u64) {
+        self.max_allowed_packet = max_allowed_packet;
     }
 
     /// Opens a new [`OpenTxn`] pinning the current visible MVCC version as the read snapshot.
@@ -537,18 +581,34 @@ impl Session {
         self.open_new_txn(read_only);
     }
 
-    /// Executes one statement.
-    ///
-    /// Control statements (`BEGIN`/`START TRANSACTION`, `COMMIT`, `ROLLBACK`, `SET`) are
-    /// intercepted before binding; see the module docs for the full state machine. Every other
-    /// statement is parsed, bound, and dispatched through the open transaction's buffered write
-    /// set when one is open (explicit or implicit), or autocommit otherwise, under the same
-    /// `LocalServer::execution_lock` serialization as [`LocalServer::execute`] (Phase 10 plan
-    /// amendment A1).
+    /// Parses `sql` into a single statement and executes it via [`Session::execute_statement`].
     ///
     /// # Errors
     ///
-    /// Returns [`HtapError`] on parse/bind/execution failure; [`HtapError::Conflict`] if the
+    /// Returns [`HtapError`] on parse failure, or whatever [`Session::execute_statement`] returns
+    /// for the parsed statement.
+    pub fn execute(&mut self, sql: &str) -> Result<StatementResult> {
+        let statement = htap_sql::parse_one(sql)?;
+        self.execute_statement(statement)
+    }
+
+    /// Executes one already-parsed statement.
+    ///
+    /// Control statements (`BEGIN`/`START TRANSACTION`, `COMMIT`, `ROLLBACK`, `SET`) are
+    /// intercepted before binding; see the module docs for the full state machine. Every other
+    /// statement is bound and dispatched through the open transaction's buffered write set when
+    /// one is open (explicit or implicit), or autocommit otherwise, under the same
+    /// `LocalServer::execution_lock` serialization as [`LocalServer::execute`] (Phase 10 plan
+    /// amendment A1).
+    ///
+    /// The [`SessionState::CommitOutcomePending`] gate is checked first, before any other work
+    /// (Phase 11 plan task 2): every caller that dispatches a parsed [`sqlparser::ast::Statement`]
+    /// against this session, not just [`Session::execute`]'s own text path (e.g. a prepared
+    /// statement's `EXECUTE`), goes through this same check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on bind/execution failure; [`HtapError::Conflict`] if the
     /// session's last commit left it in the `CommitOutcomePending` state, if the transaction is
     /// already poisoned, or if this statement's own read hits a new conflict (which poisons the
     /// transaction); [`HtapError::Unsupported`] for DDL inside an open transaction or an
@@ -563,12 +623,10 @@ impl Session {
     /// ordinary statement's catalog load, bind, and dispatch below, exactly like
     /// [`LocalServer::execute`] — never re-locked while already held, which would deadlock
     /// against `parking_lot::Mutex`'s non-reentrant lock.
-    pub fn execute(&mut self, sql: &str) -> Result<StatementResult> {
+    pub fn execute_statement(&mut self, statement: SqlStatement) -> Result<StatementResult> {
         if matches!(self.state, SessionState::CommitOutcomePending { .. }) {
             return Err(outcome_pending_error(&self.state));
         }
-
-        let statement = htap_sql::parse_one(sql)?;
 
         match &statement {
             SqlStatement::StartTransaction {
@@ -651,6 +709,7 @@ impl Session {
             user_vars: &self.user_vars,
             autocommit: self.autocommit,
             read_only: read_only_ctx,
+            max_allowed_packet: self.max_allowed_packet,
         };
 
         let outcome = match &mut self.state {
@@ -923,6 +982,7 @@ impl Session {
             user_vars: &self.user_vars,
             autocommit: self.autocommit,
             read_only,
+            max_allowed_packet: self.max_allowed_packet,
         };
         let eval_ctx = EvalContext {
             row: &[],
@@ -1121,6 +1181,32 @@ impl Session {
         self.state = SessionState::Idle;
         Ok(())
     }
+
+    /// Resets this session to a freshly opened state (Phase 11 plan task 2; backs
+    /// `COM_RESET_CONNECTION`).
+    ///
+    /// If the session is [`SessionState::CommitOutcomePending`], returns the stored
+    /// `DurablePending` error and changes nothing at all — the session stays quarantined until
+    /// server recovery resolves the ambiguity, exactly like every other statement rejected in
+    /// that state ([`outcome_pending_error`]). Otherwise: rolls back any open transaction
+    /// (discarding its buffered write set, same as [`Session::rollback`]), clears every `@name`
+    /// user variable, sets `autocommit` back to its MySQL-compatible default of on, and clears
+    /// any pending `SET TRANSACTION READ ONLY`/`READ WRITE` default for the next transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stored `DurablePending` error if the session is `CommitOutcomePending`;
+    /// otherwise never fails.
+    pub fn reset(&mut self) -> Result<()> {
+        if matches!(self.state, SessionState::CommitOutcomePending { .. }) {
+            return Err(outcome_pending_error(&self.state));
+        }
+        self.rollback()?;
+        self.user_vars.clear();
+        self.autocommit = true;
+        self.next_txn_read_only = None;
+        Ok(())
+    }
 }
 
 impl Drop for Session {
@@ -1138,6 +1224,7 @@ struct SessionVariables<'a> {
     user_vars: &'a BTreeMap<String, Value>,
     autocommit: bool,
     read_only: bool,
+    max_allowed_packet: u64,
 }
 
 impl VariableLookup for SessionVariables<'_> {
@@ -1156,6 +1243,10 @@ impl SessionVarsView for SessionVariables<'_> {
 
     fn transaction_read_only(&self) -> bool {
         self.read_only
+    }
+
+    fn max_allowed_packet(&self) -> u64 {
+        self.max_allowed_packet
     }
 }
 
@@ -1303,6 +1394,7 @@ impl LocalServer {
             user_vars: BTreeMap::new(),
             autocommit: true,
             next_txn_read_only: None,
+            max_allowed_packet: DEFAULT_MAX_ALLOWED_PACKET,
         }
     }
 }

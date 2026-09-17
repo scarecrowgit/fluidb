@@ -723,7 +723,12 @@ self-serializing (`LocalServer::execution_lock`), and the local MVP explicitly e
 distributed transport, and TLS elsewhere, so the network layer needed to match that scope rather than
 introduce new concurrency or dependency surface. (Updated by ADR-018: Phase 10 added a real
 `htap_server::Session` per connection on top of this same thread-per-connection design; the "no session
-state" framing below describes this ADR's scope at the time it was made, not the current wire contract.)
+state" framing below describes this ADR's scope at the time it was made, not the current wire contract.
+Updated by ADR-019: Phase 11 added the binary protocol/prepared statements, `COM_RESET_CONNECTION`/
+`COM_CHANGE_USER`, ≥16 MiB message reassembly with a real `max_allowed_packet`, a CSPRNG handshake scramble,
+negotiated `CLIENT_MULTI_STATEMENTS`, and shutdown force-close on top of the same thread-per-connection
+framing decided here; the "text protocol only"/"no prepared statements" and "non-cryptographic scramble RNG"
+framing below describes this ADR's scope at the time it was made, not the current wire contract.)
 
 ### Options considered
 
@@ -1358,7 +1363,7 @@ pass on top of the same ADR:
 - One `htap-wire` connection is one `Session` (ADR-016's thread-per-connection design is unchanged); a
   connection's own transaction is rolled back on every disconnect path, and the wire-layer `SET`/`@@sysvar`
   shim shrank to only the two statement forms `vendor/sqlparser` cannot parse at all
-  (`SET CHARACTER SET`/`SET CHARSET`) plus `USE`/`SELECT 1`/`VERSION()`/`DATABASE()`, since everything else
+  (`SET CHARACTER SET`/`SET CHARSET`) plus `USE`/`SELECT 1`/`VERSION()`/`DATABASE()`/`SCHEMA()`, since everything else
   now has a real session-backed answer.
 
 ### How to reverse it
@@ -1435,3 +1440,285 @@ answer to a conversion publishing a new base mid-transaction), ADR-016 (hand-wri
 protocol, thread-per-connection — unchanged framing; one connection is now one `Session` on top of it), and
 ADR-017 (general query executor — the read-your-own-writes overlay reuses `scan_partition_compact`, the same
 per-partition storage path `Route::Query` and `Route::OlapScan` already use).
+
+---
+
+## ADR-019: MySQL binary protocol via AST-level placeholder substitution; best-effort PREPARE metadata; real `max_allowed_packet`; unsigned-64 rejection; SEND_LONG_DATA poisoning; reset/change-user under quarantine; multi-statement stop-on-error
+
+`Status: Accepted`
+`Date: 2026-09-17`
+
+### Context
+
+ADR-016 explicitly deferred the binary protocol, prepared statements, `COM_RESET_CONNECTION`,
+`COM_CHANGE_USER`, ≥16 MiB messages, a cryptographic handshake scramble, and multi-statements. The user
+explicitly lifted these deferred items for Phase 11 (TLS, compression, and per-user ACL remain Phase 12
+scope, with seams left for them: a capability struct, a `Read`/`Write`-generic packet layer, and a
+`verify_credentials` auth hook). None of this touches the rowstore, catalog, or on-disk envelope formats;
+CLAUDE.md's durability invariants (one MVCC version domain, `CommitOutcomePending` quarantine, R5) had to be
+preserved unchanged. Consulted a panel (`reasoner`+`gemini`) on the five hardest design questions, then had
+`architect` approve decisions 1-4 below with refinements before implementation began.
+
+### Options considered
+
+**Parameterization (how a bound `?` becomes part of the executed statement):**
+- **(a) Re-render the statement to SQL text with parameters substituted, then reparse.** Rejected: a `BLOB`
+  parameter would have to be re-encoded as a string literal and reparsed back into bytes (doubling encode/
+  decode work and risking a lossy round trip for arbitrary bytes), and edge values (`i64::MIN`, non-finite
+  floats) do not have a lossless canonical text spelling that survives a second parse in every position a
+  literal can appear.
+- **(b) A native `Value`-carrying `Param` AST node threaded through the binder**, so the binder resolves a
+  parameter's type from context the same way it resolves a literal's type today, without ever materializing a
+  substituted AST. Rejected: it would mean touching every literal-acceptance site in `htap-sql::binder` and
+  `binder_query` to also accept `Param`, doubling the surface area of the binder's literal-handling code for a
+  benefit (avoiding one clone-and-mutate pass per `EXECUTE`) that does not matter at this engine's scale;
+  `vendor/sqlparser`'s own `Visit`/`VisitMut` traits also do not guarantee source-text order across all node
+  kinds this binder needs to walk (join `ON`, `LIMIT`/`OFFSET`, CTEs), so a visitor-based placeholder walk
+  could not be trusted to agree with a raw tokenizer's left-to-right count without writing the same
+  hand-written walk anyway.
+- **(c) Hand-written AST-level substitution**: a single recursive walk over the exact statement/query shapes
+  the binder accepts (shared by counting and substitution, so they cannot disagree with each other), replacing
+  each placeholder `Expr` node in place with a literal `Expr` built directly from the bound `Value`, with no
+  intermediate text form. Chosen.
+
+**PREPARE response metadata (result-set column definitions before any parameter value is known):**
+- **(a) Always report `num_columns = 0`.** Rejected: several real clients (including `libmysqlclient`-based
+  ones) use `COM_STMT_PREPARE_OK`'s column count to decide how to allocate bind buffers before the first
+  `EXECUTE`; reporting zero columns for a plain `SELECT` with no parameter-typed projection would break them
+  unnecessarily.
+- **(b) Require the caller to supply parameter types at PREPARE time (as some MySQL C API extensions do) and
+  bind eagerly against them.** Rejected: the wire protocol's `COM_STMT_PREPARE` request carries no parameter
+  type information at all — only `COM_STMT_EXECUTE` does — so this would require a second round trip this
+  protocol does not have, or inventing a private extension.
+- **(c) Best-effort: infer each placeholder's type from purely local context (assignment target, comparison
+  operand), and only when *every* placeholder's type is inferable, probe the real, unmodified binder with
+  representative non-NULL values of those types to get the exact output schema it would produce; otherwise
+  report `num_columns = 0` and generic parameter definitions.** Chosen, with the `architect` refinement that
+  the probe must go through the same binder every real `EXECUTE` uses (not a schema-only shortcut), so the
+  reported schema can never drift from what execution actually returns.
+
+**`max_allowed_packet`:**
+- **(a) Leave the limit as a fixed, non-configurable constant.** Rejected: MySQL operators expect
+  `max_allowed_packet` to be a real, settable server parameter, and a fixed value forces recompilation to
+  raise or lower it.
+- **(b) Make it configurable, defaulting to MySQL's own default of 64 MiB.** Chosen: matches operator
+  expectations for a MySQL-compatible server and gives `htapd --max-allowed-packet`/`HTAPD_MAX_ALLOWED_PACKET`
+  a familiar unit and default.
+
+**Unsigned 64-bit parameters above `i64::MAX`:**
+- **(a) Add a `UInt64` variant to the engine's `Value` type to represent them exactly.** Rejected: this is a
+  storage/type-system change reaching well outside the wire layer (every column type, comparison, and
+  arithmetic rule in `htap-sql`/`htap-common` would need a new numeric case) for a narrow protocol edge case;
+  out of scope for a wire-layer phase per CLAUDE.md's scope rule.
+- **(b) Silently wrap or reinterpret as a negative `i64`.** Rejected: silently reinterpreting `18446744073709551615` as `-1` is exactly the kind of silent data corruption CLAUDE.md's evidence and correctness rules exist to prevent.
+- **(c) Reject cleanly with a message naming the value and the limit.** Chosen; documented as a first-class,
+  permanent limitation (not a "not yet implemented" gap) until the engine gains a genuine unsigned 64-bit
+  value type.
+
+**`COM_STMT_SEND_LONG_DATA` error reporting:**
+- **(a) Invent a private response packet for this command.** Rejected: the protocol defines
+  `COM_STMT_SEND_LONG_DATA` as having no response at all (success or failure); a private response would break
+  every real client, which does not read one after sending this command.
+- **(b) Poison the statement and surface the stored error at the next `EXECUTE`.** Chosen: this is the only
+  option that reports the failure at all without violating the protocol's "no response" contract; the
+  statement remains unusable until `COM_STMT_RESET` clears the poison.
+
+**`COM_RESET_CONNECTION`/`COM_CHANGE_USER` vs. the ADR-018 `CommitOutcomePending` quarantine:**
+- **(a) Let RESET/CHANGE_USER unconditionally clear session state, including a quarantined session.**
+  Rejected: this would let a client silently discard a `DurablePending`/`RecoveryRequired` outcome whose real
+  resolution is still unknown — exactly the ambiguity ADR-018's quarantine exists to keep visible until a
+  process restart resolves it, not to let a client mask by resetting the connection.
+- **(b) Route both through `Session::reset()`, which already returns the stored outcome-pending error without
+  mutating anything when quarantined, and otherwise performs an ordinary rollback/variable-clear.** Chosen:
+  reuses the exact ADR-018 gate with no new special-casing in the wire layer.
+
+**Multi-statement batch semantics:**
+- **(a) Execute every statement in the batch regardless of an earlier failure, reporting all outcomes.**
+  Rejected: MySQL's own multi-statement semantics stop at the first error, and continuing past a
+  `DurablePending`/`RecoveryRequired` outcome specifically would mean issuing further statements against a
+  transaction manager already in an ambiguous, latched state — exactly what ADR-018's recovery latch exists to
+  prevent for *any* caller, not just the one that hit it.
+- **(b) Stop at the first error, including a `DurablePending`/`RecoveryRequired` outcome.** Chosen; matches
+  both real MySQL client expectations and the existing single-statement quarantine/latch semantics.
+
+### Decision
+
+1. **Parameterization: AST-level substitution (`htap_sql::prepare`), option (c) above.** A single recursive
+   walk (`count_placeholders`/`substitute_placeholders`, sharing one traversal so they can never disagree)
+   covers every literal-bearing position the binder accepts: INSERT VALUES rows, UPDATE SET/WHERE, DELETE
+   WHERE, SELECT projection/WHERE/HAVING/GROUP BY/ORDER BY/JOIN ON, subquery bodies (scalar/IN/EXISTS),
+   derived tables, CTE bodies, UNION branches, and `LIMIT`/`OFFSET` — the plan's original task list named only
+   the top-level clauses; a main-session amendment (A1) added the nested positions, since MySQL clients
+   routinely prepare `SELECT ... LIMIT ?` and similar shapes. A `?` in a position the walk does not recognize
+   (an identifier, a DDL default, a `SET` target) makes `checked_placeholder_count`'s raw-tokenizer count
+   disagree with the walk's count, and the statement is rejected as `HtapError::Unsupported` naming the
+   mismatch, never silently under-substituted. Only `INSERT`/`UPDATE`/`DELETE`/`SELECT` can be prepared.
+2. **PREPARE metadata: best-effort, probed through the real binder, option (c) above.**
+   `resolve_prepare_output_schema` infers each placeholder's type from purely local context and, only when
+   every placeholder's type is known, probes the unmodified binder with representative non-NULL values;
+   otherwise `num_columns = 0` and parameter definitions are generic. `INSERT`/`UPDATE`/`DELETE` always report
+   `num_columns = 0`.
+3. **`max_allowed_packet`: real and configurable, default 64 MiB, option (b) above.**
+   `WireServerConfig::max_allowed_packet` is enforced by `codec::read_message_with_stop`/`write_message` (used
+   at every call site that may exceed 16 MiB), configurable via `htapd --max-allowed-packet`/
+   `HTAPD_MAX_ALLOWED_PACKET`, and reported dynamically as `@@max_allowed_packet`. An oversize message is
+   rejected with `ER_NET_PACKET_TOO_LARGE`/1153 (best effort) and the connection closed.
+4. **Unsigned 64-bit values above `i64::MAX`: rejected cleanly, option (c) above**, documented as a
+   first-class, permanent limitation in `docs/LIMITATIONS.md` rather than a deferred feature.
+5. **`COM_STMT_SEND_LONG_DATA`: poison-and-surface-later, option (b) above.** A long-data error (an
+   out-of-range parameter index, or exceeding the connection's byte cap) is stored on the statement and
+   returned verbatim by the next `EXECUTE`; `COM_STMT_RESET` clears it.
+6. **`COM_RESET_CONNECTION`/`COM_CHANGE_USER`: route through `Session::reset()`, option (b) above.** Both
+   clear the prepared-statement registry on success; a quarantined session's outcome-pending error is
+   returned unchanged, with the registry left intact, exactly as ADR-018 already specifies for any other
+   rejected operation on a quarantined session. `COM_CHANGE_USER` additionally re-authenticates via a new
+   `verify_credentials(scramble, configured_password, auth_response) -> bool` seam — the same function
+   `htapd`'s handshake path now calls, and the seam Phase 12 per-user ACL will extend — closing the
+   connection with `ER_ACCESS_DENIED` on failure without touching session state.
+7. **Multi-statement batches: stop at the first error, option (b) above**, including a
+   `DurablePending`/`RecoveryRequired` outcome. `CLIENT_MULTI_STATEMENTS`/`CLIENT_MULTI_RESULTS` are
+   advertised but only honored when the connecting client actually negotiated them; a negotiated batch runs
+   sequentially through `Session::execute_statement` with `SERVER_MORE_RESULTS_EXISTS` set on every result but
+   the last. `COM_STMT_PREPARE` rejects multi-statement text even when the capability is negotiated.
+8. **CSPRNG handshake scramble.** `getrandom::fill` replaces the seeded-xorshift generator ADR-016 shipped,
+   with no fallback: a failed OS RNG call fails the handshake rather than falling back to a weaker source.
+9. **≥16 MiB messages: real, bounded reassembly/splitting**, not an unsupported case that closes the
+   connection. `read_message_with_stop` continues reassembling while a chunk's length is exactly 0xFFFFFF,
+   checking the running total against `max_allowed_packet` before allocating further; `write_message` splits
+   an outbound message the same way, with a trailing empty packet on an exact multiple.
+10. **Shutdown force-close.** A `live_connections` registry of `try_clone`d streams (RAII-unregistered on
+    every connection-thread exit, including a panic) lets `WireServer::shutdown()` call `Shutdown::Both` on
+    every live connection before joining connection threads, so a connection blocked mid-packet is torn down
+    immediately instead of waiting indefinitely for the rest of a packet that may never arrive.
+
+### Post-acceptance fix pass
+
+A follow-up hardening pass on this phase's implementation surfaced two findings worth recording against
+this ADR's decisions (the rest of that pass — pre-authentication read bounds, `COM_CHANGE_USER` scramble
+persistence, panic-safe connection-count accounting, `ORDER BY`/`LIMIT` placeholder-hint coverage,
+`DATE`/`DATETIME`/`TIMESTAMP` calendar-range validation, checked-arithmetic decoders plus a decode fuzz
+harness, and prepared-statement id-wraparound handling — are implementation-correctness fixes to code this
+ADR already covers, not new design decisions; see the "Network layer" and "Prepared statements and binary
+protocol" sections of `docs/ARCHITECTURE.md` for their contract and evidence).
+
+- **Finding 2 (decision 1, parameterization): `DECIMAL`/`NEWDECIMAL` parameters were substituted through a
+  lossy path.** The binary decoder already kept a `DECIMAL` parameter as validated text
+  (`ParamValue::DecimalText`), but the function that turned it into a substituted AST literal went through
+  an `f64`/`i64` round trip first — exactly the kind of precision loss decision 1's option (a) (re-render to
+  text and reparse) was rejected for, reintroduced one layer down. Fixed by adding
+  `htap_sql::ParamLiteral::NumericText` and `substitute_placeholders_ext`, an extension of the existing
+  `ParamLiteral::Value` substitution path that builds the literal `Expr` directly from the validated numeric
+  text (`numeric_text_to_expr`), never through a lossy intermediate type. This makes the wire-to-AST step
+  itself lossless; what happens after that is unchanged and correct per decision 1 — the binder coerces the
+  literal into the target `Int64`/`Float64` column exactly as it would the identical literal typed directly
+  into SQL text, and precision beyond what those two types hold is lost there, not before it, because the
+  engine has no arbitrary-precision `DECIMAL` type (documented in `docs/LIMITATIONS.md`). Verified by
+  `crates/htap-sql/tests/prepare.rs::test_numeric_text_decimal_round_trips_exactly_into_bigint_column`,
+  `test_numeric_text_negative_decimal_with_fraction_round_trips`, `test_numeric_text_validates_strictly`, and
+  `crates/htap-wire/tests/wire_server.rs::test_wire_prepared_decimal_param_round_trips_exactly_into_bigint_column`.
+- **Finding 8 (new, not covered by decisions 1-10): OK/EOF status flags were a hardcoded constant.**
+  `build_command_ok`/`build_resultset_terminator` always reported `SERVER_STATUS_AUTOCOMMIT` and never set
+  `SERVER_STATUS_IN_TRANS`, regardless of the connection's actual `autocommit` setting or whether a
+  transaction was open — a pre-existing gap from ADR-016 this ADR's decisions did not touch. Fixed by
+  threading the session's real status bitmask (`server::session_status_flags`) into both packet builders as
+  an explicit `status: u16` parameter, composed with `SERVER_MORE_RESULTS_EXISTS` (decision 7) rather than
+  replacing it. Chosen over leaving `SERVER_STATUS_IN_TRANS` permanently unset (the ADR-016-era rationale,
+  since transactions were the OLTP-only Phase 8/9 kind): Phase 10 sessions gave this server a real,
+  observable "transaction open" state that some MySQL clients and proxies key behavior off of, and
+  hardcoding autocommit-only made `SET autocommit = 0` and `BEGIN` invisible on the wire even though they
+  were enforced correctly. Verified by
+  `crates/htap-wire/tests/wire_server.rs::test_wire_status_flags_reflect_autocommit_and_transaction_state`
+  and `crates/htap-wire/src/result_codec.rs` unit tests (`command_ok_reports_the_status_it_is_given`,
+  `more_results_flag_sets_server_more_results_exists`).
+
+### Consequences
+
+- No on-disk, WAL, catalog, or MVCC format changed; this phase is wire-protocol- and SQL-front-end-only
+  (`htap-wire`, `htap-sql::prepare`, `htap-client`). The `CommitOutcomePending` gate lives in exactly one
+  place (`Session::execute_statement`/`Session::reset`); every new command (`COM_STMT_EXECUTE`,
+  `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, a multi-statement batch) reaches it through that same function,
+  never a wire-layer bypass, per the plan's hard requirement.
+- `COM_STMT_EXECUTE` and multi-statement batches go through `Session::execute_statement` under the same
+  per-statement `execution_lock` discipline Phase 10 already uses; no new wire-level lock is held across
+  statement execution (amendment A4).
+- A `VARCHAR`/`VAR_STRING`-family bound parameter's raw bytes cannot be told apart from a bound `Vec<u8>` on
+  the wire (both arrive as the same type code); resolved by decoding as `Value::String` when valid UTF-8 and
+  `Value::Bytes` otherwise, and teaching the binder a narrow, literal-only coercion (a string literal into a
+  `BYTES` column; the integer literals `0`/`1` into a `BOOL` column) so `INSERT`/`UPDATE`/`WHERE` all accept
+  what the wire layer can actually produce (amendment A3) — a real gap the plan asked to be resolved or
+  documented; resolved here rather than left as a limitation.
+- `htapd`'s per-user ACL, TLS, and compression remain Phase 12 scope; this phase leaves the seams named in
+  the plan (a capability struct generalized beyond `CLIENT_MULTI_STATEMENTS`/`CLIENT_MULTI_RESULTS`, a
+  `Read`/`Write`-generic packet layer, and `verify_credentials`) for that work rather than pre-building it.
+- `COM_STMT_FETCH`, exact `DECIMAL` (kept as validated text, not arbitrary precision), `TIME`-typed
+  parameters, and unsigned 64-bit values above `i64::MAX` remain permanent or near-term limitations,
+  documented in `docs/LIMITATIONS.md` rather than silently mishandled.
+
+### How to reverse it
+
+Each piece is independently revertible without touching the others or any on-disk format: dropping
+`htap-wire::{binary_codec, prepared}` and the new command handlers in `server.rs` returns to ADR-016's
+text-protocol-only surface; reverting `max_allowed_packet` to a fixed constant, the scramble to a seeded
+generator, or multi-statements to "advertise but never honor" are each single-file changes; `htap_sql::prepare`
+is additive and unused by any other execution path if removed.
+
+### Test Evidence
+
+- `crates/htap-sql/tests/prepare.rs` (placeholder count/tokenizer agreement across statement shapes including
+  subqueries/derived tables/CTEs/UNION/`LIMIT`, substitution identical to literal-SQL binding, output-schema
+  resolution positive/`None` cases, `i64::MIN`/non-finite-float/string/bytes edge cases,
+  `test_no_supported_shape_ever_mismatches_tokenizer_count`,
+  `test_placeholder_in_unsupported_position_returns_unsupported_error`).
+- `crates/htap-wire/src/binary_codec.rs` unit tests (full parameter type matrix round trip, NULL-bitmap
+  offsets 0/2, `new_params_bound_flag` caching, unsigned `LONGLONG` boundary, `TIME`/unknown-type rejection,
+  invalid `DECIMAL` text, `VAR_STRING` UTF-8/non-UTF-8 decoding, binary row round trip).
+- `crates/htap-wire/src/prepared.rs` unit tests (registry insert/close/reset, statement cap, long-data
+  accumulation/clearing/poisoning).
+- `crates/htap-wire/src/codec.rs` unit tests (`test_message_reassembly_at_exact_boundary_with_trailing_empty_packet`,
+  `test_message_reassembly_rejects_over_max_allowed_packet_before_full_read`,
+  `test_message_reassembly_rejects_sequence_id_mismatch_across_chunks`,
+  `test_write_message_splits_exact_multiple_and_non_multiple`,
+  `write_message_and_read_message_sequence_ids_wrap_at_256`).
+- `crates/htap-wire/src/handshake.rs::scramble_is_printable_and_varies`.
+- `crates/htap-wire/src/shim.rs::shim_never_matches_multi_statement_text`.
+- `crates/htap-sql/src/variables.rs::max_allowed_packet_reads_dynamically_but_set_stays_a_no_op`.
+- `crates/htap-wire/tests/wire_server.rs`: `test_prepared_statement_unsupported_kinds_rejected`,
+  `test_prepared_statement_unknown_id_and_close_and_reset`, `test_prepared_statement_send_long_data`,
+  `test_prepared_statement_param_type_cache_new_params_bound_zero`,
+  `test_prepared_statement_in_transaction_and_commit_outcome_pending`,
+  `test_prepared_statements_mysql_crate_interop_all_types`, `test_prepare_placeholder_in_limit_and_subquery`,
+  `test_wire_reset_connection_clears_state_and_prepared_statements`,
+  `test_wire_reset_connection_while_commit_outcome_pending_stays_quarantined`,
+  `test_wire_quit_allowed_while_commit_outcome_pending`, `test_wire_change_user_reauth_and_reset`,
+  `test_wire_change_user_wrong_password_closes_connection`,
+  `test_wire_change_user_while_commit_outcome_pending_stays_quarantined`,
+  `test_wire_large_payload_over_16mb_round_trip`,
+  `test_wire_max_allowed_packet_rejects_oversize_query_and_closes_connection`,
+  `test_max_allowed_packet_variable_reflects_wire_config`,
+  `test_wire_multi_statements_sequential_execution_and_more_results_flag`,
+  `test_wire_multi_statements_stops_on_first_error`, `test_wire_multi_statements_stops_on_durable_pending`,
+  `test_wire_multi_statements_rejected_without_capability`,
+  `test_wire_prepare_rejects_multi_statement_text_even_when_negotiated`,
+  `test_shutdown_force_closes_connection_blocked_mid_packet`,
+  `test_shutdown_force_close_rolls_back_open_transaction`, `test_wire_mysql_connector_startup_still_works`.
+- `crates/htap-client/tests/prepared.rs`: `test_remote_prepared_statement_matches_embedded_literal_execution`,
+  `test_remote_prepared_statement_close_then_execute_errors`.
+- Post-acceptance fix pass (findings 2 and 8 above): `crates/htap-sql/tests/prepare.rs`
+  (`test_numeric_text_decimal_round_trips_exactly_into_bigint_column`,
+  `test_numeric_text_negative_decimal_with_fraction_round_trips`, `test_numeric_text_validates_strictly`);
+  `crates/htap-wire/tests/wire_server.rs`
+  (`test_wire_prepared_decimal_param_round_trips_exactly_into_bigint_column`,
+  `test_wire_status_flags_reflect_autocommit_and_transaction_state`); `crates/htap-wire/src/result_codec.rs`
+  unit tests (`command_ok_reports_the_status_it_is_given`, `more_results_flag_sets_server_more_results_exists`).
+- `crates/htap-server/tests/session.rs`: `test_reset_clears_state`,
+  `test_reset_while_outcome_pending_is_rejected_without_mutation`,
+  `test_execute_and_execute_statement_are_equivalent`,
+  `test_execute_statement_respects_commit_outcome_pending`.
+- `crates/htap-sql/tests/query_bind.rs::test_where_bytes_column_compared_against_string_literal_coerces`
+  (amendment A3, WHERE-clause coercion).
+
+Cross-references: ADR-016 (hand-written synchronous wire protocol — this ADR extends it, decisions 8-10
+directly amend that ADR's "no prepared statements"/"non-cryptographic scramble"/text-only framing), ADR-018
+(`CommitOutcomePending` quarantine and the `RecoveryLatch` — decisions 5-7 above are new callers of exactly
+that existing gate, not new gates), and ADR-017 (general query executor — `Session::execute_statement` is the
+same single entry point Phase 9/10 already funnel every statement kind through).

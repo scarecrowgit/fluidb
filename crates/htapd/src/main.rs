@@ -2,9 +2,11 @@
 //!
 //! ```text
 //! htapd --root <dir> [--listen 127.0.0.1:3307] [--max-connections 64] [--password <pw>]
+//!       [--max-allowed-packet 67108864]
 //! ```
 //!
-//! The password may also come from `HTAPD_PASSWORD`; the flag wins. With neither set, no
+//! The password may also come from `HTAPD_PASSWORD`, and the packet size limit from
+//! `HTAPD_MAX_ALLOWED_PACKET`; in both cases the flag wins. With neither password source set, no
 //! password is required. The default bind address is loopback only; there is no TLS, so
 //! query text and results are cleartext on any non-loopback address.
 //!
@@ -31,6 +33,8 @@ OPTIONS:
     --listen <addr>           Bind address. Default 127.0.0.1:3307 (loopback only).
     --max-connections <n>     Maximum simultaneous connections. Default 64.
     --password <pw>           Shared password (mysql_native_password). Overrides HTAPD_PASSWORD.
+    --max-allowed-packet <n>  Maximum protocol message size, in bytes. Default 64 MiB. Overrides
+                              HTAPD_MAX_ALLOWED_PACKET.
     --help                    Print this help.
 
 SECURITY:
@@ -55,6 +59,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
             config.password = Some(pw);
         }
     }
+    if let Ok(v) = std::env::var("HTAPD_MAX_ALLOWED_PACKET") {
+        if !v.is_empty() {
+            config.max_allowed_packet = v
+                .parse::<usize>()
+                .map_err(|e| format!("invalid HTAPD_MAX_ALLOWED_PACKET '{v}': {e}"))?;
+        }
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -76,6 +87,15 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
             }
             "--password" => {
                 config.password = Some(args.next().ok_or("--password requires a value")?);
+            }
+            "--max-allowed-packet" => {
+                let v = args.next().ok_or("--max-allowed-packet requires a value")?;
+                config.max_allowed_packet = v
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --max-allowed-packet '{v}': {e}"))?;
+                if config.max_allowed_packet == 0 {
+                    return Err("--max-allowed-packet must be at least 1".into());
+                }
             }
             other => return Err(format!("unknown argument '{other}'")),
         }

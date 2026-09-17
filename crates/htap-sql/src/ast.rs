@@ -33,6 +33,31 @@ pub fn parse_one(sql: &str) -> Result<Statement> {
     }
 }
 
+/// Parses SQL text containing one or more `;`-separated statements using [`MySqlDialect`]
+/// (Phase 11 plan task 10, `CLIENT_MULTI_STATEMENTS`).
+///
+/// Empty statements produced by extra or trailing `;` (e.g. the second half of `"SELECT 1;;"`,
+/// or all of `";"`) are dropped by the underlying parser and never appear in the result — verified
+/// directly against `vendor/sqlparser`. Rejects input that is empty after trimming whitespace and
+/// `;` with [`HtapError::InvalidArgument`], and maps parser syntax errors the same way
+/// [`parse_one`] does (including statement shapes the shim answers, like `SET CHARACTER SET`,
+/// which have no AST node at all and so fail the whole batch).
+pub fn parse_many(sql: &str) -> Result<Vec<Statement>> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err(HtapError::InvalidArgument("statement is empty".to_string()));
+    }
+
+    let dialect = MySqlDialect {};
+    let statements = Parser::parse_sql(&dialect, trimmed)
+        .map_err(|err| HtapError::InvalidArgument(format!("SQL parse error: {err}")))?;
+
+    if statements.is_empty() {
+        return Err(HtapError::InvalidArgument("statement is empty".to_string()));
+    }
+    Ok(statements)
+}
+
 /// A validated, catalog-bound SQL statement ready for planning and execution.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundStatement {

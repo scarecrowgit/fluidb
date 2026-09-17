@@ -648,6 +648,47 @@ fn test_multi_statement_sql_returns_invalid_argument() {
     }
 }
 
+#[test]
+fn test_parse_many_splits_and_drops_empty_statements() {
+    let sql = "SELECT 1; SELECT 2";
+    let stmts = htap_sql::parse_many(sql).unwrap();
+    assert_eq!(stmts.len(), 2);
+
+    // Extra/trailing `;` produce no empty statements.
+    for sql in ["SELECT 1;;", "SELECT 1; ; SELECT 2;", "SELECT 1;"] {
+        let stmts = htap_sql::parse_many(sql).unwrap();
+        assert!(!stmts.is_empty());
+    }
+    assert_eq!(
+        htap_sql::parse_many("SELECT 1; ; SELECT 2;").unwrap().len(),
+        2
+    );
+    assert_eq!(htap_sql::parse_many("SELECT 1;").unwrap().len(), 1);
+
+    // A single statement round-trips identically to `parse_one`.
+    assert_eq!(
+        htap_sql::parse_many("SELECT 1").unwrap(),
+        vec![parse_one("SELECT 1").unwrap()]
+    );
+}
+
+#[test]
+fn test_parse_many_rejects_empty_and_semicolons_only() {
+    for case in ["", "   ", ";", "  ;  ;  "] {
+        let res = htap_sql::parse_many(case);
+        assert!(
+            matches!(res, Err(HtapError::InvalidArgument(_))),
+            "expected InvalidArgument for {case:?}, got {res:?}"
+        );
+    }
+}
+
+#[test]
+fn test_parse_many_propagates_syntax_errors() {
+    let res = htap_sql::parse_many("SELECT 1; NOT VALID SQL AT ALL");
+    assert!(matches!(res, Err(HtapError::InvalidArgument(_))));
+}
+
 use htap_catalog::{CatalogSnapshot, TableDescriptor, TableId};
 use htap_common::types::{
     ColumnDef as CommonColumnDef, DataType as CommonDataType, Row, Schema, Value as CommonValue,

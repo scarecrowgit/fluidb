@@ -9,19 +9,25 @@ pub mod ast;
 pub mod binder;
 mod binder_query;
 pub mod expr;
+pub mod prepare;
 pub mod query;
 pub mod result;
 pub mod route;
 pub mod variables;
 
 pub use ast::{
-    parse_one, AggregateFunction, AlterPartitions, AnalyticExpr, AnalyticFilter, AnalyticOrderBy,
-    AnalyticSelect, BoundStatement, ComparisonOp, CreateTable, DeleteByPrimaryKey,
+    parse_many, parse_one, AggregateFunction, AlterPartitions, AnalyticExpr, AnalyticFilter,
+    AnalyticOrderBy, AnalyticSelect, BoundStatement, ComparisonOp, CreateTable, DeleteByPrimaryKey,
     DropTableStatement, Insert, PointSelect, ShowStatement, UpdateStatement, UpdateTarget,
 };
 pub use binder::bind;
 pub use expr::{
     AggFn, AggregateSpec, BinOp, EvalContext, Expr, ExprType, ScalarFn, VariableLookup,
+};
+pub use prepare::{
+    checked_placeholder_count, count_placeholders, infer_placeholder_type_hints,
+    resolve_prepare_output_schema, substitute_placeholders, substitute_placeholders_ext,
+    tokenizer_placeholder_count, ParamLiteral,
 };
 pub use query::{
     BoundQuery, JoinKind, JoinSpec, OrderItem, ProjectionItem, QueryBody, SelectBody, SetOpKind,
@@ -31,5 +37,5 @@ pub use result::{CommandResult, QueryResult, StatementResult};
 pub use route::{classify_route, Route};
 pub use variables::{
     classify_set_target, parse_autocommit_value, system_variable_value, validate_isolation_level,
-    SessionVarsView, SetClass, SetScope, REPORTED_VERSION,
+    SessionVarsView, SetClass, SetScope, DEFAULT_MAX_ALLOWED_PACKET, REPORTED_VERSION,
 };

@@ -1519,6 +1519,186 @@ fn test_connector_startup_set_statements_accepted() {
     assert!(matches!(err2, HtapError::Unsupported(_)));
 }
 
+// ---------------------------------------------------------------------------------------------
+// Phase 11 task 2: `execute`/`execute_statement` split and `Session::reset`.
+// ---------------------------------------------------------------------------------------------
+
+/// `Session::execute(sql)` must behave exactly like parsing `sql` once with `htap_sql::parse_one`
+/// and calling `Session::execute_statement` on the result: two independently driven sessions
+/// against identically seeded servers must see the same outcomes for every statement in a mixed
+/// sequence (DDL, autocommit DML, an explicit transaction, and a read).
+#[test]
+fn test_execute_and_execute_statement_are_equivalent() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let server_a = Arc::new(LocalServer::open(dir_a.path()).unwrap());
+    let server_b = Arc::new(LocalServer::open(dir_b.path()).unwrap());
+    let mut session_a = server_a.open_session();
+    let mut session_b = server_b.open_session();
+
+    let statements = [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);",
+        "INSERT INTO t (id, v) VALUES (1, 10);",
+        "BEGIN;",
+        "INSERT INTO t (id, v) VALUES (2, 20);",
+        "UPDATE t SET v = 999 WHERE id = 1;",
+        "SELECT id, v FROM t ORDER BY id;",
+        "COMMIT;",
+        "SELECT id, v FROM t ORDER BY id;",
+    ];
+
+    for sql in statements {
+        let result_a = session_a.execute(sql);
+        let parsed = htap_sql::parse_one(sql).unwrap();
+        let result_b = session_b.execute_statement(parsed);
+        match (result_a, result_b) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a, b, "statement {sql} diverged");
+            }
+            (Err(ea), Err(eb)) => {
+                assert_eq!(ea.to_string(), eb.to_string(), "statement {sql} diverged");
+            }
+            (a, b) => panic!("statement {sql} diverged: {a:?} vs {b:?}"),
+        }
+        assert_eq!(
+            session_a.in_transaction(),
+            session_b.in_transaction(),
+            "statement {sql} left sessions in different transaction states"
+        );
+    }
+}
+
+/// The `CommitOutcomePending` gate lives in `execute_statement` (Phase 11 plan task 2, hard
+/// requirement): calling it directly with an already-parsed statement, bypassing `execute`
+/// entirely, must still return the original stored `DurablePending` error and change nothing.
+#[test]
+fn test_execute_statement_respects_commit_outcome_pending() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.begin().unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (1, 1);")
+        .unwrap();
+
+    server.txn_manager().set_commit_append_hook(|_journal| {
+        Err(HtapError::Io(std::io::Error::other(
+            "simulated disk failure during commit record append",
+        )))
+    });
+    let commit_err = session.commit().unwrap_err();
+    assert!(commit_err.is_durable_pending());
+
+    let statement = htap_sql::parse_one("SELECT 1;").unwrap();
+    let err = session.execute_statement(statement).unwrap_err();
+    assert!(
+        err.is_durable_pending(),
+        "expected DurablePending, got {err:?}"
+    );
+    assert_eq!(err.to_string(), commit_err.to_string());
+
+    // Nothing changed: a further call still reports the very same stored outcome.
+    let statement2 = htap_sql::parse_one("SELECT 1;").unwrap();
+    let err2 = session.execute_statement(statement2).unwrap_err();
+    assert_eq!(err2.to_string(), commit_err.to_string());
+}
+
+/// `Session::reset` clears an open transaction's buffered writes, user variables, restores
+/// `autocommit` to on, and clears any pending `SET TRANSACTION READ ONLY`/`READ WRITE` default.
+#[test]
+fn test_reset_clears_state() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("SET @x = 42;").unwrap();
+    session.execute("SET autocommit = 0;").unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (1, 1);")
+        .unwrap();
+    assert!(session.in_transaction());
+    // Sets the pending `READ ONLY` default for the *next* transaction; the currently open one
+    // (already `READ WRITE`) is unaffected. `reset()` below must clear this pending default too.
+    session.execute("SET TRANSACTION READ ONLY;").unwrap();
+
+    session.reset().unwrap();
+
+    assert!(
+        !session.in_transaction(),
+        "reset must roll back any open transaction"
+    );
+    // The buffered write never committed.
+    assert!(exec_rows(&server, "SELECT id FROM t;").is_empty());
+    // User variables are cleared.
+    assert_eq!(
+        session_rows(&mut session, "SELECT @x;"),
+        vec![Row::new(vec![Value::Null])]
+    );
+    // Autocommit is back on.
+    assert_eq!(
+        session_rows(&mut session, "SELECT @@autocommit;"),
+        vec![Row::new(vec![Value::Int64(1)])]
+    );
+    // The pending `READ ONLY` default was cleared: the next transaction is `READ WRITE` and can
+    // buffer a write.
+    session.begin().unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (2, 2);")
+        .unwrap();
+    session.commit().unwrap();
+    assert_eq!(
+        exec_rows(&server, "SELECT id FROM t;"),
+        vec![Row::new(vec![Value::Int64(2)])]
+    );
+}
+
+/// A session in `CommitOutcomePending` must reject `reset()` with the original stored
+/// `DurablePending` error and leave every bit of session state untouched — no silent recovery
+/// from quarantine.
+#[test]
+fn test_reset_while_outcome_pending_is_rejected_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("SET @x = 7;").unwrap();
+    session.begin().unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (1, 1);")
+        .unwrap();
+
+    server.txn_manager().set_commit_append_hook(|_journal| {
+        Err(HtapError::Io(std::io::Error::other(
+            "simulated disk failure during commit record append",
+        )))
+    });
+    let commit_err = session.commit().unwrap_err();
+    assert!(commit_err.is_durable_pending());
+
+    let reset_err = session.reset().unwrap_err();
+    assert!(
+        reset_err.is_durable_pending(),
+        "expected DurablePending, got {reset_err:?}"
+    );
+    assert_eq!(reset_err.to_string(), commit_err.to_string());
+
+    // Still quarantined: nothing was cleared or mutated by the rejected reset.
+    let exec_err = session.execute("SELECT 1;").unwrap_err();
+    assert!(exec_err.is_durable_pending());
+    let rollback_err = session.rollback().unwrap_err();
+    assert!(rollback_err.is_durable_pending());
+}
+
 #[test]
 fn test_select_system_variable_via_plain_execute() {
     let dir = TempDir::new().unwrap();

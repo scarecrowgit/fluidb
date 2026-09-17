@@ -93,9 +93,21 @@ fn is_unparseable_charset_set(lower: &str) -> bool {
 
 /// Intercepts client start-up statements the engine cannot answer itself. Returns `None` for
 /// ordinary SQL, which the caller runs through the connection's `htap_server::Session`.
+///
+/// Only ever matches when `sql` is a single statement (Phase 11 plan task 10): after stripping
+/// *trailing* `;` characters, any `;` still remaining means `sql` is really a
+/// `CLIENT_MULTI_STATEMENTS` batch, so this returns `None` unconditionally and leaves the whole
+/// text to the parser-driven multi-statement path (`crate::server::respond_query`). This matters
+/// for `SET CHARACTER SET <x>` / `SET CHARSET <x>` in particular: those two forms have no AST
+/// node in `vendor/sqlparser` at all (see the module docs), so a batch such as
+/// `"SET CHARACTER SET utf8mb4; SELECT 1"` cannot be parsed as two statements and fails the whole
+/// batch with a parse error, rather than this shim silently answering only the first half.
 pub fn try_shim(sql: &str) -> Option<ShimOutcome> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(';') {
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
@@ -204,5 +216,23 @@ mod tests {
         assert_eq!(try_shim("INSERT INTO t VALUES (1)"), None);
         assert_eq!(try_shim("CREATE TABLE t (id BIGINT PRIMARY KEY)"), None);
         assert_eq!(try_shim(""), None);
+    }
+
+    /// Phase 11 plan task 10: a genuine multi-statement batch never matches the shim, even when
+    /// its first half looks exactly like a single-statement shim form.
+    #[test]
+    fn shim_never_matches_multi_statement_text() {
+        assert_eq!(try_shim("SELECT 1; SELECT 2"), None);
+        assert_eq!(try_shim("USE htap; SELECT 1"), None);
+        assert_eq!(
+            try_shim("SET CHARACTER SET utf8mb4; SELECT 1"),
+            None,
+            "a batch containing a shim-only SET form must fall through to the parser, which \
+             then fails the whole batch (no AST node for SET CHARACTER SET), rather than the \
+             shim silently answering only the first half"
+        );
+        // Multiple trailing `;` with nothing after the last real statement still matches: only
+        // an *embedded* `;` disables the shim.
+        assert_eq!(try_shim("SELECT 1;;"), try_shim("SELECT 1"));
     }
 }

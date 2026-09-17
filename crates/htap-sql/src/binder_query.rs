@@ -1326,6 +1326,12 @@ impl<'a> ExprBinder<'a> {
                 };
                 let l = self.bind(left)?;
                 let r = self.bind(right)?;
+                let (l, r) = if op.is_comparison() {
+                    let (l, r) = coerce_bool_literal_pair(l, r);
+                    coerce_bytes_literal_pair(l, r)
+                } else {
+                    (l, r)
+                };
                 check_binary_types(op, &l, &r)?;
                 Ok(Expr::BinaryOp {
                     op,
@@ -1902,6 +1908,66 @@ fn check_comparable(l: &Expr, r: &Expr, what: &str) -> Result<()> {
     )))
 }
 
+/// Narrow coercion: if exactly one side of a comparison is BOOL-typed and the other is the
+/// integer literal 0 or 1, rewrite that literal to the matching BOOL literal so the comparison
+/// is type-homogeneous (MySQL clients commonly send BOOL as TINYINT(1), e.g. `boolcol = 1`).
+fn coerce_bool_literal_pair(l: Expr, r: Expr) -> (Expr, Expr) {
+    let l_is_bool = l.expr_type().data_type == DataType::Bool;
+    let r_is_bool = r.expr_type().data_type == DataType::Bool;
+    let l = if r_is_bool {
+        coerce_int_literal_to_bool(l)
+    } else {
+        l
+    };
+    let r = if l_is_bool {
+        coerce_int_literal_to_bool(r)
+    } else {
+        r
+    };
+    (l, r)
+}
+
+fn coerce_int_literal_to_bool(expr: Expr) -> Expr {
+    match &expr {
+        Expr::Literal(Value::Int32(0)) | Expr::Literal(Value::Int64(0)) => {
+            Expr::Literal(Value::Bool(false))
+        }
+        Expr::Literal(Value::Int32(1)) | Expr::Literal(Value::Int64(1)) => {
+            Expr::Literal(Value::Bool(true))
+        }
+        _ => expr,
+    }
+}
+
+/// Narrow coercion: if exactly one side of a comparison is BYTES-typed and the other is a string
+/// *literal*, encode that literal as UTF-8 bytes so the comparison is type-homogeneous. Mirrors
+/// `coerce_to_column`'s INSERT/UPDATE assignment coercion for the same underlying reason: a bound
+/// parameter (or literal) whose raw bytes happen to be valid UTF-8 decodes as `Value::String` (see
+/// `htap_wire::binary_codec::decode_execute`'s doc comment), so a WHERE comparison against a BYTES
+/// column would otherwise reject it even though INSERT/UPDATE already accept it.
+fn coerce_bytes_literal_pair(l: Expr, r: Expr) -> (Expr, Expr) {
+    let l_is_bytes = l.expr_type().data_type == DataType::Bytes;
+    let r_is_bytes = r.expr_type().data_type == DataType::Bytes;
+    let l = if r_is_bytes {
+        coerce_string_literal_to_bytes(l)
+    } else {
+        l
+    };
+    let r = if l_is_bytes {
+        coerce_string_literal_to_bytes(r)
+    } else {
+        r
+    };
+    (l, r)
+}
+
+fn coerce_string_literal_to_bytes(expr: Expr) -> Expr {
+    match expr {
+        Expr::Literal(Value::String(s)) => Expr::Literal(Value::Bytes(s.into_bytes())),
+        other => other,
+    }
+}
+
 fn check_binary_types(op: BinOp, l: &Expr, r: &Expr) -> Result<()> {
     match op {
         BinOp::And | BinOp::Or => {
@@ -1958,6 +2024,31 @@ fn coerce_to_column(expr: Expr, col: &ColumnDef) -> Result<Expr> {
     }
     if t.data_type == col.data_type {
         return Ok(expr);
+    }
+    // Narrow coercion (bytes-vs-string codec fix, Phase 11): a bound parameter whose raw bytes
+    // happen to be valid UTF-8 decodes as `Value::String` (see
+    // `htap_wire::binary_codec::decode_execute`'s doc comment); accept a string literal for a
+    // BYTES assignment target, encoded as UTF-8, exactly like `htap_sql::binder`'s typed INSERT
+    // literal path does for the same reason. `coerce_bytes_literal_pair` applies the same
+    // coercion to WHERE-clause comparisons (`check_comparable`'s `BinaryOp` callers), so the two
+    // paths no longer disagree.
+    if col.data_type == DataType::Bytes && t.data_type == DataType::String {
+        if let Expr::Literal(Value::String(s)) = &expr {
+            return Ok(Expr::Literal(Value::Bytes(s.as_bytes().to_vec())));
+        }
+    }
+    // Narrow coercion: accept the integer literals 0/1 for a BOOL column (MySQL clients
+    // commonly send BOOL as TINYINT(1)). Only literal 0/1 coerce; other integer values or
+    // non-literal expressions of numeric type still fail below.
+    if col.data_type == DataType::Bool {
+        let literal_bool = match &expr {
+            Expr::Literal(Value::Int32(0)) | Expr::Literal(Value::Int64(0)) => Some(false),
+            Expr::Literal(Value::Int32(1)) | Expr::Literal(Value::Int64(1)) => Some(true),
+            _ => None,
+        };
+        if let Some(b) = literal_bool {
+            return Ok(Expr::Literal(Value::Bool(b)));
+        }
     }
     let numeric = |d: DataType| {
         matches!(

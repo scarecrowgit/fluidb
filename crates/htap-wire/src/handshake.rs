@@ -1,8 +1,6 @@
 //! Connection-phase packets: initial handshake, client response, and auth switch.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::codec::{
     read_fixed, read_lenenc_str, read_null_terminated, read_u16, read_u32, write_lenenc_str,
@@ -13,34 +11,28 @@ use crate::proto::*;
 /// Length of the authentication scramble.
 pub const SCRAMBLE_LEN: usize = 20;
 
-static SCRAMBLE_COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-
 /// Generates a 20-byte scramble of printable, non-zero ASCII bytes.
 ///
-/// The generator is a xorshift64* stream seeded from the wall clock and a process-wide
-/// counter. It is **not** cryptographically secure; it only needs to make replays of a
-/// captured native-password response unlikely across connections. The wire layer offers no
-/// TLS and is intended for loopback deployments (see the security contract in the docs).
-pub fn generate_scramble() -> [u8; SCRAMBLE_LEN] {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let counter = SCRAMBLE_COUNTER.fetch_add(0x2545_F491_4F6C_DD1D, Ordering::Relaxed);
-    let mut state = nanos ^ counter.rotate_left(17) ^ 0xD1B5_4A32_D192_ED03;
-    if state == 0 {
-        state = 0x1234_5678_9ABC_DEF1;
-    }
+/// Bytes come from the OS CSPRNG via [`getrandom::fill`] (Phase 11 plan task 9), each mapped
+/// into the printable, non-zero ASCII range `0x21..=0x7e` by taking it modulo 94 and offsetting
+/// — this preserves enough entropy per byte (94 outcomes) to make replaying a captured
+/// native-password response infeasible, while satisfying the handshake packet's requirement
+/// that the scramble never contain a NUL byte (`HandshakeV10::encode`'s first 8 bytes precede a
+/// NUL filler, and `AuthSwitchRequest::encode` NUL-terminates the whole 20 bytes).
+///
+/// # Errors
+///
+/// Returns the underlying [`getrandom::Error`] (wrapped as [`io::Error`]) if the OS RNG is
+/// unavailable. There is no fallback: a handshake this fails just fails, rather than silently
+/// falling back to a weaker generator.
+pub fn generate_scramble() -> io::Result<[u8; SCRAMBLE_LEN]> {
+    let mut raw = [0u8; SCRAMBLE_LEN];
+    getrandom::fill(&mut raw).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
     let mut out = [0u8; SCRAMBLE_LEN];
-    for b in out.iter_mut() {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let v = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        // Printable ASCII range 0x21..=0x7e, never zero (the first 8 bytes precede a NUL filler).
-        *b = 0x21 + ((v >> 56) % 94) as u8;
+    for (o, b) in out.iter_mut().zip(raw.iter()) {
+        *o = 0x21 + (*b % 94);
     }
-    out
+    Ok(out)
 }
 
 /// Initial handshake packet (protocol version 10) sent by the server.
@@ -80,6 +72,12 @@ impl HandshakeV10 {
         buf.push(0);
         buf.extend_from_slice(&((self.capabilities & 0xffff) as u16).to_le_bytes());
         buf.push(COLLATION_UTF8MB4 as u8);
+        // Checked as part of the Phase 11 fix pass (finding 8): no `htap_server::Session` exists
+        // yet at handshake time (`crate::server::authenticate` creates one only after this
+        // packet and the auth exchange complete), and a session's default state is always
+        // autocommit-on with no open transaction, so this literal status is exactly right here
+        // — unlike the OK/EOF/terminator builders used once a session exists, which now report
+        // its real `autocommit`/`in_transaction` state instead of hardcoding this same value.
         buf.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
         buf.extend_from_slice(&((self.capabilities >> 16) as u16).to_le_bytes());
         buf.push((SCRAMBLE_LEN + 1) as u8);
@@ -281,14 +279,86 @@ impl AuthSwitchRequest {
     }
 }
 
+/// Decoded `COM_CHANGE_USER` request body (Phase 11 plan task 7), after the leading command byte
+/// has already been stripped by the caller.
+///
+/// Layout per the MySQL protocol: a NUL-terminated username; an auth response whose length
+/// encoding depends on the *connection's* negotiated capability flags (lenenc if
+/// `CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA`, else a 1-byte length prefix if
+/// `CLIENT_SECURE_CONNECTION`, else NUL-terminated — the same three-way choice
+/// [`HandshakeResponse41::decode`] makes for the initial handshake); a NUL-terminated database
+/// name (possibly empty); then an optional trailer of a 2-byte character set, a NUL-terminated
+/// auth plugin name (only if `CLIENT_PLUGIN_AUTH`), and connect attributes. The trailer is parsed
+/// leniently (each piece only if further bytes remain) and connect attributes are always ignored
+/// without requiring every trailing byte to be consumed: at least one real client
+/// (`mysql_common`'s `ComChangeUserMoreData::serialize`) always writes a connect-attributes block
+/// on the wire regardless of what it actually negotiated ("We'll always act like
+/// CLIENT_CONNECT_ATTRS is set, this is to avoid looking into the actual connection flags",
+/// `mysql_common-0.37.3/src/packets/mod.rs` line ~2199), so a decoder that demanded the trailer's
+/// bytes balance exactly would reject a real driver's request whenever `CLIENT_CONNECT_ATTRS` was
+/// not itself negotiated at the initial handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeUserRequest {
+    /// User name (accepted but not verified beyond the password challenge/response).
+    pub username: String,
+    /// Authentication response bytes.
+    pub auth_response: Vec<u8>,
+    /// Requested database, if any (empty string and absent are both `None`).
+    pub database: Option<String>,
+    /// Authentication plugin proposed by the client, if any.
+    pub auth_plugin: Option<String>,
+}
+
+impl ChangeUserRequest {
+    /// Decodes a `COM_CHANGE_USER` request body using `capability_flags` negotiated at this
+    /// connection's initial handshake (never re-negotiated by `COM_CHANGE_USER` itself).
+    pub fn decode(payload: &[u8], capability_flags: u32) -> io::Result<Self> {
+        let mut pos = 0;
+        let username =
+            String::from_utf8_lossy(read_null_terminated(payload, &mut pos)?).into_owned();
+        let auth_response = if capability_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+            read_lenenc_str(payload, &mut pos)?.to_vec()
+        } else if capability_flags & CLIENT_SECURE_CONNECTION != 0 {
+            let len = read_fixed(payload, &mut pos, 1)?[0] as usize;
+            read_fixed(payload, &mut pos, len)?.to_vec()
+        } else {
+            read_null_terminated(payload, &mut pos)?.to_vec()
+        };
+        let database = {
+            let raw = read_null_terminated(payload, &mut pos)?;
+            if raw.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(raw).into_owned())
+            }
+        };
+        if pos + 2 <= payload.len() {
+            let _charset = read_fixed(payload, &mut pos, 2)?;
+        }
+        let auth_plugin = if capability_flags & CLIENT_PLUGIN_AUTH != 0 && pos < payload.len() {
+            Some(String::from_utf8_lossy(read_null_terminated(payload, &mut pos)?).into_owned())
+        } else {
+            None
+        };
+        // Connect attributes, if present, are read into nothing: this decoder does not require
+        // every trailing byte to be consumed (see the doc comment above).
+        Ok(Self {
+            username,
+            auth_response,
+            database,
+            auth_plugin,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn scramble_is_printable_and_varies() {
-        let a = generate_scramble();
-        let b = generate_scramble();
+        let a = generate_scramble().unwrap();
+        let b = generate_scramble().unwrap();
         assert!(a.iter().all(|&c| (0x21..=0x7e).contains(&c)));
         assert_ne!(a, b);
     }
@@ -369,5 +439,50 @@ mod tests {
         assert_eq!(bytes[0], EOF_HEADER);
         assert_eq!(AuthSwitchRequest::decode(&bytes).unwrap(), req);
         assert!(AuthSwitchRequest::decode(&bytes[..10]).is_err());
+    }
+
+    #[test]
+    fn change_user_request_decodes_secure_connection_layout_with_trailer() {
+        let caps = CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_ATTRS;
+        let mut payload = Vec::new();
+        write_null_terminated(&mut payload, b"root");
+        payload.push(3); // auth response length (1-byte form)
+        payload.extend_from_slice(&[1, 2, 3]);
+        write_null_terminated(&mut payload, b"htap");
+        payload.extend_from_slice(&COLLATION_UTF8MB4.to_le_bytes());
+        write_null_terminated(&mut payload, AUTH_PLUGIN_NATIVE.as_bytes());
+        // A trailing connect-attributes block that this decoder never has to fully consume.
+        payload.push(0); // lenenc length 0: no attributes
+
+        let decoded = ChangeUserRequest::decode(&payload, caps).unwrap();
+        assert_eq!(decoded.username, "root");
+        assert_eq!(decoded.auth_response, vec![1, 2, 3]);
+        assert_eq!(decoded.database.as_deref(), Some("htap"));
+        assert_eq!(decoded.auth_plugin.as_deref(), Some(AUTH_PLUGIN_NATIVE));
+    }
+
+    #[test]
+    fn change_user_request_decodes_minimal_payload_without_trailer() {
+        let caps = CLIENT_SECURE_CONNECTION;
+        let mut payload = Vec::new();
+        write_null_terminated(&mut payload, b"root");
+        payload.push(0); // empty auth response
+        write_null_terminated(&mut payload, b""); // no database
+        let decoded = ChangeUserRequest::decode(&payload, caps).unwrap();
+        assert_eq!(decoded.username, "root");
+        assert!(decoded.auth_response.is_empty());
+        assert_eq!(decoded.database, None);
+        assert_eq!(decoded.auth_plugin, None);
+    }
+
+    #[test]
+    fn change_user_request_lenenc_auth_response_layout() {
+        let caps = CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
+        let mut payload = Vec::new();
+        write_null_terminated(&mut payload, b"root");
+        write_lenenc_str(&mut payload, &[9, 9, 9, 9]);
+        write_null_terminated(&mut payload, b"");
+        let decoded = ChangeUserRequest::decode(&payload, caps).unwrap();
+        assert_eq!(decoded.auth_response, vec![9, 9, 9, 9]);
     }
 }

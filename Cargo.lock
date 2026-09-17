@@ -705,11 +705,13 @@ dependencies = [
 name = "htap-wire"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
  "htap-common",
  "htap-server",
  "htap-sql",
  "mysql",
  "parking_lot",
+ "sqlparser",
  "tempfile",
  "tracing",
 ]

@@ -21,6 +21,12 @@ use htap_common::types::Value;
 /// `htap-wire/src/proto.rs`'s `version_constant_matches_variable_registry` test.
 pub const REPORTED_VERSION: &str = "8.0.0-fluidb-0.1.0";
 
+/// Default `@@max_allowed_packet` (MySQL's own default), used by embedded sessions with no wire
+/// connection (`LocalServer::execute`, [`DefaultVariables`](crate)'s default trait method below)
+/// and as `htap_wire::server::WireServerConfig::max_allowed_packet`'s default, so the two crates'
+/// defaults never drift apart (Phase 11 plan task 8).
+pub const DEFAULT_MAX_ALLOWED_PACKET: u64 = 64 * 1024 * 1024;
+
 /// One registry entry: a canonical name plus any MySQL aliases for it.
 struct VariableEntry {
     canonical: &'static str,
@@ -44,10 +50,13 @@ const VARIABLES: &[VariableEntry] = &[
         aliases: &[],
         dynamic: false,
     },
+    // Read is dynamic (reflects the wire server's/session's configured value, Phase 11 plan task
+    // 8), but `SET max_allowed_packet = ...` stays a read-only no-op regardless (amendment A2
+    // Phase 10 semantics) — see `classify_set_target`'s explicit override below.
     VariableEntry {
         canonical: "max_allowed_packet",
         aliases: &[],
-        dynamic: false,
+        dynamic: true,
     },
     VariableEntry {
         canonical: "wait_timeout",
@@ -197,7 +206,6 @@ fn constant_value(canonical: &str) -> Value {
     match canonical {
         "version_comment" => Value::String("fluidb".into()),
         "version" => Value::String(REPORTED_VERSION.into()),
-        "max_allowed_packet" => Value::Int64(16 * 1024 * 1024),
         "wait_timeout" | "interactive_timeout" => Value::Int64(28_800),
         "net_write_timeout" | "net_read_timeout" => Value::Int64(60),
         "auto_increment_increment" => Value::Int64(1),
@@ -237,6 +245,13 @@ pub trait SessionVarsView {
     /// Whether the current/next transaction is read-only (`transaction_read_only` /
     /// `tx_read_only`).
     fn transaction_read_only(&self) -> bool;
+    /// Configured `@@max_allowed_packet` (Phase 11 plan task 8). Defaults to
+    /// [`DEFAULT_MAX_ALLOWED_PACKET`] so embedded sessions with no wire connection (and any other
+    /// implementor that never calls a setter for this) report MySQL's own default without needing
+    /// to override this method.
+    fn max_allowed_packet(&self) -> u64 {
+        DEFAULT_MAX_ALLOWED_PACKET
+    }
 }
 
 /// Value of a variable resolved from live session state.
@@ -245,6 +260,7 @@ fn dynamic_value(canonical: &str, session: &dyn SessionVarsView) -> Value {
         "autocommit" => Value::Int64(session.autocommit() as i64),
         "transaction_isolation" => Value::String(session.transaction_isolation().to_string()),
         "transaction_read_only" => Value::Int64(session.transaction_read_only() as i64),
+        "max_allowed_packet" => Value::Int64(session.max_allowed_packet() as i64),
         other => unreachable!("dynamic_value called for non-dynamic variable '{other}'"),
     }
 }
@@ -298,6 +314,12 @@ pub fn classify_set_target(scope: SetScope, name: &str) -> Result<SetClass> {
         )));
     }
     let entry = find_entry(name).ok_or_else(|| unknown_variable(name))?;
+    // `max_allowed_packet`'s value is read dynamically (see `SessionVarsView::max_allowed_packet`)
+    // but stays a read-only no-op to `SET` regardless (amendment A2 Phase 10 semantics; Phase 11
+    // plan task 8 only made the *read* side dynamic, not the write side).
+    if entry.canonical == "max_allowed_packet" {
+        return Ok(SetClass::ReadOnlyNoOp);
+    }
     Ok(if entry.dynamic {
         SetClass::Dynamic
     } else {
@@ -381,10 +403,6 @@ mod tests {
             Value::String("fluidb".into())
         );
         assert_eq!(
-            system_variable_value("max_allowed_packet", &SESSION).unwrap(),
-            Value::Int64(16 * 1024 * 1024)
-        );
-        assert_eq!(
             system_variable_value("socket", &SESSION).unwrap(),
             Value::Null
         );
@@ -428,6 +446,39 @@ mod tests {
         assert_eq!(
             system_variable_value("transaction_read_only", &on).unwrap(),
             Value::Int64(0)
+        );
+    }
+
+    #[test]
+    fn max_allowed_packet_reads_dynamically_but_set_stays_a_no_op() {
+        // `FakeSession` never overrides `max_allowed_packet`, so it reads the trait's default.
+        assert_eq!(
+            system_variable_value("max_allowed_packet", &SESSION).unwrap(),
+            Value::Int64(DEFAULT_MAX_ALLOWED_PACKET as i64)
+        );
+
+        struct ConfiguredSession(u64);
+        impl SessionVarsView for ConfiguredSession {
+            fn autocommit(&self) -> bool {
+                true
+            }
+            fn transaction_read_only(&self) -> bool {
+                false
+            }
+            fn max_allowed_packet(&self) -> u64 {
+                self.0
+            }
+        }
+        let configured = ConfiguredSession(1024 * 1024);
+        assert_eq!(
+            system_variable_value("max_allowed_packet", &configured).unwrap(),
+            Value::Int64(1024 * 1024)
+        );
+
+        // `SET max_allowed_packet = ...` stays a read-only no-op regardless.
+        assert_eq!(
+            classify_set_target(SetScope::Session, "max_allowed_packet").unwrap(),
+            SetClass::ReadOnlyNoOp
         );
     }
 

@@ -59,6 +59,15 @@ Phase 10 has a completed local MVP for server-side sessions and explicit transac
 overlay reads until one `COMMIT` runs the existing 2PC path against the transaction's own pinned snapshot.
 One `EmbeddedClient::open_session`/wire connection is one `Session`. See "Sessions and explicit transactions
 (Phase 10)" below.
+Phase 11 has a completed local MVP for the MySQL binary protocol and prepared statements
+(`htap-wire::{binary_codec, prepared}`, `htap-sql::prepare`): `COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/
+`SEND_LONG_DATA` (`COM_STMT_FETCH` and server-side cursors are cleanly rejected), `COM_RESET_CONNECTION` and
+`COM_CHANGE_USER` (both respecting the ADR-018 `CommitOutcomePending` quarantine), reassembled/split messages
+of 16 MiB or more with a real, configurable `max_allowed_packet` (default 64 MiB), an OS-CSPRNG handshake
+scramble (`getrandom`, no fallback), `CLIENT_MULTI_STATEMENTS` (honored only when negotiated, sequential
+execution with `SERVER_MORE_RESULTS_EXISTS`, stopping at the first error), and a shutdown path that
+force-closes connections blocked mid-packet. `RemoteClient` gained `prepare`/`execute_prepared`/
+`close_prepared`. See "Prepared statements and binary protocol (Phase 11)" below.
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
@@ -70,9 +79,9 @@ GROUP BY ordinals, LIMIT BY, INSERT ... SELECT, UPDATE with joins/subqueries, DE
 cost-based optimization, vectorized/pipelined execution, worker-pool parallelism for the general query path, memory bounds/spilling for the general path,
 physical reclamation on DROP TABLE, semi-join rewrites of IN/EXISTS, integer DIV, broader string/date function coverage,
 multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow integration,
-`SELECT ... FOR UPDATE`/locking reads, prepared statements/binary protocol, savepoints, XA, TLS, compression, multi-statements,
-idle-transaction timeout/reaping, MVCC garbage collection, IPC/multiprocess access, per-user ACL,
-Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors);
+`SELECT ... FOR UPDATE`/locking reads, savepoints, XA, TLS, compression, per-user ACL,
+idle-transaction timeout/reaping, MVCC garbage collection, IPC/multiprocess access,
+Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors; server-side cursors via `COM_STMT_FETCH`, exact DECIMAL, and `TIME`-typed bound parameters also remain deferred — see "Prepared statements and binary protocol (Phase 11)" below);
 note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation remain deferred).
 See [`PROGRESS.md`](./PROGRESS.md).
 
@@ -131,7 +140,7 @@ flowchart TD
     class plan_df,plan_coord,plan_remote,plan_compact planned;
 ```
 
-The current active path operates entirely in-process within `LocalServer` for `EmbeddedClient`, and over a loopback-by-default synchronous MySQL text-protocol connection (`htap-wire` `WireServer`, `htapd`) for `RemoteClient`, without distributed dependencies: queries are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and `SnapshotPinned` manifest-less partitions). In contrast, the planned target architecture—including DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with background compaction—is deferred and strictly separated from active execution paths.
+The current active path operates entirely in-process within `LocalServer` for `EmbeddedClient`, and over a loopback-by-default synchronous MySQL text- and binary-protocol connection (`htap-wire` `WireServer`, `htapd`) for `RemoteClient`, without distributed dependencies: queries are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and `SnapshotPinned` manifest-less partitions). In contrast, the planned target architecture—including DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with background compaction—is deferred and strictly separated from active execution paths.
 
 ### Current In-Process Execution Call Flow (Implemented Local Slice)
 
@@ -140,7 +149,7 @@ In the implemented local slice, all SQL execution is synchronous and in-process.
 ```mermaid
 flowchart TD
     subgraph CurrentDirectCalls ["Direct Current In-Process Execution"]
-        RC["RemoteClient (htap-wire WireClient)"] -->|"MySQL text protocol,<br/>loopback by default"| WS["htap-wire WireServer<br/>(thread-per-connection)"]
+        RC["RemoteClient (htap-wire WireClient)"] -->|"MySQL text &amp; binary protocol,<br/>loopback by default"| WS["htap-wire WireServer<br/>(thread-per-connection)"]
         WS --> LS["LocalServer.execute(sql)"]
         EC["EmbeddedClient.execute(sql)"] --> LS
         LS --> Lock["Acquire execution_lock<br/>(parking_lot::Mutex)"]
@@ -241,7 +250,7 @@ Neither persistent converter background workers nor coordinator lease managers a
 
 ## Process and role model
 
-**Status: `implemented (local MVP)`** (synchronous `LocalServer` in-process execution façade, `EmbeddedClient`, the network daemon `htapd`/`htap-wire`/`RemoteClient`, and server-side sessions/explicit transactions (`htap-server::session`, Phase 10; see "Sessions and explicit transactions" below) are implemented for the narrow local slice; prepared statements/binary protocol, TLS, compression, and multi-statements remain planned/deferred).
+**Status: `implemented (local MVP)`** (synchronous `LocalServer` in-process execution façade, `EmbeddedClient`, the network daemon `htapd`/`htap-wire`/`RemoteClient`, server-side sessions/explicit transactions (`htap-server::session`, Phase 10; see "Sessions and explicit transactions" below), and the MySQL binary protocol/prepared statements (Phase 11; see "Prepared statements and binary protocol" below) are implemented for the narrow local slice; TLS, compression, and per-user ACL remain planned/deferred).
 
 The system now ships **a single binary, `htapd`** (ADR-007), which runs `LocalServer` behind a MySQL
 text-protocol listener (`htap-wire`). `htapd` does not implement a selectable frontend/backend role split;
@@ -275,12 +284,13 @@ therefore a **deployment choice, not a rewrite**.
 
 ## Network layer (`htap-wire`, `htapd`)
 
-**Status: `implemented (local MVP)`** (hand-written synchronous MySQL text-protocol server and daemon, with
-one `htap_server::Session` per connection for `BEGIN`/`COMMIT`/`ROLLBACK` and session variables (Phase 10;
-see "Sessions and explicit transactions" below); TLS, compression, prepared statements/binary protocol,
-multi-statements, and Docker packaging are planned/deferred).
+**Status: `implemented (local MVP)`** (hand-written synchronous MySQL text- and binary-protocol server and
+daemon, with one `htap_server::Session` per connection for `BEGIN`/`COMMIT`/`ROLLBACK` and session variables (Phase 10;
+see "Sessions and explicit transactions" below), plus the binary protocol and prepared statements (Phase 11;
+see "Prepared statements and binary protocol" below); TLS, compression, and Docker packaging remain
+planned/deferred).
 
-`htap-wire` implements a hand-written, synchronous MySQL text protocol on top of `Arc<LocalServer>`: one
+`htap-wire` implements a hand-written, synchronous MySQL protocol on top of `Arc<LocalServer>`: one
 accept thread plus one thread per connection (std::net, no async runtime), statements serialized by the
 server's own `execution_lock`. Since Phase 10, each authenticated connection owns one `htap_server::Session`
 for its whole lifetime, so a connection's statements auto-commit only while that session's `autocommit` is
@@ -288,49 +298,262 @@ on; `BEGIN`/`COMMIT`/`ROLLBACK`/`SET` sent as ordinary SQL behave exactly as the
 `Session::execute` directly, and a connection that disconnects (`QUIT`, EOF, a framing error, or server
 shutdown) has its open transaction rolled back explicitly, with the session's `Drop` as a safety net. It
 supports handshake v10 with `mysql_native_password` (clients proposing another plugin get an
-`AuthSwitchRequest`), `COM_QUERY` (text result sets), `COM_PING`, `COM_INIT_DB`, and `COM_QUIT`.
-`COM_STMT_PREPARE`/`COM_STMT_EXECUTE` (binary protocol), `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, and every
-other command return `ERR 1047`. A small start-up compatibility shim (`htap_wire::shim`) now only answers
+`AuthSwitchRequest`), `COM_QUERY` (text result sets), `COM_PING`, `COM_INIT_DB`, `COM_QUIT`,
+`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/`SEND_LONG_DATA` (binary protocol, Phase 11; see below),
+`COM_RESET_CONNECTION`, and `COM_CHANGE_USER`. `COM_STMT_FETCH` (server-side cursors) and every other
+command return a clean error (`ER_UNKNOWN_STMT_HANDLER`/1243 for an unknown statement id, `ERR 1047` for
+anything else unimplemented). A small start-up compatibility shim (`htap_wire::shim`) now only answers
 `USE <db>`, `SELECT 1`, `SELECT VERSION()`, `SELECT DATABASE()`/`SELECT SCHEMA()`, and the two MySQL
 positional `SET CHARACTER SET <x>` / `SET CHARSET <x>` forms that `vendor/sqlparser` cannot parse into an AST
 node at all; every other `SET`, `SELECT @@sysvar`, and `SELECT @uservar` now flows through the connection's
-real `Session` and the `htap-sql::variables` registry instead of being faked in the shim. Result-set
+real `Session` and the `htap-sql::variables` registry instead of being faked in the shim (these two
+shim-only forms are not usable inside a `CLIENT_MULTI_STATEMENTS` batch — see below — since the shim only
+ever sees a single statement at a time). Result-set
 terminators always use header `0xFE` (legacy EOF, or an OK-shaped packet when `CLIENT_DEPRECATE_EOF` is
 negotiated); OK-packet `info` carries a private convention (empty for DDL, `version=<n>`/`version=none` for
-DML) that lets `RemoteClient` recover the exact `CommandResult`. Payloads of 16 MB or more (multi-packet
-messages) are unsupported and close the connection. Because the wire layer passes every non-shim statement
-through to the connection's `Session::execute` unchanged, the Phase 9 SQL breadth (joins, `UPDATE`, `DROP
-TABLE`, `SHOW`/`DESCRIBE`) and the Phase 10 session/transaction surface are both available over the wire with
-no additional wire-layer logic, verified end-to-end by
+DML) that lets `RemoteClient` recover the exact `CommandResult`. Because the wire layer passes every non-shim
+statement through to the connection's `Session::execute` unchanged, the Phase 9 SQL breadth (joins, `UPDATE`,
+`DROP TABLE`, `SHOW`/`DESCRIBE`) and the Phase 10 session/transaction surface are both available over the
+wire with no additional wire-layer logic, verified end-to-end by
 `crates/htap-wire/tests/wire_server.rs::test_general_sql_over_wire` and
 `test_wire_begin_commit_rollback_round_trip`.
 
+**Message size and `max_allowed_packet` (Phase 11).** A protocol message of 16 MiB or more is no longer
+unsupported: `codec::read_message_with_stop` reassembles a message made of multiple 0xFFFFFF-length chunks
+(continuing while a chunk's length is exactly the maximum, checking the running total before allocating more
+memory), and `write_message` splits a large outbound message the same way (with a trailing empty packet on
+an exact multiple of the chunk size), both used at every call site that may exceed 16 MiB. The limit itself,
+`WireServerConfig::max_allowed_packet`, defaults to 64 MiB (MySQL's own default) and is configurable via
+`htapd --max-allowed-packet <n>` / `HTAPD_MAX_ALLOWED_PACKET`; it is reported dynamically as
+`@@max_allowed_packet` through `htap_sql::variables`/`Session::set_max_allowed_packet`. A message over the
+configured limit is rejected with `ER_NET_PACKET_TOO_LARGE`/1153 (best effort — the limit is checked before
+the full message is read) and the connection is closed. This is a wire-message-size limit, independent of
+the roughly 4 MiB effective 2PC transaction payload cap described in `docs/LIMITATIONS.md`. Verified in
+`crates/htap-wire/src/codec.rs` unit tests (`test_message_reassembly_at_exact_boundary_with_trailing_empty_packet`,
+`test_message_reassembly_rejects_over_max_allowed_packet_before_full_read`,
+`test_message_reassembly_rejects_sequence_id_mismatch_across_chunks`,
+`test_write_message_splits_exact_multiple_and_non_multiple`,
+`write_message_and_read_message_sequence_ids_wrap_at_256`) and
+`crates/htap-wire/tests/wire_server.rs` (`test_wire_large_payload_over_16mb_round_trip`,
+`test_wire_max_allowed_packet_rejects_oversize_query_and_closes_connection`,
+`test_max_allowed_packet_variable_reflects_wire_config`).
+
+**`COM_RESET_CONNECTION` and `COM_CHANGE_USER` (Phase 11).** Both call `htap_server::Session::reset()`, which
+rolls back any open transaction, clears user variables, resets `autocommit` to on, and — the ADR-018
+quarantine — leaves a session in `SessionState::CommitOutcomePending` untouched, returning the stored
+`DurablePending`/`RecoveryRequired` error instead of resetting anything (`COM_QUIT` never goes through this
+gate). On success, both also clear the connection's prepared-statement registry. `COM_CHANGE_USER`
+additionally re-authenticates: it hashes the request's auth response against this connection's *current*
+stored scramble — the original handshake scramble, or a later auth-switch's scramble if one has happened
+since (see below) — or issues a fresh `AuthSwitchRequest` if the client proposes a different plugin, via the
+same `verify_credentials` seam `htapd`'s single shared password already uses — the seam Phase 12 per-user ACL
+will extend. When a plugin switch does happen, the fresh scramble it issues is now persisted onto the
+connection's `Session` (Phase 11 fix pass) so a *later* `COM_CHANGE_USER` that itself needs no switch
+authenticates against that same, still-current nonce, matching real client behavior (confirmed against
+`mysql-28.0.2`'s `perform_auth_switch`, which updates its own stored nonce the moment it receives the
+`AuthSwitchRequest`); before this fix, a later `COM_CHANGE_USER` always re-hashed against the *original*
+handshake scramble even after a switch, and a real client would legitimately fail to authenticate. A failed
+`COM_CHANGE_USER` sends `ER_ACCESS_DENIED` and closes the connection; a successful one behaves exactly like
+`COM_RESET_CONNECTION`. Verified in `crates/htap-wire/tests/wire_server.rs`
+(`test_wire_reset_connection_clears_state_and_prepared_statements`,
+`test_wire_reset_connection_while_commit_outcome_pending_stays_quarantined`,
+`test_wire_quit_allowed_while_commit_outcome_pending`, `test_wire_change_user_reauth_and_reset`,
+`test_wire_change_user_wrong_password_closes_connection`,
+`test_wire_change_user_while_commit_outcome_pending_stays_quarantined`,
+`test_wire_change_user_reuses_switched_scramble_on_later_change_user`).
+
+**`CLIENT_MULTI_STATEMENTS` (Phase 11).** The server advertises `CLIENT_MULTI_STATEMENTS`/
+`CLIENT_MULTI_RESULTS`, but only honors a semicolon-separated `COM_QUERY` batch when the connecting client
+actually negotiated the capability at handshake; otherwise multi-statement text is a syntax error exactly as
+before. A negotiated batch (`htap_sql::parse_many`) runs each statement sequentially through
+`Session::execute_statement`, setting `SERVER_MORE_RESULTS_EXISTS` on every result but the last, and stops at
+the first error — including a `DurablePending`/`RecoveryRequired` outcome, which stops the batch rather than
+continuing past an ambiguous commit. `COM_STMT_PREPARE` rejects multi-statement text even when the capability
+is negotiated (a prepared statement is always exactly one statement). Verified in
+`crates/htap-wire/tests/wire_server.rs`
+(`test_wire_multi_statements_sequential_execution_and_more_results_flag`,
+`test_wire_multi_statements_stops_on_first_error`, `test_wire_multi_statements_stops_on_durable_pending`,
+`test_wire_multi_statements_rejected_without_capability`,
+`test_wire_prepare_rejects_multi_statement_text_even_when_negotiated`) and
+`crates/htap-wire/src/shim.rs::shim_never_matches_multi_statement_text`.
+
+**Shutdown force-close (Phase 11).** `WireServer` now keeps a `live_connections` registry of `try_clone`d
+`TcpStream`s (unregistered via an RAII `ConnectionGuard` on every connection-thread exit path, including a
+panic); `shutdown()` sets the stop flag, calls `Shutdown::Both` on every live stream (so a connection thread
+blocked mid-read on a partial packet is unblocked immediately rather than waiting for the rest of that
+packet), and then joins every connection thread. A connection torn down this way has its open transaction
+rolled back the same way any other disconnect does. The same `ConnectionGuard::drop` also decrements
+`connection_count` (Phase 11 fix pass, finding 4): before this fix the decrement lived in the spawned
+closure *after* `handle_connection` returned, so a panic inside that call skipped it and permanently leaked
+the count, eventually wedging `max_connections`. Verified by
+`crates/htap-wire/tests/wire_server.rs::test_shutdown_force_closes_connection_blocked_mid_packet`,
+`test_shutdown_force_close_rolls_back_open_transaction` (both bounded-time tests), and
+`crates/htap-wire/src/server.rs::connection_guard_decrements_count_and_unregisters_on_panic_unwind`.
+
+**Status flags reflect real session state (Phase 11 fix pass).** Every OK and result-set-terminator packet's
+`SERVER_STATUS_*` word now comes from the connection's actual `Session` state instead of a hardcoded
+constant: `SERVER_STATUS_AUTOCOMMIT` follows the session's `autocommit` setting, and `SERVER_STATUS_IN_TRANS`
+is set whenever a transaction is open (an explicit one, or an implicit one under `autocommit = 0`), on every
+OK and EOF/terminator this server sends. `SERVER_MORE_RESULTS_EXISTS` (Phase 11, `CLIENT_MULTI_STATEMENTS`)
+composes with these same flags rather than replacing them. Before this fix, every OK/EOF packet always
+hardcoded `SERVER_STATUS_AUTOCOMMIT` and never set `SERVER_STATUS_IN_TRANS`, so `SET autocommit = 0` and open
+transactions were invisible on the wire even though they were enforced correctly server-side. The
+pre-session handshake packet (before a `Session` exists) still reports plain `SERVER_STATUS_AUTOCOMMIT`.
+Verified by `crates/htap-wire/tests/wire_server.rs::test_wire_status_flags_reflect_autocommit_and_transaction_state`
+and `crates/htap-wire/src/result_codec.rs` unit tests (`command_ok_reports_the_status_it_is_given`,
+`more_results_flag_sets_server_more_results_exists`).
+
+**Checked arithmetic and decode fuzzing (Phase 11 fix pass).** The lenenc-int/string decoders in
+`codec.rs` use `checked_add`/`checked_mul` rather than raw arithmetic when computing buffer offsets and
+lengths, turning a would-be panic or wrap-around on adversarial input into a clean decode error. This is
+exercised by a deterministic 20k-iteration fuzz harness, `crates/htap-wire/tests/fuzz_decode.rs`, which feeds
+pseudo-random byte sequences into `decode_execute`, `ChangeUserRequest::decode`, `HandshakeResponse41::decode`,
+and `decode_binary_row`, asserting none of them ever panics (`fuzz_decode_execute_never_panics`,
+`fuzz_change_user_request_decode_never_panics`, `fuzz_handshake_response41_decode_never_panics`,
+`fuzz_decode_binary_row_never_panics`).
+
 `htapd` (`crates/htapd`) is a thin binary: `htapd --root <dir> [--listen 127.0.0.1:3307]
-[--max-connections 64] [--password <pw>]`, opens `LocalServer::open(root)`, starts a `WireServer`, and parks
-until killed (Ctrl-C/SIGTERM; there is no signal handler, so shutdown is a hard process stop and storage
-recovers on next start per ADR-004/008/009). `htap-client::RemoteClient` is the Rust-side counterpart,
-returning the same `StatementResult` that `EmbeddedClient` returns and mapping server error codes back to
-`HtapError` categories.
+[--max-connections 64] [--password <pw>] [--max-allowed-packet 67108864]`, opens `LocalServer::open(root)`,
+starts a `WireServer`, and parks until killed (Ctrl-C/SIGTERM; there is no signal handler, so shutdown is a
+hard process stop and storage recovers on next start per ADR-004/008/009). `htap-client::RemoteClient` is the
+Rust-side counterpart, returning the same `StatementResult` that `EmbeddedClient` returns and mapping server
+error codes back to `HtapError` categories; it also exposes `prepare`/`execute_prepared`/`close_prepared` (see
+below).
 
 ### Security model
 
 - **Loopback by default.** `WireServerConfig::listen` defaults to `127.0.0.1:3307`; binding a non-loopback
   address is an explicit opt-in and `htapd` logs a warning when it happens.
 - **One implicit user.** The username sent by the client is logged but never checked; there is no per-user
-  ACL or RBAC.
+  ACL or RBAC. `COM_CHANGE_USER` (Phase 11) re-authenticates against the connection's single shared password
+  through the same `verify_credentials` seam, not a per-user credential store — that is Phase 12 scope.
 - **Single shared credential.** `--password` overrides `HTAPD_PASSWORD`; with neither set, no password is
   required. `WireServerConfig::password = None` accepts any client.
 - **No TLS.** The password exchange is a `mysql_native_password` challenge/response hash, but query text and
   result rows travel in cleartext. Binding a non-loopback address without a trusted network or an SSH tunnel
   exposes both.
-- **Non-cryptographic scramble RNG.** The handshake scramble is generated with a xorshift generator seeded
-  from the clock and a counter, not a CSPRNG; it is sufficient to make replay of a captured hash
-  infeasible within a session but is not a general-purpose cryptographic primitive.
+- **CSPRNG scramble (Phase 11).** The handshake scramble now comes from the OS CSPRNG (`getrandom::fill`, no
+  fallback), mapped to printable non-zero ASCII bytes; handshake fails cleanly if the OS RNG call itself
+  fails. Verified by `crates/htap-wire/src/handshake.rs::scramble_is_printable_and_varies`.
+- **Pre-authentication reads are bounded before allocation (Phase 11 fix pass).** The initial handshake
+  response, either side of an auth-plugin switch, and a `COM_CHANGE_USER` auth-switch reply are all read
+  through `server::read`, capped at `AUTH_PHASE_MAX_PACKET` (64 KiB) intersected with the connection's
+  configured `max_allowed_packet` — checked against the message's *declared* length before anything is
+  allocated. Before this bound, an unauthenticated peer could make every connection attempt allocate up to
+  just under 16 MiB merely by declaring a large packet length and never sending the bytes. Verified by
+  `crates/htap-wire/tests/wire_server.rs::test_pre_auth_oversize_handshake_rejected_before_allocation`.
 
 Verified in `crates/htap-wire/src/*.rs` (unit tests, including `config_defaults_are_loopback_only`) and
 `crates/htap-wire/tests/wire_server.rs` (`test_handshake_empty_password_ok`,
 `test_handshake_wrong_password_rejected_1045`, `test_handshake_correct_password_ok`,
-`test_auth_switch_to_native_password`, `test_ssl_request_rejected_and_pre41_rejected`).
+`test_auth_switch_to_native_password`, `test_ssl_request_rejected_and_pre41_rejected`,
+`test_pre_auth_oversize_handshake_rejected_before_allocation`).
+
+---
+
+## Prepared statements and binary protocol (Phase 11)
+
+**Status: `implemented (local MVP)`** (`htap-wire::{binary_codec, prepared}`, `htap-sql::prepare`,
+`htap-client::RemoteClient`; `COM_STMT_FETCH`/server-side cursors, exact `DECIMAL`, `TIME`-typed bound
+parameters, unsigned 64-bit values above `i64::MAX`, and per-user ACL remain planned/deferred).
+
+- **Parameterization is AST-level substitution, not text re-render.** `htap_sql::prepare` walks the parsed
+  `sqlparser` AST once to find every `?` placeholder (`count_placeholders`/`substitute_placeholders` share one
+  walk, so they can never disagree with each other) and, at `EXECUTE` time, replaces each placeholder `Expr`
+  node in place with a literal `Expr` built directly from the bound `Value` — the statement text is never
+  re-rendered and reparsed, avoiding double-escaping and float/`i64::MIN` precision edge cases. The walk
+  covers every position the binder accepts a literal in: INSERT VALUES rows, UPDATE SET/WHERE, DELETE WHERE,
+  SELECT projection/WHERE/HAVING/GROUP BY/ORDER BY/JOIN ON, subquery bodies (scalar/IN/EXISTS), derived
+  tables, CTE bodies, UNION branches, and `LIMIT`/`OFFSET`. Separately, `checked_placeholder_count`
+  cross-checks the walk's count against a raw tokenizer scan of the original SQL text; a `?` sitting in a
+  position the walk does not recognize (an identifier, a DDL default, a `SET` target) makes the two counts
+  disagree, and the statement is rejected as `HtapError::Unsupported` rather than silently
+  under-substituted. Only `INSERT`/`UPDATE`/`DELETE`/`SELECT` can be prepared; `SET`, transaction control,
+  DDL, and `SHOW` are rejected as `Unsupported` at `PREPARE` time.
+- **`PREPARE` response metadata is best-effort.** `resolve_prepare_output_schema` returns the real output
+  schema only when every placeholder's type is statically inferable from local context (a target column's
+  type in an INSERT/UPDATE cell, or the other operand's column type in a simple comparison/`BETWEEN`/`IN`/
+  `LIKE`); it then probes the statement with representative non-NULL values of those types through the real,
+  unmodified binder, so the reported schema matches what executing the prepared statement would actually
+  return. Any inference gap (e.g. `SELECT ? AS x`, a join, or an ambiguous position) yields `num_columns = 0`
+  and generic parameter definitions rather than guessing. `INSERT`/`UPDATE`/`DELETE` always report
+  `num_columns = 0`. `infer_placeholder_type_hints` (`htap_sql::prepare`) covers a placeholder in every
+  expression shape `ORDER BY`/`LIMIT` accept it in — a bare column, `CASE`, `LIKE`, `IN` list, `BETWEEN`, or
+  function call — and, defensively (Phase 11 fix pass, finding 5), falls back to `num_columns = 0` rather than
+  an internal error if a hint count ever disagreed with `count_placeholders` for some future expression shape.
+  Verified by `crates/htap-sql/tests/prepare.rs::test_case_in_order_by_resolves_output_schema_without_error`
+  and `test_hint_count_matches_placeholder_count_for_every_supported_shape`, and
+  `crates/htap-wire/tests/wire_server.rs::test_wire_prepare_and_execute_case_in_order_by`.
+- **Per-statement parameter-type cache (`new_params_bound_flag = 0`).** libmysqlclient-based connectors
+  (the C API, Python `mysqlclient`, PHP `mysqli`) commonly re-execute a prepared statement with
+  `new_params_bound_flag = 0`, meaning "reuse the last `EXECUTE` that actually sent types." Each prepared
+  statement caches the last `(type, unsigned)` list seen with the flag set to 1; a flag-0 `EXECUTE` reuses it,
+  a flag-0 `EXECUTE` with no cache (or a length mismatch) is a clean protocol error, and `COM_STMT_RESET`
+  clears the cache.
+- **Binary parameter type matrix.** `binary_codec::decode_execute` decodes `TINY`, `SHORT`, `INT24` (the wire
+  4-byte form; "24" is only the SQL display width), `LONG`, `LONGLONG` (unsigned values above `i64::MAX`
+  rejected cleanly — there is no `UInt64` `Value` variant in the engine; documented as a first-class
+  limitation), `YEAR`, `FLOAT`, `DOUBLE`, `NEWDECIMAL`/`DECIMAL` (kept as validated text and substituted as a
+  numeric literal so the binder's own numeric-literal handling applies — no exact-decimal type exists in the
+  engine, so this is a text pass-through, not arbitrary-precision arithmetic), `VARCHAR`/`VAR_STRING`/
+  `STRING`/`ENUM`/`SET`/`TINY_BLOB`/`MEDIUM_BLOB`/`LONG_BLOB`/`BLOB`, `DATE`/`DATETIME`/`TIMESTAMP` (decoded to
+  integer microseconds), and `NULL`. `TIME` and any other type code are a clean decode error naming the
+  unsupported type. Binary `DATE`/`DATETIME`/`TIMESTAMP` values are range-validated on decode (Phase 11 fix
+  pass, finding 6): year `0..=9999`, month/day valid for the calendar (including leap years), and
+  hour/minute/second/microseconds each in their valid range, all as clean decode errors rather than a
+  panic or silently wrapped value; a zero date (`0000-00-00`) maps to `0000-01-01` as MySQL's own client
+  libraries do. The same range is enforced on encode: a `Value::Timestamp` outside the wire format's
+  `0..=9999`-year range is a clean `io::Error` for that result rather than a truncated year, and
+  `RemoteClient`/`WireClient` surface it as an ordinary error. Verified by
+  `crates/htap-wire/src/binary_codec.rs` unit tests (`decode_binary_datetime_rejects_invalid_calendar_fields`,
+  `decode_binary_datetime_zero_month_and_day_together_is_the_sentinel`,
+  `encode_binary_datetime_rejects_year_outside_0_to_9999`,
+  `encode_binary_row_propagates_out_of_range_timestamp_error`,
+  `encode_execute_request_propagates_out_of_range_timestamp_error`). A `VARCHAR`/`VAR_STRING`-family
+  parameter's raw bytes decode as `Value::String` when
+  valid UTF-8 and `Value::Bytes` otherwise (the wire format cannot distinguish a bound Rust `String` from a
+  bound `Vec<u8>` any other way); the binder accepts a string literal for a `BYTES` column (`INSERT`,
+  `UPDATE`, and `WHERE` comparisons) and the integer literals `0`/`1` for a `BOOL` column, closing the gap
+  this ambiguity would otherwise create. Timestamps bind as integer microseconds, matching the binder's own
+  `TIMESTAMP` literal handling (not a datetime string).
+- **`COM_STMT_SEND_LONG_DATA` has no response, by protocol.** Its errors (an out-of-range parameter index, or
+  exceeding the connection's long-data byte cap) poison the statement instead, and the stored error surfaces
+  at the next `EXECUTE` rather than being silently dropped or reported out of band.
+- **Per-connection limits.** A connection's `PreparedStatementRegistry` holds at most 4096 statements
+  (`MAX_PREPARED_STATEMENTS`); total buffered `SEND_LONG_DATA` bytes across every parameter of every
+  statement are capped by the connection's configured `max_allowed_packet` (see above). Statement ids are
+  assigned from a wrapping `u32` counter; when it wraps back onto an id still in use (a long-lived
+  connection with a still-open statement near the old id), insertion now skips past every id still occupied
+  rather than overwriting it (Phase 11 fix pass, finding 9). Verified by
+  `crates/htap-wire/src/prepared.rs::insert_skips_ids_still_in_use_when_next_id_wraps`.
+- **`RemoteClient` and `WireClient`.** `htap_wire::client::WireClient` gained `prepare`, `execute_prepared`,
+  `close_stmt`, and `query_multi`; `htap_client::RemoteClient` gained `prepare(sql) -> PreparedStatement`,
+  `execute_prepared`, and `close_prepared`, mirroring the shape `EmbeddedClient`'s literal-SQL execution
+  already returns.
+
+Verified in `crates/htap-wire/src/binary_codec.rs` unit tests (full parameter type matrix, NULL-bitmap
+offset, `new_params_bound_flag` caching, unsigned `LONGLONG` boundary, `TIME`/unknown-type rejection, invalid
+`DECIMAL` text, `VAR_STRING` UTF-8/non-UTF-8 decoding, binary row round-trip for every result column type,
+`DATE`/`DATETIME`/`TIMESTAMP` calendar-range validation on decode and encode); `crates/htap-wire/tests/fuzz_decode.rs`
+(20k-iteration fuzz of `decode_execute`/`ChangeUserRequest::decode`/`HandshakeResponse41::decode`/
+`decode_binary_row`, asserting no panics); `crates/htap-wire/src/prepared.rs` unit tests (registry
+insert/close/reset, statement cap, long-data accumulation/clearing/poisoning, id-wraparound skip);
+`crates/htap-sql/tests/prepare.rs` (placeholder count/tokenizer agreement across ≥15 statement shapes
+including subqueries/derived tables/CTEs/UNION/`LIMIT`, substitution binding identically to literal SQL,
+output-schema resolution positive/`None` cases, `i64::MIN`/non-finite-float edge cases, exact-numeric-text
+`DECIMAL` substitution via `test_numeric_text_decimal_round_trips_exactly_into_bigint_column`/
+`test_numeric_text_negative_decimal_with_fraction_round_trips`/`test_numeric_text_validates_strictly`,
+placeholder-in-`ORDER BY` coverage via `test_case_in_order_by_resolves_output_schema_without_error`/
+`test_hint_count_matches_placeholder_count_for_every_supported_shape`); `crates/htap-wire/tests/wire_server.rs`
+(`test_prepared_statement_unsupported_kinds_rejected`,
+`test_prepared_statement_unknown_id_and_close_and_reset`, `test_prepared_statement_send_long_data`,
+`test_prepared_statement_param_type_cache_new_params_bound_zero`,
+`test_prepared_statement_in_transaction_and_commit_outcome_pending`,
+`test_prepared_statements_mysql_crate_interop_all_types`,
+`test_prepare_placeholder_in_limit_and_subquery`, `test_wire_prepare_and_execute_case_in_order_by`,
+`test_wire_prepared_decimal_param_round_trips_exactly_into_bigint_column`); and
+`crates/htap-client/tests/prepared.rs` (`test_remote_prepared_statement_matches_embedded_literal_execution`,
+`test_remote_prepared_statement_close_then_execute_errors`).
 
 ---
 

@@ -17,17 +17,21 @@ This repository implements a modular local MVP covering LSM row storage, columna
 This project is delivered as a verified local library, a network daemon, and a test suite. The following
 components are **deliberately not implemented** and are out of scope for this local MVP:
 
-- **No MySQL binary/prepared-statement protocol:** `htapd`/`htap-wire` implement the MySQL *text* protocol
-  only (`COM_QUERY`, `COM_PING`, `COM_INIT_DB`, `COM_QUIT`). Prepared statements and the binary protocol
-  (`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`), `COM_RESET_CONNECTION`, and `COM_CHANGE_USER` are answered with an
-  error rather than implemented.
+- **No server-side cursors:** `COM_STMT_FETCH` is answered with a clean error rather than implemented;
+  there is no cursor support of any kind. (`htapd`/`htap-wire` do implement the MySQL text *and* binary
+  protocols, including prepared statements, `COM_RESET_CONNECTION`, and `COM_CHANGE_USER` — see "Prepared
+  statements" below; only cursors are excluded here.)
 - **No TLS, compression, or per-user ACL:** The wire server has no TLS, no protocol compression, and a
   single shared password with no per-user accounts or RBAC; see "Network server (`htapd`)" below.
 - **No Docker image or Docker Compose deployment:** No `Dockerfile`, `docker-compose.yml`, or container images are provided or required.
-- **No `SELECT ... FOR UPDATE`, locking reads, prepared statements, savepoints, or XA:** Sessions and
+- **No `SELECT ... FOR UPDATE`, locking reads, savepoints, or XA:** Sessions and
   explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, session variables) are implemented — see "Sessions and
-  explicit transactions" below — but there is no locking-read syntax, no prepared-statement/binary protocol,
-  no savepoints, and no distributed (XA) transactions. There is also no idle-transaction timeout/reaping yet.
+  explicit transactions" below — but there is no locking-read syntax, no savepoints, and no distributed (XA)
+  transactions. There is also no idle-transaction timeout/reaping yet.
+- **No unsigned 64-bit values, exact `DECIMAL`, or `TIME` parameters in prepared statements:** there is no
+  `UInt64` value type in the engine (a permanent limitation, not "not yet implemented"); `DECIMAL`/
+  `NEWDECIMAL` parameters are kept as text and bound as a numeric literal (no arbitrary-precision decimal
+  type); `TIME`-typed parameters are rejected. See "Prepared statements" below.
 - **No TPC-C or TPC-H compliance:** The system does not implement the TPC-C or TPC-H benchmark specifications, relational transaction models, or analytical query profiles. Microbenchmarks evaluate isolated internal subsystem performance only.
 - **No window functions, correlated subqueries, or cost-based optimization:** The general query executor
   (see "Supported SQL Subset" below) handles joins, expressions, subqueries, and set operations over
@@ -170,7 +174,7 @@ Deferred on this path: window functions, correlated subqueries, recursive CTEs, 
 
 ## Network server (`htapd`)
 
-`htapd` exposes a `LocalServer` root over the MySQL text protocol, so the same engine `EmbeddedClient` drives
+`htapd` exposes a `LocalServer` root over the MySQL text and binary protocols, so the same engine `EmbeddedClient` drives
 in-process can also be reached over TCP, from any MySQL client or from `htap-client::RemoteClient`.
 
 ```bash
@@ -178,11 +182,15 @@ in-process can also be reached over TCP, from any MySQL client or from `htap-cli
 cargo run -p htapd -- --root /tmp/htap_demo
 
 # Optional flags
-cargo run -p htapd -- --root /tmp/htap_demo --listen 127.0.0.1:3307 --max-connections 64 --password secret
+cargo run -p htapd -- --root /tmp/htap_demo --listen 127.0.0.1:3307 --max-connections 64 --password secret \
+  --max-allowed-packet 67108864
 ```
 
-The password may also come from the `HTAPD_PASSWORD` environment variable; `--password` wins if both are
-set, and with neither set no password is required.
+The password may also come from the `HTAPD_PASSWORD` environment variable, and the packet-size limit from
+`HTAPD_MAX_ALLOWED_PACKET`; the flag wins over the environment variable in both cases, and with neither
+password source set no password is required. `--max-allowed-packet` defaults to 64 MiB (MySQL's own
+default) and bounds every protocol message, including prepared-statement `SEND_LONG_DATA` buffers; it is
+reported dynamically as `@@max_allowed_packet`.
 
 Connect with any MySQL client, e.g. the `mysql` CLI (if installed):
 
@@ -268,11 +276,56 @@ fn main() -> Result<()> {
 }
 ```
 
-Deferred: `SELECT ... FOR UPDATE`/locking reads, prepared statements/binary protocol, savepoints, XA,
+Deferred: `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, and MVCC garbage collection. Only `REPEATABLE READ` is offered (other
 isolation levels are rejected, not silently downgraded); DDL is rejected inside an open transaction (the
 transaction survives, unpoisoned). See "Sessions and explicit transactions (Phase 10)" in
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md), ADR-018 in [`docs/DECISIONS.md`](./docs/DECISIONS.md), and
+[`docs/LIMITATIONS.md`](./docs/LIMITATIONS.md) for the full contract, remaining gaps, and test evidence.
+
+---
+
+## Prepared statements
+
+`RemoteClient::prepare(sql)` returns a `PreparedStatement` handle that `execute_prepared` can run repeatedly
+with different parameters over the MySQL binary protocol (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`); `?` is a
+placeholder anywhere the binder accepts a literal, including inside subqueries, derived tables, CTEs,
+`UNION` branches, and `LIMIT`/`OFFSET`:
+
+```rust
+use htap_client::RemoteClient;
+use htap_common::types::Value;
+use htap_common::Result;
+
+fn main() -> Result<()> {
+    let mut client = RemoteClient::connect("127.0.0.1:3307", None)?;
+    client.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance INT);")?;
+
+    let insert = client.prepare("INSERT INTO accounts (id, balance) VALUES (?, ?);")?;
+    client.execute_prepared(&insert, &[Value::Int64(1), Value::Int32(100)])?;
+    client.execute_prepared(&insert, &[Value::Int64(2), Value::Int32(0)])?;
+    client.close_prepared(insert)?;
+
+    let select = client.prepare("SELECT balance FROM accounts WHERE id = ?;")?;
+    let result = client.execute_prepared(&select, &[Value::Int64(1)])?;
+    client.close_prepared(select)?;
+
+    println!("{result:?}");
+    Ok(())
+}
+```
+
+Parameters are substituted at the AST level (never by re-rendering the statement to text and reparsing),
+so there is no string-interpolation risk and no `BLOB`/float precision loss. Placeholder position and count
+are cross-checked against a raw tokenizer scan of the SQL text at `PREPARE` time; a `?` in a position this
+engine cannot substitute (an identifier, a DDL default, a `SET` target) is rejected up front rather than
+silently ignored. Only `INSERT`/`UPDATE`/`DELETE`/`SELECT` can be prepared. `PREPARE` response metadata
+(result column definitions) is best-effort: it is the real output schema when every placeholder's type can
+be inferred from local context, or `num_columns = 0` otherwise. There is no `UInt64` value type, so an
+unsigned 64-bit parameter above `i64::MAX` is rejected cleanly; `DECIMAL`/`NEWDECIMAL` parameters bind as a
+numeric literal (no arbitrary-precision decimal type); `TIME`-typed parameters and `COM_STMT_FETCH`
+(server-side cursors) are rejected. See "Prepared statements and binary protocol (Phase 11)" in
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md), ADR-019 in [`docs/DECISIONS.md`](./docs/DECISIONS.md), and
 [`docs/LIMITATIONS.md`](./docs/LIMITATIONS.md) for the full contract, remaining gaps, and test evidence.
 
 ---
@@ -294,7 +347,7 @@ The workspace consists of 14 modular crates (plus the vendored `vendor/sqlparser
 | `crates/htap-sql` | SQL front-end using `sqlparser` (MySQL dialect): strict narrow catalog binder (typed `PointSelect`/`AnalyticSelect`), a general query binder (`query`/`expr`/`binder_query`: joins, expressions, subqueries, `UPDATE`/`DROP TABLE`/`SHOW`), and structural query router (`Route::RowstorePointRead`, `Route::OlapScan`, `Route::Query`, `Route::RowstoreUpdate`, `Route::CatalogRead`). |
 | `crates/htap-server` | Durable synchronous in-process engine façade (`LocalServer`) integrating catalog, rowstore, transactions, data movement, narrow analytical scan execution (`<root>/colstore`), and the general query executor (`query_exec`: joins, expressions, subqueries, `UNION`, `UPDATE`, `DROP TABLE`, `SHOW`). |
 | `crates/htap-client` | Synchronous in-process embedded client (`EmbeddedClient`) and network client (`RemoteClient`) providing an ergonomic SQL execution interface over `LocalServer`, in-process or over TCP. |
-| `crates/htap-wire` | Hand-written, synchronous MySQL text-protocol server (`WireServer`) exposing `LocalServer` over TCP, and the `WireClient` used by `RemoteClient`. |
+| `crates/htap-wire` | Hand-written, synchronous MySQL text- and binary-protocol server (`WireServer`) exposing `LocalServer` over TCP, including prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/`SEND_LONG_DATA`), `COM_RESET_CONNECTION`/`COM_CHANGE_USER`, and the `WireClient` used by `RemoteClient`. |
 | `crates/htapd` | Network daemon binary: opens a `LocalServer` root and serves it via `htap-wire::WireServer`. |
 | `crates/htap-bench` | Criterion microbenchmark suite (`benches/local_mvp.rs`) measuring rowstore point lookups, columnar zone-map scans, conversion, CSV import, and coordination. |
 

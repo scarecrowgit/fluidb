@@ -1421,6 +1421,15 @@ fn parse_literal_value(expr: &Expr, col_def: &CommonColumnDef) -> Result<Value> 
                 if let sqlparser::ast::Value::Boolean(b) = v.value {
                     return Ok(Value::Bool(b));
                 }
+                // Narrow coercion: MySQL clients commonly send BOOL columns as the integer
+                // literals 0/1 (TINYINT(1) convention); accept exactly those two spellings.
+                if let sqlparser::ast::Value::Number(s, _) = &v.value {
+                    match s.as_str() {
+                        "0" => return Ok(Value::Bool(false)),
+                        "1" => return Ok(Value::Bool(true)),
+                        _ => {}
+                    }
+                }
             }
             Err(HtapError::InvalidArgument(format!(
                 "type mismatch for column '{}': expected boolean",
@@ -1482,9 +1491,23 @@ fn parse_literal_value(expr: &Expr, col_def: &CommonColumnDef) -> Result<Value> 
         }
         CommonDataType::Bytes => {
             if let Expr::Value(v) = current {
-                if let sqlparser::ast::Value::HexStringLiteral(s) = &v.value {
-                    let bytes = parse_hex_bytes(s, &col_def.name)?;
-                    return Ok(Value::Bytes(bytes));
+                match &v.value {
+                    sqlparser::ast::Value::HexStringLiteral(s) => {
+                        let bytes = parse_hex_bytes(s, &col_def.name)?;
+                        return Ok(Value::Bytes(bytes));
+                    }
+                    // Narrow coercion (bytes-vs-string codec fix, Phase 11): a bound parameter
+                    // whose raw bytes happen to be valid UTF-8 decodes as `Value::String` and
+                    // substitutes as a single-quoted string literal, not a hex literal (see
+                    // `htap_wire::binary_codec::decode_execute`'s doc comment on the client-driven
+                    // `String`-vs-`Vec<u8>` ambiguity). Accept it here too, encoded as UTF-8, so
+                    // such a parameter can still bind into a BYTES column exactly as if the
+                    // client had sent the equivalent hex literal.
+                    sqlparser::ast::Value::SingleQuotedString(s)
+                    | sqlparser::ast::Value::DoubleQuotedString(s) => {
+                        return Ok(Value::Bytes(s.as_bytes().to_vec()));
+                    }
+                    _ => {}
                 }
             }
             Err(HtapError::InvalidArgument(format!(

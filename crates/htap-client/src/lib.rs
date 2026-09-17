@@ -37,7 +37,10 @@
 //!
 //! This embedded client explicitly does **not** provide:
 //! - **No network transport in `EmbeddedClient`**: it executes in-process; use [`RemoteClient`] for TCP.
-//! - **No prepared statements**: Queries are parsed and planned synchronously on each call without prepared statement handles or binary parameter binding.
+//! - **No prepared statements in `EmbeddedClient`**: queries are parsed and planned synchronously
+//!   on each call without prepared statement handles or binary parameter binding.
+//!   [`RemoteClient::prepare`] offers `COM_STMT_PREPARE`/`EXECUTE`/`CLOSE` over the wire protocol
+//!   (Phase 11 plan task 5).
 //! - **Deferred partition & storage capabilities**: Physical data migration for populated partition reorganization, physical storage reclamation for dropped partitions, delete vectors, compaction, autonomous background conversion scheduling, hash/multiple tablets, distributed/remote movement, consensus/HA, and full MySQL compatibility remain deferred.
 
 #![forbid(unsafe_code)]
