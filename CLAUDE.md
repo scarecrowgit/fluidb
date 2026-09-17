@@ -43,7 +43,7 @@ Read before non-trivial work: `docs/ARCHITECTURE.md` (component statuses), `docs
 |---|---|---|
 | `researcher` | sonnet | Turn a problem into a precise, file-level implementation plan. Read-only. |
 | `validator` | opus | Cold gate: `approve` / `reject` / `edit` / `flag` on a plan or a diff checkpoint. |
-| `implementer` | sonnet | Execute one approved, well-specified task and verify it with cargo. |
+| `implementer` | haiku wrapper → 9router `ag/claude-sonnet-4-6` | Execute one approved, well-specified task: the 9router model writes the code, the wrapper applies it and verifies with cargo. |
 | `storage-reviewer` | opus | Deep review of durability, recovery, MVCC, 2PC, fencing, and on-disk format changes. |
 | `docs-keeper` | sonnet | Bring README/ARCHITECTURE/PROGRESS/LIMITATIONS/ADRs in line with the code after a change. |
 
@@ -56,7 +56,7 @@ follow these steps. The validator gates are mandatory, not judgment calls:
 
 1. `researcher` → plan (tasks, files, risks, tests, doc updates).
 2. `validator` with `CHECKPOINT: plan` → do not start implementing without `approve`.
-3. Implement: main session or `implementer`, one task at a time; fast loop per crate.
+3. Implement: `implementer` only (code authored by 9router `ag/claude-sonnet-4-6` via MCP), one task at a time; fast loop per crate.
 4. If the diff touches rowstore/txn/catalog/convert/movement/coord persistence, recovery, MVCC, or envelopes → `storage-reviewer`.
 5. `docs-keeper` if behavior, status, scope, or evidence changed.
 6. `./ci.sh` green, then `validator` with `CHECKPOINT: diff` → do not report done or commit without `approve`.
@@ -79,6 +79,7 @@ DETAIL:
 - `mcp__9router__ask` / `mcp__9router__panel` are available in every role that lists them. Pass files by path.
 - `gemini` (1M context) suits whole-doc consistency sweeps and reading large StarRocks sources.
 - `reasoner` suits alternative designs; `reviewer` suits independent diff reads.
+- `ag/claude-sonnet-4-6` (alias `coder`) is the code author behind `implementer`; Claude roles don't write implementation code.
 - `architect` (heavy tier, rarely) is for ADR-level decisions that are costly to reverse. `heavy` (rarely) is for
   corruption or concurrency questions where other models disagree.
 - External answers are input, not truth: confirm every claim against the code before acting on it.
