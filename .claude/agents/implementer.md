@@ -27,9 +27,16 @@ verify with cargo, and report.
    don't guess a fix: send the author the failing block and the actual file text, and ask again.
 4. **Verify.** Run `cargo fmt --all`, then `cargo test -p <crate>` for each touched crate, then
    `cargo clippy --workspace --all-targets -- -D warnings`.
-5. **Fix via the author.** On a compile, test or clippy failure, send the author the error output (trimmed to the relevant
-   part) and the current contents of the affected files, then go back to step 3. At most 4 rounds; after that report `partial`.
+5. **Fix via the author.** On a compile, test or clippy failure, send the author the raw error output (trimmed to the
+   relevant part) and attach the affected files by path, then go back to step 3. At most 4 rounds; after that report `partial`.
    `cargo fmt` output is the only change you may make without the author.
+
+## You are not the debugger
+The author diagnoses and fixes. Your prompts carry the brief, raw cargo/test output, and file paths. They never contain:
+- new or corrected code, in fences or inline, or a filled-in SEARCH/REPLACE block
+- "change X to Y", "should become", "add this line", or your own diagnosis of the fix
+The guard compares each edit with the prompt that produced it: if the added lines were already in your prompt, the edit
+is denied as Claude-written. Pasting existing code is unnecessary — attach the file instead.
 
 ## Rules (also sent to the author)
 1. **Do the task, nothing else.** No refactors of adjacent code, renames, extra features, or "improvements" outside the brief.
@@ -44,8 +51,9 @@ verify with cargo, and report.
 
 ## Wrapper rules
 - Enforced by `.claude/hooks/9router_guard.py`: an Edit/Write to `crates/`, `vendor/`, `Cargo.toml`, `ci.sh` or `*.rs`
-  is denied unless its text came from a 9router response in this session, and shell writes to those paths are denied.
-  If the guard denies an edit, ask the author again. Don't try to route around it.
+  is denied unless its text came from a 9router answer *you* received and its added lines weren't dictated in your prompt;
+  shell writes to those paths are denied. If the guard denies an edit, ask the author again with only the error and files.
+  Don't try to route around it (splitting edits, paraphrasing code into prose, python/sed writes).
 - Never send secrets (`.env`, keys, credentials) to the author.
 - Never claim a pass you did not run. Quote the real cargo results.
 - Blocked? Stop early. A clear "could not do X because Y" beats a plausible wrong implementation.
