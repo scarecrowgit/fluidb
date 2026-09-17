@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use htap_client::{ClientOptions, EmbeddedClient, RemoteClient, StatementResult};
+use htap_common::types::{Row, Value};
 use htap_common::HtapError;
 use htap_server::LocalServer;
 use htap_wire::{WireServer, WireServerConfig};
@@ -95,5 +96,61 @@ fn test_remote_client_matches_embedded_client_ddl_dml_select() {
         StatementResult::Query(q) => assert_eq!(q.num_rows(), 1),
         other => panic!("{other:?}"),
     }
+    wire.shutdown();
+}
+
+/// One `RemoteClient` connection is one server-side session (Phase 10 task 9): `BEGIN`/
+/// `COMMIT`/`ROLLBACK` sent over it as ordinary SQL manage a real explicit transaction whose
+/// buffered writes are visible only on this connection until `COMMIT`, and gone entirely after
+/// `ROLLBACK`.
+#[test]
+fn test_remote_client_transaction_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    let wire = WireServer::start(
+        WireServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            read_timeout: Duration::from_millis(50),
+            ..WireServerConfig::default()
+        },
+        server,
+    )
+    .unwrap();
+
+    let mut a = RemoteClient::connect(wire.local_addr(), None).unwrap();
+    let mut b = RemoteClient::connect(wire.local_addr(), None).unwrap();
+
+    a.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+
+    a.execute("BEGIN").unwrap();
+    a.execute("INSERT INTO t (id, v) VALUES (1, 10)").unwrap();
+    // Read-your-own-writes on `a`'s connection, before COMMIT.
+    match a.execute("SELECT v FROM t WHERE id = 1").unwrap() {
+        StatementResult::Query(q) => assert_eq!(q.rows, vec![Row::new(vec![Value::Int32(10)])]),
+        other => panic!("{other:?}"),
+    }
+    // `b`, a separate connection/session, does not see it yet.
+    match b.execute("SELECT id FROM t WHERE id = 1").unwrap() {
+        StatementResult::Query(q) => assert!(q.rows.is_empty()),
+        other => panic!("{other:?}"),
+    }
+
+    a.execute("COMMIT").unwrap();
+    match b.execute("SELECT v FROM t WHERE id = 1").unwrap() {
+        StatementResult::Query(q) => assert_eq!(q.rows, vec![Row::new(vec![Value::Int32(10)])]),
+        other => panic!("{other:?}"),
+    }
+
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET v = 999 WHERE id = 1").unwrap();
+    a.execute("ROLLBACK").unwrap();
+    match b.execute("SELECT v FROM t WHERE id = 1").unwrap() {
+        StatementResult::Query(q) => {
+            assert_eq!(q.rows, vec![Row::new(vec![Value::Int32(10)])]);
+        }
+        other => panic!("{other:?}"),
+    }
+
     wire.shutdown();
 }

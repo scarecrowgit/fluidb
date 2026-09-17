@@ -9,8 +9,10 @@
 
 pub mod olap;
 mod query_exec;
+mod session;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use htap_catalog::local::LocalCatalogStore;
@@ -40,12 +42,16 @@ use htap_sql::ast::{
     PointSelect, UpdateStatement, UpdateTarget,
 };
 use htap_sql::ast::{DropTableStatement, ShowStatement};
+use htap_sql::expr::VariableLookup;
 use htap_sql::result::StatementResult;
 use htap_sql::route::{classify_route, Route};
 use htap_txn::{
-    ParticipantId, ParticipantWork, RowstoreParticipant, TransactionManager, TransactionRequest,
+    ParticipantId, ParticipantWork, RowstoreParticipant, Transaction, TransactionManager,
+    TransactionRequest,
 };
 use parking_lot::Mutex;
+use session::{DefaultVariables, WriteSet};
+pub use session::{Session, SessionId};
 
 /// Definition of a partitioned table to be created via [`LocalServer::create_partitioned_table`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +118,7 @@ pub struct LocalServer {
     execution_lock: Mutex<()>,
     colstore_dir: PathBuf,
     scan_workers: usize,
+    next_session_id: AtomicU64,
 }
 
 impl std::fmt::Debug for LocalServer {
@@ -121,6 +128,63 @@ impl std::fmt::Debug for LocalServer {
             .field("scan_workers", &self.scan_workers)
             .finish()
     }
+}
+
+/// Read/write context for [`LocalServer::dispatch_bound`]: either an autocommit statement, where
+/// each write commits its own 2PC transaction immediately exactly as before Phase 10, or one
+/// statement inside an open [`Session`] transaction, where reads observe a pinned snapshot
+/// overlaid with the session's buffered write set and writes are buffered into it rather than
+/// committed.
+///
+/// Always constructed and consumed with `LocalServer::execution_lock` already held by the caller
+/// (Phase 10 plan amendment A1); [`LocalServer::dispatch_bound`] never re-locks.
+enum ExecMode<'a> {
+    /// Every write commits immediately through `TransactionManager::commit_request`.
+    Autocommit,
+    /// Part of an open session transaction.
+    Txn {
+        /// MVCC snapshot pinned when the transaction began.
+        snapshot: Snapshot,
+        /// The transaction's accumulated write set; writes merge into it instead of committing.
+        write_set: &'a mut WriteSet,
+    },
+}
+
+impl ExecMode<'_> {
+    /// Read-side view: the MVCC snapshot to read at, and the write set to overlay below
+    /// relational operators (`None` in autocommit mode, which is byte-for-byte the pre-Phase-10
+    /// read path).
+    fn read_view(&self, server: &LocalServer) -> (Snapshot, Option<&WriteSet>) {
+        match self {
+            ExecMode::Autocommit => (Snapshot::new(server.txn_manager.visible_version()), None),
+            ExecMode::Txn {
+                snapshot,
+                write_set,
+            } => (*snapshot, Some(&**write_set)),
+        }
+    }
+}
+
+/// Rejects a duplicate `(partition_id, key)` within one statement's own mutation batch, with the
+/// same error `Engine::prepare`/`RowstoreParticipant::prepare` gives an autocommit statement
+/// (storage-reviewer finding F6): `WriteSet::insert`'s `(partition_id, key)`-keyed map would
+/// otherwise silently keep only the last row inside an explicit transaction, unlike autocommit.
+fn reject_duplicate_mutation_keys(mutations: &[Mutation]) -> Result<()> {
+    let mut seen = std::collections::HashSet::with_capacity(mutations.len());
+    for m in mutations {
+        let (partition_id, key) = match m {
+            Mutation::Put {
+                partition_id, key, ..
+            } => (*partition_id, key.as_slice()),
+            Mutation::Delete { partition_id, key } => (*partition_id, key.as_slice()),
+        };
+        if !seen.insert((partition_id, key)) {
+            return Err(HtapError::InvalidArgument(format!(
+                "duplicate key in mutation batch: partition {partition_id}, key {key:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl LocalServer {
@@ -186,6 +250,7 @@ impl LocalServer {
             execution_lock: Mutex::new(()),
             colstore_dir,
             scan_workers: DEFAULT_SCAN_WORKERS,
+            next_session_id: AtomicU64::new(1),
         })
     }
 
@@ -235,48 +300,78 @@ impl LocalServer {
         let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
         let bound = htap_sql::bind(&statement, &catalog)?;
 
+        self.dispatch_bound(bound, &catalog, ExecMode::Autocommit, &DefaultVariables)
+    }
+
+    /// Returns the server's transaction manager.
+    ///
+    /// Exposed for tests that need to inject commit-path failures via
+    /// [`htap_txn::TransactionManager::set_commit_append_hook`] /
+    /// [`htap_txn::TransactionManager::set_commit_sync_hook`] to exercise `DurablePending`
+    /// handling in [`Session::commit`].
+    pub fn txn_manager(&self) -> &TransactionManager {
+        &self.txn_manager
+    }
+
+    /// Binds and routes a single statement, either autocommit or inside an open [`Session`]
+    /// transaction.
+    ///
+    /// Always called with `execution_lock` already held by the caller ([`Self::execute`] or
+    /// [`Session::execute`]/[`Session::commit`]); never re-locks (Phase 10 plan amendment A1).
+    ///
+    /// `variables` resolves `@name`/`@@name` expressions (Phase 10 task 7): [`Session::execute`]
+    /// passes the session's own user variables and live state; [`Self::execute`] (no session)
+    /// passes [`DefaultVariables`], so `SELECT @@autocommit` still resolves (to the process
+    /// default) even without a session, while a user variable is always `NULL`.
+    fn dispatch_bound(
+        &self,
+        bound: BoundStatement,
+        catalog: &CatalogSnapshot,
+        mut mode: ExecMode,
+        variables: &dyn VariableLookup,
+    ) -> Result<StatementResult> {
         match bound {
             BoundStatement::CreateTable(create) => {
                 let _route = classify_route(
                     &BoundStatement::CreateTable(create.clone()),
                     &StorageDescriptor::Row,
                 )?;
-                self.execute_create_table(create, &catalog)
+                self.execute_create_table(create, catalog)
             }
             BoundStatement::Insert(insert) => {
-                let table_desc = self.resolve_table(&insert.table, &catalog)?;
-                self.execute_insert(insert, table_desc, &catalog)
+                let table_desc = self.resolve_table(&insert.table, catalog)?;
+                self.execute_insert(insert, table_desc, catalog, &mut mode)
             }
             BoundStatement::Delete(delete) => {
-                let table_desc = self.resolve_table(&delete.table, &catalog)?;
-                let partition_id = self.route_pk_to_partition(table_desc, &delete.key, &catalog)?;
-                let partition = self.validate_partition(table_desc, partition_id, &catalog)?;
+                let table_desc = self.resolve_table(&delete.table, catalog)?;
+                let partition_id = self.route_pk_to_partition(table_desc, &delete.key, catalog)?;
+                let partition = self.validate_partition(table_desc, partition_id, catalog)?;
                 let _route =
                     classify_route(&BoundStatement::Delete(delete.clone()), &partition.storage)?;
-                self.execute_delete(delete, partition.id)
+                self.execute_delete(delete, table_desc.id, partition.id, &mut mode)
             }
             BoundStatement::Select(select) => {
-                let table_desc = self.resolve_table(&select.table, &catalog)?;
-                let partition_id = self.route_pk_to_partition(table_desc, &select.key, &catalog)?;
-                let partition = self.validate_partition(table_desc, partition_id, &catalog)?;
+                let table_desc = self.resolve_table(&select.table, catalog)?;
+                let partition_id = self.route_pk_to_partition(table_desc, &select.key, catalog)?;
+                let partition = self.validate_partition(table_desc, partition_id, catalog)?;
                 let route =
                     classify_route(&BoundStatement::Select(select.clone()), &partition.storage)?;
                 let key = match route {
                     Route::RowstorePointRead { key } => key,
                     _ => unreachable!(),
                 };
-                self.execute_select(select, table_desc, partition.id, key)
+                self.execute_select(select, table_desc, partition.id, key, &mode)
             }
             BoundStatement::AnalyticSelect(select) => {
                 let (table_desc, partitions) =
-                    self.resolve_table_and_all_partitions(&select.table, &catalog)?;
+                    self.resolve_table_and_all_partitions(&select.table, catalog)?;
                 for partition in &partitions {
                     let _route = classify_route(
                         &BoundStatement::AnalyticSelect(select.clone()),
                         &partition.storage,
                     )?;
                 }
-                self.execute_analytic_select(select, table_desc, &partitions, &catalog)
+                self.execute_analytic_select(select, table_desc, &partitions, catalog, &mode)
             }
             BoundStatement::AlterPartitions(alter) => {
                 let _route = classify_route(
@@ -289,7 +384,7 @@ impl LocalServer {
                 // Every base slot must be a known table; storage descriptors of all
                 // partitions are accepted (rowstore, columnar, converting).
                 for slot in Self::general_base_tables(&query) {
-                    let (_, partitions) = self.resolve_table_and_all_partitions(&slot, &catalog)?;
+                    let (_, partitions) = self.resolve_table_and_all_partitions(&slot, catalog)?;
                     for partition in partitions {
                         let _route = classify_route(
                             &BoundStatement::Query(query.clone()),
@@ -297,16 +392,24 @@ impl LocalServer {
                         )?;
                     }
                 }
-                query_exec::execute_query(self, &query, &catalog)
+                let (snapshot, write_set) = mode.read_view(self);
+                query_exec::execute_query(
+                    self,
+                    &query,
+                    catalog,
+                    snapshot,
+                    write_set,
+                    Some(variables),
+                )
             }
             BoundStatement::Update(update) => {
-                let table_desc = self.resolve_table(&update.table, &catalog)?;
+                let table_desc = self.resolve_table(&update.table, catalog)?;
                 match &update.target {
                     UpdateTarget::PrimaryKey(key_values) => {
                         let partition_id =
-                            self.route_pk_to_partition(table_desc, key_values, &catalog)?;
+                            self.route_pk_to_partition(table_desc, key_values, catalog)?;
                         let partition =
-                            self.validate_partition(table_desc, partition_id, &catalog)?;
+                            self.validate_partition(table_desc, partition_id, catalog)?;
                         let route = classify_route(
                             &BoundStatement::Update(update.clone()),
                             &partition.storage,
@@ -315,11 +418,18 @@ impl LocalServer {
                             Route::RowstoreUpdate { key: Some(key) } => key,
                             _ => unreachable!(),
                         };
-                        self.execute_update_by_key(&update, table_desc, partition.id, key)
+                        self.execute_update_by_key(
+                            &update,
+                            table_desc,
+                            partition.id,
+                            key,
+                            &mut mode,
+                            variables,
+                        )
                     }
                     UpdateTarget::Filter(filter) => {
                         let (_, partitions) =
-                            self.resolve_table_and_all_partitions(&update.table, &catalog)?;
+                            self.resolve_table_and_all_partitions(&update.table, catalog)?;
                         for partition in &partitions {
                             let _route = classify_route(
                                 &BoundStatement::Update(update.clone()),
@@ -330,7 +440,9 @@ impl LocalServer {
                             &update,
                             table_desc,
                             filter.as_ref(),
-                            &catalog,
+                            catalog,
+                            variables,
+                            &mut mode,
                         )
                     }
                 }
@@ -340,12 +452,12 @@ impl LocalServer {
                     &BoundStatement::DropTable(drop.clone()),
                     &StorageDescriptor::Row,
                 )?;
-                self.execute_drop_table(&drop, &catalog)
+                self.execute_drop_table(&drop, catalog)
             }
             BoundStatement::Show(show) => {
                 let _route =
                     classify_route(&BoundStatement::Show(show.clone()), &StorageDescriptor::Row)?;
-                Self::execute_show(&show, &catalog)
+                Self::execute_show(&show, catalog)
             }
         }
     }
@@ -820,6 +932,7 @@ impl LocalServer {
         insert: Insert,
         table_desc: &TableDescriptor,
         catalog: &CatalogSnapshot,
+        mode: &mut ExecMode,
     ) -> Result<StatementResult> {
         let mut mutations = Vec::with_capacity(insert.rows.len());
         for row in &insert.rows {
@@ -861,21 +974,19 @@ impl LocalServer {
             });
         }
 
-        let payload = RowstoreParticipant::encode_payload(&mutations)?;
-        let work = ParticipantWork::new(ParticipantId::new(1), payload);
-        let req = TransactionRequest::new(vec![work])?;
-        let committed = self.txn_manager.commit_request(req)?;
-
-        Ok(StatementResult::dml(
-            mutations.len() as u64,
-            Some(committed.version),
-        ))
+        // A blind `INSERT` never reads, but autocommit's own 2PC commit still needs the snapshot
+        // it would have read at (F4): taken here, before the commit below, exactly like a
+        // statement that does read.
+        let (statement_snapshot, _) = mode.read_view(self);
+        self.commit_or_buffer(table_desc.id, mutations, mode, statement_snapshot)
     }
 
     fn execute_delete(
         &self,
         delete: DeleteByPrimaryKey,
+        table_id: TableId,
         partition_id: PartitionId,
+        mode: &mut ExecMode,
     ) -> Result<StatementResult> {
         let key = encode_key(&delete.key)?;
         let mutation = Mutation::Delete {
@@ -883,12 +994,10 @@ impl LocalServer {
             key,
         };
 
-        let payload = RowstoreParticipant::encode_payload(&[mutation])?;
-        let work = ParticipantWork::new(ParticipantId::new(1), payload);
-        let req = TransactionRequest::new(vec![work])?;
-        let committed = self.txn_manager.commit_request(req)?;
-
-        Ok(StatementResult::dml(1, Some(committed.version)))
+        // See `execute_insert`: a blind `DELETE` never reads either, but still needs a statement
+        // snapshot for autocommit's own commit (F4).
+        let (statement_snapshot, _) = mode.read_view(self);
+        self.commit_or_buffer(table_id, vec![mutation], mode, statement_snapshot)
     }
 
     /// `DROP TABLE`: removes the table and its partitions, tablets, and replicas from the
@@ -1053,10 +1162,18 @@ impl LocalServer {
         update: &UpdateStatement,
         table_desc: &TableDescriptor,
         row: &Row,
+        variables: &dyn VariableLookup,
     ) -> Result<Row> {
         let mut values = row.values().to_vec();
         for (col_idx, expr) in &update.assignments {
-            let value = expr.eval(&htap_sql::EvalContext::row_only(&values))?;
+            let ctx = htap_sql::EvalContext {
+                row: &values,
+                aggregates: &[],
+                output: None,
+                subqueries: &[],
+                variables: Some(variables),
+            };
+            let value = expr.eval(&ctx)?;
             let col = table_desc.schema.column(*col_idx).ok_or_else(|| {
                 HtapError::Internal(format!("assignment column index {col_idx} out of bounds"))
             })?;
@@ -1081,65 +1198,160 @@ impl LocalServer {
         Ok(Row::new(values))
     }
 
-    /// Commits a batch of `Put` mutations as one transaction.
-    fn commit_puts(&self, mutations: Vec<Mutation>) -> Result<StatementResult> {
+    /// Commits (autocommit) or buffers (open session transaction) a batch of mutations as one
+    /// unit, all belonging to `table_id`.
+    ///
+    /// `statement_snapshot` is the MVCC snapshot this statement actually read at — in autocommit
+    /// mode, [`ExecMode::read_view`]'s `Snapshot::new(server.txn_manager.visible_version())` from
+    /// before this statement did any reading, or, for a blind `INSERT`/`DELETE` that never reads,
+    /// the equally valid snapshot taken just for this purpose (see the call sites). In
+    /// [`ExecMode::Txn`] mode this is always `open_txn.snapshot` (the transaction's own pinned
+    /// snapshot) and is ignored here (only autocommit's own 2PC commit needs it).
+    ///
+    /// In autocommit mode this commits with `Transaction::new(.., statement_snapshot.version)` +
+    /// `TransactionManager::commit`, exactly like a session's own commit (plan amendment A3) —
+    /// never `TransactionManager::commit_request`, whose internal `begin()` would instead pin
+    /// `read_version` at the *current* visible version at commit time, which can have moved
+    /// forward past `statement_snapshot` if a concurrent writer (e.g. an import, which does not
+    /// take `execution_lock`) committed between this statement's read and its commit; that would
+    /// defeat `Engine::prepare`'s first-writer-wins check and silently overwrite the concurrent
+    /// writer's row (storage-reviewer finding F4: previously observable as a lost update on an
+    /// autocommit `UPDATE`). A first-writer-wins conflict caught here is therefore correct,
+    /// intentional behavior, not a regression: an autocommit `INSERT`/`UPDATE`/`DELETE` whose
+    /// snapshot predates a concurrent writer that already touched the same key must now lose,
+    /// exactly like an explicit transaction would.
+    ///
+    /// In [`ExecMode::Txn`] mode the mutations are staged into a statement-local [`WriteSet`]
+    /// delta and merged into the transaction's write set only if the whole delta fits the payload
+    /// cap (`WriteSet::try_merge`), so a statement that would overflow it fails without polluting
+    /// the write set with a partial delta. A duplicate `(partition_id, key)` within this one
+    /// statement's own `mutations` is rejected here with the same error
+    /// `Engine::prepare`/`RowstoreParticipant::prepare` would give autocommit (storage-reviewer
+    /// finding F6): without this check, `WriteSet`'s `(partition_id, key)`-keyed map would
+    /// silently keep only the last row, unlike autocommit's `Engine::prepare`, which rejects the
+    /// whole batch.
+    fn commit_or_buffer(
+        &self,
+        table_id: TableId,
+        mutations: Vec<Mutation>,
+        mode: &mut ExecMode,
+        statement_snapshot: Snapshot,
+    ) -> Result<StatementResult> {
         if mutations.is_empty() {
             return Ok(StatementResult::dml(0, None));
         }
         let affected = mutations.len() as u64;
-        let payload = RowstoreParticipant::encode_payload(&mutations)?;
-        let work = ParticipantWork::new(ParticipantId::new(1), payload);
-        let req = TransactionRequest::new(vec![work])?;
-        let committed = self.txn_manager.commit_request(req)?;
-        Ok(StatementResult::dml(affected, Some(committed.version)))
+        match mode {
+            ExecMode::Autocommit => {
+                let payload = RowstoreParticipant::encode_payload(&mutations)?;
+                let work = ParticipantWork::new(ParticipantId::new(1), payload);
+                let request = TransactionRequest::new(vec![work])?;
+                let mut txn =
+                    Transaction::new(self.txn_manager.next_txn_id()?, statement_snapshot.version);
+                txn.set_request(request);
+                let committed = self.txn_manager.commit(&mut txn)?;
+                Ok(StatementResult::dml(affected, Some(committed.version)))
+            }
+            ExecMode::Txn { write_set, .. } => {
+                reject_duplicate_mutation_keys(&mutations)?;
+                let mut delta = WriteSet::new();
+                for mutation in mutations {
+                    delta.insert(table_id, mutation)?;
+                }
+                write_set.try_merge(delta, self.txn_manager.max_frame_size())?;
+                Ok(StatementResult::dml(affected, None))
+            }
+        }
     }
 
-    /// Point UPDATE: read the row at the current snapshot, apply the assignments, and write
-    /// the new version of the row under the same key.
+    /// Reads one row by exact key, consulting an open transaction's write set first
+    /// ("read your own writes") before falling back to the MVCC snapshot.
+    fn read_with_overlay(
+        &self,
+        partition_id: u64,
+        key: &[u8],
+        snapshot: Snapshot,
+        write_set: Option<&WriteSet>,
+    ) -> Result<Option<Row>> {
+        if let Some(ws) = write_set {
+            if let Some(buffered) = ws.get(partition_id, key) {
+                return Ok(match &buffered.mutation {
+                    Mutation::Put { row, .. } => Some(row.clone()),
+                    Mutation::Delete { .. } => None,
+                });
+            }
+        }
+        self.engine.get(partition_id, key, snapshot)
+    }
+
+    /// Point UPDATE: read the row at the current snapshot (overlaid with any open transaction's
+    /// write set), apply the assignments, and write the new version of the row under the same
+    /// key.
     fn execute_update_by_key(
         &self,
         update: &UpdateStatement,
         table_desc: &TableDescriptor,
         partition_id: PartitionId,
         key: Vec<u8>,
+        mode: &mut ExecMode,
+        variables: &dyn VariableLookup,
     ) -> Result<StatementResult> {
-        let snapshot = Snapshot::new(self.txn_manager.visible_version());
-        let Some(row) = self.engine.get(partition_id.as_u64(), &key, snapshot)? else {
+        let (snapshot, write_set) = mode.read_view(self);
+        let Some(row) = self.read_with_overlay(partition_id.as_u64(), &key, snapshot, write_set)?
+        else {
             return Ok(StatementResult::dml(0, None));
         };
-        let updated = Self::apply_assignments(update, table_desc, &row)?;
-        self.commit_puts(vec![Mutation::Put {
-            partition_id: partition_id.as_u64(),
-            key,
-            row: updated,
-        }])
+        let updated = Self::apply_assignments(update, table_desc, &row, variables)?;
+        self.commit_or_buffer(
+            table_desc.id,
+            vec![Mutation::Put {
+                partition_id: partition_id.as_u64(),
+                key,
+                row: updated,
+            }],
+            mode,
+            snapshot,
+        )
     }
 
-    /// Scan UPDATE: read every partition at one snapshot, evaluate the filter, and commit
-    /// all rewritten rows in a single transaction (bounded by the transaction payload cap).
+    /// Scan UPDATE: read every partition at one snapshot (overlaid with any open transaction's
+    /// write set), evaluate the filter, and commit or buffer all rewritten rows as one unit
+    /// (bounded by the transaction payload cap).
     fn execute_update_by_filter(
         &self,
         update: &UpdateStatement,
         table_desc: &TableDescriptor,
         filter: Option<&htap_sql::Expr>,
         catalog: &CatalogSnapshot,
+        variables: &dyn VariableLookup,
+        mode: &mut ExecMode,
     ) -> Result<StatementResult> {
+        let (snapshot, write_set) = mode.read_view(self);
         let ctx = query_exec::ExecContext {
             server: self,
             catalog,
-            snapshot: Snapshot::new(self.txn_manager.visible_version()),
+            snapshot,
+            write_set,
+            variables: Some(variables),
         };
         let all_columns: std::collections::BTreeSet<usize> = (0..table_desc.schema.len()).collect();
         let rows = query_exec::scan_base_table(&ctx, &update.table, &all_columns, 0, &[])?;
         let mut mutations = Vec::new();
         for values in rows {
             if let Some(f) = filter {
-                if !f.eval_predicate(&htap_sql::EvalContext::row_only(&values))? {
+                let filter_ctx = htap_sql::EvalContext {
+                    row: &values,
+                    aggregates: &[],
+                    output: None,
+                    subqueries: &[],
+                    variables: Some(variables),
+                };
+                if !f.eval_predicate(&filter_ctx)? {
                     continue;
                 }
             }
             let row = Row::new(values);
-            let updated = Self::apply_assignments(update, table_desc, &row)?;
+            let updated = Self::apply_assignments(update, table_desc, &row, variables)?;
             let pk_values: Vec<Value> = table_desc
                 .primary_key
                 .iter()
@@ -1156,7 +1368,7 @@ impl LocalServer {
                 row: updated,
             });
         }
-        self.commit_puts(mutations)
+        self.commit_or_buffer(table_desc.id, mutations, mode, snapshot)
     }
 
     fn execute_select(
@@ -1165,6 +1377,7 @@ impl LocalServer {
         table_desc: &TableDescriptor,
         partition_id: PartitionId,
         key: Vec<u8>,
+        mode: &ExecMode,
     ) -> Result<StatementResult> {
         let projected_columns: Vec<ColumnDef> = select
             .projection
@@ -1179,8 +1392,8 @@ impl LocalServer {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let snapshot = Snapshot::new(self.txn_manager.visible_version());
-        let row_opt = self.engine.get(partition_id.as_u64(), &key, snapshot)?;
+        let (snapshot, write_set) = mode.read_view(self);
+        let row_opt = self.read_with_overlay(partition_id.as_u64(), &key, snapshot, write_set)?;
 
         let rows = match row_opt {
             Some(row) => {
@@ -1207,11 +1420,12 @@ impl LocalServer {
         table_desc: &TableDescriptor,
         partitions: &[&PartitionDescriptor],
         catalog: &CatalogSnapshot,
+        mode: &ExecMode,
     ) -> Result<StatementResult> {
         // 1. Freeze catalog, snapshot, and plan
         let selected_partitions =
             olap::prune_partitions(table_desc, partitions, select.filter.as_ref());
-        let snapshot = Snapshot::new(self.txn_manager.visible_version());
+        let (snapshot, write_set) = mode.read_view(self);
         let (source_columns, mapping) = olap::plan_source_columns(&select);
         let pushdown_predicate = olap::select_pushdown_predicate(select.filter.as_ref());
 
@@ -1232,6 +1446,7 @@ impl LocalServer {
                         &source_columns,
                         &table_desc.primary_key,
                         pushdown_predicate.as_ref(),
+                        write_set,
                     )
                 })
                 .collect()
@@ -1251,6 +1466,7 @@ impl LocalServer {
                     let source_cols = &source_columns;
                     let pk = &table_desc.primary_key;
                     let pred = pushdown_predicate.as_ref();
+                    let ws = write_set;
 
                     handles.push(s.spawn(move || {
                         let mut res = Vec::with_capacity(worker_parts.len());
@@ -1264,6 +1480,7 @@ impl LocalServer {
                                 source_cols,
                                 pk,
                                 pred,
+                                ws,
                             );
                             res.push((idx, part_res));
                         }
@@ -1303,20 +1520,36 @@ pub(crate) fn scan_partition_compact(
     source_columns: &[usize],
     primary_key: &[usize],
     pushdown_predicate: Option<&Predicate>,
+    write_set: Option<&WriteSet>,
 ) -> Result<Vec<Row>> {
     let tablet_id = partition.tablets[0];
     let tablet = catalog
         .tablet(tablet_id)
         .ok_or_else(|| HtapError::Internal(format!("tablet {tablet_id} not found")))?;
 
-    match &partition.storage {
+    // When a session write set overlay is active, every base row must carry its primary key
+    // columns so it can be matched against buffered mutations (keyed by encoded primary key),
+    // even if the statement itself did not project them. In autocommit (`write_set == None`)
+    // `internal_columns` is exactly `source_columns`, so that path's scan request and output are
+    // byte-for-byte unchanged from before Phase 10.
+    let internal_columns: Vec<usize> = match write_set {
+        Some(_) => {
+            let mut cols: std::collections::BTreeSet<usize> =
+                source_columns.iter().copied().collect();
+            cols.extend(primary_key.iter().copied());
+            cols.into_iter().collect()
+        }
+        None => source_columns.to_vec(),
+    };
+
+    let base_rows = match &partition.storage {
         StorageDescriptor::Row => {
             let entries = engine.scan_partition(partition.id.as_u64(), snapshot)?;
             let rows = htap_convert::collapse_entries_to_rows(&entries);
             let mut compact_rows = Vec::with_capacity(rows.len());
             for row in rows {
-                let mut values = Vec::with_capacity(source_columns.len());
-                for &idx in source_columns {
+                let mut values = Vec::with_capacity(internal_columns.len());
+                for &idx in &internal_columns {
                     let val = row.get(idx).cloned().ok_or_else(|| {
                         HtapError::Internal(format!("row missing column index {idx}"))
                     })?;
@@ -1324,7 +1557,7 @@ pub(crate) fn scan_partition_compact(
                 }
                 compact_rows.push(Row::new(values));
             }
-            Ok(compact_rows)
+            compact_rows
         }
         StorageDescriptor::Column => {
             let cat_manifest = tablet.column_manifest.as_ref().ok_or_else(|| {
@@ -1340,17 +1573,64 @@ pub(crate) fn scan_partition_compact(
                     disk_manifest.generation, cat_manifest.generation
                 )));
             }
+            // Stale-snapshot-vs-columnar-base conflict (Phase 10 task 6a; storage-reviewer
+            // finding F5).
+            //
+            // `cat_manifest.base_version` is the rowstore MVCC version at which this columnar
+            // base was materialized: every row committed at or before it is baked into the
+            // segment files. `htap_convert::read_column_partition[_compact]_core` already knows
+            // how to answer a read whose snapshot predates `base_version` correctly *today*: it
+            // falls back to reading the rowstore directly ("rowstore is authoritative for
+            // historical reads before manifest base_version"), which works only because this
+            // engine never compacts or garbage-collects old rowstore MVCC versions (see
+            // docs/LIMITATIONS.md) — nothing has ever thrown away the data that predates the
+            // columnar base.
+            //
+            // A one-shot autocommit read cannot rely on that indefinitely, though: conversion
+            // pins `base_version` from `rowstore.visible_version()` (`htap_convert`), which reads
+            // a *different* version counter than `TransactionManager::visible_version()` (the
+            // source of an autocommit read's `snapshot`); the two are not updated atomically
+            // together, so during a narrow window around a concurrent import's commit the
+            // rowstore-side counter this conversion read can briefly be ahead of the manager-side
+            // counter an autocommit statement's snapshot was just taken from. That made
+            // `snapshot.version < base_version` observably possible for an autocommit read too
+            // (contradicting an earlier version of this comment, which claimed it could
+            // "structurally never hold" there) — a real bug, spuriously conflicting a plain
+            // autocommit read with no open transaction to roll back. Autocommit therefore keeps
+            // the prior fallback behavior unconditionally (fall through to the rowstore-backed
+            // read below, which is correct precisely because this engine never compacts old
+            // versions) and never runs this check at all.
+            //
+            // A session's explicit transaction (`write_set.is_some()`, i.e. `ExecMode::Txn`) is
+            // different: it pins its snapshot once at `BEGIN` and can stay open across many
+            // statements and an arbitrary amount of wall-clock time, during which another
+            // connection can convert the table to columnar. Continuing to serve such a read via
+            // the rowstore fallback would make the transaction's correctness depend forever on
+            // "the rowstore never compacts old versions" — exactly the invariant a future
+            // compaction/GC feature would break, with no pinned-snapshot registry (see DECISIONS
+            // ADR-018) to keep the data reachable for as long as the transaction needs it. Rather
+            // than take on that indefinite dependency, a stale read inside an explicit
+            // transaction is treated as a hard, retryable conflict instead: the transaction is
+            // poisoned and must be rolled back and retried against a fresher snapshot.
+            if write_set.is_some() && snapshot.version < cat_manifest.base_version {
+                return Err(HtapError::Conflict(format!(
+                    "snapshot version {} predates columnar base version {} for partition {}: \
+                     the table was converted to columnar storage after this transaction's \
+                     snapshot was pinned; roll back and retry the transaction",
+                    snapshot.version, cat_manifest.base_version, partition.id
+                )));
+            }
             let compact_res = htap_convert::read_column_partition_compact_core(
                 catalog,
                 engine,
                 colstore_dir,
                 partition.id,
                 snapshot,
-                source_columns,
+                &internal_columns,
                 primary_key,
                 pushdown_predicate.cloned(),
             )?;
-            Ok(compact_res.rows)
+            compact_res.rows
         }
         StorageDescriptor::Converting { .. } => match &tablet.column_manifest {
             Some(cat_manifest) => {
@@ -1361,17 +1641,30 @@ pub(crate) fn scan_partition_compact(
                         disk_manifest.generation, cat_manifest.generation
                     )));
                 }
+                // Same stale-snapshot-vs-columnar-base conflict as the `Column` branch above
+                // (storage-reviewer finding F5: only checked for a transaction read); see its
+                // comment for the full justification. A `Converting` partition already has a
+                // manifest on disk once it reaches `SegmentsWritten`/`ReadyToPublish`, and that
+                // manifest's `base_version` carries exactly the same meaning.
+                if write_set.is_some() && snapshot.version < cat_manifest.base_version {
+                    return Err(HtapError::Conflict(format!(
+                        "snapshot version {} predates columnar base version {} for converting \
+                         partition {}: the table was converted to columnar storage after this \
+                         transaction's snapshot was pinned; roll back and retry the transaction",
+                        snapshot.version, cat_manifest.base_version, partition.id
+                    )));
+                }
                 let compact_res = htap_convert::read_column_partition_compact_core(
                     catalog,
                     engine,
                     colstore_dir,
                     partition.id,
                     snapshot,
-                    source_columns,
+                    &internal_columns,
                     primary_key,
                     pushdown_predicate.cloned(),
                 )?;
-                Ok(compact_res.rows)
+                compact_res.rows
             }
             None => {
                 let is_snapshot_pinned = partition
@@ -1384,8 +1677,8 @@ pub(crate) fn scan_partition_compact(
                     let rows = htap_convert::collapse_entries_to_rows(&entries);
                     let mut compact_rows = Vec::with_capacity(rows.len());
                     for row in rows {
-                        let mut values = Vec::with_capacity(source_columns.len());
-                        for &idx in source_columns {
+                        let mut values = Vec::with_capacity(internal_columns.len());
+                        for &idx in &internal_columns {
                             let val = row.get(idx).cloned().ok_or_else(|| {
                                 HtapError::Internal(format!("row missing column index {idx}"))
                             })?;
@@ -1393,15 +1686,27 @@ pub(crate) fn scan_partition_compact(
                         }
                         compact_rows.push(Row::new(values));
                     }
-                    Ok(compact_rows)
+                    compact_rows
                 } else {
-                    Err(HtapError::InvalidArgument(format!(
+                    return Err(HtapError::InvalidArgument(format!(
                         "partition {} is converting without manifest but phase is not SnapshotPinned",
                         partition.id
-                    )))
+                    )));
                 }
             }
         },
+    };
+
+    match write_set {
+        None => Ok(base_rows),
+        Some(ws) => session::overlay_rows(
+            base_rows,
+            &internal_columns,
+            source_columns,
+            primary_key,
+            partition.id.as_u64(),
+            ws,
+        ),
     }
 }
 

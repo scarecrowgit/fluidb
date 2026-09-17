@@ -36,7 +36,7 @@ The following operational facilities and production features are **explicitly no
 - **Narrow OLAP SQL, No Full SQL Analytics:** `LocalServer` executes narrow single-table analytical scans (plain projections, AND-only typed filters, `COUNT(*)`, `COUNT(col)`, `SUM(Int32/Int64/Float64)`, `MIN/MAX`, deterministic `GROUP BY` with SQL NULL grouping, and simple unqualified source/projected column `ORDER BY` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break) over logical rowstore and base-plus-delta rows using server-root `<root>/colstore` for materialized `Column`/`Converting` partitions. For `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads (PK + requested column union), safely pushing down one eligible predicate leaf directly into `SegmentReader::scan`, suppressing stale base rows via post-base rowstore deltas, and evaluating residual SQL logic. ScanStats/pruning is available as internal execution evidence, but SQL still uses materialized logical rows and vectorized aggregation is not implemented. Complete-PK `RowstorePointRead` remains separate and unchanged. Direct `SegmentReader` pushdown optimization is implemented for the compact base path; compound `AND` pushdown beyond one leaf, `!=` pushdown, joins, CTEs, windows, expressions, aliases if rejected, aggregate ordering in `ORDER BY`, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, broad MySQL ordering, vectorized operator pipelines, multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow, and full MySQL breadth remain unsupported.
 - **No High Availability (HA) or Distributed Consensus:** No Raft (`openraft`), ZooKeeper ensemble backend, network heartbeats, ephemeral sessions, remote RPC replica serving, or active failover exists.
 - **One-Owner Multiprocess-Exclusive Mode (Not Concurrent Shared-Root Writers):** Root locking (`<root>/LOCK`) enforces that only one operating system process may open a server or coordinator root. Concurrent multiprocess shared-root operations and concurrent writers are strictly unsupported. Standalone subsystem opens (`Engine::open`, `LocalCatalogStore::open`, `LocalDataMover::new`) do not acquire this lock and remain unsafe for direct concurrent use.
-- **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks Applies:** Neither `txn.journal` nor the rowstore `MANIFEST` v2 external ledger implements compaction or coordinated retention. The external ledger enforces a hard cap (`MAX_APPLIED_EXTERNAL_TXNS = 1_000_000`). Once full, new external applies fail with `HtapError::CapacityExceeded`.
+- **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks Applies:** Neither `txn.journal` nor the rowstore `MANIFEST` v2 external ledger implements compaction or coordinated retention. The external ledger enforces a hard cap (`MAX_APPLIED_EXTERNAL_TXNS = 1_000_000`). Once full, new external applies fail with `HtapError::InvalidArgument` (there is no `HtapError::CapacityExceeded` variant); a Phase 10 fix pass moved this check into `Engine::prepare` as well, so a real 2PC/direct-commit transaction is rejected before any journal write rather than only at apply time.
 - **Possible Later Flush-Boundary Duplicate SST Publication After Crash:** Crashes occurring after an SST is written but before reader registration, manifest update, or checkpoint advance can cause duplicate SST publication on subsequent cycles, requiring future staged flush recovery.
 - **No Power-Loss Proof:** Integration crash tests prove recovery across process `SIGKILL` termination, not physical machine power loss, host kernel panics, or write cache invalidation.
 - **Whole-Dataset Materialization in Conversion, Export, and Clone:** HTAP conversion (`htap-convert`), data export (`htap-movement`, where exports materialize the full logical partition before writing), and tablet snapshot cloning materialize entire datasets into memory or intermediate files without streaming.
@@ -166,8 +166,55 @@ flowchart TD
    - 2-Phase Commit (2PC) coordination journal tracking transaction lifecycle: `Prepare`, `Commit`, `Abort`.
    - Irrevocable commit boundary: once the commit record is fsynced, abort is rejected.
    - Manager decision serialization: all transitions serialized under one manager lock (`88cc314`).
-   - Post-commit append/sync/apply/publish failures return `DurablePending`.
+   - Post-commit append/sync/apply/publish failures return `DurablePending` to the caller that hit them.
    - Read via bounded streaming frame validation with fixed probe buffers (`b7ff200`).
+   - A failed journal append (`Journal::append_nosync`, used for the unsynced `Commit` frame write) truncates
+     the file back to its pre-append offset, so a partial write from a crashed or short `write_all` cannot
+     make the journal look like unrecoverable middle-of-log corruption on the next open.
+   - **Recovery-required latch (Phase 10, corrected and widened by two follow-up fix passes):** once any
+     `commit` call returns `DurablePending`, the manager latches "recovery required," recording a
+     `RecoveryCause` of `ParticipantIo` (the commit record was already durable; only the participant's own
+     `apply`/`publish` failed) or `JournalIo` (the journal append or sync itself failed). A third fix pass
+     widened `JournalIo` beyond the `Commit` boundary: a failed `Intent` or `Abort` append/sync now latches the
+     manager the same way (only for a real I/O error, never a pure oversize-frame rejection). Every *other*
+     later `commit` — from any session, in-process or over the wire — is rejected with
+     `HtapError::RecoveryRequired { blocking_txn, reason }` (a distinct error from the blocking transaction's
+     own `DurablePending`; both map to MySQL 1105/`HY000`, never 1213/`40001`). `abort()` of an unrelated
+     transaction is also rejected with `RecoveryRequired` while the latch's cause is `JournalIo`.
+     `TransactionManager::recover()` can in principle clear the latch in-process only when the cause is
+     `ParticipantIo`; a `JournalIo` latch — or the underlying `Journal` independently reporting itself
+     poisoned (see below) — makes `recover()` refuse outright with `RecoveryRequired` and apply nothing,
+     rather than attempt any replay, so it clears only on a fresh reopen (a brand-new `TransactionManager` from
+     a brand-new file open and scan — an in-process resync after a failed sync proves nothing about whether
+     the original write was durable). **In practice, even a `ParticipantIo` latch is only cleared by restarting
+     the process**, because `LocalServer` calls `recover()` solely during `LocalServer::open` startup, never
+     during normal operation — there is no other in-process trigger that would call it. Operationally this is
+     an outage, not necessarily a corruption: restarting the process (`LocalServer::open` calls `recover()`
+     during startup — see section 5, "Reopen Recovery Guarantees") always clears the latch regardless of its
+     cause; see ADR-018 and "Sessions and explicit transactions (Phase 10)" in `docs/ARCHITECTURE.md`.
+   - **Journal poisoning, independent of the manager latch:** `Journal` itself now tracks a `poisoned` state
+     (set when an `append`'s or `sync`'s `fsync` fails, when the best-effort truncate after a failed write
+     itself fails, or when an append wrote bytes but then failed to fsync). While poisoned, every further
+     `append`/`append_nosync`/`sync` on that handle fails immediately; only a fresh `Journal::open` clears it.
+     **After a journal `fsync` error, simply restarting the process is not proof of durability:** a new file
+     descriptor from a fresh `open` will not report the earlier descriptor's `fsync` error, and the record that
+     failed to sync may still be sitting only in the OS page cache. The safe operator action is to reboot the
+     host (or otherwise ensure the page cache backing the journal's filesystem volume is dropped) before
+     reopening, not just restart the process on the same still-warm cache. See "Reopen Recovery Guarantees"
+     below for what happens if the journal and rowstore have genuinely diverged.
+   - **Effective transaction payload cap is about 4 MiB, not the nominal 16 MiB `MAX_PAYLOAD_SIZE`:** the
+     durable `Intent` frame JSON-encodes each participant's payload as a number array, which is larger than
+     the raw payload and is itself bounded by the journal's 16 MiB frame limit. `TransactionManager::commit`
+     rejects an oversize request with `HtapError::InvalidArgument` before prepare; see `docs/LIMITATIONS.md`
+     for the exact figure. An operator seeing this error on a large `INSERT`/`UPDATE`/explicit-transaction
+     `COMMIT` should reduce the statement's mutation payload size — there is no chunking.
+   - **No compaction; `max_journal_size` checked only at open:** `txn.journal` only ever grows — records are
+     never pruned or checkpointed against participant state — and its total size is checked against
+     `max_journal_size` (default 64 MiB, `DEFAULT_MAX_JOURNAL_SIZE`) only in `Journal::open_with_options`/
+     `Journal::scan` (i.e. at `open` and during `recover()`), never on an ordinary `append`. A long-running
+     root can therefore accumulate a journal past this limit without any single write ever failing, only to
+     have a later `LocalServer::open` fail with `HtapError::Corruption`. Journal checkpoint/retention is
+     planned for a later phase; see `docs/LIMITATIONS.md`.
 
 4. **`movement/` (`htap_movement::LocalDataMover` — `b7ff200`):**
    - Tracks data movement jobs (CSV/JSONL import/export, tablet snapshot migrations).
@@ -230,6 +277,32 @@ When reopening an existing directory via `LocalServer::open(path)`:
    - Replays `txn.journal` using bounded streaming frame inspection (`b7ff200`).
    - Treats committed records as irrevocable (`88cc314`).
    - Matches prepared and committed states, re-applies committed operations across participants idempotently via the external ledger (`f7a4975`), and completes unpublished transactions.
+   - **fsync-before-replay:** `recover()` fsyncs the journal file it just read from before replaying any
+     `Commit` record into a participant, since an ordinary file read alone does not prove the record was ever
+     actually synced to disk. If this sync fails, `recover()` (and therefore `LocalServer::open`) fails and
+     latches the manager as `RecoveryCause::JournalIo` (the underlying `Journal` also poisons itself); a
+     second `LocalServer::open` attempt against the same still-warm page cache does not resolve this — see the
+     reboot guidance in "Recovery-required latch" and "Journal poisoning" above.
+   - **`recover()` refuses outright, applying nothing, if already latched `JournalIo` or if the journal is
+     poisoned:** this check runs before any replay work, so a caller cannot make partial progress by calling
+     `recover()`/reopening repeatedly against the same unrecovered journal state; only a genuinely fresh
+     `Journal`/`TransactionManager` (a real reopen, and after a `fsync` failure specifically, ideally after a
+     host reboot — see above) clears it.
+   - **Post-replay corruption cross-check:** after replay completes, `recover()` compares every registered
+     participant's own durable `committed_version()` (for the rowstore, `Engine::committed_version()`)
+     against the journal's own replayed maximum commit version. A mismatch in either direction —
+     `committed_version()` ahead of the journal (a durable commit record has gone missing from `txn.journal`)
+     or behind it (replay did not fully apply what the journal records) — fails `LocalServer::open` with
+     `HtapError::Corruption` rather than starting up on a state the journal cannot account for. **Operator
+     action:** this is a genuine data-consistency problem between `rowstore/` and `txn.journal`, not a
+     transient fault; it means one of the two was modified or lost independently of the other (e.g. by
+     restoring `rowstore/` and `txn.journal` from backups taken at different times — see "Safe Local Backup
+     Boundaries" above). Do not attempt to "fix" it by deleting `txn.journal` or a WAL segment. Investigate
+     with the exact `Corruption` message (it states which side and by how much), consult the most recent
+     consistent backup or snapshot of the whole root, and treat the affected root as needing manual recovery
+     rather than routine restart.
+   - `next_txn_id` is restored via `fetch_max` (never regressing it, even if a `begin()` call races the
+     replay in-process).
 4. **Fencing Token Monotonicity:** On reopening `LocalCoordinator`, persisted high-water tokens are restored, ensuring subsequent leadership acquisitions yield strictly greater fencing tokens than any token issued prior to restart.
 
 ---
@@ -238,7 +311,13 @@ When reopening an existing directory via `LocalServer::open(path)`:
 
 `htapd` (`crates/htapd`) is a thin binary that opens a `LocalServer` root and serves it over the MySQL text
 protocol via `htap-wire::WireServer` (see ADR-016 and the "Network layer" section of
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the protocol implementation itself).
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the protocol implementation itself). Since Phase 10, each
+authenticated connection owns one `htap_server::Session` for its lifetime (`BEGIN`/`COMMIT`/`ROLLBACK`,
+`autocommit`, session variables — see ADR-018), rolled back explicitly on `QUIT`/EOF/a framing error/server
+shutdown, with the session's own `Drop` as a safety net. The start-up compatibility shim
+(`htap_wire::shim`) now only answers `USE`/`SELECT 1`/`VERSION()`/`DATABASE()`/`SCHEMA()` and the two `SET
+CHARACTER SET`/`SET CHARSET` positional forms `vendor/sqlparser` cannot parse; every other `SET` and
+`SELECT @@sysvar`/`SELECT @uservar` now goes through the connection's real session.
 
 ```text
 htapd --root <dir> [--listen 127.0.0.1:3307] [--max-connections 64] [--password <pw>]

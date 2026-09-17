@@ -53,6 +53,12 @@ TABLE` (metadata-only, `Route::CatalogDdl`), and `SHOW TABLES`/`SHOW DATABASES`/
 persist an identifier high-water mark (`IdHighWater`) so dropped table/partition/tablet/replica ids are never
 reissued; version-1 catalogs still decode. See the "Query routing" and "OLAP execution paths" sections below
 and [`PROGRESS.md`](./PROGRESS.md).
+Phase 10 has a completed local MVP for server-side sessions and explicit transactions
+(`htap-server::session`, `htap-sql::variables`): `BEGIN`/`START TRANSACTION`/`COMMIT`/`ROLLBACK`,
+`autocommit`, `@user`/`@@system` variables, and session-buffered uncommitted writes (never journaled) that
+overlay reads until one `COMMIT` runs the existing 2PC path against the transaction's own pinned snapshot.
+One `EmbeddedClient::open_session`/wire connection is one `Session`. See "Sessions and explicit transactions
+(Phase 10)" below.
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
@@ -64,7 +70,8 @@ GROUP BY ordinals, LIMIT BY, INSERT ... SELECT, UPDATE with joins/subqueries, DE
 cost-based optimization, vectorized/pipelined execution, worker-pool parallelism for the general query path, memory bounds/spilling for the general path,
 physical reclamation on DROP TABLE, semi-join rewrites of IN/EXISTS, integer DIV, broader string/date function coverage,
 multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow integration,
-sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, prepared statements/binary protocol, TLS, compression, multi-statements,
+`SELECT ... FOR UPDATE`/locking reads, prepared statements/binary protocol, savepoints, XA, TLS, compression, multi-statements,
+idle-transaction timeout/reaping, MVCC garbage collection, IPC/multiprocess access, per-user ACL,
 Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors);
 note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation remain deferred).
 See [`PROGRESS.md`](./PROGRESS.md).
@@ -141,7 +148,7 @@ flowchart TD
         SQL --> Route["htap_sql::classify_route(bound, storage)"]
 
         Route -->|"Route::CatalogDdl<br/>(CREATE TABLE)"| DDL["DDL Catalog CAS<br/>LocalCatalogStore.compare_and_set"]
-        Route -->|"Route::RowstoreWrite<br/>(INSERT / DELETE)"| DML["TransactionManager.commit_request<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
+        Route -->|"Route::RowstoreWrite<br/>(INSERT / DELETE)"| DML["commit_or_buffer -> TransactionManager.commit<br/>(statement's own read snapshot)<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
         Route -->|"Route::RowstorePointRead<br/>(complete-PK SELECT)"| PointRead["Snapshot(visible_version)<br/>htap_rowstore::Engine.get(key)"]
         Route -->|"Route::OlapScan<br/>(AnalyticSelect)"| OlapScan["execute_analytic_select"]
         Route -->|"Route::Query<br/>(joins/expressions/subqueries/UNION)"| GenQuery["query_exec::execute_query<br/>one Snapshot per statement"]
@@ -171,7 +178,7 @@ flowchart TD
 
 ### DML Transaction Execution Sequence
 
-Transactional mutations (`INSERT` and `DELETE`) execute through `LocalServer`'s single execution lock, 2PC `TransactionManager` logging, and rowstore participant application, returning the assigned monotonic MVCC version:
+Transactional mutations (`INSERT` and `DELETE`) execute through `LocalServer`'s single execution lock, 2PC `TransactionManager` logging, and rowstore participant application, returning the assigned monotonic MVCC version. Since Phase 10 (ADR-018), `commit_or_buffer`'s autocommit branch (used by both plain `LocalServer::execute` and a `Session` with `autocommit` on) calls `TransactionManager::commit` directly against the statement's own read snapshot, not `TransactionManager::commit_request`:
 
 ```mermaid
 sequenceDiagram
@@ -198,9 +205,10 @@ sequenceDiagram
     Server->>Parser: classify_route(BoundStatement, partition.storage)
     Parser-->>Server: Route::RowstoreWrite
 
-    Server->>TxnMgr: commit_request(TransactionRequest)
-    Note over TxnMgr: Acquire manager lock (serializes commit decision)
+    Server->>TxnMgr: commit(Transaction{statement's own read snapshot, TransactionRequest})
+    Note over TxnMgr: Acquire manager lock (serializes commit decision);<br/>reject up front if recovery_required is latched (Phase 10)
     TxnMgr->>RowstorePart: prepare(snapshot, payload)
+    Note over RowstorePart: first-writer-wins check runs here,<br/>before any journal write (Phase 10)
     RowstorePart-->>TxnMgr: Ok
     TxnMgr->>Journal: Append & fsync INTENT frame
     TxnMgr->>Journal: Append & fsync COMMIT frame (irrevocable)
@@ -233,7 +241,7 @@ Neither persistent converter background workers nor coordinator lease managers a
 
 ## Process and role model
 
-**Status: `implemented (local MVP)`** (synchronous `LocalServer` in-process execution façade, `EmbeddedClient`, and the network daemon `htapd`/`htap-wire`/`RemoteClient` are implemented for the narrow local slice; sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, prepared statements/binary protocol, TLS, compression, and multi-statements remain planned/deferred).
+**Status: `implemented (local MVP)`** (synchronous `LocalServer` in-process execution façade, `EmbeddedClient`, the network daemon `htapd`/`htap-wire`/`RemoteClient`, and server-side sessions/explicit transactions (`htap-server::session`, Phase 10; see "Sessions and explicit transactions" below) are implemented for the narrow local slice; prepared statements/binary protocol, TLS, compression, and multi-statements remain planned/deferred).
 
 The system now ships **a single binary, `htapd`** (ADR-007), which runs `LocalServer` behind a MySQL
 text-protocol listener (`htap-wire`). `htapd` does not implement a selectable frontend/backend role split;
@@ -267,26 +275,35 @@ therefore a **deployment choice, not a rewrite**.
 
 ## Network layer (`htap-wire`, `htapd`)
 
-**Status: `implemented (local MVP)`** (hand-written synchronous MySQL text-protocol server and daemon; TLS,
-compression, prepared statements/binary protocol, multi-statements, sessions/`BEGIN`/`COMMIT`/`ROLLBACK`, and
-Docker packaging are planned/deferred).
+**Status: `implemented (local MVP)`** (hand-written synchronous MySQL text-protocol server and daemon, with
+one `htap_server::Session` per connection for `BEGIN`/`COMMIT`/`ROLLBACK` and session variables (Phase 10;
+see "Sessions and explicit transactions" below); TLS, compression, prepared statements/binary protocol,
+multi-statements, and Docker packaging are planned/deferred).
 
 `htap-wire` implements a hand-written, synchronous MySQL text protocol on top of `Arc<LocalServer>`: one
 accept thread plus one thread per connection (std::net, no async runtime), statements serialized by the
-server's own `execution_lock`, every statement auto-committed. It supports handshake v10 with
-`mysql_native_password` (clients proposing another plugin get an `AuthSwitchRequest`), `COM_QUERY` (text
-result sets), `COM_PING`, `COM_INIT_DB`, and `COM_QUIT`. `COM_STMT_PREPARE`/`COM_STMT_EXECUTE` (binary
-protocol), `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, and every other command return `ERR 1047`. A small
-start-up compatibility shim (`htap_wire::shim`) answers `SET ...` as a no-op OK, `USE <db>`, `SELECT 1`,
-`SELECT VERSION()`, `SELECT DATABASE()`, and `SELECT @@<sysvar>[, ...]` for a fixed table of system variables
-without touching the engine; everything else passes through to `LocalServer::execute` unchanged. Result-set
+server's own `execution_lock`. Since Phase 10, each authenticated connection owns one `htap_server::Session`
+for its whole lifetime, so a connection's statements auto-commit only while that session's `autocommit` is
+on; `BEGIN`/`COMMIT`/`ROLLBACK`/`SET` sent as ordinary SQL behave exactly as they do for
+`Session::execute` directly, and a connection that disconnects (`QUIT`, EOF, a framing error, or server
+shutdown) has its open transaction rolled back explicitly, with the session's `Drop` as a safety net. It
+supports handshake v10 with `mysql_native_password` (clients proposing another plugin get an
+`AuthSwitchRequest`), `COM_QUERY` (text result sets), `COM_PING`, `COM_INIT_DB`, and `COM_QUIT`.
+`COM_STMT_PREPARE`/`COM_STMT_EXECUTE` (binary protocol), `COM_RESET_CONNECTION`, `COM_CHANGE_USER`, and every
+other command return `ERR 1047`. A small start-up compatibility shim (`htap_wire::shim`) now only answers
+`USE <db>`, `SELECT 1`, `SELECT VERSION()`, `SELECT DATABASE()`/`SELECT SCHEMA()`, and the two MySQL
+positional `SET CHARACTER SET <x>` / `SET CHARSET <x>` forms that `vendor/sqlparser` cannot parse into an AST
+node at all; every other `SET`, `SELECT @@sysvar`, and `SELECT @uservar` now flows through the connection's
+real `Session` and the `htap-sql::variables` registry instead of being faked in the shim. Result-set
 terminators always use header `0xFE` (legacy EOF, or an OK-shaped packet when `CLIENT_DEPRECATE_EOF` is
 negotiated); OK-packet `info` carries a private convention (empty for DDL, `version=<n>`/`version=none` for
 DML) that lets `RemoteClient` recover the exact `CommandResult`. Payloads of 16 MB or more (multi-packet
 messages) are unsupported and close the connection. Because the wire layer passes every non-shim statement
-through to `LocalServer::execute` unchanged, the Phase 9 SQL breadth (joins, `UPDATE`, `DROP TABLE`,
-`SHOW`/`DESCRIBE`) is available over the wire with no wire-layer changes, verified end-to-end by
-`crates/htap-wire/tests/wire_server.rs::test_general_sql_over_wire`.
+through to the connection's `Session::execute` unchanged, the Phase 9 SQL breadth (joins, `UPDATE`, `DROP
+TABLE`, `SHOW`/`DESCRIBE`) and the Phase 10 session/transaction surface are both available over the wire with
+no additional wire-layer logic, verified end-to-end by
+`crates/htap-wire/tests/wire_server.rs::test_general_sql_over_wire` and
+`test_wire_begin_commit_rollback_round_trip`.
 
 `htapd` (`crates/htapd`) is a thin binary: `htapd --root <dir> [--listen 127.0.0.1:3307]
 [--max-connections 64] [--password <pw>]`, opens `LocalServer::open(root)`, starts a `WireServer`, and parks
@@ -511,9 +528,16 @@ The transactional rowstore path provides ACID point operations, durable MVCC ver
 ### Transactional write execution path (`INSERT` / `DELETE` -> 2PC -> `RowstoreParticipant`)
 
 1. **Binding and routing:** Literal `INSERT` and PK `DELETE` bind to `BoundStatement::Insert` or `BoundStatement::Delete` and classify as `Route::RowstoreWrite` across all partition storage descriptors (`Row`, `Column`, `Converting`).
-2. **Transaction manager coordination:** `LocalServer::execute_insert` and `execute_delete` construct a `TransactionRequest` containing mutations (`Mutation::Put` or `Mutation::Delete`) and invoke `TransactionManager::commit_request`.
+2. **Transaction manager coordination:** `LocalServer::execute_insert` and `execute_delete` construct a `TransactionRequest` containing mutations (`Mutation::Put` or `Mutation::Delete`) and route it through `commit_or_buffer` (shared with `UPDATE`, `Session`'s buffering branch, and `Session::commit`'s own final 2PC step), which in autocommit mode builds `Transaction::new(next_txn_id, statement_snapshot.version)` and calls `TransactionManager::commit` directly against the statement's own read snapshot — never `TransactionManager::commit_request` (Phase 10 fix, ADR-018: `commit_request`'s own `begin()` would instead pin a fresh snapshot at commit time, which could let a concurrent writer's commit go undetected as a conflict).
 3. **Two-phase commit sequence:** Under the transaction manager's internal lock, mutations coordinate across registered participants. `LocalServer` registers a single participant: `RowstoreParticipant` with ID 1 (`ROWSTORE_PARTICIPANT_ID = 1`):
-   - **Prepare:** `RowstoreParticipant::prepare` validates the mutation batch (non-empty, no duplicate keys).
+   - **Prepare:** `RowstoreParticipant::prepare` delegates to `Engine::prepare`, which validates the mutation
+     batch (non-empty, no duplicate keys) and, since Phase 10 (ADR-018), also runs the first-writer-wins
+     conflict check here — before any journal write — rather than only later in `apply_prepared_locked`. A
+     second Phase 10 fix pass moved the applied-external-transactions ledger capacity check
+     (`MAX_APPLIED_EXTERNAL_TXNS`) here too: a real 2PC/direct-commit prepare (non-`u64::MAX` snapshot) now
+     rejects with `HtapError::InvalidArgument` if the ledger is already full, before any Intent/Commit record
+     is journaled, instead of only discovering the full ledger at apply time after the commit decision was
+     already durable (`test_ledger_full_commit_rejected_at_prepare_before_journal_growth`).
    - **Intent logging:** `TransactionManager` appends and fsyncs an `INTENT` frame to `<root>/txn.journal`.
    - **Commit decision:** `TransactionManager` appends and fsyncs a `COMMIT` frame to `<root>/txn.journal`. Once fsynced, the transaction is irrevocably committed.
    - **Apply:** `RowstoreParticipant::apply` calls `Engine::apply_external`, writing mutations to the rowstore WAL and inserting them into the active memtable.
@@ -529,14 +553,18 @@ separate write path for updated rows:
 - **Point form (complete-PK `WHERE`):** `execute_update_by_key` reads the row at the statement's snapshot
   (`Engine::get`), applies the assignments left to right against the progressively updated row (so `SET a =
   a + 1, b = a` observes the new `a`), enforces `NOT NULL` on the result, and commits a single
-  `Mutation::Put` under the same key through `commit_puts` (one `TransactionRequest`, one version). Zero
+  `Mutation::Put` under the same key through `commit_or_buffer` (one `TransactionRequest`, one version in
+  autocommit; buffered into the open transaction's write set otherwise). Zero
   matches (row absent) return `affected 0, version None` without a transaction.
 - **Scan form (no complete-PK `WHERE`, or a non-PK filter):** `execute_update_by_filter` scans every
   partition of the table at one snapshot via the general query executor's `scan_base_table` helper (same
   `Row`/`Column`/`Converting` storage paths `Route::Query` uses), evaluates the filter (if any) per row,
   applies assignments, re-encodes the primary key, and routes each rewritten row to its partition. All
-  rewritten rows commit as `Mutation::Put`s in **one** transaction (inherits the 2PC payload cap of 16 MiB —
-  `htap_txn::participant::MAX_PAYLOAD_SIZE` — with no chunking across multiple transactions); zero matches
+  rewritten rows commit as `Mutation::Put`s in **one** transaction (inherits the 2PC transaction's effective
+  payload limit — nominally `htap_txn::participant::MAX_PAYLOAD_SIZE` (16 MiB) of raw mutation JSON, but the
+  durable journal `Intent` frame re-encodes that payload as a JSON number array inside a 16 MiB frame, so the
+  effective cap is about 4 MiB of raw payload; see "Isolation" under "Sessions and explicit transactions"
+  below and `docs/LIMITATIONS.md` — with no chunking across multiple transactions); zero matches
   commit no transaction (`affected 0, version None`).
 - **Value coercion and rejections:** Assignment values are coerced to the target column type at bind time
   (numeric widening/narrowing, literal folding); `NOT NULL` is enforced. The binder rejects (as
@@ -579,6 +607,305 @@ The OLTP rowstore execution path is verified by the following test suites:
   (`test_update_by_primary_key_and_reopen_recovery`,
   `test_update_by_filter_across_partitions_and_storage_formats_with_reopen`,
   `test_update_by_primary_key_on_column_and_converting_partitions`).
+
+---
+
+## Sessions and explicit transactions (Phase 10)
+
+**Status: `implemented (local MVP)`** (`htap-server::session`, `htap-sql::variables`/`expr`, `htap-client`,
+`htap-wire`; `SELECT ... FOR UPDATE`/locking reads, prepared statements, savepoints, XA, and idle-transaction
+timeout/reaping remain planned/deferred — see `docs/LIMITATIONS.md`).
+
+### Model
+
+A [`Session`] (`crates/htap-server/src/session.rs`) is opened against an `Arc<LocalServer>` via
+`LocalServer::open_session` (or `EmbeddedClient::open_session`) and owns at most one open transaction at a
+time. Uncommitted writes never touch the rowstore WAL, the transaction journal, or the memtable: they live
+only in the session's own in-memory `WriteSet`, keyed by `(partition_id, encoded primary key)`, so a crash or
+process exit before `COMMIT` is equivalent to an implicit `ROLLBACK` — there is nothing durable to undo.
+`COMMIT` builds one `TransactionRequest` from the accumulated write set and runs it through the existing 2PC
+path exactly once, against the transaction's own pinned snapshot (`TransactionManager::commit`, never
+`commit_request`; see "Bug fixes" below). One `EmbeddedClient::open_session` call, or one `htap-wire`
+connection, is one `Session` for its whole lifetime; `RemoteClient` is the same connection-scoped session
+reached over the network. `EmbeddedClient::execute`/`LocalServer::execute` keep auto-committing every
+statement exactly as before Phase 10, with the same public signature and behavior, and never see another
+session's buffered writes; their underlying commit mechanism picked up the same autocommit snapshot fix
+described under "Bug fixes" below, since it shares `commit_or_buffer`'s autocommit branch with a `Session`.
+
+### Statements and autocommit
+
+`Session::execute` intercepts these before binding:
+
+- `BEGIN` / `START TRANSACTION [READ ONLY | READ WRITE] [WITH CONSISTENT SNAPSHOT]` — pins
+  `Snapshot::new(txn_manager.visible_version())` as the read snapshot. `BEGIN` while a transaction is already
+  open implicitly commits it first (on implicit-commit failure, no new transaction starts).
+- `COMMIT` / `ROLLBACK` — see "Poisoning and commit-time revalidation" below.
+- `SET autocommit = <0|1|ON|OFF|TRUE|FALSE>` — turning it on while a transaction is open commits that
+  transaction first (MySQL semantics); turning it on redundantly leaves an open transaction untouched.
+- `SET @x = expr[, @y = expr, ...]` — evaluated with a table-less `EvalContext` against this session's own
+  variables (`@x`/`@@sysvar` read back through the same session, e.g. `SET @b = @a + 1`).
+- `SET [SESSION] TRANSACTION ISOLATION LEVEL REPEATABLE READ` — the only level accepted; any other requested
+  level is rejected with `HtapError::Unsupported`, never silently downgraded.
+- `SET [SESSION] TRANSACTION READ ONLY | READ WRITE` — sets the default for the *next*
+  `BEGIN`/`START TRANSACTION` only, even when written as `SESSION`, because the vendored parser's AST does
+  not distinguish a session-persistent default from a next-transaction-only one.
+- `SET NAMES ...`, known read-only variables (`sql_mode`, `character_set_*`, `time_zone`, ...) as no-ops, and
+  `GLOBAL` scope rejected — MySQL connectors send these unconditionally on connect.
+- `SET CHARACTER SET <x>` / `SET CHARSET <x>` — answered by the `htap-wire` shim, not the session, because
+  `vendor/sqlparser` has no AST node for these MySQL-specific positional forms at all and fails to parse them
+  before a session ever sees them (`SET NAMES <x>` parses fine and reaches the session as `Set::SetNames`).
+
+With `autocommit` off (MySQL-compatible default: on), the first statement after `Idle`/`COMMIT`/`ROLLBACK`
+implicitly opens a transaction. `@name` user variables and `@@name` system variables resolve through
+`htap_sql::variables::{system_variable_value, SessionVarsView}` (the single registry that replaced the old
+ad hoc `htap_wire::shim::system_variable` table) in every context — `SELECT @x`, `SELECT @@autocommit`,
+inside `WHERE`/`SET`, and via `LocalServer::execute` with no session (which reports MySQL-compatible process
+defaults through `DefaultVariables`, since there is nowhere to store a user variable without a session).
+Variable result column types are inferred from the runtime `Value` returned, not fixed at bind time. DDL
+(`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ... PARTITION`) inside any open transaction, explicit or implicit,
+is rejected with `HtapError::Unsupported` and does not poison the transaction.
+
+### Isolation
+
+Snapshot isolation with first-writer-wins, write skew permitted, reported to clients as `REPEATABLE READ`
+(there is no weaker or stronger level to request; see `validate_isolation_level`). One snapshot is pinned at
+`BEGIN` (or at the first statement under `autocommit = 0`) and reused for every statement in the transaction.
+Uncommitted writes are buffered in session memory only, overlaid below relational operators
+(`crate::session::overlay_rows`) for point reads, narrow analytic scans, the general executor, and `UPDATE`,
+across `Row`, `Column`, and `Converting` partitions — read-your-own-writes, never visible to any other session
+or to autocommit statements on the same server until `COMMIT`. The 2PC transaction payload cap
+(`htap_txn::MAX_PAYLOAD_SIZE`, 16 MiB of raw mutation JSON) is enforced incrementally, per statement, in
+`WriteSet::try_merge`, all-or-nothing (a statement that would overflow it fails before partially updating the
+write set). A second Phase 10 fix pass found that the durable journal `Intent` frame re-encodes each
+participant's payload bytes as a JSON number array (`serde_json`'s default `Vec<u8>` encoding), which is
+roughly 3-4x larger than the raw payload, inside a journal frame bounded at 16 MiB
+(`DEFAULT_MAX_FRAME_SIZE`) — so a write set that passes the 16 MiB raw check can still produce an oversize
+`Intent` frame. `TransactionManager::commit` now also checks a conservative, never-underestimating bound
+(`intent_frame_size_bound`) on the total payload before prepare, and `Session::commit` runs the same check
+before removing the transaction (so it stays open on rejection); the effective cap this leaves on raw
+mutation payload bytes is about 4 MiB (see `docs/LIMITATIONS.md`), not the nominal 16 MiB. Covered by
+`crates/htap-server/tests/session.rs::test_commit_of_write_set_exceeding_intent_frame_is_rejected_and_txn_stays_open`
+and `test_autocommit_oversize_insert_rejected_cleanly_before_any_journal_write`.
+
+### Conflicts and poisoning
+
+A write-write conflict detected at `COMMIT` returns `HtapError::Conflict` (MySQL 1213). A read inside the
+transaction that hits a stale snapshot against a columnar base published mid-transaction (see
+`scan_partition_compact`) is also a `Conflict`, but detected at read time; either kind poisons the
+transaction — every further ordinary statement fails with the same stored message, and `COMMIT` returns that
+message and discards the transaction in the same call (there is no separate "poisoned but still open" state;
+a `ROLLBACK` afterward is a no-op against an already-`Idle` session). Ordinary statement errors (`NOT NULL`,
+type mismatch, ...) do not poison, matching MySQL's behavior for a failed statement inside a transaction. At
+`COMMIT`, every buffered partition is revalidated against a freshly reloaded catalog, so a concurrent `DROP
+TABLE` or partition `ALTER` since the writes were buffered is caught as a `Conflict` rather than silently
+applied to a partition the transaction no longer recognizes. An infrastructure failure before the commit
+decision point (e.g. a catalog load I/O error) leaves the transaction open exactly as it was, so `COMMIT` can
+simply be retried.
+
+### `DurablePending`, `RecoveryRequired`, and the recovery latch
+
+If the underlying 2PC commit itself returns `DurablePending` (the commit record is durably journaled, but
+apply/publish did not conclusively finish), the session that issued *that* commit enters an outcome-pending
+state that rejects every further statement — including `ROLLBACK` and `BEGIN` — with the original
+`DurablePending` error (MySQL 1105/HY000, never 1213/`Conflict`, since a client that retries on 1213 could
+double-apply an already-applied write).
+
+Independently, `TransactionManager` latches "recovery required" (`RecoveryLatch`, storing the earliest
+unresolved transaction's id, version, reason, and a `RecoveryCause`) the moment any `commit` call returns
+`DurablePending`. A second Phase 10 fix pass corrected what every *other* later `commit` — from any session,
+on any thread — is rejected with: not the blocking transaction's own `DurablePending` (this transaction did
+no work and definitely did not commit, so treating it as ambiguous overstates the problem), but
+`HtapError::RecoveryRequired { blocking_txn, reason }`, also mapped to MySQL 1105/HY000 and never 1213
+(`recovery_required_never_maps_to_the_retryable_conflict_code`). `abort()` on an unrelated transaction is
+rejected the same way while the latch's `cause` is `RecoveryCause::JournalIo` (see below); it is still
+permitted while the cause is `RecoveryCause::ParticipantIo`, because in that case the journal itself is known
+sound.
+
+A third Phase 10 fix pass widened where a `RecoveryCause::JournalIo` latch gets set: it is no longer only a
+`Commit`-boundary outcome. `commit`'s own `Intent` append/sync and `abort`'s `Abort` append/sync now latch the
+manager the same way whenever the failure is a real `HtapError::Io` (never for a pure validation/oversize-frame
+rejection, e.g. `encode_frame` refusing a frame bigger than `max_frame_size` — only this one transaction is
+rejected then, and a smaller retry still works normally)
+(`test_intent_append_failure_latches_manager_as_journal_io`, `test_abort_append_failure_latches_manager_as_journal_io`).
+Unlike a `DurablePending`-triggered latch, an `Intent`/`Abort` I/O failure is itself a clean, definite abort for
+*that* transaction — only the manager-wide latch (protecting every other later transaction from an
+untrustworthy journal handle) is new here.
+
+**Journal-level poisoning, independent of the manager's latch:** `Journal` (`crates/htap-txn/src/journal.rs`)
+now has its own `poisoned: Option<String>` state, set when: an `append`'s or `sync`'s `fsync` fails (poisoned
+unconditionally, even if the following best-effort truncate back to the pre-write offset succeeds — a failed
+fsync alone makes the kernel's page-cache state for that file handle unknowable, regardless of whether a later
+fsync on the same fd would succeed); a failed `write_all`'s best-effort truncate-back-to-offset itself also
+fails (the file may then hold stale bytes past `valid_end`); or an append wrote bytes but then failed to fsync
+(truncated best-effort first, then poisoned unconditionally regardless of whether that truncate succeeded).
+While poisoned, every `append`/`append_nosync`/`sync` call is rejected immediately (`Journal::is_poisoned`,
+`Journal::poison_reason`); only a fresh `Journal::open`/`open_with_options` (a brand-new file handle and scan)
+clears it. A failed `write_all` also truncates the file back to its pre-append offset even outside the
+poisoning paths, matching the `Journal::append_nosync` truncate-on-failure behavior already documented below
+(`test_truncate_failure_poisons_journal`,
+`test_append_sync_failure_then_shorter_frame_reopen_succeeds_or_is_rejected`).
+
+**`RecoveryCause` — whether `recover()` may clear the latch in-process or must wait for a fresh reopen:**
+- **`RecoveryCause::ParticipantIo`** — the commit record itself was already durably appended and fsynced;
+  the failure was in a participant's own `apply`/`publish` step. `TransactionManager::recover()` replays the
+  durable commit with the exact stored payload and either completes it (it appears in `committed_txns`) or
+  conclusively shows it never applied (it appears in `unresolved_txns`); either outcome is trustworthy
+  in-process, so the latch clears as soon as `recover()` reaches it
+  (`test_latch_via_participant_apply_failure_clears_in_process_recover`).
+- **`RecoveryCause::JournalIo`** — the journal append or sync itself failed at the commit decision boundary.
+  An in-process resync afterward proves nothing: fsync succeeding after an earlier fsync failed does not
+  establish that the earlier write was durable. Only a fresh reopen — a brand-new `TransactionManager` built
+  from a brand-new file open and scan, exactly what a real process restart does — clears this latch
+  (`test_latch_via_commit_sync_hook_survives_in_process_recover_until_reopen`).
+
+**`recover()` refuses outright under a `JournalIo` latch or a poisoned journal (third Phase 10 fix pass):**
+Before doing anything else, `recover()` now checks whether the manager is already latched with
+`RecoveryCause::JournalIo` *or* the underlying `Journal` is separately marked poisoned (see above); either
+condition makes it return `HtapError::RecoveryRequired` immediately and apply nothing — it never attempts a
+replay in that state. If the journal is poisoned but the manager was not already latched (e.g. poisoning
+happened through some path that did not itself latch), `recover()` latches defensively with the journal's own
+poison reason before returning. This makes the earlier "an in-process resync afterward proves nothing" rule
+absolute: a `JournalIo` latch (whichever of `Intent`/`Commit`/`Abort` caused it) or a poisoned journal is
+therefore cleared only by reopening — a fresh `Journal`/`TransactionManager`, not by calling `recover()` again
+on the same handle (`test_in_process_recover_under_journal_io_latch_is_rejected_and_applies_nothing`).
+
+**`recover()` hardening (second Phase 10 fix pass):**
+- `recover()` now fsyncs the journal itself immediately after reading records back, before replaying any
+  `Commit` record into a participant: an ordinary file read proves nothing about durability by itself if the
+  underlying page was never actually synced. If this sync fails, `recover()` itself fails **and latches the
+  manager as `RecoveryCause::JournalIo`** (the underlying `Journal` also poisons itself via `Journal::sync`;
+  third Phase 10 fix pass), consistent with the front-loaded check above rejecting every subsequent `recover()`
+  call until a fresh reopen.
+- After replay, `recover()` cross-checks every registered participant's own durable `committed_version()`
+  (for `RowstoreParticipant`, `Engine::committed_version()`) against the journal's own replayed
+  `max_version`. A participant strictly ahead means a durable commit record has gone missing from this very
+  journal; strictly behind means replay did not fully apply the journal's committed transactions. Either
+  direction now fails `recover()` with `HtapError::Corruption` rather than silently starting up on a state
+  the journal cannot account for
+  (`test_recover_detects_engine_ahead_of_journal_as_corruption`). This exact-match check is only sound under a
+  documented contract on [`TxnParticipant::committed_version`]: every `TransactionManager` commit registered
+  against this journal must touch **every** participant that overrides `committed_version` to return `Some`
+  (i.e. that participant's `apply` runs for every committed transaction, not just some of them) — a
+  participant that overrides it but is only sometimes included in a transaction's participant set would fall
+  behind and be reported as corruption even though nothing is actually wrong; such a participant should return
+  `None` instead.
+- `next_txn_id` is restored via `fetch_max`, not a plain store, since `begin()`'s own id allocation does not
+  take the manager's `decision_lock` and can race a concurrent `recover()`; `fetch_max` guarantees recovery
+  only ever raises the counter, never lowers it below an id already handed to a live transaction.
+- A failed journal append (`Journal::append_nosync`) now truncates the file back to the pre-append offset, so
+  a partial frame from a failed write can never leave the journal in a state that looks like middle-of-log
+  corruption on the next open (`test_append_nosync_failure_truncates_partial_write_and_journal_stays_openable`).
+
+This latch exists because a later commit could otherwise allocate the next MVCC version ahead of the
+still-pending one, which `apply_external`/`publish` would then reject, compounding the ambiguity recovery has
+to reason about. Operationally, both latch causes' *software* state is cleared by restarting the process (see
+`docs/OPERATIONS.md`): `LocalServer::open` runs `TransactionManager::recover()` against a fresh journal
+replay, which always clears the latch regardless of `RecoveryCause`. A `RecoveryCause::ParticipantIo` latch
+can additionally be cleared without restarting by calling `recover()` directly in-process
+(`test_commit_while_manager_latched_by_other_session_keeps_txn_open` covers a session's `COMMIT` observing
+the latch from another session/thread). That mechanical clearing is not the same as proving the underlying
+disk state is durable: if the `JournalIo` cause was itself an `fsync` failure, restarting the *process* alone
+reopens a fresh file descriptor that cannot see the earlier descriptor's error and may still be sitting on an
+unflushed page cache — see the reboot-vs-restart guidance in `docs/LIMITATIONS.md` and `docs/OPERATIONS.md`
+before treating a bare process restart as sufficient in that specific case.
+
+### Bug fixes made in the course of this work
+
+- **Prepare-time conflict detection.** The first-writer-wins check previously ran only in
+  `Engine::apply_prepared_locked`, *after* the transaction's Commit journal record was already fsynced —
+  latent before Phase 10 because `execution_lock` serialized whole statements, but sessions widen the window
+  between a pinned snapshot and `COMMIT` far beyond one statement. `Engine::prepare` now runs the same check
+  (`Engine::check_first_writer_wins`) before returning a `PreparedTransaction`, so a stale-snapshot conflict
+  is rejected before any durable journal write; the apply-time check remains as defense in depth (documented
+  as unreachable for the 2PC path, still relevant for the legacy direct `Engine::commit`, which sessions and
+  `TransactionManager` must never call).
+- **Autocommit snapshot fix.** This one is not session-specific: `commit_or_buffer`'s autocommit branch
+  (`ExecMode::Autocommit`, used identically by plain `LocalServer::execute` with no session at all and by a
+  `Session` with `autocommit` on) now commits an `INSERT`/`DELETE`/`UPDATE` against the statement's own read
+  snapshot (`Transaction::new` + `TransactionManager::commit`) rather than the fresh snapshot
+  `TransactionManager::commit_request`'s own `begin()` would otherwise assign at commit time, which
+  previously could lose a concurrent `copy_from_*`/import commit landing between the read and the commit
+  decision. Sessions motivated finding it, but the fix applies to every autocommit statement.
+- **`TransactionManager` recovery latch, `RecoveryRequired`, and `recover()` hardening.** See
+  "`DurablePending`, `RecoveryRequired`, and the recovery latch" above (second and third Phase 10 fix passes).
+- **Effective transaction payload cap.** See "Isolation" above (second Phase 10 fix pass): the journal
+  `Intent` frame's JSON-number-array payload encoding, not the nominal `MAX_PAYLOAD_SIZE`, is the binding
+  limit, and it is now checked before prepare as well as incrementally per statement. A third Phase 10 fix
+  pass (a) scaled `intent_frame_size_bound`'s conservative overhead by participant count
+  (`INTENT_PER_PARTICIPANT_OVERHEAD_BYTES = 128` bytes per participant, on top of the existing fixed 512-byte
+  overhead), since a transaction with many small-payload participants can add more JSON punctuation overhead
+  than one fixed constant covers, and (b) added `TransactionManager::max_frame_size()` so `WriteSet::try_merge`
+  and `Session::commit` bound the estimated frame against this manager's own journal's actual configured
+  `max_frame_size` instead of assuming `DEFAULT_MAX_FRAME_SIZE`. See `docs/LIMITATIONS.md` for the resulting
+  effective single-participant byte cap.
+- **Applied-external-transactions ledger capacity checked at prepare.** See "Transactional write execution
+  path" above (second Phase 10 fix pass): a full ledger is now rejected before any journal write, not only
+  discovered at apply time after the commit decision was already durable.
+
+### Sequence: `BEGIN` → statements → `COMMIT`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Caller as Caller (EmbeddedClient / wire connection)
+    participant Session as htap_server::Session
+    participant Server as LocalServer
+    participant TxnMgr as TransactionManager
+    participant RowstorePart as RowstoreParticipant (ID 1)
+
+    Caller->>Session: execute("BEGIN")
+    Session->>Server: pin Snapshot::new(visible_version) under execution_lock
+    Server-->>Session: OpenTxn { snapshot, write_set: empty }
+
+    Caller->>Session: execute("INSERT ...")
+    Session->>Server: dispatch_bound(bound, ExecMode::Txn)
+    Note over Session: buffered into open_txn.write_set;<br/>no WAL, no journal write
+
+    Caller->>Session: execute("SELECT ... WHERE pk = ?")
+    Session->>Server: dispatch_bound(bound, ExecMode::Txn)
+    Note over Server: read snapshot overlaid with write_set<br/>("read your own writes")
+
+    Caller->>Session: commit()
+    Session->>Server: reload catalog, revalidate touched partitions
+    alt catalog still valid
+        Session->>TxnMgr: TransactionManager::commit(Transaction{snapshot.version, TransactionRequest})
+        TxnMgr->>RowstorePart: prepare(snapshot, payload) [first-writer-wins, pre-journal]
+        RowstorePart-->>TxnMgr: Ok
+        TxnMgr->>TxnMgr: append & fsync Intent, then Commit journal frames
+        TxnMgr->>RowstorePart: apply, then publish
+        RowstorePart-->>TxnMgr: Ok
+        TxnMgr-->>Session: CommittedTransaction
+        Session-->>Caller: Ok (session now Idle)
+    else concurrent DROP TABLE / ALTER
+        Session-->>Caller: HtapError::Conflict (transaction discarded)
+    end
+```
+
+### Test evidence
+
+Verified in `crates/htap-server/tests/session.rs` (session lifecycle, read-your-own-writes overlays across
+storage formats, poisoning/revalidation, `DurablePending` quarantine, and reopen recovery — see
+`docs/PROGRESS.md` for the full test name list — plus the second fix pass's
+`test_commit_while_manager_latched_by_other_session_keeps_txn_open`,
+`test_commit_of_write_set_exceeding_intent_frame_is_rejected_and_txn_stays_open`, and
+`test_autocommit_oversize_insert_rejected_cleanly_before_any_journal_write`),
+`crates/htap-server/tests/session_concurrency.rs`, and `crates/htap-server/tests/session_recovery.rs`;
+`crates/htap-txn/tests/two_phase_commit.rs`
+(`test_conflict_detected_before_journal_commit_not_after`, `test_stale_snapshot_non_conflicting_key_still_commits`,
+`test_commit_after_durable_pending_is_rejected_until_recovery`,
+`test_latch_via_commit_sync_hook_survives_in_process_recover_until_reopen`,
+`test_latch_via_participant_apply_failure_clears_in_process_recover`,
+`test_ledger_full_commit_rejected_at_prepare_before_journal_growth`,
+`test_recover_detects_engine_ahead_of_journal_as_corruption`);
+`crates/htap-txn/tests/journal.rs::test_append_nosync_failure_truncates_partial_write_and_journal_stays_openable`;
+`crates/htap-wire/src/error_map.rs::recovery_required_never_maps_to_the_retryable_conflict_code`;
+`crates/htap-sql/tests/query_bind.rs`
+(`test_user_and_system_variable_binding`, `test_global_scope_rejected`) and
+`crates/htap-sql/tests/route.rs::test_narrow_shape_gate_excludes_variables`;
+`crates/htap-client/tests/session.rs`; and `crates/htap-wire/tests/wire_server.rs`
+(`test_wire_begin_commit_rollback_round_trip`, `test_wire_rollback_on_disconnect`,
+`test_wire_concurrent_sessions_conflict_returns_1213`, `test_wire_set_autocommit_and_user_variable_round_trip`,
+`test_wire_sysvar_reads_now_reflect_session_state`).
 
 ---
 

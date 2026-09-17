@@ -13,8 +13,12 @@ use htap_wire::{ClientOptions, WireClient, WireResult};
 /// execution without changing how it reads results. Server-side errors are mapped back to
 /// stable [`HtapError`] categories by their MySQL error code.
 ///
-/// Like the server, the client offers no TLS and no session state; every statement
-/// auto-commits.
+/// One `RemoteClient` connection is one server-side `htap_server::Session` for its whole
+/// lifetime (Phase 10): sending `BEGIN`/`COMMIT`/`ROLLBACK` or `SET autocommit = 0` as ordinary
+/// SQL through [`RemoteClient::execute`] opens and manages an explicit transaction exactly as
+/// it would for an embedded session, with the transaction's buffered writes visible only to
+/// statements sent over this same connection until `COMMIT`. There is still no TLS; query text
+/// and results travel in cleartext unless the connection is otherwise tunneled.
 #[derive(Debug)]
 pub struct RemoteClient {
     client: WireClient,

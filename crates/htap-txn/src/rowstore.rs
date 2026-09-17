@@ -84,4 +84,8 @@ impl TxnParticipant for RowstoreParticipant {
         self.engine.publish(version)?;
         Ok(())
     }
+
+    fn committed_version(&self) -> Option<Version> {
+        Some(self.engine.committed_version())
+    }
 }

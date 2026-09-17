@@ -4,7 +4,11 @@
 //! is defined here. Values follow the public MySQL protocol documentation.
 
 /// Server version string advertised in the initial handshake.
-pub const SERVER_VERSION: &str = "8.0.0-fluidb-0.1.0";
+///
+/// References `htap_sql::variables::REPORTED_VERSION` directly (rather than duplicating the
+/// literal) so this and `@@version`/`SELECT VERSION()` can never drift apart; see
+/// `version_constant_matches_variable_registry` below.
+pub const SERVER_VERSION: &str = htap_sql::variables::REPORTED_VERSION;
 
 /// Protocol version byte of the initial handshake packet.
 pub const PROTOCOL_VERSION: u8 = 10;
@@ -131,3 +135,17 @@ pub const ER_BAD_DB: (u16, &str) = (1049, "42000");
 pub const ER_NOT_SUPPORTED_AUTH_MODE: (u16, &str) = (1251, "08004");
 /// `ER_UNKNOWN_ERROR`.
 pub const ER_UNKNOWN: (u16, &str) = (1105, "HY000");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards against the two reported version strings drifting apart again: `SERVER_VERSION`
+    /// references `htap_sql::variables::REPORTED_VERSION` directly, so this is trivially true
+    /// today, but it fails loudly if a future edit replaces the reference with a hardcoded
+    /// literal (Phase 10 plan, task 9).
+    #[test]
+    fn version_constant_matches_variable_registry() {
+        assert_eq!(SERVER_VERSION, htap_sql::variables::REPORTED_VERSION);
+    }
+}

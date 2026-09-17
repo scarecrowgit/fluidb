@@ -2,13 +2,15 @@
 //!
 //! [`server::WireServer`] exposes a [`htap_server::LocalServer`] over TCP to any MySQL
 //! client (`mysql` CLI, drivers, [`client::WireClient`]). The protocol implementation is
-//! hand-written and synchronous: one thread per connection, statements serialized by the
-//! server's execution lock, every statement auto-committed.
+//! hand-written and synchronous: one thread per connection, each owning one
+//! [`htap_server::Session`] for its lifetime (Phase 10), so `BEGIN`/`COMMIT`/`ROLLBACK`,
+//! autocommit, and session variables behave the same as calling that `Session` directly.
 //!
 //! Supported: handshake v10 with `mysql_native_password`, `COM_QUERY` (text result sets),
-//! `COM_PING`, `COM_INIT_DB`, `COM_QUIT`, and a small start-up compatibility shim
-//! ([`shim`]). Not supported: TLS, compression, prepared statements / binary protocol,
-//! multi-statements, multi-results, session state, and payloads of 16MB or more.
+//! `COM_PING`, `COM_INIT_DB`, `COM_QUIT`, explicit transactions and session variables via
+//! [`htap_server::Session`], and a small start-up compatibility shim ([`shim`]) for statements
+//! the engine itself cannot answer. Not supported: TLS, compression, prepared statements /
+//! binary protocol, multi-statements, multi-results, and payloads of 16MB or more.
 //!
 //! See [`server`] for the security contract.
 

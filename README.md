@@ -24,7 +24,10 @@ components are **deliberately not implemented** and are out of scope for this lo
 - **No TLS, compression, or per-user ACL:** The wire server has no TLS, no protocol compression, and a
   single shared password with no per-user accounts or RBAC; see "Network server (`htapd`)" below.
 - **No Docker image or Docker Compose deployment:** No `Dockerfile`, `docker-compose.yml`, or container images are provided or required.
-- **No interactive sessions or session state:** Each statement executes independently without connection-level state, session variables, or explicit transaction handles (`BEGIN`/`COMMIT`/`ROLLBACK`), whether reached in-process via `EmbeddedClient` or over the network via `RemoteClient`.
+- **No `SELECT ... FOR UPDATE`, locking reads, prepared statements, savepoints, or XA:** Sessions and
+  explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, session variables) are implemented — see "Sessions and
+  explicit transactions" below — but there is no locking-read syntax, no prepared-statement/binary protocol,
+  no savepoints, and no distributed (XA) transactions. There is also no idle-transaction timeout/reaping yet.
 - **No TPC-C or TPC-H compliance:** The system does not implement the TPC-C or TPC-H benchmark specifications, relational transaction models, or analytical query profiles. Microbenchmarks evaluate isolated internal subsystem performance only.
 - **No window functions, correlated subqueries, or cost-based optimization:** The general query executor
   (see "Supported SQL Subset" below) handles joins, expressions, subqueries, and set operations over
@@ -204,6 +207,76 @@ for the full protocol scope and operational lifecycle.
 
 ---
 
+## Sessions and explicit transactions
+
+`EmbeddedClient::execute`/`RemoteClient::execute` keep auto-committing exactly as before. `open_session()`
+opens an explicit `Session` (one `EmbeddedClient::open_session()` call, or one wire connection, is one
+session for its lifetime) supporting `BEGIN`/`START TRANSACTION`, `COMMIT`, `ROLLBACK`, `autocommit`, and
+`@user`/`@@system` variables. Uncommitted writes are buffered in the session and never touch the WAL,
+transaction journal, or memtable — a crash before `COMMIT` is an implicit `ROLLBACK` — and are visible only
+to statements run through that same session (read-your-own-writes) until `COMMIT` runs the existing 2PC path
+once. Isolation is snapshot isolation with first-writer-wins (write skew permitted), reported as
+`REPEATABLE READ`; a concurrent write to the same row is a clean `Conflict` at `COMMIT`.
+
+Embedded:
+
+```rust
+use htap_client::EmbeddedClient;
+use htap_common::Result;
+
+fn main() -> Result<()> {
+    let client = EmbeddedClient::open("/tmp/htap_demo3")?;
+    client.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance INT);")?;
+    client.execute("INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 0);")?;
+
+    let mut session = client.open_session();
+    session.begin()?;
+    session.execute("UPDATE accounts SET balance = balance - 50 WHERE id = 1;")?;
+    session.execute("UPDATE accounts SET balance = balance + 50 WHERE id = 2;")?;
+    // Read-your-own-writes: visible inside the session before COMMIT, not to `client.execute`.
+    session.execute("SELECT balance FROM accounts WHERE id = 1;")?;
+    session.commit()?; // one 2PC transaction for both UPDATEs
+
+    assert!(!session.in_transaction());
+    Ok(())
+}
+```
+
+Over the wire, the same `BEGIN`/`COMMIT`/`ROLLBACK` are ordinary SQL on one connection — a `mysql` client
+session, or `RemoteClient`:
+
+```bash
+mysql -h 127.0.0.1 -P 3307 -u root <<'SQL'
+BEGIN;
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+UPDATE accounts SET balance = balance + 50 WHERE id = 2;
+COMMIT;
+SQL
+```
+
+```rust
+use htap_client::RemoteClient;
+use htap_common::Result;
+
+fn main() -> Result<()> {
+    let mut client = RemoteClient::connect("127.0.0.1:3307", None)?;
+    client.execute("BEGIN;")?;
+    client.execute("UPDATE accounts SET balance = balance - 50 WHERE id = 1;")?;
+    client.execute("UPDATE accounts SET balance = balance + 50 WHERE id = 2;")?;
+    client.execute("COMMIT;")?;
+    Ok(())
+}
+```
+
+Deferred: `SELECT ... FOR UPDATE`/locking reads, prepared statements/binary protocol, savepoints, XA,
+idle-transaction timeout/reaping, and MVCC garbage collection. Only `REPEATABLE READ` is offered (other
+isolation levels are rejected, not silently downgraded); DDL is rejected inside an open transaction (the
+transaction survives, unpoisoned). See "Sessions and explicit transactions (Phase 10)" in
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md), ADR-018 in [`docs/DECISIONS.md`](./docs/DECISIONS.md), and
+[`docs/LIMITATIONS.md`](./docs/LIMITATIONS.md) for the full contract, remaining gaps, and test evidence.
+
+---
+
 ## Workspace Architecture
 
 The workspace consists of 14 modular crates (plus the vendored `vendor/sqlparser`) separated by architectural boundaries:
@@ -294,9 +367,10 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
   ```
   A complete-PK `WHERE` takes a point read-modify-write and commits one `Mutation::Put`; any other `WHERE`
   (or none) scans every partition at one snapshot and commits all rewritten rows in **one** transaction
-  (16 MiB 2PC payload cap, no chunking). Assignments evaluate left to right against the progressively
-  updated row. Rejected: assigning a primary-key or partition-key column, subqueries in `SET`, and
-  `UPDATE ... FROM`/`JOIN`/`ORDER BY`/`LIMIT`.
+  (effective 2PC payload cap of about 4 MiB — nominally 16 MiB, but the durable journal frame's own encoding
+  makes the actual bound smaller; see `docs/LIMITATIONS.md` — no chunking). Assignments evaluate left to right
+  against the progressively updated row. Rejected: assigning a primary-key or partition-key column, subqueries
+  in `SET`, and `UPDATE ... FROM`/`JOIN`/`ORDER BY`/`LIMIT`.
 - **`DROP TABLE`** (`Route::CatalogDdl`):
   ```sql
   DROP TABLE IF EXISTS orders;
@@ -350,7 +424,7 @@ Direct `SegmentReader` pushdown optimization is implemented for the compact base
 - Cost-based query optimization, memory bounds/spilling for the general query path, physical reclamation of data on `DROP TABLE`.
 - Multi-tablet or distributed scans, distributed fanout, resource quotas, disk spilling, query cancellation (conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented locally).
 - DataFusion and Apache Arrow integration.
-- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, integer `DIV`, broader string/date functions, sessions, and transaction controls (`BEGIN`, `COMMIT`, `ROLLBACK`).
+- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, integer `DIV`, and broader string/date functions. (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
 - **MySQL Partition DDL & Partition Lifecycle Boundary:**
   - Supported SQL partitioning: MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via vendored `sqlparser` and bound to validated catalog partition models.
   - Supported SQL lifecycle DDL: `ALTER TABLE <table> ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` for strict finite range and list forms and final `MAXVALUE` where supported, gated by empty-source rowstore checks before catalog mutation.

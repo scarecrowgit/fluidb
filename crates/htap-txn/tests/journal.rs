@@ -1345,8 +1345,26 @@ fn test_commit_append_failure_at_decision_boundary() {
             .any(|r| matches!(r, JournalRecord::Abort { .. })));
     }
 
-    // Recovery runs safely: leaves the transaction unresolved with explicit reason
-    let report = tm.recover().unwrap();
+    // Fix-pass round 3, item 2: the commit-append hook's failure is a journal-I/O cause, so the
+    // manager is now latched (see `test_commit_after_durable_pending_is_rejected_until_recovery`
+    // in `two_phase_commit.rs`), and an in-process `recover()` must be rejected outright and
+    // apply nothing — an in-process sync succeeding afterward proves nothing about the earlier
+    // failed one on the same fd. Only a fresh reopen can resolve it.
+    let err_recover = tm.recover().unwrap_err();
+    assert!(
+        err_recover.is_recovery_required(),
+        "expected an in-process recover() under a journal-I/O latch to be rejected, got {err_recover:?}"
+    );
+    assert_eq!(p.applies.load(Ordering::SeqCst), 0);
+    assert_eq!(p.publishes.load(Ordering::SeqCst), 0);
+    assert!(tm.recovery_required());
+
+    // A fresh reopen resolves it correctly: the transaction is left unresolved (its commit
+    // record never actually landed), with no participant apply/publish.
+    let tm2 = TransactionManager::open(&path).unwrap();
+    let p2 = Arc::new(MockParticipant::new(10));
+    tm2.register_participant(p2.clone());
+    let report = tm2.recover().unwrap();
     assert!(report.committed_txns.is_empty());
     assert!(report.aborted_txns.is_empty());
     assert_eq!(report.unresolved_txns, vec![TransactionId::new(1)]);
@@ -1358,11 +1376,10 @@ fn test_commit_append_failure_at_decision_boundary() {
         reason.contains("left unresolved"),
         "expected unresolved reason, got {reason}"
     );
-
-    // Participants were not applied or published
-    assert_eq!(p.applies.load(Ordering::SeqCst), 0);
-    assert_eq!(p.publishes.load(Ordering::SeqCst), 0);
-    assert_eq!(p.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(p2.applies.load(Ordering::SeqCst), 0);
+    assert_eq!(p2.publishes.load(Ordering::SeqCst), 0);
+    assert_eq!(p2.aborts.load(Ordering::SeqCst), 0);
+    assert!(!tm2.recovery_required());
 }
 
 #[test]
@@ -1414,8 +1431,26 @@ fn test_commit_append_torn_tail_failure_and_recovery_semantics() {
         );
     }
 
-    // 2. Recovery with auto_repair = true (default) repairs torn final and leaves transaction unresolved
-    let report = tm.recover().unwrap();
+    // Fix-pass round 3, item 2: `tm`'s own in-process `recover()` is latched on the journal-I/O
+    // cause from the commit-append hook above, so it must be rejected outright and apply
+    // nothing, even though the torn tail it would otherwise have found and repaired is
+    // perfectly safe to discard. Only a fresh reopen resolves it.
+    let err_recover = tm.recover().unwrap_err();
+    assert!(
+        err_recover.is_recovery_required(),
+        "expected an in-process recover() under a journal-I/O latch to be rejected, got {err_recover:?}"
+    );
+    assert_eq!(p.applies.load(Ordering::SeqCst), 0);
+    assert_eq!(p.publishes.load(Ordering::SeqCst), 0);
+    assert!(tm.recovery_required());
+
+    // 2. A fresh reopen (auto_repair = true, the default) repairs the torn final record — at
+    // `Journal::open` construction time, before `recover()` is even called — and its own
+    // `recover()` correctly leaves the transaction unresolved with no participant touched.
+    let tm3 = TransactionManager::open(&path).unwrap();
+    let p3 = Arc::new(MockParticipant::new(10));
+    tm3.register_participant(p3.clone());
+    let report = tm3.recover().unwrap();
     assert!(report.committed_txns.is_empty());
     assert!(report.aborted_txns.is_empty());
     assert_eq!(report.unresolved_txns, vec![TransactionId::new(1)]);
@@ -1424,9 +1459,12 @@ fn test_commit_append_torn_tail_failure_and_recovery_semantics() {
         .get(&TransactionId::new(1))
         .unwrap();
     assert!(
-        reason.contains("torn and safely discarded"),
-        "expected torn tail discarded in reason, got {reason}"
+        reason.contains("left unresolved"),
+        "expected unresolved reason, got {reason}"
     );
+    assert_eq!(p3.applies.load(Ordering::SeqCst), 0);
+    assert_eq!(p3.publishes.load(Ordering::SeqCst), 0);
+    assert!(!tm3.recovery_required());
 
     // Verify journal file is clean and repaired now
     {
@@ -1500,16 +1538,374 @@ fn test_commit_sync_failure_at_decision_boundary() {
             .any(|r| matches!(r, JournalRecord::Abort { .. })));
     }
 
-    // Recovery replays the durable Commit record and successfully completes the transaction
-    let report = tm.recover().unwrap();
+    // Fix-pass round 3, item 2: the commit-sync hook's failure is a journal-I/O cause, so `tm` is
+    // now latched, and its own in-process `recover()` must be rejected outright and apply
+    // nothing — even though the Commit record really is durably on disk (confirmed above) and a
+    // naive in-process replay would "work". Only a fresh reopen may replay it.
+    let err_recover = tm.recover().unwrap_err();
+    assert!(
+        err_recover.is_recovery_required(),
+        "expected an in-process recover() under a journal-I/O latch to be rejected, got {err_recover:?}"
+    );
+    assert_eq!(p.applies.load(Ordering::SeqCst), 0);
+    assert_eq!(p.publishes.load(Ordering::SeqCst), 0);
+    assert_eq!(tm.visible_version(), Version::INITIAL);
+    assert!(tm.recovery_required());
+
+    // A fresh reopen replays the durable Commit record and successfully completes the
+    // transaction exactly once.
+    let tm2 = TransactionManager::open(&path).unwrap();
+    let p2 = Arc::new(MockParticipant::new(10));
+    tm2.register_participant(p2.clone());
+    let report = tm2.recover().unwrap();
     assert_eq!(report.committed_txns, vec![TransactionId::new(1)]);
     assert!(report.aborted_txns.is_empty());
     assert!(report.unresolved_txns.is_empty());
     assert_eq!(report.visible_version, Version::new(2));
-    assert_eq!(tm.visible_version(), Version::new(2));
+    assert_eq!(tm2.visible_version(), Version::new(2));
+    assert!(!tm2.recovery_required());
 
     // Participant was applied and published during recovery
-    assert_eq!(p.applies.load(Ordering::SeqCst), 1);
-    assert_eq!(p.publishes.load(Ordering::SeqCst), 1);
-    assert_eq!(p.aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(p2.applies.load(Ordering::SeqCst), 1);
+    assert_eq!(p2.publishes.load(Ordering::SeqCst), 1);
+    assert_eq!(p2.aborts.load(Ordering::SeqCst), 0);
+}
+
+/// Fix-pass item 6a: on a failed partial `append_nosync`, the journal must truncate the file back
+/// to its last known-good boundary (best effort), so a later, shorter frame appended after the
+/// caller recovers does not land past leftover garbage bytes — which would otherwise make the
+/// journal refuse to reopen with unrecoverable middle-of-log corruption.
+///
+/// `Journal::append`/`append_nosync` have no real way to defeat the OS and force a genuine
+/// partial `write_all` deterministically, so this uses the smallest possible test seam:
+/// `Journal::inject_partial_write_fault_for_test`, a `#[doc(hidden)]` one-shot hook that writes
+/// only the first `n` bytes of the next frame and then reports an I/O error — exactly what a real
+/// crashed/short `write_all` would leave behind — exercising the exact same truncate-on-failure
+/// code path a real failure would.
+#[test]
+fn test_append_nosync_failure_truncates_partial_write_and_journal_stays_openable() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    let mut journal = Journal::open(&path).unwrap();
+    journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(1),
+            version: Version::new(2),
+        })
+        .unwrap();
+    let valid_end_before = journal.valid_bytes();
+    let file_len_before = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(valid_end_before, file_len_before);
+
+    // Inject a partial write of a bigger frame: only the first 6 bytes (a full header plus a
+    // couple of payload bytes) actually land on disk before the simulated failure.
+    journal.inject_partial_write_fault_for_test(6);
+    let big_record = JournalRecord::Intent {
+        txn_id: TransactionId::new(2),
+        snapshot: Version::new(2),
+        participants: vec![ParticipantWork::new(1, vec![0xab; 200])],
+    };
+    let err = journal.append_nosync(&big_record).unwrap_err();
+    assert!(matches!(err, HtapError::Io(_)));
+
+    // `valid_end` and the file's real on-disk length are both back at the pre-attempt boundary:
+    // no leftover garbage past it.
+    assert_eq!(journal.valid_bytes(), valid_end_before);
+    let file_len_after_failed_append = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(
+        file_len_after_failed_append, valid_end_before,
+        "a failed partial append_nosync must leave no trailing garbage past valid_end"
+    );
+
+    // A later, shorter frame (e.g. what `abort()` would append) appends cleanly right after the
+    // last good boundary, exactly as if the failed attempt never happened.
+    journal
+        .append_nosync(&JournalRecord::Abort {
+            txn_id: TransactionId::new(2),
+        })
+        .unwrap();
+    journal.sync().unwrap();
+    drop(journal);
+
+    // The journal reopens cleanly (no middle-of-log corruption) and contains exactly the two
+    // real records, with no trace of the failed partial write.
+    let mut reopened = Journal::open(&path).unwrap();
+    reopened.check_integrity().unwrap();
+    let records = reopened.read_all().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(matches!(records[0], JournalRecord::Commit { .. }));
+    assert!(matches!(records[1], JournalRecord::Abort { .. }));
+}
+
+/// Storage-reviewer fix-pass round 3, item 1(i): if `Journal::append`'s internal `fsync` fails
+/// after its `write_all` already succeeded, `valid_end` must not silently disagree with the
+/// file's real on-disk length. Before this fix, `append` returned early on a sync failure without
+/// touching either `valid_end` or the file, leaving the just-written (unsynced) frame's bytes
+/// sitting past the old `valid_end`; a later, shorter frame appended at that same old `valid_end`
+/// (e.g. by a caller that treats the sync failure as "nothing happened yet") would then overlap
+/// the leftover bytes, and reopening would see either silent corruption or a huge bogus length
+/// parsed from the leftover tail. The fix instead best-effort truncates the file back to
+/// `write_offset` and unconditionally poisons the journal handle (a failed fsync makes the
+/// kernel's page-cache state for those bytes unknowable, even if a later fsync on the same fd
+/// would report success) — so every further append on this handle is rejected until a fresh
+/// reopen, and the file itself is left exactly at its last known-good boundary either way.
+#[test]
+fn test_append_sync_failure_then_shorter_frame_reopen_succeeds_or_is_rejected() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    let mut journal = Journal::open(&path).unwrap();
+    journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(1),
+            version: Version::new(2),
+        })
+        .unwrap();
+    let valid_end_before = journal.valid_bytes();
+    let file_len_before = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(valid_end_before, file_len_before);
+
+    // Inject a one-shot fsync failure into the next append's internal sync-on-write step. The
+    // `write_all` itself succeeds for real (a bigger Intent record), so its bytes really do land
+    // on disk before the simulated fsync failure fires.
+    journal.inject_sync_fault_for_test();
+    let big_record = JournalRecord::Intent {
+        txn_id: TransactionId::new(2),
+        snapshot: Version::new(2),
+        participants: vec![ParticipantWork::new(1, vec![0xab; 200])],
+    };
+    let err = journal.append(&big_record).unwrap_err();
+    assert!(matches!(err, HtapError::Io(_)));
+
+    // The journal is now poisoned: `valid_end` and the file's real length are both back at the
+    // pre-attempt boundary (the best-effort truncate ran and succeeded for real), and every
+    // further append on this same handle is rejected outright, never silently "succeeding after
+    // truncation" — a failed fsync alone is reason enough to distrust this file handle.
+    assert!(
+        journal.is_poisoned(),
+        "a failed fsync must poison the journal handle unconditionally"
+    );
+    assert_eq!(journal.valid_bytes(), valid_end_before);
+    let file_len_after_failed_append = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(
+        file_len_after_failed_append, valid_end_before,
+        "the unsynced frame's bytes must be truncated back off after the fsync failure"
+    );
+
+    let next_attempt = journal.append_nosync(&JournalRecord::Abort {
+        txn_id: TransactionId::new(2),
+    });
+    assert!(
+        next_attempt.is_err(),
+        "every further append on a poisoned journal handle must be rejected"
+    );
+    assert!(matches!(next_attempt.unwrap_err(), HtapError::Io(_)));
+    let sync_attempt = journal.sync();
+    assert!(
+        sync_attempt.is_err(),
+        "sync on a poisoned handle must also be rejected"
+    );
+
+    drop(journal);
+
+    // Reopening (a fresh `Journal` handle, exactly like a real process restart) is unaffected by
+    // the poisoned in-memory flag: the file itself was left clean, so it opens with no corruption
+    // and contains exactly the one real record.
+    let mut reopened = Journal::open(&path).unwrap();
+    reopened.check_integrity().unwrap();
+    assert!(!reopened.is_poisoned());
+    let records = reopened.read_all().unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(matches!(records[0], JournalRecord::Commit { .. }));
+
+    // A later, shorter frame appends cleanly right after the last good boundary.
+    reopened
+        .append(&JournalRecord::Abort {
+            txn_id: TransactionId::new(2),
+        })
+        .unwrap();
+    let records_after = reopened.read_all().unwrap();
+    assert_eq!(records_after.len(), 2);
+}
+
+/// Storage-reviewer fix-pass round 3, item 1(ii): if the best-effort truncate that runs after a
+/// failed write (`Journal::truncate_partial_write_best_effort`) itself fails, the journal cannot
+/// know whether stale bytes remain on disk past `valid_end`. Swallowing that second failure (the
+/// pre-fix behavior) would let a later, shorter frame be appended at the old `valid_end`, landing
+/// right before the leftover garbage and producing exactly the kind of unrecoverable middle-of-log
+/// corruption this whole fix pass exists to prevent. The fix instead poisons the journal handle
+/// whenever the recovery truncate itself fails, rejecting every further append until a fresh
+/// reopen — which is unaffected, since it performs its own independent scan/repair of the real
+/// file contents.
+#[test]
+fn test_truncate_failure_poisons_journal() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    let mut journal = Journal::open(&path).unwrap();
+    journal
+        .append(&JournalRecord::Commit {
+            txn_id: TransactionId::new(1),
+            version: Version::new(2),
+        })
+        .unwrap();
+    let valid_end_before = journal.valid_bytes();
+    let file_len_before = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(valid_end_before, file_len_before);
+
+    // Inject a partial write (fewer bytes than a frame header, so the leftover tail is a clean
+    // "torn final" case at reopen) whose own best-effort recovery truncate is also made to fail.
+    journal.inject_partial_write_fault_for_test(6);
+    journal.inject_truncate_fault_for_test();
+    let big_record = JournalRecord::Intent {
+        txn_id: TransactionId::new(2),
+        snapshot: Version::new(2),
+        participants: vec![ParticipantWork::new(1, vec![0xcd; 200])],
+    };
+    let err = journal.append_nosync(&big_record).unwrap_err();
+    assert!(matches!(err, HtapError::Io(_)));
+
+    // The journal is poisoned: the simulated truncate failure means the 6 partial bytes really
+    // are still sitting on disk past `valid_end` (the real `set_len` never actually ran).
+    assert!(
+        journal.is_poisoned(),
+        "a failed best-effort truncate after a failed write must poison the journal handle"
+    );
+    assert_eq!(journal.valid_bytes(), valid_end_before);
+    let file_len_after_failed_append = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(
+        file_len_after_failed_append,
+        valid_end_before + 6,
+        "the simulated truncate failure must leave the partial write's bytes on disk"
+    );
+
+    // Every further append on this same poisoned handle is rejected.
+    let next_attempt = journal.append_nosync(&JournalRecord::Abort {
+        txn_id: TransactionId::new(2),
+    });
+    assert!(next_attempt.is_err());
+    assert!(matches!(next_attempt.unwrap_err(), HtapError::Io(_)));
+
+    drop(journal);
+
+    // Reopening performs its own independent scan/repair of the real file: the 6 leftover bytes
+    // (fewer than a frame header) are a clean torn-final case, auto-repaired away, and the
+    // journal opens successfully with no corruption and exactly the one real record.
+    let mut reopened = Journal::open(&path).unwrap();
+    reopened.check_integrity().unwrap();
+    assert!(!reopened.is_poisoned());
+    assert_eq!(reopened.valid_bytes(), valid_end_before);
+    let records = reopened.read_all().unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(matches!(records[0], JournalRecord::Commit { .. }));
+
+    // A later, shorter frame still appends cleanly.
+    reopened
+        .append(&JournalRecord::Abort {
+            txn_id: TransactionId::new(2),
+        })
+        .unwrap();
+    let records_after = reopened.read_all().unwrap();
+    assert_eq!(records_after.len(), 2);
+}
+
+/// Storage-reviewer fix-pass round 3, item 1: a real journal-I/O failure while writing the Intent
+/// record must latch the manager (`JournalIo` cause) exactly like a Commit-boundary failure does,
+/// so a later `commit`/`abort` reports the well-known `RecoveryRequired` instead of a raw journal
+/// error — even though this specific transaction's own outcome is a clean, definite abort (an
+/// Intent never became durable, so there is nothing ambiguous about *this* transaction).
+#[test]
+fn test_intent_append_failure_latches_manager_as_journal_io() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    let tm = TransactionManager::open(&path).unwrap();
+    let p = Arc::new(MockParticipant::new(10));
+    tm.register_participant(p.clone());
+
+    tm.set_intent_append_hook(|_journal| {
+        Err(HtapError::Io(std::io::Error::other(
+            "simulated disk failure while writing the Intent record",
+        )))
+    });
+
+    let mut txn_a = tm.begin().unwrap();
+    txn_a.add_participant(10, b"work_intent_fail");
+    let err_a = tm.commit(&mut txn_a).unwrap_err();
+    assert!(
+        matches!(err_a, HtapError::Io(_)),
+        "this transaction's own outcome is a definite abort via the raw journal error, got {err_a:?}"
+    );
+    assert_eq!(txn_a.state(), TxnState::Aborted);
+    assert_eq!(p.aborts.load(Ordering::SeqCst), 1);
+
+    // The manager itself is now latched: a later, otherwise valid, commit is rejected with
+    // `RecoveryRequired`, never silently allowed through.
+    assert!(tm.recovery_required());
+    let mut txn_b = tm.begin().unwrap();
+    txn_b.add_participant(10, b"work_after_intent_fail");
+    let err_b = tm.commit(&mut txn_b).unwrap_err();
+    assert!(
+        err_b.is_recovery_required(),
+        "expected RecoveryRequired after an Intent-append journal-I/O failure, got {err_b:?}"
+    );
+
+    // A fresh reopen clears the latch and commits work normally again.
+    drop(tm);
+    let tm2 = TransactionManager::open(&path).unwrap();
+    let p2 = Arc::new(MockParticipant::new(10));
+    tm2.register_participant(p2.clone());
+    tm2.recover().unwrap();
+    assert!(!tm2.recovery_required());
+    let mut txn_c = tm2.begin().unwrap();
+    txn_c.add_participant(10, b"work_after_reopen");
+    tm2.commit(&mut txn_c).unwrap();
+}
+
+/// Storage-reviewer fix-pass round 3, item 1: same as the Intent case above, but for a real
+/// journal-I/O failure while writing the Abort record.
+#[test]
+fn test_abort_append_failure_latches_manager_as_journal_io() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+
+    let tm = TransactionManager::open(&path).unwrap();
+    let p = Arc::new(MockParticipant::new(10));
+    tm.register_participant(p.clone());
+
+    tm.set_abort_append_hook(|_journal| {
+        Err(HtapError::Io(std::io::Error::other(
+            "simulated disk failure while writing the Abort record",
+        )))
+    });
+
+    // Abort an active (never-prepared) transaction directly; `TransactionManager::abort` still
+    // appends its own Abort journal record regardless of prepare state.
+    let mut txn_a = tm.begin().unwrap();
+    txn_a.add_participant(10, b"work_never_committed");
+    let abort_err = tm.abort(&mut txn_a).unwrap_err();
+    assert!(
+        matches!(abort_err, HtapError::Io(_)),
+        "expected the raw journal error from the injected hook, got {abort_err:?}"
+    );
+
+    assert!(tm.recovery_required());
+    let mut txn_b = tm.begin().unwrap();
+    txn_b.add_participant(10, b"work_after_abort_fail");
+    let err_b = tm.commit(&mut txn_b).unwrap_err();
+    assert!(
+        err_b.is_recovery_required(),
+        "expected RecoveryRequired after an Abort-append journal-I/O failure, got {err_b:?}"
+    );
+
+    drop(tm);
+    let tm2 = TransactionManager::open(&path).unwrap();
+    let p2 = Arc::new(MockParticipant::new(10));
+    tm2.register_participant(p2.clone());
+    tm2.recover().unwrap();
+    assert!(!tm2.recovery_required());
+    let mut txn_c = tm2.begin().unwrap();
+    txn_c.add_participant(10, b"work_after_reopen");
+    tm2.commit(&mut txn_c).unwrap();
 }

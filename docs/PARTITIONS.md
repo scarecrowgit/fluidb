@@ -292,7 +292,11 @@ When inserting rows into a partitioned table (`LocalServer::execute_insert`):
 5. **Mutation Batching:** Creates `Mutation::Put { partition_id, key, row }`.
 6. **Single Atomic Commit:**
    - All mutations spanning different partitions are encoded into a single payload: `RowstoreParticipant::encode_payload(&mutations)`.
-   - A single `TransactionRequest` is committed through the 2PC manager (`self.txn_manager.commit_request(req)`).
+   - A single `TransactionRequest` is committed through the 2PC manager via `commit_or_buffer`, which builds
+     `Transaction::new(next_txn_id, statement_snapshot.version)` and calls `TransactionManager::commit`
+     directly against the statement's own read snapshot (not `TransactionManager::commit_request`, since
+     Phase 10 — see ADR-018 — so a concurrent writer that already advanced the visible version past this
+     statement's snapshot is caught as a first-writer-wins conflict instead of silently overwritten).
    - **One Commit Version:** All rows across all touched partitions are committed atomically under a single transaction version step. No multi-version split or partial commits occur.
 
 ### Complete-PK `DELETE` and `SELECT`: Fast Path Preservation

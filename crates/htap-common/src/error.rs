@@ -38,6 +38,16 @@ pub enum HtapError {
         reason: String,
     },
 
+    /// A transaction manager is latched pending recovery of an earlier, still-ambiguous commit
+    /// (`blocking_txn`): this transaction itself was rejected before any work was done and
+    /// definitely did not commit, so it is safe to retry once recovery resolves the blocking
+    /// transaction. Distinct from [`Self::DurablePending`] (whose own commit outcome is
+    /// ambiguous) and from [`Self::Conflict`] (retryable "rolled back"): a client must not treat
+    /// this the same as a rolled-back-and-retryable write, since the *caller's* transaction is
+    /// simply queued behind someone else's unresolved one, not aborted for a write conflict.
+    #[error("manager is latched pending recovery of txn {blocking_txn}: {reason}")]
+    RecoveryRequired { blocking_txn: u64, reason: String },
+
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
@@ -49,6 +59,11 @@ impl HtapError {
     /// Returns true if this error is [`HtapError::DurablePending`].
     pub fn is_durable_pending(&self) -> bool {
         matches!(self, Self::DurablePending { .. })
+    }
+
+    /// Returns true if this error is [`HtapError::RecoveryRequired`].
+    pub fn is_recovery_required(&self) -> bool {
+        matches!(self, Self::RecoveryRequired { .. })
     }
 }
 
@@ -99,6 +114,18 @@ mod tests {
         );
         assert!(err_dp.is_durable_pending());
         assert!(!err_fence.is_durable_pending());
+        assert!(!err_dp.is_recovery_required());
+
+        let err_rr = HtapError::RecoveryRequired {
+            blocking_txn: 7,
+            reason: "commit sync failed at decision boundary".into(),
+        };
+        assert_eq!(
+            err_rr.to_string(),
+            "manager is latched pending recovery of txn 7: commit sync failed at decision boundary"
+        );
+        assert!(err_rr.is_recovery_required());
+        assert!(!err_rr.is_durable_pending());
 
         let err_unsupp = HtapError::Unsupported("feature X".into());
         assert_eq!(err_unsupp.to_string(), "Unsupported: feature X");

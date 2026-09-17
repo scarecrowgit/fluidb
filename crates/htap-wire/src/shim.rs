@@ -1,12 +1,23 @@
-//! Compatibility shim for statements MySQL clients issue on connection start-up.
+//! Compatibility shim for a small set of statements MySQL clients issue on connection
+//! start-up that the engine itself cannot answer.
 //!
-//! Drivers and CLIs probe system variables (`SELECT @@version_comment`), set session
-//! variables (`SET NAMES utf8mb4`), or select a database (`USE htap`) before running user
-//! SQL. None of these exist in the engine, so the wire layer answers a small, explicit set of
-//! them itself. Everything else is passed to [`htap_server::LocalServer::execute`] unchanged.
+//! Since Phase 10, every connection owns a real [`htap_server::Session`] (see
+//! [`crate::server`]): `SET`, `SELECT @@sysvar`, and `SELECT @uservar` all flow through it and
+//! are answered by the real system/user-variable registry rather than faked here. Only three
+//! things remain shimmed:
+//! - `USE <db>` / `COM_INIT_DB`: the server has one flat namespace, so this just validates the
+//!   name against [`ACCEPTED_SCHEMAS`].
+//! - `SELECT 1` / `SELECT VERSION()` / `SELECT DATABASE()` / `SELECT SCHEMA()`: trivial
+//!   constant probes some clients send that the general query executor does not implement
+//!   (no scalar functions, no zero-table `SELECT 1`).
+//! - `SET CHARACTER SET <x>` / `SET CHARSET <x>`: MySQL-specific positional `SET` forms (as
+//!   opposed to `SET NAMES <x>`, which the vendored parser handles as `Set::SetNames`) that
+//!   `vendor/sqlparser` has no AST node for at all, so `htap_sql::parse_one` fails on them
+//!   before a session ever gets a chance to run them. Verified directly against the vendored
+//!   parser: `SET CHARACTER SET utf8mb4` and `SET CHARSET utf8mb4` both fail to parse, while
+//!   `SET NAMES utf8mb4` parses fine.
 //!
-//! `SET` statements are accepted as no-ops: every statement auto-commits regardless of any
-//! `autocommit` or isolation-level setting a client claims to apply.
+//! Everything else is passed to the connection's [`htap_server::Session::execute`] unchanged.
 
 use htap_common::types::{ColumnDef, DataType, Row, Value};
 
@@ -53,86 +64,8 @@ fn int_col(name: &str) -> ColumnDef {
     }
 }
 
-/// Known system variables and their constant values.
-fn system_variable(name: &str) -> Option<Value> {
-    let v = match name {
-        "version_comment" => Value::String("fluidb".into()),
-        "version" => Value::String(SERVER_VERSION.into()),
-        "max_allowed_packet" => Value::Int64(16 * 1024 * 1024),
-        "wait_timeout" | "interactive_timeout" => Value::Int64(28_800),
-        "net_write_timeout" | "net_read_timeout" => Value::Int64(60),
-        "autocommit" => Value::Int64(1),
-        "auto_increment_increment" => Value::Int64(1),
-        "lower_case_table_names" => Value::Int64(0),
-        "socket" => Value::Null,
-        "tx_isolation" | "transaction_isolation" => Value::String("REPEATABLE-READ".into()),
-        "tx_read_only" | "transaction_read_only" => Value::Int64(0),
-        "sql_mode" => Value::String(String::new()),
-        "time_zone" | "system_time_zone" => Value::String("UTC".into()),
-        "character_set_client"
-        | "character_set_connection"
-        | "character_set_results"
-        | "character_set_server"
-        | "character_set_database" => Value::String("utf8mb4".into()),
-        "collation_connection" | "collation_server" | "collation_database" => {
-            Value::String("utf8mb4_general_ci".into())
-        }
-        "init_connect" | "license" => Value::String(String::new()),
-        "performance_schema" | "query_cache_size" | "query_cache_type" => Value::Int64(0),
-        _ => return None,
-    };
-    Some(v)
-}
-
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
-}
-
-/// Parses one `@@[session.|global.]name [[AS] alias]` projection item.
-fn parse_sysvar_item(item: &str) -> Option<(String, Value)> {
-    let item = item.trim();
-    let rest = item.strip_prefix("@@")?;
-    let lower = rest.to_ascii_lowercase();
-    let lower = lower
-        .strip_prefix("session.")
-        .or_else(|| lower.strip_prefix("global."))
-        .unwrap_or(&lower);
-    let name_len = lower.chars().take_while(|c| is_ident_char(*c)).count();
-    if name_len == 0 {
-        return None;
-    }
-    let name = &lower[..name_len];
-    let value = system_variable(name)?;
-    let tail = lower[name_len..].trim();
-    let column = if tail.is_empty() {
-        item.to_string()
-    } else {
-        let alias = tail.strip_prefix("as ").map(str::trim).unwrap_or(tail);
-        if alias.is_empty() || !alias.chars().all(is_ident_char) {
-            return None;
-        }
-        alias.to_string()
-    };
-    Some((column, value))
-}
-
-fn split_top_level_commas(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&s[start..]);
-    parts
 }
 
 /// Strips a trailing `LIMIT <n>` clause, if any.
@@ -147,7 +80,19 @@ fn strip_limit(s: &str) -> &str {
     s
 }
 
-/// Intercepts client start-up statements. Returns `None` for ordinary SQL.
+/// Returns `true` for the two MySQL positional `SET` forms `SET CHARACTER SET <x>` / `SET
+/// CHARSET <x>` that `vendor/sqlparser` cannot parse at all (see module docs). `lower` is
+/// already trimmed and lowercased with any trailing `;` removed.
+fn is_unparseable_charset_set(lower: &str) -> bool {
+    let Some(rest) = lower.strip_prefix("set ") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.starts_with("character set ") || rest.starts_with("charset ")
+}
+
+/// Intercepts client start-up statements the engine cannot answer itself. Returns `None` for
+/// ordinary SQL, which the caller runs through the connection's `htap_server::Session`.
 pub fn try_shim(sql: &str) -> Option<ShimOutcome> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
@@ -155,7 +100,7 @@ pub fn try_shim(sql: &str) -> Option<ShimOutcome> {
     }
     let lower = trimmed.to_ascii_lowercase();
 
-    if lower == "set" || lower.starts_with("set ") {
+    if is_unparseable_charset_set(&lower) {
         return Some(ShimOutcome::Ok);
     }
 
@@ -169,7 +114,6 @@ pub fn try_shim(sql: &str) -> Option<ShimOutcome> {
 
     let body = lower.strip_prefix("select ")?;
     let body = strip_limit(body.trim());
-    let original_body = strip_limit(trimmed[7..].trim());
 
     if body == "1" {
         return Some(ShimOutcome::Rows {
@@ -190,25 +134,7 @@ pub fn try_shim(sql: &str) -> Option<ShimOutcome> {
         });
     }
 
-    if !body.starts_with("@@") {
-        return None;
-    }
-    let mut columns = Vec::new();
-    let mut values = Vec::new();
-    for item in split_top_level_commas(original_body) {
-        let (name, value) = parse_sysvar_item(item)?;
-        let col = match &value {
-            Value::Int64(_) => int_col(&name),
-            Value::Null => string_col(&name, true),
-            _ => string_col(&name, false),
-        };
-        columns.push(col);
-        values.push(value);
-    }
-    Some(ShimOutcome::Rows {
-        columns,
-        rows: vec![Row::new(values)],
-    })
+    None
 }
 
 #[cfg(test)]
@@ -216,67 +142,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shim_set_returns_ok() {
-        assert_eq!(try_shim("SET NAMES utf8mb4"), Some(ShimOutcome::Ok));
-        assert_eq!(try_shim("set autocommit=1;"), Some(ShimOutcome::Ok));
+    fn shim_charset_set_forms_return_ok() {
+        assert_eq!(try_shim("SET CHARACTER SET utf8mb4"), Some(ShimOutcome::Ok));
+        assert_eq!(try_shim("set charset utf8mb4;"), Some(ShimOutcome::Ok));
+        assert_eq!(try_shim("SET CHARSET DEFAULT"), Some(ShimOutcome::Ok));
+    }
+
+    #[test]
+    fn shim_no_longer_answers_plain_set_or_sysvar_reads() {
+        // Phase 10 task 9: these now flow to the connection's `htap_server::Session`, not the
+        // shim, so every one of these returns `None` here.
+        assert_eq!(try_shim("SET NAMES utf8mb4"), None);
+        assert_eq!(try_shim("set autocommit=1;"), None);
         assert_eq!(
             try_shim("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"),
-            Some(ShimOutcome::Ok)
+            None
         );
+        assert_eq!(try_shim("SELECT @@version_comment"), None);
+        assert_eq!(try_shim("SELECT @@autocommit"), None);
+        assert_eq!(try_shim("SELECT @x"), None);
         assert_eq!(try_shim("settle"), None);
     }
 
     #[test]
     fn shim_version_comment_single_row() {
-        match try_shim("select @@version_comment limit 1").unwrap() {
-            ShimOutcome::Rows { columns, rows } => {
-                assert_eq!(columns[0].name, "@@version_comment");
-                assert_eq!(rows[0].values(), &[Value::String("fluidb".into())]);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
         match try_shim("SELECT VERSION()").unwrap() {
             ShimOutcome::Rows { rows, .. } => {
                 assert_eq!(rows[0].values(), &[Value::String(SERVER_VERSION.into())]);
             }
             other => panic!("unexpected {other:?}"),
         }
-        match try_shim("SELECT 1").unwrap() {
+        match try_shim("SELECT 1 limit 1").unwrap() {
             ShimOutcome::Rows { rows, .. } => assert_eq!(rows[0].values(), &[Value::Int64(1)]),
             other => panic!("unexpected {other:?}"),
         }
-    }
-
-    #[test]
-    fn shim_multi_sysvar_with_aliases() {
-        let sql = "SELECT @@session.auto_increment_increment AS auto_increment_increment, \
-                   @@character_set_client AS character_set_client, @@max_allowed_packet, @@socket";
-        match try_shim(sql).unwrap() {
-            ShimOutcome::Rows { columns, rows } => {
-                let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-                assert_eq!(
-                    names,
-                    [
-                        "auto_increment_increment",
-                        "character_set_client",
-                        "@@max_allowed_packet",
-                        "@@socket"
-                    ]
-                );
-                assert_eq!(
-                    rows[0].values(),
-                    &[
-                        Value::Int64(1),
-                        Value::String("utf8mb4".into()),
-                        Value::Int64(16 * 1024 * 1024),
-                        Value::Null
-                    ]
-                );
+        match try_shim("SELECT database()").unwrap() {
+            ShimOutcome::Rows { rows, .. } => {
+                assert_eq!(rows[0].values(), &[Value::String("htap".into())]);
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert_eq!(try_shim("SELECT @@no_such_variable"), None);
-        assert_eq!(try_shim("SELECT @@version, id FROM t"), None);
     }
 
     #[test]

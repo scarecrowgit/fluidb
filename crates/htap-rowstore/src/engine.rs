@@ -127,6 +127,13 @@ pub struct EngineOptions {
     pub wal: WalOptions,
     /// Optional test-oriented fault hook invoked at named I/O boundaries.
     pub io_fault_hook: Option<IoFaultHook>,
+    /// Effective cap on the number of entries the applied-external-transactions ledger can hold,
+    /// enforced by [`Engine::prepare`]/[`Engine::apply_prepared`]/[`Engine::apply_external`].
+    /// Defaults to [`MAX_APPLIED_EXTERNAL_TXNS`], the hard on-disk manifest format bound; this
+    /// field can only ever be *lowered* (never raised past it — see
+    /// [`Self::with_max_applied_external_txns_for_test`]), since the manifest's own encoded
+    /// ledger is bounded by that constant regardless of this setting.
+    max_applied_external_txns: usize,
 }
 
 impl std::fmt::Debug for EngineOptions {
@@ -140,6 +147,7 @@ impl std::fmt::Debug for EngineOptions {
                 "io_fault_hook",
                 &self.io_fault_hook.as_ref().map(|_| "<io_fault_hook>"),
             )
+            .field("max_applied_external_txns", &self.max_applied_external_txns)
             .finish()
     }
 }
@@ -155,6 +163,7 @@ impl EngineOptions {
             dir,
             memtable_bytes: DEFAULT_MEMTABLE_BYTES,
             io_fault_hook: None,
+            max_applied_external_txns: MAX_APPLIED_EXTERNAL_TXNS,
         }
     }
 
@@ -186,6 +195,18 @@ impl EngineOptions {
     #[must_use]
     pub fn with_io_fault_hook(mut self, hook: IoFaultHook) -> Self {
         self.io_fault_hook = Some(hook);
+        self
+    }
+
+    /// Test-only override lowering the applied-external-transactions ledger capacity enforced by
+    /// [`Engine::prepare`]/[`Engine::apply_prepared`]/[`Engine::apply_external`], so a test can
+    /// exercise ledger-full rejection without committing a million transactions. Clamped to never
+    /// exceed [`MAX_APPLIED_EXTERNAL_TXNS`], the hard on-disk manifest format bound, which this
+    /// setting can never raise. Production code must not call this.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_max_applied_external_txns_for_test(mut self, cap: usize) -> Self {
+        self.max_applied_external_txns = cap.min(MAX_APPLIED_EXTERNAL_TXNS);
         self
     }
 }
@@ -564,8 +585,18 @@ impl Engine {
 
     /// Prepare a transaction by validating its batch of mutations.
     ///
-    /// Validates against empty batches and duplicate `(partition_id, key)` pairs.
-    /// Performs no conflict checks, WAL writes, memtable modifications, or visibility changes.
+    /// Validates against empty batches and duplicate `(partition_id, key)` pairs, then
+    /// performs the first-writer-wins conflict check (see [`Self::check_first_writer_wins`])
+    /// against the active memtable, immutable memtables, and SSTs at `snapshot`, unless
+    /// `snapshot.version == u64::MAX`, the sentinel `apply_external` always re-prepares with
+    /// (journal recovery / external replay, and every normal 2PC commit's own
+    /// `RowstoreParticipant::apply` step), where the check is skipped outright rather than run
+    /// for a guaranteed no-op (storage-reviewer finding F9). This is the authoritative conflict
+    /// check for the 2PC path: it runs and can fail *before* any caller (e.g. [`crate`]'s
+    /// `TransactionManager::commit`) durably journals an Intent or Commit record, so a rejected
+    /// `prepare` never leaves a dangling durable decision.
+    ///
+    /// Performs no WAL writes, memtable modifications, or visibility changes.
     pub fn prepare(
         &self,
         txn_id: u64,
@@ -593,11 +624,73 @@ impl Engine {
             }
         }
 
+        // Storage-reviewer finding F9 (performance): `apply_external` (journal recovery /
+        // external replay, and every normal 2PC commit's own `RowstoreParticipant::apply` step
+        // re-preparing before `apply_prepared_locked`) always calls this with the `u64::MAX`
+        // sentinel snapshot specifically because `check_first_writer_wins` can structurally never
+        // find a newer committed version than `u64::MAX` (see `apply_prepared_locked`'s doc
+        // comment). Running the check anyway wastes a real `find_newest_version` lookup per
+        // mutation (memtable + immutable memtables + SSTs) on every single commit for a check
+        // that is guaranteed to be a no-op; skip it outright in that case. The real conflict
+        // check for the 2PC path already ran with the transaction's actual snapshot in the
+        // `RowstoreParticipant::prepare` step that always precedes this re-prepare.
+        if snapshot.version.get() != u64::MAX {
+            // Storage-reviewer fix-pass finding: the applied-external-transactions ledger cap was
+            // previously only enforced at apply time (`apply_prepared_locked`/`apply_external`),
+            // so a full ledger let a 2PC transaction durably journal its Intent and Commit records
+            // and only then discover at apply that it can never be applied — a brick. Every real
+            // 2PC/direct-commit prepare (a non-`u64::MAX` snapshot) will, once it commits, consume
+            // exactly one new ledger slot (2PC transaction ids are never reused), so reject here,
+            // before any journal record, if the ledger is already full. `apply_external`'s own
+            // internal re-prepare (the `u64::MAX` sentinel path) already checked capacity itself
+            // before ever calling this, so it is intentionally excluded here.
+            let applied_len = self.commit_lock.lock().applied_txns.len();
+            if applied_len >= self.options.max_applied_external_txns {
+                return Err(HtapError::InvalidArgument(format!(
+                    "applied external transactions cap reached: {applied_len} >= {}",
+                    self.options.max_applied_external_txns
+                )));
+            }
+
+            let read_guard = self.read_state.read();
+            Self::check_first_writer_wins(&read_guard, &mutations, snapshot.version)?;
+        }
+
         Ok(PreparedTransaction {
             txn_id,
             snapshot,
             mutations,
         })
+    }
+
+    /// First-writer-wins conflict check shared by [`Self::prepare`] and
+    /// [`Self::apply_prepared_locked`].
+    ///
+    /// For each mutation's `(partition_id, key)`, finds the newest committed version across
+    /// active memtable, immutable memtables, and SSTs. If that version is newer than
+    /// `snapshot_version`, the writer's snapshot is stale and the transaction conflicts.
+    fn check_first_writer_wins(
+        read_guard: &ReadState,
+        mutations: &[Mutation],
+        snapshot_version: Version,
+    ) -> Result<()> {
+        for m in mutations {
+            let (partition_id, key) = match m {
+                Mutation::Put {
+                    partition_id, key, ..
+                } => (*partition_id, key.as_slice()),
+                Mutation::Delete { partition_id, key } => (*partition_id, key.as_slice()),
+            };
+            if let Some(newest_version) = Self::find_newest_version(read_guard, partition_id, key)?
+            {
+                if newest_version > snapshot_version {
+                    return Err(HtapError::Conflict(format!(
+                        "write-write conflict on partition {partition_id}, key {key:?}: newest committed version {newest_version} > snapshot {snapshot_version}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply a previously prepared transaction with an externally assigned commit version.
@@ -633,11 +726,16 @@ impl Engine {
                 )));
             }
 
-            // Reject new external transaction when ledger cap is full BEFORE any mutation
-            if commit_guard.applied_txns.len() >= MAX_APPLIED_EXTERNAL_TXNS {
+            // Reject new external transaction when ledger cap is full BEFORE any mutation.
+            // Defense in depth: `Engine::prepare` (for the 2PC/direct-commit path) and
+            // `Engine::apply_external` (for its own internal re-prepare) already check this
+            // before any journal record is written; this recheck should be unreachable in
+            // practice.
+            if commit_guard.applied_txns.len() >= self.options.max_applied_external_txns {
                 return Err(HtapError::InvalidArgument(format!(
-                    "applied external transactions cap reached: {} >= {MAX_APPLIED_EXTERNAL_TXNS}",
-                    commit_guard.applied_txns.len()
+                    "applied external transactions cap reached: {} >= {}",
+                    commit_guard.applied_txns.len(),
+                    self.options.max_applied_external_txns
                 )));
             }
         }
@@ -653,27 +751,28 @@ impl Engine {
             )));
         }
 
-        // 2. Conflict check (first-writer-wins)
-        {
+        // 2. Conflict check (first-writer-wins) — defense in depth.
+        //
+        // `Engine::prepare` (which built `prepared`) already ran this exact check via
+        // `check_first_writer_wins`. On the 2PC path (`RowstoreParticipant::prepare` ->
+        // `TransactionManager::commit`), the manager's `decision_lock` serializes the whole
+        // prepare..publish sequence per transaction, so no conflicting writer can land between
+        // `prepare` and `apply_prepared_locked` here: this recheck should be unreachable for
+        // 2PC transactions. It still matters for `Engine::commit` (the legacy direct-commit
+        // path), where `prepare` and this apply happen under separate lock acquisitions and a
+        // conflicting writer could in principle interleave between them. `apply_external`
+        // (journal recovery / external replay) intentionally re-prepares with a `u64::MAX`
+        // snapshot, which can structurally never trigger this check (no version is ever newer
+        // than `u64::MAX`); skip it outright in that case, exactly like `Engine::prepare` does,
+        // rather than running a real `find_newest_version` lookup per mutation for a guaranteed
+        // no-op (nit fix: this recheck previously always ran even for that sentinel).
+        if prepared.snapshot.version.get() != u64::MAX {
             let read_guard = self.read_state.read();
-            for m in &prepared.mutations {
-                let (partition_id, key) = match m {
-                    Mutation::Put {
-                        partition_id, key, ..
-                    } => (*partition_id, key.as_slice()),
-                    Mutation::Delete { partition_id, key } => (*partition_id, key.as_slice()),
-                };
-                if let Some(newest_version) =
-                    Self::find_newest_version(&read_guard, partition_id, key)?
-                {
-                    if newest_version > prepared.snapshot.version {
-                        return Err(HtapError::Conflict(format!(
-                            "write-write conflict on partition {partition_id}, key {key:?}: newest committed version {newest_version} > snapshot {}",
-                            prepared.snapshot.version
-                        )));
-                    }
-                }
-            }
+            Self::check_first_writer_wins(
+                &read_guard,
+                &prepared.mutations,
+                prepared.snapshot.version,
+            )?;
         }
 
         // 3. Append mutations and commit record to WAL
@@ -798,10 +897,11 @@ impl Engine {
             }
 
             // Reject new external transaction when ledger cap is full BEFORE prepare or any mutation
-            if commit_guard.applied_txns.len() >= MAX_APPLIED_EXTERNAL_TXNS {
+            if commit_guard.applied_txns.len() >= self.options.max_applied_external_txns {
                 return Err(HtapError::InvalidArgument(format!(
-                    "applied external transactions cap reached: {} >= {MAX_APPLIED_EXTERNAL_TXNS}",
-                    commit_guard.applied_txns.len()
+                    "applied external transactions cap reached: {} >= {}",
+                    commit_guard.applied_txns.len(),
+                    self.options.max_applied_external_txns
                 )));
             }
         }
@@ -860,6 +960,16 @@ impl Engine {
     /// 3. Assign `commit_version = committed_version.next()`.
     /// 4. Recheck first-writer-wins conflicts, append to WAL, and apply to active memtable.
     /// 5. Immediately publish `commit_version`.
+    ///
+    /// # Not for session/transaction code
+    ///
+    /// This is a single-shot, non-2PC commit path: it prepares, applies, and publishes in one
+    /// call with no Intent/Commit journal record and no coordination with other participants.
+    /// Session and transaction-manager code (anything going through `htap_txn::TransactionManager`)
+    /// must never call this directly — use `RowstoreParticipant` registered with the
+    /// `TransactionManager` instead, so that commits are durably journaled and go through
+    /// [`Self::prepare`]'s first-writer-wins check before any commit decision is made durable.
+    /// This method remains for engine-local tests and non-transactional callers only.
     pub fn commit(
         &self,
         txn_id: u64,

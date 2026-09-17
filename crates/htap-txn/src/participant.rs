@@ -243,6 +243,31 @@ pub trait TxnParticipant: Send + Sync {
         let _ = (txn_id, version);
         Ok(())
     }
+
+    /// This participant's own highest durably applied commit version, if it tracks one.
+    ///
+    /// [`crate::TransactionManager::recover`] uses this to cross-check that a participant never
+    /// silently drifts ahead of (or stays behind) the transaction journal it is registered with:
+    /// in one shared MVCC version domain, a participant's own durable state must land exactly on
+    /// the journal's replayed high-water mark once recovery has applied every committed
+    /// transaction. Defaults to `None` for participants that do not track a comparable version
+    /// (e.g. test mocks), which excludes them from that check.
+    ///
+    /// # Contract for participants that override this (return `Some`)
+    ///
+    /// The exact-match check above is only sound if **every** [`crate::TransactionManager`]
+    /// commit registered against this journal touches **every** participant that overrides
+    /// [`Self::committed_version`] to return `Some` — i.e. every such participant's
+    /// [`Self::apply`] is called for every committed transaction, so its own tracked version
+    /// advances in lockstep with the journal's replayed high-water mark. A participant that
+    /// overrides this but is only sometimes included in a transaction's participant set (so some
+    /// commits bump the journal's `max_version` without ever calling that participant's `apply`)
+    /// will fall behind and be reported as corruption by [`crate::TransactionManager::recover`]
+    /// even though nothing is actually wrong. Return `None` instead for a participant that does
+    /// not (or cannot) meet this "touched by every commit" contract.
+    fn committed_version(&self) -> Option<Version> {
+        None
+    }
 }
 
 /// Sorts a slice of references to participants in deterministic ascending order of their IDs.

@@ -17,16 +17,26 @@
 //! - Complete-PK `SELECT`: Point lookups projecting expressions or all columns matching the complete primary key in the `WHERE` clause, routed to the target partition while strictly preserving the rowstore fast path.
 //! - Analytic `SELECT`: Narrow OLAP scans projecting columns or aggregates (`COUNT`, `SUM`, `MIN`, `MAX`) with AND-only filters and optional `GROUP BY`, scanning all partitions of the table at a single visible snapshot and combining results.
 //!
+//! # Sessions and explicit transactions
+//!
+//! [`EmbeddedClient::execute`] auto-commits, exactly as before. [`EmbeddedClient::open_session`]
+//! opens a [`Session`] against the same underlying [`LocalServer`] for explicit
+//! `BEGIN`/`COMMIT`/`ROLLBACK`, session variables, and `autocommit = 0` (Phase 10); statements
+//! run through an open session buffer their writes in the session until `COMMIT` and never
+//! affect a concurrent `execute()` call or another session on the same server until then.
+//!
 //! # Network access
 //!
 //! [`RemoteClient`] connects to an `htapd` daemon (or an embedded [`htap_wire::WireServer`])
-//! over TCP using the MySQL text protocol and returns the same [`StatementResult`] shape.
+//! over TCP using the MySQL text protocol and returns the same [`StatementResult`] shape. Each
+//! `RemoteClient` connection is one server-side [`Session`] for its lifetime, so `BEGIN`/
+//! `COMMIT`/`ROLLBACK` sent as ordinary SQL through [`RemoteClient::execute`] behave the same
+//! way they do for an embedded [`Session`].
 //!
 //! # Explicit Scope Limitations & Non-Features
 //!
 //! This embedded client explicitly does **not** provide:
 //! - **No network transport in `EmbeddedClient`**: it executes in-process; use [`RemoteClient`] for TCP.
-//! - **No session state**: Each statement executes independently without connection-level state, session variables, or multi-statement transaction handles.
 //! - **No prepared statements**: Queries are parsed and planned synchronously on each call without prepared statement handles or binary parameter binding.
 //! - **Deferred partition & storage capabilities**: Physical data migration for populated partition reorganization, physical storage reclamation for dropped partitions, delete vectors, compaction, autonomous background conversion scheduling, hash/multiple tablets, distributed/remote movement, consensus/HA, and full MySQL compatibility remain deferred.
 
@@ -34,12 +44,14 @@
 #![warn(missing_docs)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use htap_common::Result;
 use htap_server::LocalServer;
 
 pub mod remote;
 
+pub use htap_server::{Session, SessionId};
 pub use htap_sql::{CommandResult, QueryResult, StatementResult};
 pub use htap_wire::ClientOptions;
 pub use remote::RemoteClient;
@@ -59,9 +71,10 @@ pub use remote::RemoteClient;
 ///
 /// # Unsupported Features & Limitations
 /// Does **not** support network connections (no host or port), MySQL wire protocol
-/// or client driver compatibility, sessions, or prepared statements.
+/// or client driver compatibility, or prepared statements. See [`EmbeddedClient::open_session`]
+/// for explicit transactions and session state.
 pub struct EmbeddedClient {
-    server: LocalServer,
+    server: Arc<LocalServer>,
 }
 
 impl EmbeddedClient {
@@ -75,7 +88,7 @@ impl EmbeddedClient {
     /// Returns [`htap_common::HtapError`] if directory creation, catalog recovery,
     /// or storage initialization fails.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let server = LocalServer::open(root)?;
+        let server = Arc::new(LocalServer::open(root)?);
         Ok(Self { server })
     }
 
@@ -96,5 +109,16 @@ impl EmbeddedClient {
     /// or underlying storage failure.
     pub fn execute(&self, sql: &str) -> Result<StatementResult> {
         self.server.execute(sql)
+    }
+
+    /// Opens a new [`Session`] against this client's underlying [`LocalServer`] for explicit
+    /// `BEGIN`/`COMMIT`/`ROLLBACK`, `autocommit = 0`, and session variables (Phase 10).
+    ///
+    /// A session's uncommitted writes are only ever visible to statements run through that same
+    /// session (read-your-own-writes); [`EmbeddedClient::execute`] and every other open session
+    /// on this server keep seeing only committed state until `COMMIT`. Dropping a session with
+    /// an open transaction rolls it back.
+    pub fn open_session(&self) -> Session {
+        self.server.open_session()
     }
 }

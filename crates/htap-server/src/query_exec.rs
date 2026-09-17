@@ -38,15 +38,18 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use htap_catalog::{CatalogSnapshot, TableDescriptor};
 use htap_common::error::{HtapError, Result};
-use htap_common::types::{DataType, Row, Value};
+use htap_common::types::{ColumnDef, DataType, Row, Value};
 use htap_rowstore::Snapshot;
 use htap_sql::ast::{AnalyticFilter, ComparisonOp};
-use htap_sql::expr::{cast_value, compare, AggFn, AggregateSpec, BinOp, EvalContext, Expr};
+use htap_sql::expr::{
+    cast_value, compare, AggFn, AggregateSpec, BinOp, EvalContext, Expr, VariableLookup,
+};
 use htap_sql::query::{
     BoundQuery, JoinKind, JoinSpec, OrderItem, QueryBody, SelectBody, SetOpKind, TableSlot,
 };
 use htap_sql::result::StatementResult;
 
+use crate::session::WriteSet;
 use crate::{olap, scan_partition_compact, LocalServer};
 
 /// Per-statement execution context.
@@ -54,6 +57,13 @@ pub(crate) struct ExecContext<'a> {
     pub server: &'a LocalServer,
     pub catalog: &'a CatalogSnapshot,
     pub snapshot: Snapshot,
+    /// Open transaction's buffered write set to overlay below relational operators, or `None`
+    /// in autocommit mode (byte-for-byte the pre-Phase-10 read path).
+    pub write_set: Option<&'a WriteSet>,
+    /// Source of values for `@name`/`@@name` expressions (Phase 10 task 7): the session's user
+    /// variables and live state, or [`crate::session::DefaultVariables`] when there is no
+    /// session (`LocalServer::execute`).
+    pub variables: Option<&'a dyn VariableLookup>,
 }
 
 /// Executes a bound query and returns its result set.
@@ -61,14 +71,85 @@ pub(crate) fn execute_query(
     server: &LocalServer,
     query: &BoundQuery,
     catalog: &CatalogSnapshot,
+    snapshot: Snapshot,
+    write_set: Option<&WriteSet>,
+    variables: Option<&dyn VariableLookup>,
 ) -> Result<StatementResult> {
     let ctx = ExecContext {
         server,
         catalog,
-        snapshot: Snapshot::new(server.txn_manager.visible_version()),
+        snapshot,
+        write_set,
+        variables,
     };
     let rows = run_query(&ctx, query)?;
-    Ok(StatementResult::query(query.output_columns.clone(), rows))
+    let dynamic = dynamic_output_flags(&query.body);
+    let columns = infer_dynamic_column_types(query.output_columns.clone(), &dynamic, &rows);
+    Ok(StatementResult::query(columns, rows))
+}
+
+/// Per-output-column flags mirroring `htap_sql::binder_query::body_output_columns`'s structure:
+/// `true` where the projection expression is [`htap_sql::expr::ExprType::is_dynamic`] (an
+/// `Expr::Variable`, whose bind-time static type is a placeholder, not its real type).
+fn dynamic_output_flags(body: &QueryBody) -> Vec<bool> {
+    match body {
+        QueryBody::Select(sel) => sel
+            .projection
+            .iter()
+            .map(|p| p.expr.expr_type().is_dynamic)
+            .collect(),
+        QueryBody::SetOp { left, right, .. } => {
+            let l = dynamic_output_flags(&left.body);
+            let r = dynamic_output_flags(&right.body);
+            l.iter().zip(r.iter()).map(|(a, b)| *a || *b).collect()
+        }
+    }
+}
+
+/// Storage-reviewer finding F10: a result column whose bind-time static type is
+/// [`htap_sql::expr::ExprType::is_dynamic`] (`@name`/`@@name`) is reported as a nullable string
+/// by `htap_sql::binder_query::body_output_columns` regardless of the variable's actual value, so
+/// a wire client that trusts the declared column type (as the MySQL text protocol requires: every
+/// value is sent as text and decoded according to its column's declared type) would decode an
+/// integer-valued system variable like `@@max_allowed_packet` as a string instead of an integer,
+/// unlike before variables were resolved as real expressions.
+///
+/// For each `dynamic[i]` column, this instead reports the type inferred from `rows`' actual
+/// values at that position: the shared [`DataType`] of every non-null value if they all agree,
+/// `DataType::String` if they disagree (or there were no rows/values to look at at all), and
+/// nullable if any row's value was `NULL` or there was no evidence either way. A `SELECT
+/// @x`/`SELECT @@sysvar` variable expression evaluates to the same value on every row (it never
+/// depends on row data), so in practice this is exactly that one value's type.
+fn infer_dynamic_column_types(
+    mut columns: Vec<ColumnDef>,
+    dynamic: &[bool],
+    rows: &[Row],
+) -> Vec<ColumnDef> {
+    for (i, col) in columns.iter_mut().enumerate() {
+        if !dynamic.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let mut inferred: Option<DataType> = None;
+        let mut consistent = true;
+        let mut saw_null = false;
+        for row in rows {
+            let Some(value) = row.get(i) else { continue };
+            match value.data_type() {
+                None => saw_null = true,
+                Some(dt) => match inferred {
+                    None => inferred = Some(dt),
+                    Some(existing) if existing == dt => {}
+                    Some(_) => consistent = false,
+                },
+            }
+        }
+        col.data_type = match (consistent, inferred) {
+            (true, Some(dt)) => dt,
+            _ => DataType::String,
+        };
+        col.nullable = saw_null || inferred.is_none();
+    }
+    columns
 }
 
 /// A produced row together with its `ORDER BY` sort keys.
@@ -107,7 +188,8 @@ pub(crate) fn run_query(ctx: &ExecContext<'_>, query: &BoundQuery) -> Result<Vec
             }
             let mut out = Vec::with_capacity(rows.len());
             for output in rows {
-                let keys = order_keys_from_output(&query.order_by, &output, &subqueries)?;
+                let keys =
+                    order_keys_from_output(&query.order_by, &output, &subqueries, ctx.variables)?;
                 out.push(Keyed { output, keys });
             }
             out
@@ -131,12 +213,14 @@ fn order_keys_from_output(
     order_by: &[OrderItem],
     output: &[Value],
     subqueries: &[Vec<Row>],
+    variables: Option<&dyn VariableLookup>,
 ) -> Result<Vec<Value>> {
     let ctx = EvalContext {
         row: &[],
         aggregates: &[],
         output: Some(output),
         subqueries,
+        variables,
     };
     order_by.iter().map(|o| o.expr.eval(&ctx)).collect()
 }
@@ -274,7 +358,15 @@ fn run_select(
         let right_offset = sel.slot_offset(join.right_slot);
         let right_width = sel.slots[join.right_slot].width();
         debug_assert_eq!(j + 1, join.right_slot);
-        current = join_rows(current, right, right_offset, right_width, join, subqueries)?;
+        current = join_rows(
+            current,
+            right,
+            right_offset,
+            right_width,
+            join,
+            subqueries,
+            ctx.variables,
+        )?;
     }
 
     // 4. WHERE.
@@ -286,6 +378,7 @@ fn run_select(
                 aggregates: &[],
                 output: None,
                 subqueries,
+                variables: ctx.variables,
             };
             if filter.eval_predicate(&c)? {
                 kept.push(row);
@@ -305,6 +398,7 @@ fn run_select(
                 aggregates: &[],
                 output: None,
                 subqueries,
+                variables: ctx.variables,
             };
             let key: Vec<Value> = sel
                 .group_by
@@ -341,13 +435,16 @@ fn run_select(
                 .zip(sel.aggregates.iter())
                 .map(|(s, spec)| s.finish(spec))
                 .collect::<Result<_>>()?;
-            if let Some(k) = project_row(sel, order_by, &row, &aggregates, subqueries)? {
+            if let Some(k) =
+                project_row(sel, order_by, &row, &aggregates, subqueries, ctx.variables)?
+            {
                 produced.push(k);
             }
         }
     } else {
         for row in current {
-            if let Some(k) = project_row(sel, order_by, &row, &no_aggs, subqueries)? {
+            if let Some(k) = project_row(sel, order_by, &row, &no_aggs, subqueries, ctx.variables)?
+            {
                 produced.push(k);
             }
         }
@@ -368,12 +465,14 @@ fn project_row(
     row: &[Value],
     aggregates: &[Value],
     subqueries: &[Vec<Row>],
+    variables: Option<&dyn VariableLookup>,
 ) -> Result<Option<Keyed>> {
     let c = EvalContext {
         row,
         aggregates,
         output: None,
         subqueries,
+        variables,
     };
     let output: Vec<Value> = sel
         .projection
@@ -385,6 +484,7 @@ fn project_row(
         aggregates,
         output: Some(&output),
         subqueries,
+        variables,
     };
     if let Some(h) = &sel.having {
         if !h.eval_predicate(&c)? {
@@ -533,6 +633,7 @@ pub(crate) fn scan_base_table(
             &source_columns,
             &table_desc.primary_key,
             pushdown.as_ref(),
+            ctx.write_set,
         )?;
         for row in rows {
             let mut full = vec![Value::Null; width];
@@ -555,6 +656,7 @@ fn join_rows(
     right_width: usize,
     join: &JoinSpec,
     subqueries: &[Vec<Row>],
+    variables: Option<&dyn VariableLookup>,
 ) -> Result<Vec<Vec<Value>>> {
     let null_right = vec![Value::Null; right_width];
     let mut out = Vec::new();
@@ -606,6 +708,7 @@ fn join_rows(
             aggregates: &[],
             output: None,
             subqueries,
+            variables,
         })
     };
 

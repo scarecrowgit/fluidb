@@ -10,8 +10,9 @@ pub mod participant;
 pub mod rowstore;
 
 pub use journal::{
-    decode_frame_slice, encode_frame, FrameStatus, Journal, JournalOptions, JournalRecord,
-    JournalScan, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_JOURNAL_SIZE, HEADER_SIZE,
+    decode_frame_slice, encode_frame, intent_frame_size_bound, FrameStatus, Journal,
+    JournalOptions, JournalRecord, JournalScan, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_JOURNAL_SIZE,
+    HEADER_SIZE,
 };
 pub use manager::{RecoveryReport, Transaction, TransactionManager, TxnState};
 pub use participant::{

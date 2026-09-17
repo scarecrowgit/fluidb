@@ -2,11 +2,11 @@
 //! UPDATE, DROP TABLE and SHOW/DESCRIBE.
 
 use htap_catalog::{CatalogSnapshot, TableDescriptor, TableId};
-use htap_common::error::HtapError;
+use htap_common::error::{HtapError, Result};
 use htap_common::types::{DataType, Row, Value};
 use htap_sql::{
     bind, parse_one, BoundQuery, BoundStatement, EvalContext, Expr, JoinKind, QueryBody,
-    ShowStatement, TableSlot, UpdateTarget,
+    ShowStatement, TableSlot, UpdateTarget, VariableLookup,
 };
 
 fn catalog() -> CatalogSnapshot {
@@ -627,4 +627,128 @@ fn test_bound_predicate_evaluation_with_joined_rows() {
     let row = joined(Value::Float64(6.0), "cid");
     assert!(filter.eval_predicate(&EvalContext::row_only(&row)).unwrap());
     let _ = Row::new(vec![]);
+}
+
+struct FakeVars {
+    x: Option<Value>,
+    autocommit: Value,
+}
+
+impl VariableLookup for FakeVars {
+    fn lookup(&self, name: &str, is_system: bool) -> Result<Value> {
+        match (is_system, name) {
+            (false, "x") => Ok(self.x.clone().unwrap_or(Value::Null)),
+            (false, _) => Ok(Value::Null),
+            (true, "autocommit") => Ok(self.autocommit.clone()),
+            (true, _) => Err(HtapError::Unsupported(format!(
+                "unknown system variable '{name}'"
+            ))),
+        }
+    }
+}
+
+#[test]
+fn test_user_and_system_variable_binding() {
+    // A bare user variable with no FROM clause binds through the zero-table general path.
+    let q = bind_query("SELECT @x");
+    let proj = &select_body(&q).projection;
+    assert_eq!(proj.len(), 1);
+    assert_eq!(
+        proj[0].expr,
+        Expr::Variable {
+            name: "x".into(),
+            is_system: false,
+        }
+    );
+    assert_eq!(proj[0].name, "@x");
+    let t = proj[0].expr.expr_type();
+    assert!(t.nullable);
+    assert!(t.is_dynamic);
+
+    // `@@name` (unscoped) is a session-scoped system variable.
+    let q2 = bind_query("SELECT @@autocommit");
+    assert_eq!(
+        select_body(&q2).projection[0].expr,
+        Expr::Variable {
+            name: "autocommit".into(),
+            is_system: true,
+        }
+    );
+
+    // `@@session.name` strips the explicit scope qualifier.
+    let q3 = bind_query("SELECT @@session.autocommit");
+    assert_eq!(
+        select_body(&q3).projection[0].expr,
+        Expr::Variable {
+            name: "autocommit".into(),
+            is_system: true,
+        }
+    );
+
+    // A variable also binds inside a WHERE clause, comparing against a real column.
+    let q4 = bind_query("SELECT name FROM users WHERE age = @x");
+    let filter = select_body(&q4).filter.clone().unwrap();
+    let row = vec![
+        Value::Int32(1),
+        Value::String("ann".into()),
+        Value::Int32(30),
+        Value::Float64(1.0),
+    ];
+    let vars = FakeVars {
+        x: None,
+        autocommit: Value::Int64(1),
+    };
+    // No lookup provided: an unset user variable is NULL, so `age = NULL` is never true.
+    assert!(!filter.eval_predicate(&EvalContext::row_only(&row)).unwrap());
+    let ctx = EvalContext {
+        row: &row,
+        aggregates: &[],
+        output: None,
+        subqueries: &[],
+        variables: Some(&vars),
+    };
+    assert!(!filter.eval_predicate(&ctx).unwrap());
+    let vars_match = FakeVars {
+        x: Some(Value::Int32(30)),
+        autocommit: Value::Int64(1),
+    };
+    let ctx_match = EvalContext {
+        variables: Some(&vars_match),
+        ..ctx
+    };
+    assert!(filter.eval_predicate(&ctx_match).unwrap());
+
+    // A system variable with no lookup provided is a clear error, not a panic.
+    let sys = Expr::Variable {
+        name: "autocommit".into(),
+        is_system: true,
+    };
+    assert!(matches!(
+        sys.eval(&EvalContext::row_only(&[])),
+        Err(HtapError::Unsupported(_))
+    ));
+    // The same variable resolves once a lookup is available.
+    assert_eq!(
+        sys.eval(&EvalContext {
+            row: &[],
+            aggregates: &[],
+            output: None,
+            subqueries: &[],
+            variables: Some(&vars),
+        })
+        .unwrap(),
+        Value::Int64(1)
+    );
+}
+
+#[test]
+fn test_global_scope_rejected() {
+    assert!(matches!(
+        bind_err("SELECT @@global.autocommit"),
+        HtapError::Unsupported(_)
+    ));
+    assert!(matches!(
+        bind_err("SELECT @@GLOBAL.autocommit FROM users"),
+        HtapError::Unsupported(_)
+    ));
 }

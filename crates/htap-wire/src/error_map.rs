@@ -20,6 +20,7 @@ pub fn map_htap_error(err: &HtapError) -> (u16, &'static str) {
         | HtapError::Fenced { .. }
         | HtapError::CounterOverflow { .. }
         | HtapError::DurablePending { .. }
+        | HtapError::RecoveryRequired { .. }
         | HtapError::Internal(_) => ER_UNKNOWN,
     }
 }
@@ -151,6 +152,13 @@ mod tests {
                 },
                 1105,
             ),
+            (
+                HtapError::RecoveryRequired {
+                    blocking_txn: 1,
+                    reason: "x".into(),
+                },
+                1105,
+            ),
             (HtapError::Internal("x".into()), 1105),
         ];
         for (err, code) in cases {
@@ -176,6 +184,39 @@ mod tests {
             wire_error_to_htap(1045, "m".into()),
             HtapError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn durable_pending_never_maps_to_the_retryable_conflict_code() {
+        // Storage-reviewer finding F1: a session that surfaces `DurablePending` after an
+        // ambiguous commit must never be reported to a MySQL client as 1213/`40001`
+        // ("rolled back, retry"), since the write may already have applied; a client that
+        // retries on that code could double-apply it.
+        let err = HtapError::DurablePending {
+            txn_id: 1,
+            version: Version::new(2),
+            reason: "commit sync failed at decision boundary".into(),
+        };
+        let mapped = map_htap_error(&err);
+        assert_ne!(mapped.0, 1213, "DurablePending must not map to 1213");
+        assert_ne!(mapped.1, "40001", "DurablePending must not map to 40001");
+        assert_eq!(mapped, ER_UNKNOWN, "DurablePending maps to 1105/HY000");
+    }
+
+    #[test]
+    fn recovery_required_never_maps_to_the_retryable_conflict_code() {
+        // Fix-pass item 5: a session commit rejected because the manager is latched behind an
+        // unrelated, still-ambiguous transaction must never be reported as 1213/`40001`
+        // ("rolled back, retry") either — the caller's own transaction never committed at all,
+        // but it is not a write-write conflict, and the wording matters for client retry logic.
+        let err = HtapError::RecoveryRequired {
+            blocking_txn: 9,
+            reason: "manager is latched pending recovery of an earlier ambiguous commit".into(),
+        };
+        let mapped = map_htap_error(&err);
+        assert_ne!(mapped.0, 1213, "RecoveryRequired must not map to 1213");
+        assert_ne!(mapped.1, "40001", "RecoveryRequired must not map to 40001");
+        assert_eq!(mapped, ER_UNKNOWN, "RecoveryRequired maps to 1105/HY000");
     }
 
     #[test]

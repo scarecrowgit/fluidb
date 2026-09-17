@@ -621,7 +621,7 @@ fn is_integer_literal(v: &sql::Value) -> bool {
 
 fn require_bool(expr: &Expr, clause: &str) -> Result<()> {
     let t = expr.expr_type();
-    if t.data_type != DataType::Bool && !t.is_null_literal {
+    if t.data_type != DataType::Bool && !t.is_permissive() {
         return Err(invalid(format!(
             "{clause} condition must be boolean, found {}",
             t.data_type.name()
@@ -643,7 +643,8 @@ fn check_grouped(expr: &Expr, group_by: &[Expr], what: &str) -> Result<()> {
         | Expr::Literal(_)
         | Expr::AggregateRef { .. }
         | Expr::ScalarSubquery { .. }
-        | Expr::Exists { .. } => Ok(()),
+        | Expr::Exists { .. }
+        | Expr::Variable { .. } => Ok(()),
         Expr::BinaryOp { left, right, .. } => {
             check_grouped(left, group_by, what)?;
             check_grouped(right, group_by, what)
@@ -1037,6 +1038,57 @@ fn limit_literal(expr: &SqlExpr, what: &str) -> Result<u64> {
     }
 }
 
+/// Parses a MySQL variable identifier with no scope qualifier: `@name` (user variable) or
+/// `@@name` (unscoped system variable; MySQL treats this as session-scoped). Returns `Ok(None)`
+/// if `raw` does not start with `@` (an ordinary column reference).
+///
+/// The MySQL dialect's tokenizer treats `@` as an identifier-start character
+/// (`vendor/sqlparser/src/dialect/mysql.rs`), so `@x` and `@@x` each arrive as one
+/// `Expr::Identifier`, not a unary operator applied to a bare identifier.
+fn parse_variable_ident(raw: &str) -> Result<Option<Expr>> {
+    let (rest, is_system) = if let Some(r) = raw.strip_prefix("@@") {
+        (r, true)
+    } else if let Some(r) = raw.strip_prefix('@') {
+        (r, false)
+    } else {
+        return Ok(None);
+    };
+    if rest.is_empty() {
+        return Err(invalid("empty variable name"));
+    }
+    Ok(Some(Expr::Variable {
+        name: rest.to_string(),
+        is_system,
+    }))
+}
+
+/// Parses `@@session.name` / `@@global.name`: a two-part compound identifier whose first part
+/// starts with `@@` (the `.` is not an identifier character, so the tokenizer splits `@@scope`
+/// and `name` into separate parts). Returns `Ok(None)` if `qualifier` does not start with `@@`
+/// (an ordinary qualified column reference, e.g. `t.c`).
+fn parse_scoped_system_variable(qualifier: &str, name: &str) -> Result<Option<Expr>> {
+    let Some(scope) = qualifier.strip_prefix("@@") else {
+        return Ok(None);
+    };
+    if scope.eq_ignore_ascii_case("global") {
+        return Err(unsupported(
+            "SET/SELECT @@GLOBAL is not supported; this engine only exposes SESSION-scoped system variables",
+        ));
+    }
+    if !scope.eq_ignore_ascii_case("session") {
+        return Err(unsupported(format!(
+            "unsupported system variable scope '{scope}'"
+        )));
+    }
+    if name.is_empty() {
+        return Err(invalid("empty system variable name"));
+    }
+    Ok(Some(Expr::Variable {
+        name: name.to_string(),
+        is_system: true,
+    }))
+}
+
 /// Expression binder over a set of slots.
 struct ExprBinder<'a> {
     slots: &'a [SlotInfo],
@@ -1204,9 +1256,18 @@ impl<'a> ExprBinder<'a> {
     fn bind(&mut self, expr: &SqlExpr) -> Result<Expr> {
         match expr {
             SqlExpr::Nested(inner) => self.bind(inner),
-            SqlExpr::Identifier(ident) => self.resolve_column(None, &ident.value),
+            SqlExpr::Identifier(ident) => match parse_variable_ident(&ident.value)? {
+                Some(v) => Ok(v),
+                None => self.resolve_column(None, &ident.value),
+            },
             SqlExpr::CompoundIdentifier(parts) => match parts.len() {
-                2 => self.resolve_column(Some(&parts[0].value), &parts[1].value),
+                2 => {
+                    if let Some(v) = parse_scoped_system_variable(&parts[0].value, &parts[1].value)?
+                    {
+                        return Ok(v);
+                    }
+                    self.resolve_column(Some(&parts[0].value), &parts[1].value)
+                }
                 _ => Err(unsupported(format!(
                     "multi-part column reference not supported: {expr}"
                 ))),
@@ -1321,7 +1382,7 @@ impl<'a> ExprBinder<'a> {
                 let p = self.bind(pattern)?;
                 for (x, what) in [(&e, "LIKE operand"), (&p, "LIKE pattern")] {
                     let t = x.expr_type();
-                    if t.data_type != DataType::String && !t.is_null_literal {
+                    if t.data_type != DataType::String && !t.is_permissive() {
                         return Err(invalid(format!(
                             "{what} must be a string, found {}",
                             t.data_type.name()
@@ -1581,7 +1642,7 @@ impl<'a> ExprBinder<'a> {
             "LENGTH" | "OCTET_LENGTH" => {
                 arity(1)?;
                 let t = args[0].expr_type();
-                if !matches!(t.data_type, DataType::String | DataType::Bytes) && !t.is_null_literal
+                if !matches!(t.data_type, DataType::String | DataType::Bytes) && !t.is_permissive()
                 {
                     return Err(invalid(format!("{name} requires a string argument")));
                 }
@@ -1805,7 +1866,7 @@ fn is_numeric_type(t: &ExprType) -> bool {
 
 fn require_numeric(e: &Expr, what: &str) -> Result<()> {
     let t = e.expr_type();
-    if !is_numeric_type(&t) && !t.is_null_literal {
+    if !is_numeric_type(&t) && !t.is_permissive() {
         return Err(invalid(format!(
             "{what} requires a numeric operand, found {}",
             t.data_type.name()
@@ -1816,7 +1877,7 @@ fn require_numeric(e: &Expr, what: &str) -> Result<()> {
 
 fn require_string(e: &Expr, what: &str) -> Result<()> {
     let t = e.expr_type();
-    if t.data_type != DataType::String && !t.is_null_literal {
+    if t.data_type != DataType::String && !t.is_permissive() {
         return Err(invalid(format!(
             "{what} requires a string argument, found {}",
             t.data_type.name()
@@ -1828,7 +1889,7 @@ fn require_string(e: &Expr, what: &str) -> Result<()> {
 fn check_comparable(l: &Expr, r: &Expr, what: &str) -> Result<()> {
     let lt = l.expr_type();
     let rt = r.expr_type();
-    if lt.is_null_literal || rt.is_null_literal {
+    if lt.is_permissive() || rt.is_permissive() {
         return Ok(());
     }
     if lt.data_type == rt.data_type || (is_numeric_type(&lt) && is_numeric_type(&rt)) {
@@ -1864,7 +1925,7 @@ fn common_type(exprs: &[Expr], what: &str) -> Result<(DataType, bool)> {
     for e in exprs {
         let t = e.expr_type();
         nullable |= t.nullable;
-        if t.is_null_literal {
+        if t.is_permissive() {
             continue;
         }
         result = Some(match result {
@@ -1888,6 +1949,11 @@ fn coerce_to_column(expr: Expr, col: &ColumnDef) -> Result<Expr> {
         if !col.nullable {
             return Err(invalid(format!("column '{}' is NOT NULL", col.name)));
         }
+        return Ok(expr);
+    }
+    if t.is_dynamic {
+        // The value is only known at evaluation time: it may or may not be NULL, so the
+        // NOT NULL constraint is enforced when the assignment executes, not here.
         return Ok(expr);
     }
     if t.data_type == col.data_type {

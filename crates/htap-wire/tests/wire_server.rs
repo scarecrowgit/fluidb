@@ -422,10 +422,19 @@ fn test_com_init_db_known_and_unknown_db() {
 fn test_shim_set_and_version_comment() {
     let (_dir, wire) = start(None, 4);
     let mut c = WireClient::connect(addr(&wire), None).unwrap();
+    // `SET NAMES` and `SELECT @@sysvar` now flow through the connection's real
+    // `htap_server::Session` (Phase 10 task 9), not a hardcoded shim.
     let r = ok(c.query("SET NAMES utf8mb4").unwrap());
     assert_eq!(r.affected_rows, 0);
     let rs = rows(c.query("select @@version_comment limit 1").unwrap());
     assert_eq!(rs, vec![Row::new(vec![Value::String("fluidb".into())])]);
+    // A system variable's bind-time static column type is a placeholder nullable string (its
+    // real type is only known when it's evaluated; see `htap_sql::expr::ExprType::is_dynamic`),
+    // but the server infers the reported column type from the actual evaluated value
+    // (storage-reviewer finding F10, `htap_server::query_exec::infer_dynamic_column_types`), so
+    // an integer-valued variable like `max_allowed_packet` still decodes as `Int64`, exactly like
+    // the old hardcoded shim. `@@socket`'s `NULL` is unaffected either way: `NULL` is
+    // encoded/decoded the same way regardless of declared column type.
     let rs = rows(c.query("SELECT @@max_allowed_packet, @@socket").unwrap());
     assert_eq!(
         rs,
@@ -436,9 +445,213 @@ fn test_shim_set_and_version_comment() {
         rs,
         vec![Row::new(vec![Value::String(SERVER_VERSION.into())])]
     );
-    // Unknown system variables fall through to the engine and fail as SQL.
+    // Unknown system variables fail as SQL, now from the general query executor's bind step
+    // rather than the shim.
     let err = c.query("SELECT @@does_not_exist").unwrap_err();
     assert!(matches!(err, WireError::Server { .. }));
+    wire.shutdown();
+}
+
+#[test]
+fn test_shim_charset_set_forms_over_wire() {
+    // `SET CHARACTER SET <x>` / `SET CHARSET <x>` have no AST node in `vendor/sqlparser`, so
+    // they are the one `SET` form still answered by the wire-layer shim rather than the
+    // session (see `htap_wire::shim`).
+    let (_dir, wire) = start(None, 4);
+    let mut c = WireClient::connect(addr(&wire), None).unwrap();
+    ok(c.query("SET CHARACTER SET utf8mb4").unwrap());
+    ok(c.query("SET CHARSET utf8mb4").unwrap());
+    // The connection is still usable afterwards, and other SET forms still work through the
+    // real session.
+    ok(c.query("SET autocommit = 1").unwrap());
+    wire.shutdown();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 10 task 9: one real `htap_server::Session` per connection.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_wire_begin_commit_rollback_round_trip() {
+    let (_dir, wire) = start(None, 4);
+    let mut c = WireClient::connect(addr(&wire), None).unwrap();
+    ok(c.query("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap());
+
+    ok(c.query("BEGIN").unwrap());
+    ok(c.query("INSERT INTO t (id, v) VALUES (1, 10)").unwrap());
+    // Read-your-own-writes on the same connection, before COMMIT.
+    assert_eq!(
+        rows(c.query("SELECT v FROM t WHERE id = 1").unwrap()),
+        vec![Row::new(vec![Value::Int32(10)])]
+    );
+
+    // A second, separate connection (a separate session) does not see the uncommitted write.
+    let mut other = WireClient::connect(addr(&wire), None).unwrap();
+    assert!(rows(other.query("SELECT id FROM t WHERE id = 1").unwrap()).is_empty());
+
+    ok(c.query("COMMIT").unwrap());
+    assert_eq!(
+        rows(other.query("SELECT v FROM t WHERE id = 1").unwrap()),
+        vec![Row::new(vec![Value::Int32(10)])]
+    );
+
+    ok(c.query("BEGIN").unwrap());
+    ok(c.query("UPDATE t SET v = 999 WHERE id = 1").unwrap());
+    ok(c.query("ROLLBACK").unwrap());
+    assert_eq!(
+        rows(other.query("SELECT v FROM t WHERE id = 1").unwrap()),
+        vec![Row::new(vec![Value::Int32(10)])],
+        "a rolled-back transaction must never be visible"
+    );
+    wire.shutdown();
+}
+
+#[test]
+fn test_wire_rollback_on_disconnect() {
+    let (_dir, wire) = start(None, 4);
+    let mut setup = WireClient::connect(addr(&wire), None).unwrap();
+    ok(setup
+        .query("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap());
+
+    {
+        let mut c = WireClient::connect(addr(&wire), None).unwrap();
+        ok(c.query("BEGIN").unwrap());
+        ok(c.query("INSERT INTO t (id, v) VALUES (1, 10)").unwrap());
+        c.quit().unwrap();
+        // `c` disconnects without COMMIT: the wire layer's per-connection `Session` must roll
+        // back its open transaction (explicit rollback on `COM_QUIT`, Phase 10 task 9).
+    }
+
+    assert!(
+        rows(setup.query("SELECT id FROM t WHERE id = 1").unwrap()).is_empty(),
+        "a disconnected connection's uncommitted write must never become visible"
+    );
+    wire.shutdown();
+}
+
+#[test]
+fn test_wire_concurrent_sessions_conflict_returns_1213() {
+    let (_dir, wire) = start(None, 4);
+    let mut setup = WireClient::connect(addr(&wire), None).unwrap();
+    ok(setup
+        .query("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap());
+    ok(setup.query("INSERT INTO t (id, v) VALUES (1, 1)").unwrap());
+
+    let mut a = WireClient::connect(addr(&wire), None).unwrap();
+    ok(a.query("BEGIN").unwrap());
+    ok(a.query("UPDATE t SET v = 2 WHERE id = 1").unwrap());
+
+    // A second, autocommit connection commits the same key first.
+    ok(setup.query("UPDATE t SET v = 99 WHERE id = 1").unwrap());
+
+    let err = a.query("COMMIT").unwrap_err();
+    assert_eq!(server_code(err), 1213);
+
+    // The connection is still usable afterwards: the losing transaction is gone (aborted), not
+    // stuck.
+    assert_eq!(
+        rows(a.query("SELECT v FROM t WHERE id = 1").unwrap()),
+        vec![Row::new(vec![Value::Int32(99)])]
+    );
+    assert_eq!(
+        rows(setup.query("SELECT v FROM t WHERE id = 1").unwrap()),
+        vec![Row::new(vec![Value::Int32(99)])]
+    );
+    wire.shutdown();
+}
+
+#[test]
+fn test_wire_set_autocommit_and_user_variable_round_trip() {
+    let (_dir, wire) = start(None, 4);
+    let mut c = WireClient::connect(addr(&wire), None).unwrap();
+    ok(c.query("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap());
+
+    ok(c.query("SET @x = 42").unwrap());
+    // `@x`'s bind-time static column type is a placeholder nullable string (see
+    // `test_shim_set_and_version_comment`'s comment on `ExprType::is_dynamic` and
+    // storage-reviewer finding F10), but the reported column type is inferred from the actual
+    // value, so `@x` decodes as `Int64`, matching the session's own `Int64` storage.
+    assert_eq!(
+        rows(c.query("SELECT @x").unwrap()),
+        vec![Row::new(vec![Value::Int64(42)])]
+    );
+
+    ok(c.query("SET autocommit = 0").unwrap());
+    ok(c.query("INSERT INTO t (id, v) VALUES (1, 10)").unwrap());
+    // Autocommit is off: the first statement implicitly began a transaction, so a separate
+    // connection must not see the write yet.
+    let mut other = WireClient::connect(addr(&wire), None).unwrap();
+    assert!(rows(other.query("SELECT id FROM t WHERE id = 1").unwrap()).is_empty());
+
+    ok(c.query("COMMIT").unwrap());
+    assert_eq!(
+        rows(other.query("SELECT v FROM t WHERE id = 1").unwrap()),
+        vec![Row::new(vec![Value::Int32(10)])]
+    );
+    wire.shutdown();
+}
+
+#[test]
+fn test_wire_sysvar_reads_now_reflect_session_state() {
+    let (_dir, wire) = start(None, 4);
+    let mut c = WireClient::connect(addr(&wire), None).unwrap();
+
+    // `@@autocommit`'s bind-time static column type is a placeholder nullable string (see
+    // `test_shim_set_and_version_comment`'s comment on `ExprType::is_dynamic` and
+    // storage-reviewer finding F10), but the reported column type is inferred from the actual
+    // value, so it decodes as `Int64`, matching `system_variable_value`'s own `Value::Int64`.
+    //
+    // Default: autocommit on.
+    assert_eq!(
+        rows(c.query("SELECT @@autocommit").unwrap()),
+        vec![Row::new(vec![Value::Int64(1)])]
+    );
+
+    ok(c.query("SET autocommit = 0").unwrap());
+    assert_eq!(
+        rows(c.query("SELECT @@autocommit").unwrap()),
+        vec![Row::new(vec![Value::Int64(0)])]
+    );
+
+    // A separate connection's session state is unaffected.
+    let mut other = WireClient::connect(addr(&wire), None).unwrap();
+    assert_eq!(
+        rows(other.query("SELECT @@autocommit").unwrap()),
+        vec![Row::new(vec![Value::Int64(1)])]
+    );
+    wire.shutdown();
+}
+
+/// The `mysql` crate (real driver) still connects and runs SQL under the new per-connection
+/// session, including a `SET` form the shim still fakes (`SET NAMES`) and an ordinary
+/// transaction.
+#[test]
+fn test_wire_mysql_connector_startup_still_works() {
+    use mysql::prelude::*;
+    let (_dir, wire) = start(None, 4);
+    let opts = mysql::OptsBuilder::new()
+        .ip_or_hostname(Some("127.0.0.1"))
+        .tcp_port(addr(&wire).port())
+        .user(Some("root"))
+        .prefer_socket(false)
+        .max_allowed_packet(Some(16 * 1024 * 1024));
+    let mut conn = mysql::Conn::new(opts).unwrap();
+    conn.ping().unwrap();
+    conn.query_drop("SET NAMES utf8mb4").unwrap();
+    conn.query_drop("CREATE TABLE conn_t (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    conn.query_drop("START TRANSACTION").unwrap();
+    conn.query_drop("INSERT INTO conn_t (id, v) VALUES (1, 10)")
+        .unwrap();
+    conn.query_drop("COMMIT").unwrap();
+    let got: Option<i32> = conn
+        .query_first("SELECT v FROM conn_t WHERE id = 1")
+        .unwrap();
+    assert_eq!(got, Some(10));
     wire.shutdown();
 }
 

@@ -211,6 +211,49 @@ fn test_route_classification() {
     );
 }
 
+/// A `@`/`@@` variable anywhere in an otherwise-narrow `SELECT` forces the general query path:
+/// the narrow point/analytic binders have no notion of `Expr::Variable` and would otherwise try
+/// (and fail) to resolve `@x` as a column.
+#[test]
+fn test_narrow_shape_gate_excludes_variables() {
+    let ddl = "CREATE TABLE t (pk INT PRIMARY KEY, c INT)";
+    let parsed_ddl = parse_one(ddl).expect("parse CREATE TABLE");
+    let bound_ddl = bind(&parsed_ddl, &CatalogSnapshot::empty()).expect("bind CREATE TABLE");
+    let create_table = match &bound_ddl {
+        BoundStatement::CreateTable(create) => create.clone(),
+        other => panic!("expected CreateTable, got {other:?}"),
+    };
+    let table = TableDescriptor::new(
+        TableId(1),
+        create_table.name,
+        create_table.schema,
+        create_table.primary_key,
+        vec![],
+        1,
+    );
+    let catalog = CatalogSnapshot::new(1, vec![table], vec![], vec![], vec![]);
+    let row_storage = StorageDescriptor::Row;
+
+    // A variable in the projection: without the exclusion this would still look narrow
+    // (`Expr::Identifier`) and bind to `PointSelect`, which cannot resolve `@x`.
+    let bound_projection =
+        bind(&parse_one("SELECT @x FROM t WHERE pk=1").unwrap(), &catalog).expect("bind SELECT @x");
+    assert!(matches!(bound_projection, BoundStatement::Query(_)));
+    assert_eq!(
+        classify_route(&bound_projection, &row_storage).unwrap(),
+        Route::Query
+    );
+
+    // A variable in the WHERE clause.
+    let bound_filter = bind(&parse_one("SELECT c FROM t WHERE pk=@x").unwrap(), &catalog)
+        .expect("bind SELECT ... WHERE pk=@x");
+    assert!(matches!(bound_filter, BoundStatement::Query(_)));
+    assert_eq!(
+        classify_route(&bound_filter, &row_storage).unwrap(),
+        Route::Query
+    );
+}
+
 /// R5 pin: a complete-PK, simple-projection SELECT still binds to `PointSelect` and routes
 /// to `RowstorePointRead`, never to the general query executor, even though the same table
 /// participates in joins elsewhere. Adding any general clause (LIMIT, alias, join, OR)

@@ -152,12 +152,18 @@ pub struct AggregateSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExprType {
     /// Data type. A bare `NULL` literal is typed as [`DataType::String`] and marked
-    /// [`ExprType::is_null_literal`].
+    /// [`ExprType::is_null_literal`]. A [`Expr::Variable`] is also typed as
+    /// [`DataType::String`] (nullable) and marked [`ExprType::is_dynamic`]: its true type is
+    /// only known when it is evaluated, since user variables hold whatever was last assigned
+    /// to them and system variables can be strings or integers.
     pub data_type: DataType,
     /// Whether the expression can evaluate to `NULL`.
     pub nullable: bool,
     /// Whether the expression is the literal `NULL`.
     pub is_null_literal: bool,
+    /// Whether the expression is a variable ([`Expr::Variable`]): its reported `data_type` is
+    /// a placeholder, not a real static type.
+    pub is_dynamic: bool,
 }
 
 impl ExprType {
@@ -166,6 +172,7 @@ impl ExprType {
             data_type,
             nullable,
             is_null_literal: false,
+            is_dynamic: false,
         }
     }
 
@@ -175,6 +182,12 @@ impl ExprType {
             self.data_type,
             DataType::Int32 | DataType::Int64 | DataType::Float64
         )
+    }
+
+    /// Whether static type checks should treat this expression as compatible with anything:
+    /// `NULL` literals and variables, whose real type is only known at evaluation time.
+    pub fn is_permissive(&self) -> bool {
+        self.is_null_literal || self.is_dynamic
     }
 }
 
@@ -316,10 +329,34 @@ pub enum Expr {
         /// `NOT EXISTS`.
         negated: bool,
     },
+    /// `@name` (user variable) or `@@[session.]name` (system variable), resolved at
+    /// evaluation time via [`EvalContext::variables`]. `name` has any leading `@`/`@@` sigil
+    /// and `session.` scope qualifier already stripped by the binder.
+    Variable {
+        /// Variable name, without sigils or scope qualifier.
+        name: String,
+        /// `true` for `@@name` (system variable), `false` for `@name` (user variable).
+        is_system: bool,
+    },
+}
+
+/// Provides live values for [`Expr::Variable`] during evaluation.
+///
+/// Implemented by the session layer, which owns user variable storage and the live session
+/// state needed to answer dynamic system variables (`autocommit`, `transaction_isolation`,
+/// ...; see `htap_sql::variables`).
+pub trait VariableLookup {
+    /// Looks up `name` (already stripped of its `@`/`@@` sigil and, for system variables, any
+    /// `session.` scope qualifier).
+    ///
+    /// A user variable (`is_system == false`) that was never assigned should return
+    /// `Ok(Value::Null)`, mirroring MySQL. An unknown system variable should return
+    /// `Err(HtapError::Unsupported(..))`.
+    fn lookup(&self, name: &str, is_system: bool) -> Result<Value>;
 }
 
 /// Values an [`Expr`] may need while being evaluated.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct EvalContext<'a> {
     /// Flat joined input row (all slots concatenated in slot order).
     pub row: &'a [Value],
@@ -329,6 +366,22 @@ pub struct EvalContext<'a> {
     pub output: Option<&'a [Value]>,
     /// Precomputed subquery results, indexed like the query's subquery list.
     pub subqueries: &'a [Vec<Row>],
+    /// Source of values for [`Expr::Variable`]. `None` when no session/variable context is
+    /// available (for example constant folding or the narrow point/analytic paths, which never
+    /// bind a `Variable`).
+    pub variables: Option<&'a dyn VariableLookup>,
+}
+
+impl std::fmt::Debug for EvalContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvalContext")
+            .field("row", &self.row)
+            .field("aggregates", &self.aggregates)
+            .field("output", &self.output)
+            .field("subqueries", &self.subqueries)
+            .field("variables", &self.variables.map(|_| "<dyn VariableLookup>"))
+            .finish()
+    }
 }
 
 impl<'a> EvalContext<'a> {
@@ -339,6 +392,7 @@ impl<'a> EvalContext<'a> {
             aggregates: &[],
             output: None,
             subqueries: &[],
+            variables: None,
         }
     }
 }
@@ -383,6 +437,7 @@ impl Expr {
                 data_type: DataType::String,
                 nullable: true,
                 is_null_literal: true,
+                is_dynamic: false,
             },
             Expr::Literal(v) => ExprType::new(v.data_type().unwrap_or(DataType::String), false),
             Expr::BinaryOp { op, left, right } => {
@@ -427,6 +482,12 @@ impl Expr {
             Expr::Cast { expr, to } => ExprType::new(*to, expr.expr_type().nullable),
             Expr::ScalarSubquery { data_type, .. } => ExprType::new(*data_type, true),
             Expr::InSubquery { .. } => ExprType::new(DataType::Bool, true),
+            Expr::Variable { .. } => ExprType {
+                data_type: DataType::String,
+                nullable: true,
+                is_null_literal: false,
+                is_dynamic: true,
+            },
         }
     }
 
@@ -488,7 +549,8 @@ impl Expr {
             | Expr::Literal(_)
             | Expr::AggregateRef { .. }
             | Expr::ScalarSubquery { .. }
-            | Expr::Exists { .. } => {}
+            | Expr::Exists { .. }
+            | Expr::Variable { .. } => {}
             Expr::BinaryOp { left, right, .. } => {
                 left.walk(f);
                 right.walk(f);
@@ -707,6 +769,18 @@ impl Expr {
             Expr::Exists { index, negated } => {
                 let rows = subquery_rows(ctx, *index)?;
                 Ok(Value::Bool(rows.is_empty() == *negated))
+            }
+            Expr::Variable { name, is_system } => {
+                let is_system = *is_system;
+                match ctx.variables {
+                    Some(lookup) => lookup.lookup(name, is_system),
+                    // No variable context: a user variable that was never assigned (which is
+                    // indistinguishable from "no session at all" here) is NULL, matching MySQL.
+                    None if !is_system => Ok(Value::Null),
+                    None => Err(HtapError::Unsupported(format!(
+                        "system variable '@@{name}' cannot be evaluated without a session"
+                    ))),
+                }
             }
         }
     }
@@ -1375,6 +1449,7 @@ mod tests {
             aggregates: &aggregates,
             output: None,
             subqueries: &subqueries,
+            variables: None,
         };
         let scalar = |index| Expr::ScalarSubquery {
             index,
@@ -1448,5 +1523,66 @@ mod tests {
             .data_type,
             DataType::String
         );
+        let var = Expr::Variable {
+            name: "x".into(),
+            is_system: false,
+        };
+        let t = var.expr_type();
+        assert!(t.is_dynamic);
+        assert!(t.is_permissive());
+        assert!(t.nullable);
+    }
+
+    struct FakeVars(std::collections::BTreeMap<&'static str, Value>);
+
+    impl VariableLookup for FakeVars {
+        fn lookup(&self, name: &str, is_system: bool) -> Result<Value> {
+            match self.0.get(name) {
+                Some(v) => Ok(v.clone()),
+                None if is_system => Err(HtapError::Unsupported(format!(
+                    "unknown system variable '{name}'"
+                ))),
+                None => Ok(Value::Null),
+            }
+        }
+    }
+
+    #[test]
+    fn variable_evaluation() {
+        let user_var = Expr::Variable {
+            name: "x".into(),
+            is_system: false,
+        };
+        let sys_var = Expr::Variable {
+            name: "autocommit".into(),
+            is_system: true,
+        };
+
+        // No variable context at all: user variable defaults to NULL, system variable errors.
+        assert_eq!(
+            user_var.eval(&EvalContext::row_only(&[])).unwrap(),
+            Value::Null
+        );
+        assert!(sys_var.eval(&EvalContext::row_only(&[])).is_err());
+
+        // With a lookup: values come from it, and unknown system variables still error.
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("x", Value::Int64(7));
+        vars.insert("autocommit", Value::Int64(1));
+        let fake = FakeVars(vars);
+        let ctx = EvalContext {
+            row: &[],
+            aggregates: &[],
+            output: None,
+            subqueries: &[],
+            variables: Some(&fake),
+        };
+        assert_eq!(user_var.eval(&ctx).unwrap(), Value::Int64(7));
+        assert_eq!(sys_var.eval(&ctx).unwrap(), Value::Int64(1));
+        let unknown = Expr::Variable {
+            name: "no_such_var".into(),
+            is_system: true,
+        };
+        assert!(unknown.eval(&ctx).is_err());
     }
 }

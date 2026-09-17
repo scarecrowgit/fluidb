@@ -1915,7 +1915,9 @@ fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatemen
 /// one unaliased table, no joins/CTEs/subqueries/set operations, no LIMIT/HAVING/DISTINCT,
 /// a projection of plain columns or `COUNT/SUM/MIN/MAX` over a plain column, an AND-only
 /// filter of `column op literal` / `IS [NOT] NULL` leaves, and GROUP BY / ORDER BY of plain
-/// unqualified columns.
+/// unqualified columns. A `@`/`@@`-prefixed identifier anywhere in this shape (user or system
+/// variable) always forces `false`: the narrow binders resolve every plain identifier as a
+/// column and have no notion of [`crate::expr::Expr::Variable`].
 pub fn is_narrow_select_shape(query: &Query) -> bool {
     if query.with.is_some()
         || query.limit_clause.is_some()
@@ -1955,7 +1957,11 @@ pub fn is_narrow_select_shape(query: &Query) -> bool {
         TableFactor::Table { alias: None, .. } => {}
         _ => return false,
     }
-    let is_ident = |e: &Expr| matches!(unnest(e), Expr::Identifier(_));
+    // A leading `@`/`@@` marks a user/system variable (`@x`, `@@autocommit`), not a column;
+    // such statements always fall through to the general query path, which knows how to
+    // evaluate `Expr::Variable`.
+    let is_ident =
+        |e: &Expr| matches!(unnest(e), Expr::Identifier(ident) if !ident.value.starts_with('@'));
     let is_literal = |e: &Expr| match unnest(e) {
         Expr::Value(_) => true,
         Expr::UnaryOp {
@@ -1971,7 +1977,7 @@ pub fn is_narrow_select_shape(query: &Query) -> bool {
         let ok = match item {
             SelectItem::Wildcard(_) => true,
             SelectItem::UnnamedExpr(expr) => match unnest(expr) {
-                Expr::Identifier(_) => true,
+                Expr::Identifier(ident) => !ident.value.starts_with('@'),
                 Expr::Function(func) => {
                     let name = match func.name.0.as_slice() {
                         [ObjectNamePart::Identifier(ident)] => ident.value.to_ascii_uppercase(),

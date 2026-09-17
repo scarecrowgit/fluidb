@@ -4,8 +4,13 @@
 //!
 //! One accept thread and one thread per connection. Every connection shares a single
 //! `Arc<LocalServer>`; statements are serialized by the server's own execution lock, so
-//! the wire layer holds no global lock. Each statement auto-commits; there is no session
-//! state beyond the negotiated capabilities of the connection.
+//! the wire layer holds no global lock of its own. Since Phase 10, each authenticated
+//! connection owns one [`htap_server::Session`] for its whole lifetime: `BEGIN`/`COMMIT`/
+//! `ROLLBACK`, autocommit, and session variables all behave exactly as they do for
+//! [`htap_server::Session::execute`] directly. A connection that disconnects mid-transaction
+//! (`QUIT`, EOF, a framing error, or server shutdown) has its open transaction rolled back
+//! explicitly before the connection thread exits, with the session's own `Drop` impl as a
+//! safety net for any path that doesn't.
 //!
 //! # Security contract
 //!
@@ -267,8 +272,29 @@ fn handle_connection(mut stream: TcpStream, connection_id: u32, shared: &Shared)
         "authenticated"
     );
 
+    // One `htap_server::Session` per authenticated connection (Phase 10 task 9): buffered
+    // writes, autocommit state, and user/system variables all live here for the connection's
+    // whole lifetime.
+    let mut server_session = shared.server.open_session();
+    let result = run_commands(&mut stream, shared, &session, &mut server_session);
+    // Explicit rollback on every path out of `run_commands` (`QUIT`, EOF, a framing error, or
+    // server shutdown observed mid-read), regardless of which one was taken; `Session::drop`
+    // (invoked when `server_session` goes out of scope right after this) is a safety net for
+    // any path that doesn't reach here, e.g. a panic unwinding through this frame.
+    let _ = server_session.rollback();
+    result
+}
+
+/// The connection's command loop, run after authentication with one `htap_server::Session`
+/// owned by the caller for the connection's whole lifetime.
+fn run_commands(
+    stream: &mut TcpStream,
+    shared: &Shared,
+    session: &Session,
+    server_session: &mut htap_server::Session,
+) -> io::Result<()> {
     loop {
-        let (pkt_seq, payload) = match read(&mut stream, &shared.stop) {
+        let (pkt_seq, payload) = match read(stream, &shared.stop) {
             Ok(p) => p,
             Err(e) if e.kind() == SHUTDOWN_ERROR_KIND => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -278,20 +304,15 @@ fn handle_connection(mut stream: TcpStream, connection_id: u32, shared: &Shared)
         let mut seq = SeqCounter::new();
         seq.continue_after(pkt_seq);
         let Some((&command, body)) = payload.split_first() else {
-            send_err(
-                &mut stream,
-                &mut seq,
-                ER_UNKNOWN_COMMAND,
-                "Empty command packet",
-            )?;
+            send_err(stream, &mut seq, ER_UNKNOWN_COMMAND, "Empty command packet")?;
             continue;
         };
         match command {
             COM_QUIT => return Ok(()),
-            COM_PING => send(&mut stream, &mut seq, &build_command_ok(0, ""))?,
+            COM_PING => send(stream, &mut seq, &build_command_ok(0, ""))?,
             COM_INIT_DB => {
                 let name = String::from_utf8_lossy(body).into_owned();
-                respond_use_db(&mut stream, &mut seq, &name)?;
+                respond_use_db(stream, &mut seq, &name)?;
             }
             COM_QUERY => {
                 let sql = match std::str::from_utf8(body) {
@@ -303,14 +324,14 @@ fn handle_connection(mut stream: TcpStream, connection_id: u32, shared: &Shared)
                         ))
                     }
                 };
-                respond_query(&mut stream, &mut seq, sql, shared, &session)?;
+                respond_query(stream, &mut seq, sql, session, server_session)?;
             }
             // `COM_STMT_PREPARE` / `COM_STMT_EXECUTE` (binary protocol),
             // `COM_RESET_CONNECTION`, `COM_CHANGE_USER` and every other command are
             // deliberately unsupported and answered with ERR 1047.
             _ => {
                 send_err(
-                    &mut stream,
+                    stream,
                     &mut seq,
                     ER_UNKNOWN_COMMAND,
                     &format!("Unknown command 0x{command:02x}"),
@@ -510,14 +531,14 @@ fn respond_query(
     stream: &mut TcpStream,
     seq: &mut SeqCounter,
     sql: &str,
-    shared: &Shared,
     session: &Session,
+    server_session: &mut htap_server::Session,
 ) -> io::Result<()> {
     let outcome: Result<StatementResult, HtapError> = match try_shim(sql) {
         Some(ShimOutcome::Ok) => Ok(StatementResult::ddl(0)),
         Some(ShimOutcome::Rows { columns, rows }) => Ok(StatementResult::query(columns, rows)),
         Some(ShimOutcome::UseDb(name)) => return respond_use_db(stream, seq, &name),
-        None => shared.server.execute(sql),
+        None => server_session.execute(sql),
     };
     let mut out = Vec::new();
     match outcome {
