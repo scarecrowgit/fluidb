@@ -84,7 +84,7 @@ def main():
     inp = data.get("tool_input") or {}
     who = data.get("agent_type") or "main session"
     how = ("Code under crates/, vendor/, Cargo.toml, ci.sh and *.rs must be written by 9router: call "
-           "mcp__9router__ask with model \"ag/claude-sonnet-4-6\", then apply its SEARCH/REPLACE blocks verbatim.")
+           "mcp__9router__ask with model \"cx/gpt-5.6-terra\", then apply its SEARCH/REPLACE blocks verbatim.")
 
     if tool == "Bash":
         cmd = inp.get("command", "")
