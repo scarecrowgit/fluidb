@@ -26,7 +26,7 @@ SHELL_WRITERS = re.compile(
     r"|open\([^)]*['\"][wax+]|write_text\(|\bcargo\s+(add|remove|rm)\b"
 )
 REDIRECT = re.compile(r"(?<![0-9&<])>{1,2}\s*[\"']?([^\s\"';|&)]+)")
-AUTHOR = "cx/gpt-5.6-terra"
+AUTHOR = "cx/gpt-5.6-terra (cx/gpt-5.6-sol after escalation)"
 # Added lines shorter than this (normalized) are structural (`}`, `)?;`) and prove nothing either way.
 MIN_LINE = 6
 # An edit is treated as dictated when at least this share of its significant added lines was already in the prompt.

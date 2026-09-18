@@ -23,6 +23,7 @@ Use Read/Grep only to spot-check one or two specific files or lines the checkpoi
 **CHECKPOINT: diff**
 - Verification is quoted real output (`./ci.sh` or targeted cargo commands), not claimed.
 - storage-reviewer result is present when persistence, recovery, MVCC, 2PC, fencing or envelopes were touched.
+- ext-review result (cx panel on the whole diff) is present, with each finding fixed or dismissed with a reason.
 - No new `unsafe` without a `// SAFETY:` comment; no copied StarRocks code; no unexplained `vendor/sqlparser` edits.
 - Docs claims match what was verified.
 

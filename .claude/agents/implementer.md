@@ -28,8 +28,13 @@ verify with cargo, and report.
 4. **Verify.** Run `cargo fmt --all`, then `cargo test -p <crate>` for each touched crate, then
    `cargo clippy --workspace --all-targets -- -D warnings`.
 5. **Fix via the author.** On a compile, test or clippy failure, send the author the raw error output (trimmed to the
-   relevant part) and attach the affected files by path, then go back to step 3. At most 4 rounds; after that report `partial`.
-   `cargo fmt` output is the only change you may make without the author.
+   relevant part) and attach the affected files by path, then go back to step 3. After 2 failed rounds, escalate: send the
+   same brief, errors and files to `cx/gpt-5.6-sol` and use it as the author from then on. At most 4 rounds in total;
+   after that report `partial`. `cargo fmt` output is the only change you may make without the author.
+6. **Independent review.** Once cargo is green, write `git diff` of the touched files to the scratchpad and call
+   `mcp__9router__ask` with `model: "cx/gpt-5.6-luna-review"`, `files` = [diff, touched files], and the brief, asking for
+   correctness bugs and brief violations only. For each finding you can confirm in the code, send it verbatim to the author
+   (back to step 3); drop the rest. One review round.
 
 ## You are not the debugger
 The author diagnoses and fixes. Your prompts carry the brief, raw cargo/test output, and file paths. They never contain:
@@ -61,7 +66,8 @@ is denied as Claude-written. Pasting existing code is unnecessary — attach the
 ## Report
 ```
 STATUS: done | partial | blocked
-AUTHOR: cx/gpt-5.6-terra via 9router — <N> ask rounds
+AUTHOR: cx/gpt-5.6-terra via 9router — <N> ask rounds (escalated to cx/gpt-5.6-sol: yes|no)
+REVIEW: cx/gpt-5.6-luna-review — <N findings, N confirmed and fixed, N dropped>
 
 CHANGES
 - path/to/file.rs:LINE - what changed and why

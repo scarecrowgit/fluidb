@@ -20,13 +20,16 @@ validator can approve in one pass. You never edit files.
 ## Consult external models
 A task is **design-level** if it adds a subsystem, protocol, public API, or on-disk format, lifts a `planned`/`deferred` item,
 or has more than one reasonable design. For design-level tasks consulting is **mandatory**, not optional:
-1. Draft your plan first. Then send it with `mcp__9router__panel`, `models: ["reasoner", "gemini"]`, attaching the key source
-   files and docs by path. Ask for design flaws, missing risks, and a better alternative if one exists.
+1. Draft your plan first. Then send it with `mcp__9router__panel`, `models: ["reasoner", "cx/gpt-5.6-sol", "cx/gpt-5.5"]`,
+   attaching the key source files and docs by path. Ask for design flaws, missing risks, and a better alternative if one exists.
 2. If the plan contains an ADR-level decision (on-disk format, MVCC/WAL model, wire protocol, transaction semantics),
    also ask `architect` once with the draft and the competing options.
 3. Verify every external claim against the code, then revise the plan.
 
-For small, non-design tasks consulting stays optional. Use `gemini` for reading large StarRocks files or all docs at once.
+For small, non-design tasks, still get one second opinion: `mcp__9router__ask` with `model: "cx/gpt-5.6-sol"` on the draft plan.
+Use `cx/gpt-5.6-luna` for fast first passes: summarizing StarRocks sources, locating call sites across many files, condensing
+long test output. Use `cx/gpt-5.6-sol` to read all docs at once or for deep reads; fall back to `gemini` only if the input
+exceeds its context. Summaries are leads, not facts: confirm them in the code.
 
 ## Plan format
 ```

@@ -21,7 +21,8 @@ Edit only `README.md`, `docs/*.md`, and `ATTRIBUTION.md`. Never touch code. Bash
    - `docs/DECISIONS.md`: add an ADR (next number, same structure as existing ones) when the change made a real design decision.
    - `docs/PARTITIONS.md`, `docs/OPERATIONS.md`, `docs/BENCHMARKS.md` when their area changed.
 3. Mermaid: quote edge labels that contain punctuation, and don't use reserved words as participant names (past commits fixed both).
-4. Consistency sweep for large changes: `mcp__9router__ask` with `model: "gemini"` and `files` = all of `docs/*.md` plus `README.md`,
+   For each diagram you touched, ask `cx/gpt-5.6-luna` (`mcp__9router__ask`, the doc attached) to flag Mermaid syntax errors.
+4. Consistency sweep for large changes: `mcp__9router__ask` with `model: "cx/gpt-5.6-sol"` (fall back to `gemini` only on a context-length error) and `files` = all of `docs/*.md` plus `README.md`,
    asking for contradictions about the changed feature. Verify each reported contradiction before fixing it.
 
 ## Rules

@@ -11,7 +11,7 @@ You don't edit code. Bash is for read-only git and cargo: `git diff`, `git log`,
 ## Steps
 1. Get the diff (the one the caller names, else `git diff HEAD`). List the touched persistence paths and invariants.
 2. Review it against the checklist below, reading the surrounding code, not just the hunks.
-3. Independent read: write the diff to a temp file, then `mcp__9router__panel` with `models: ["reviewer", "reasoner"]`,
+3. Independent read: write the diff to a temp file, then `mcp__9router__panel` with `models: ["cx/gpt-5.6-terra-review", "reasoner"]`,
    `files` = [diff, the full touched source files], and a prompt that states the invariants below.
 4. Confirm every finding in the code yourself. Where practical, prove it by running an existing crash/recovery test
    or describing the exact failing sequence (operation → crash point → reopen → wrong state).
@@ -38,7 +38,7 @@ You don't edit code. Bash is for read-only git and cargo: `git diff`, `git log`,
 ```
 VERDICT: no issues | issues found
 FINDINGS (most severe first)
-- severity — file:line — defect — failing sequence — fix — raised by <me|reviewer|reasoner|heavy>
+- severity — file:line — defect — failing sequence — fix — raised by <me|terra-review|reasoner|heavy>
 MISSING TESTS
 - <crate>/tests/<file>.rs — <scenario>
 Dropped N unconfirmed external findings.
