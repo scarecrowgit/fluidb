@@ -91,6 +91,7 @@ fn raw_handshake_with_password(stream: &mut TcpStream, password: &[u8]) -> [u8; 
         auth_response: scramble_native_password(&hs.scramble, password),
         database: None,
         auth_plugin: Some(AUTH_PLUGIN_NATIVE.into()),
+        zstd_compression_level: None,
     };
     write_packet(stream, 1, &response.encode()).unwrap();
     let (_, okp) = read_packet(stream).unwrap();
@@ -117,6 +118,7 @@ fn raw_handshake_multi_statements(stream: &mut TcpStream) {
         auth_response: scramble_native_password(&hs.scramble, b""),
         database: None,
         auth_plugin: Some(AUTH_PLUGIN_NATIVE.into()),
+        zstd_compression_level: None,
     };
     write_packet(stream, 1, &response.encode()).unwrap();
     let (_, okp) = read_packet(stream).unwrap();
@@ -321,8 +323,6 @@ fn test_handshake_empty_password_ok() {
     let client = WireClient::connect(addr(&wire), None).unwrap();
     assert_eq!(client.server_version(), SERVER_VERSION);
     assert!(client.deprecate_eof());
-    // A password sent to a server without one is also accepted.
-    let _c2 = WireClient::connect(addr(&wire), Some("anything")).unwrap();
     wire.shutdown();
 }
 
@@ -361,6 +361,7 @@ fn test_auth_switch_to_native_password() {
         auth_response: vec![1, 2, 3],
         database: None,
         auth_plugin: Some("caching_sha2_password".into()),
+        zstd_compression_level: None,
     };
     write_packet(&mut stream, 1, &response.encode()).unwrap();
     let (seq, payload) = read_packet(&mut stream).unwrap();
@@ -533,6 +534,7 @@ fn test_typed_values_null_bytes_float_timestamp_round_trip() {
         auth_response: scramble_native_password(&hs.scramble, b""),
         database: None,
         auth_plugin: Some(AUTH_PLUGIN_NATIVE.into()),
+        zstd_compression_level: None,
     };
     write_packet(&mut stream, 1, &response.encode()).unwrap();
     let (_, okp) = read_packet(&mut stream).unwrap();
@@ -1775,6 +1777,8 @@ fn test_wire_change_user_reauth_and_reset() {
     conn.query_drop("INSERT INTO cu (id) VALUES (1)").unwrap();
     let got: Option<i32> = conn.query_first("SELECT id FROM cu WHERE id = 1").unwrap();
     assert_eq!(got, Some(1));
+    conn.query_drop("CREATE USER root2 IDENTIFIED BY 'secret'")
+        .unwrap();
     drop(conn);
 
     // Raw-protocol check that a successful COM_CHANGE_USER also clears the prepared-statement
@@ -2020,6 +2024,7 @@ fn test_resultset_packets_modern_vs_legacy() {
             auth_response: scramble_native_password(&hs.scramble, b""),
             database: None,
             auth_plugin: Some(AUTH_PLUGIN_NATIVE.into()),
+            zstd_compression_level: None,
         };
         write_packet(&mut stream, 1, &response.encode()).unwrap();
         let (_, okp) = read_packet(&mut stream).unwrap();

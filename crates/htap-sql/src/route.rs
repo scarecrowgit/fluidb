@@ -123,7 +123,13 @@ pub fn classify_route(statement: &BoundStatement, storage: &StorageDescriptor) -
                 Ok(Route::RowstoreUpdate { key })
             }
         },
-        BoundStatement::DropTable(_) => Ok(Route::CatalogDdl),
+        BoundStatement::DropTable(_)
+        | BoundStatement::CreateUser(_)
+        | BoundStatement::AlterUser(_)
+        | BoundStatement::DropUser(_)
+        | BoundStatement::GrantPrivileges(_)
+        | BoundStatement::RevokePrivileges(_)
+        | BoundStatement::ShowGrants(_) => Ok(Route::CatalogDdl),
         BoundStatement::Show(_) => Ok(Route::CatalogRead),
     }
 }

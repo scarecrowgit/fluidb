@@ -21,8 +21,10 @@ components are **deliberately not implemented** and are out of scope for this lo
   there is no cursor support of any kind. (`htapd`/`htap-wire` do implement the MySQL text *and* binary
   protocols, including prepared statements, `COM_RESET_CONNECTION`, and `COM_CHANGE_USER` — see "Prepared
   statements" below; only cursors are excluded here.)
-- **No TLS, compression, or per-user ACL:** The wire server has no TLS, no protocol compression, and a
-  single shared password with no per-user accounts or RBAC; see "Network server (`htapd`)" below.
+- **No roles, delegated administration, or host-based ACL:** TLS, protocol compression, and per-user
+  accounts/privileges are implemented (Phase 12) — see "Network server (`htapd`)" below — but there are no
+  roles, no way to delegate a subset of superuser authority to another account (`WITH GRANT OPTION` parses but
+  is rejected), only the `%` host is accepted, and there is no `caching_sha2_password` support.
 - **No Docker image or Docker Compose deployment:** No `Dockerfile`, `docker-compose.yml`, or container images are provided or required.
 - **No `SELECT ... FOR UPDATE`, locking reads, savepoints, or XA:** Sessions and
   explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, session variables) are implemented — see "Sessions and
@@ -187,10 +189,11 @@ cargo run -p htapd -- --root /tmp/htap_demo --listen 127.0.0.1:3307 --max-connec
 ```
 
 The password may also come from the `HTAPD_PASSWORD` environment variable, and the packet-size limit from
-`HTAPD_MAX_ALLOWED_PACKET`; the flag wins over the environment variable in both cases, and with neither
-password source set no password is required. `--max-allowed-packet` defaults to 64 MiB (MySQL's own
-default) and bounds every protocol message, including prepared-statement `SEND_LONG_DATA` buffers; it is
-reported dynamically as `@@max_allowed_packet`.
+`HTAPD_MAX_ALLOWED_PACKET`; the flag wins over the environment variable in both cases. `--password`/
+`HTAPD_PASSWORD` seeds the `root` account's password exactly once, the first time this root directory is
+opened (see "Accounts and per-user privileges" below); with neither set, `root` starts with an empty
+password. `--max-allowed-packet` defaults to 64 MiB (MySQL's own default) and bounds every protocol message,
+including prepared-statement `SEND_LONG_DATA` buffers; it is reported dynamically as `@@max_allowed_packet`.
 
 Connect with any MySQL client, e.g. the `mysql` CLI (if installed):
 
@@ -207,11 +210,65 @@ let mut client = RemoteClient::connect("127.0.0.1:3307", Some("secret"))?;
 let result = client.execute("SELECT name, age FROM users WHERE id = 1;")?;
 ```
 
-**Security caveat:** there is no TLS. The password exchange (`mysql_native_password`) is hashed, but query
-text and result rows travel in cleartext, so binding a non-loopback address requires a trusted network or an
-SSH tunnel. See the "Network layer" and "Security model" sections of
-[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md), ADR-016, and [`docs/OPERATIONS.md`](./docs/OPERATIONS.md)
-for the full protocol scope and operational lifecycle.
+### TLS and compression (Phase 12)
+
+```bash
+# Enable TLS and require it (reject plaintext logins), and disable protocol compression
+cargo run -p htapd -- --root /tmp/htap_demo --listen 0.0.0.0:3307 \
+  --tls-cert /etc/htapd/server.crt --tls-key /etc/htapd/server.key \
+  --require-secure-transport --disable-compression --password secret
+```
+
+`--tls-cert`/`--tls-key` (or `HTAPD_TLS_CERT`/`HTAPD_TLS_KEY`) must be supplied together; a bad path or a
+cert/key that don't match each other fails startup with a clear error rather than silently serving plaintext.
+`--require-secure-transport`/`HTAPD_REQUIRE_SECURE_TRANSPORT` rejects a plaintext login before credentials are
+even checked, and refuses to start without TLS configured. MySQL protocol compression (zlib/zstd) is
+negotiated automatically whenever a client requests it; `--disable-compression`/`HTAPD_DISABLE_COMPRESSION`
+turns that off. Connecting with TLS from Rust:
+
+```rust
+use htap_client::RemoteClient;
+use htap_wire::{ClientOptions, TlsMode};
+
+let mut client = RemoteClient::connect_with(
+    "127.0.0.1:3307",
+    ClientOptions {
+        username: "root".into(),
+        password: Some("secret".into()),
+        tls: TlsMode::Required { ca_cert: "/etc/htapd/ca.crt".into(), server_name: None },
+        ..Default::default()
+    },
+)?;
+```
+
+**Security caveat:** TLS is opt-in. A server started without `--tls-cert`/`--tls-key` still exchanges
+cleartext query text and result rows, so binding a non-loopback address without TLS requires a trusted
+network or an SSH tunnel. See "TLS and compression (Phase 12)" in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md),
+ADR-020, and [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) for cert provisioning, reload, and the full
+protocol scope.
+
+### Accounts and per-user privileges (Phase 12)
+
+`htapd` authenticates against catalog-backed accounts instead of one shared password. The first time a root
+directory is opened, a superuser `root` account is created from `--password`/`HTAPD_PASSWORD` (or an empty
+password if neither is set); after that, `--password` only matters if you're recreating `root`'s password via
+SQL — it is not re-checked on every login.
+
+```sql
+CREATE USER 'app'@'%' IDENTIFIED BY 'app-password';
+GRANT SELECT, INSERT, UPDATE ON htap.orders TO 'app'@'%';
+GRANT SELECT ON *.* TO 'app'@'%';           -- read-only on every table
+SHOW GRANTS FOR 'app'@'%';
+REVOKE UPDATE ON htap.orders FROM 'app'@'%';
+DROP USER 'app'@'%';
+```
+
+Only the `%` host is accepted; `CREATE`/`ALTER`/`DROP USER` and `GRANT`/`REVOKE` require a superuser and are
+rejected inside an open transaction; `WITH GRANT OPTION` parses but is rejected (no delegated administration).
+A privilege check runs on every statement against the freshly loaded catalog (never cached), so a `REVOKE`
+takes effect on the very next statement in an already-open session. See "Accounts and privileges (Phase 12)"
+in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) and ADR-021 for the full model and remaining gaps (no
+roles, no `caching_sha2_password`, no `ACCOUNT LOCK` syntax).
 
 ---
 

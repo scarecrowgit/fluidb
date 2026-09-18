@@ -23,9 +23,10 @@ use htap_common::types::{ColumnDef, DataType, Schema, Value};
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Delete as SqlDelete, Expr as SqlExpr,
     Function as SqlFunction, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Insert as SqlInsert, JoinConstraint, JoinOperator, LimitClause, OrderByKind, Query, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator, Update as SqlUpdate, Value as SqlValue,
+    Insert as SqlInsert, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
+    ObjectType, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update as SqlUpdate,
+    UpdateTableFromKind, Value as SqlValue,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::tokenizer::{Token, Tokenizer};
@@ -140,6 +141,324 @@ pub fn tokenizer_placeholder_count(sql: &str) -> Result<usize> {
         .iter()
         .filter(|t| matches!(t, Token::Placeholder(_)))
         .count())
+}
+
+/// Collects the base-table names referenced by a preparable statement.
+///
+/// CTE names are excluded: references to a CTE are not catalog tables. A two-part name in the
+/// default `htap` schema is returned as its table component, while other qualified names are
+/// preserved for the binder to reject or resolve normally later.
+pub fn referenced_table_names(statement: &Statement) -> Vec<String> {
+    let mut names = Vec::new();
+    walk_referenced_statement(statement, &[], &mut names);
+    names
+}
+
+fn table_name_for_reference(name: &ObjectName) -> String {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(table)] => table.value.clone(),
+        [ObjectNamePart::Identifier(schema), ObjectNamePart::Identifier(table)]
+            if schema.value.eq_ignore_ascii_case("htap") =>
+        {
+            table.value.clone()
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn walk_referenced_statement(statement: &Statement, ctes: &[String], names: &mut Vec<String>) {
+    match statement {
+        Statement::Insert(insert) => {
+            if let TableObject::TableName(name) = &insert.table {
+                names.push(table_name_for_reference(name));
+            }
+            if let Some(source) = &insert.source {
+                walk_referenced_query(source, ctes, names);
+            }
+        }
+        Statement::Update(update) => {
+            walk_referenced_table_with_joins(&update.table, ctes, names);
+            if let Some(from) = &update.from {
+                match from {
+                    UpdateTableFromKind::BeforeSet(tables)
+                    | UpdateTableFromKind::AfterSet(tables) => {
+                        for table in tables {
+                            walk_referenced_table_with_joins(table, ctes, names);
+                        }
+                    }
+                }
+            }
+            for assignment in &update.assignments {
+                walk_referenced_expr(&assignment.value, ctes, names);
+            }
+            if let Some(selection) = &update.selection {
+                walk_referenced_expr(selection, ctes, names);
+            }
+        }
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                sqlparser::ast::FromTable::WithFromKeyword(t)
+                | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+            };
+            for table in tables {
+                walk_referenced_table_with_joins(table, ctes, names);
+            }
+            if let Some(selection) = &delete.selection {
+                walk_referenced_expr(selection, ctes, names);
+            }
+        }
+        Statement::Query(query) => walk_referenced_query(query, ctes, names),
+        Statement::AlterTable(alter_table) => {
+            names.push(table_name_for_reference(&alter_table.name));
+        }
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            names: drop_names,
+            ..
+        } => {
+            for name in drop_names {
+                names.push(table_name_for_reference(name));
+            }
+        }
+        Statement::ShowColumns { show_options, .. } => {
+            if let Some(name) = show_options
+                .show_in
+                .as_ref()
+                .and_then(|show_in| show_in.parent_name.as_ref())
+            {
+                names.push(table_name_for_reference(name));
+            }
+        }
+        Statement::ExplainTable { table_name, .. } => {
+            names.push(table_name_for_reference(table_name));
+        }
+        _ => {}
+    }
+}
+
+fn walk_referenced_query(query: &Query, ctes: &[String], names: &mut Vec<String>) {
+    let mut visible_ctes = ctes.to_vec();
+    if let Some(with) = &query.with {
+        // A CTE body sees only CTEs declared before it, matching bind_query_scoped.
+        for cte in &with.cte_tables {
+            walk_referenced_query(&cte.query, &visible_ctes, names);
+            visible_ctes.push(cte.alias.name.value.clone());
+        }
+    }
+    walk_referenced_set_expr(&query.body, &visible_ctes, names);
+    if let Some(order_by) = &query.order_by {
+        if let OrderByKind::Expressions(items) = &order_by.kind {
+            for item in items {
+                walk_referenced_expr(&item.expr, &visible_ctes, names);
+            }
+        }
+    }
+    if let Some(limit_clause) = &query.limit_clause {
+        match limit_clause {
+            LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                if let Some(limit) = limit {
+                    walk_referenced_expr(limit, &visible_ctes, names);
+                }
+                if let Some(offset) = offset {
+                    walk_referenced_expr(&offset.value, &visible_ctes, names);
+                }
+                for expr in limit_by {
+                    walk_referenced_expr(expr, &visible_ctes, names);
+                }
+            }
+            LimitClause::OffsetCommaLimit { offset, limit } => {
+                walk_referenced_expr(offset, &visible_ctes, names);
+                walk_referenced_expr(limit, &visible_ctes, names);
+            }
+        }
+    }
+}
+
+fn walk_referenced_set_expr(body: &SetExpr, ctes: &[String], names: &mut Vec<String>) {
+    match body {
+        SetExpr::Select(select) => {
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(expr)
+                    | SelectItem::ExprWithAlias { expr, .. }
+                    | SelectItem::ExprWithAliases { expr, .. } => {
+                        walk_referenced_expr(expr, ctes, names)
+                    }
+                    SelectItem::QualifiedWildcard(
+                        SelectItemQualifiedWildcardKind::Expr(expr),
+                        _,
+                    ) => walk_referenced_expr(expr, ctes, names),
+                    SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(_) => {}
+                }
+            }
+            for table in &select.from {
+                walk_referenced_table_with_joins(table, ctes, names);
+            }
+            if let Some(selection) = &select.selection {
+                walk_referenced_expr(selection, ctes, names);
+            }
+            if let GroupByExpr::Expressions(expressions, _) = &select.group_by {
+                for expr in expressions {
+                    walk_referenced_expr(expr, ctes, names);
+                }
+            }
+            if let Some(having) = &select.having {
+                walk_referenced_expr(having, ctes, names);
+            }
+        }
+        SetExpr::Query(query) => walk_referenced_query(query, ctes, names),
+        SetExpr::SetOperation { left, right, .. } => {
+            walk_referenced_set_expr(left, ctes, names);
+            walk_referenced_set_expr(right, ctes, names);
+        }
+        SetExpr::Values(values) => {
+            for row in &values.rows {
+                for expr in &row.content {
+                    walk_referenced_expr(expr, ctes, names);
+                }
+            }
+        }
+        SetExpr::Insert(statement) | SetExpr::Update(statement) | SetExpr::Delete(statement) => {
+            walk_referenced_statement(statement, ctes, names)
+        }
+        SetExpr::Merge(_) | SetExpr::Table(_) => {}
+    }
+}
+
+fn walk_referenced_table_with_joins(
+    table: &TableWithJoins,
+    ctes: &[String],
+    names: &mut Vec<String>,
+) {
+    walk_referenced_table_factor(&table.relation, ctes, names);
+    for join in &table.joins {
+        walk_referenced_table_factor(&join.relation, ctes, names);
+        match &join.join_operator {
+            JoinOperator::AsOf {
+                match_condition,
+                constraint,
+            } => {
+                walk_referenced_expr(match_condition, ctes, names);
+                if let JoinConstraint::On(expr) = constraint {
+                    walk_referenced_expr(expr, ctes, names);
+                }
+            }
+            JoinOperator::Join(constraint)
+            | JoinOperator::Inner(constraint)
+            | JoinOperator::Left(constraint)
+            | JoinOperator::LeftOuter(constraint)
+            | JoinOperator::Right(constraint)
+            | JoinOperator::RightOuter(constraint)
+            | JoinOperator::FullOuter(constraint)
+            | JoinOperator::CrossJoin(constraint)
+            | JoinOperator::Semi(constraint)
+            | JoinOperator::LeftSemi(constraint)
+            | JoinOperator::RightSemi(constraint)
+            | JoinOperator::Anti(constraint)
+            | JoinOperator::LeftAnti(constraint)
+            | JoinOperator::RightAnti(constraint)
+            | JoinOperator::StraightJoin(constraint) => {
+                if let JoinConstraint::On(expr) = constraint {
+                    walk_referenced_expr(expr, ctes, names);
+                }
+            }
+            JoinOperator::CrossApply
+            | JoinOperator::OuterApply
+            | JoinOperator::ArrayJoin
+            | JoinOperator::LeftArrayJoin
+            | JoinOperator::InnerArrayJoin => {}
+        }
+    }
+}
+
+fn walk_referenced_table_factor(table: &TableFactor, ctes: &[String], names: &mut Vec<String>) {
+    match table {
+        TableFactor::Table { name, .. } => {
+            let name = table_name_for_reference(name);
+            if !ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&name)) {
+                names.push(name);
+            }
+        }
+        TableFactor::Derived { subquery, .. } => walk_referenced_query(subquery, ctes, names),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => walk_referenced_table_with_joins(table_with_joins, ctes, names),
+        _ => {}
+    }
+}
+
+fn walk_referenced_expr(expr: &SqlExpr, ctes: &[String], names: &mut Vec<String>) {
+    match expr {
+        SqlExpr::Nested(inner)
+        | SqlExpr::UnaryOp { expr: inner, .. }
+        | SqlExpr::IsNull(inner)
+        | SqlExpr::IsNotNull(inner)
+        | SqlExpr::IsTrue(inner)
+        | SqlExpr::IsNotTrue(inner)
+        | SqlExpr::IsFalse(inner)
+        | SqlExpr::IsNotFalse(inner)
+        | SqlExpr::Cast { expr: inner, .. } => walk_referenced_expr(inner, ctes, names),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            walk_referenced_expr(left, ctes, names);
+            walk_referenced_expr(right, ctes, names);
+        }
+        SqlExpr::Like { expr, pattern, .. } => {
+            walk_referenced_expr(expr, ctes, names);
+            walk_referenced_expr(pattern, ctes, names);
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            walk_referenced_expr(expr, ctes, names);
+            for item in list {
+                walk_referenced_expr(item, ctes, names);
+            }
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            walk_referenced_expr(expr, ctes, names);
+            walk_referenced_expr(low, ctes, names);
+            walk_referenced_expr(high, ctes, names);
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                walk_referenced_expr(operand, ctes, names);
+            }
+            for when in conditions {
+                walk_referenced_expr(&when.condition, ctes, names);
+                walk_referenced_expr(&when.result, ctes, names);
+            }
+            if let Some(else_result) = else_result {
+                walk_referenced_expr(else_result, ctes, names);
+            }
+        }
+        SqlExpr::Function(function) => {
+            if let FunctionArguments::List(list) = &function.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
+                        walk_referenced_expr(expr, ctes, names);
+                    }
+                }
+            }
+        }
+        SqlExpr::Subquery(query)
+        | SqlExpr::Exists {
+            subquery: query, ..
+        } => walk_referenced_query(query, ctes, names),
+        SqlExpr::InSubquery { expr, subquery, .. } => {
+            walk_referenced_expr(expr, ctes, names);
+            walk_referenced_query(subquery, ctes, names);
+        }
+        _ => {}
+    }
 }
 
 /// Validates that the walk-based placeholder count for `statement` agrees with the raw `?`
@@ -1219,5 +1538,109 @@ fn output_schema_of(bound: &BoundStatement, catalog: &CatalogSnapshot) -> Result
         other => Err(HtapError::Internal(format!(
             "unexpected bound statement kind for a Query: {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn referenced_table_names_walks_queries_and_excludes_ctes() {
+        let statement = crate::parse_one(
+            "WITH x AS (SELECT id FROM a) \
+             SELECT (SELECT id FROM b) FROM x JOIN c ON x.id = c.id \
+             UNION SELECT id FROM d",
+        )
+        .unwrap();
+
+        assert_eq!(referenced_table_names(&statement), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn referenced_table_names_walks_insert_update_and_delete_subqueries() {
+        let insert = crate::parse_one(
+            "INSERT INTO dst (id) SELECT id FROM src WHERE id IN (SELECT id FROM x)",
+        )
+        .unwrap();
+        assert_eq!(referenced_table_names(&insert), vec!["dst", "src", "x"]);
+
+        let update = crate::parse_one(
+            "UPDATE dst SET id = (SELECT id FROM src) WHERE id IN (SELECT id FROM x)",
+        )
+        .unwrap();
+        assert_eq!(referenced_table_names(&update), vec!["dst", "src", "x"]);
+
+        let delete = crate::parse_one("DELETE FROM dst WHERE id IN (SELECT id FROM src)").unwrap();
+        assert_eq!(referenced_table_names(&delete), vec!["dst", "src"]);
+    }
+
+    #[test]
+    fn referenced_table_names_simple_select_and_qualified_select() {
+        let statement = crate::parse_one("SELECT * FROM a").unwrap();
+        assert_eq!(referenced_table_names(&statement), vec!["a"]);
+
+        let qualified = crate::parse_one("SELECT * FROM htap.a").unwrap();
+        assert_eq!(referenced_table_names(&qualified), vec!["a"]);
+    }
+
+    #[test]
+    fn referenced_table_names_walks_join_subquery_cte_and_union() {
+        let join = crate::parse_one("SELECT * FROM a JOIN b ON a.id = b.id").unwrap();
+        assert_eq!(referenced_table_names(&join), vec!["a", "b"]);
+
+        let subquery = crate::parse_one("SELECT * FROM a WHERE id IN (SELECT id FROM b)").unwrap();
+        assert_eq!(referenced_table_names(&subquery), vec!["a", "b"]);
+
+        let cte =
+            crate::parse_one("WITH x AS (SELECT id FROM a) SELECT * FROM x JOIN b ON x.id = b.id")
+                .unwrap();
+        assert_eq!(referenced_table_names(&cte), vec!["a", "b"]);
+
+        let union = crate::parse_one("SELECT id FROM a UNION SELECT id FROM b").unwrap();
+        assert_eq!(referenced_table_names(&union), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn referenced_table_names_cte_body_does_not_see_itself() {
+        let statement =
+            crate::parse_one("WITH secret AS (SELECT * FROM secret) SELECT * FROM secret").unwrap();
+
+        assert_eq!(referenced_table_names(&statement), vec!["secret"]);
+    }
+
+    #[test]
+    fn referenced_table_names_cte_body_does_not_see_later_ctes() {
+        let statement = crate::parse_one(
+            "WITH a AS (SELECT * FROM secret), secret AS (SELECT 1 AS id) SELECT * FROM a",
+        )
+        .unwrap();
+
+        assert_eq!(referenced_table_names(&statement), vec!["secret"]);
+    }
+
+    #[test]
+    fn referenced_table_names_chained_ctes_exclude_prior_cte_names() {
+        let statement = crate::parse_one(
+            "WITH a AS (SELECT * FROM source), b AS (SELECT * FROM a) SELECT * FROM b",
+        )
+        .unwrap();
+
+        assert_eq!(referenced_table_names(&statement), vec!["source"]);
+    }
+
+    #[test]
+    fn referenced_table_names_walks_dml_sources() {
+        let insert = crate::parse_one("INSERT INTO dst (id) SELECT id FROM src").unwrap();
+        assert_eq!(referenced_table_names(&insert), vec!["dst", "src"]);
+
+        let update = crate::parse_one(
+            "UPDATE dst SET id = (SELECT id FROM src) WHERE id IN (SELECT id FROM x)",
+        )
+        .unwrap();
+        assert_eq!(referenced_table_names(&update), vec!["dst", "src", "x"]);
+
+        let delete = crate::parse_one("DELETE FROM dst WHERE id IN (SELECT id FROM src)").unwrap();
+        assert_eq!(referenced_table_names(&delete), vec!["dst", "src"]);
     }
 }

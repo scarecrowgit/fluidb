@@ -80,7 +80,7 @@ fn test_remote_client_matches_embedded_client_ddl_dml_select() {
 
     // Wrong password is a clear error, not a hang.
     match RemoteClient::connect(wire.local_addr(), Some("bad")) {
-        Err(HtapError::Internal(msg)) => assert!(msg.contains("1045"), "{msg}"),
+        Err(HtapError::PermissionDenied(msg)) => assert!(msg.contains("Access denied"), "{msg}"),
         other => panic!("{other:?}"),
     }
     let mut legacy = RemoteClient::connect_with(

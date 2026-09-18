@@ -1,13 +1,20 @@
 //! Minimal MySQL text-protocol client used by `htap-client::RemoteClient` and the tests.
 
-use std::io::{self, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use htap_common::types::{ColumnDef, Row};
 
 use crate::binary_codec::{decode_binary_row, decode_stmt_prepare_ok, encode_execute_request};
 use crate::codec::{read_lenenc_int, read_message, write_message, SeqCounter};
+use crate::compression::{CompressedStream, CompressionAlgorithm};
 use crate::error_map::{parse_err_payload, WireError};
 use crate::handshake::{AuthSwitchRequest, HandshakeResponse41, HandshakeV10};
 use crate::proto::*;
@@ -16,12 +23,215 @@ use crate::result_codec::{
     parse_terminator_status, OkPacket,
 };
 use crate::sha1::scramble_native_password;
+use crate::tls::{perform_client_tls_handshake, Conn};
 use htap_common::types::Value;
+
+/// Compression behavior requested when connecting to a wire server.
+#[derive(Debug, Clone, Default)]
+pub enum CompressionMode {
+    /// Do not request protocol compression.
+    #[default]
+    Disabled,
+    /// Request MySQL zlib compression.
+    Zlib,
+    /// Request MySQL zstd compression at the supplied level.
+    Zstd {
+        /// Compression level requested from the server.
+        level: u8,
+    },
+}
+
+/// TLS behavior used when connecting to a wire server.
+#[derive(Debug, Clone, Default)]
+pub enum TlsMode {
+    /// Do not request TLS.
+    #[default]
+    Disabled,
+    /// Require TLS and validate the server certificate.
+    Required {
+        /// PEM bundle containing trusted certificate authorities.
+        ca_cert: PathBuf,
+        /// DNS name or IP address expected in the server certificate. If omitted, use the
+        /// address selected for the connection.
+        server_name: Option<String>,
+    },
+    /// Use TLS without validating the server certificate. Do not use in production.
+    InsecureSkipVerifyDoNotUseInProduction,
+}
+
+#[derive(Debug)]
+struct SkipCertificateVerification {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl ServerCertVerifier for SkipCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn encode_ssl_request(capability_flags: u32) -> Vec<u8> {
+    let mut request = Vec::with_capacity(32);
+    request.extend_from_slice(&capability_flags.to_le_bytes());
+    request.extend_from_slice(&(1u32 << 24).to_le_bytes());
+    request.push(COLLATION_UTF8MB4 as u8);
+    request.extend_from_slice(&[0u8; 23]);
+    request
+}
+
+fn load_root_store(ca_cert: &PathBuf) -> io::Result<rustls::RootCertStore> {
+    let file = File::open(ca_cert)?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+
+    let mut roots = rustls::RootCertStore::empty();
+    if roots.add_parsable_certificates(certs).0 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS CA certificate PEM contains no certificates",
+        ));
+    }
+    Ok(roots)
+}
+
+fn tls_server_name(name: Option<&str>, peer: SocketAddr) -> io::Result<ServerName<'static>> {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or_else(|| peer.ip().to_string());
+    if let Ok(ip) = name.parse::<IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    ServerName::try_from(name).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TLS server name: {e}"),
+        )
+    })
+}
+
+fn client_tls_config(mode: &TlsMode) -> io::Result<Arc<rustls::ClientConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid TLS protocol configuration: {e}"),
+            )
+        })?;
+    let config = match mode {
+        TlsMode::Required { ca_cert, .. } => builder
+            .with_root_certificates(load_root_store(ca_cert)?)
+            .with_no_client_auth(),
+        TlsMode::InsecureSkipVerifyDoNotUseInProduction => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipCertificateVerification { provider }))
+            .with_no_client_auth(),
+        TlsMode::Disabled => unreachable!("TLS configuration requested while TLS is disabled"),
+    };
+    Ok(Arc::new(config))
+}
+
+enum ClientStream {
+    Plain(Conn),
+    Compressed(CompressedStream<Conn>),
+}
+
+impl std::fmt::Debug for ClientStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plain(_) => f.write_str("ClientStream::Plain"),
+            Self::Compressed(_) => f.write_str("ClientStream::Compressed"),
+        }
+    }
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Compressed(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Compressed(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Compressed(stream) => stream.flush(),
+        }
+    }
+}
+
+impl ClientStream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Plain(stream) => stream.tcp(),
+            Self::Compressed(stream) => stream.get_ref().tcp(),
+        }
+    }
+
+    fn reset_sequence(&mut self) {
+        if let Self::Compressed(stream) = self {
+            stream.reset_sequence();
+        }
+    }
+}
 
 /// Connection options.
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
-    /// User name sent in the handshake (not verified by the server).
+    /// User name authenticated by the server against catalog accounts with
+    /// `mysql_native_password`. Defaults to the bootstrapped `root` account.
     pub username: String,
     /// Password for `mysql_native_password`.
     pub password: Option<String>,
@@ -41,6 +251,10 @@ pub struct ClientOptions {
     /// rejected by the server exactly as before this capability existed; see
     /// [`WireClient::query_multi`].
     pub multi_statements: bool,
+    /// TLS behavior for the connection.
+    pub tls: TlsMode,
+    /// Protocol compression behavior for the connection.
+    pub compression: CompressionMode,
 }
 
 impl Default for ClientOptions {
@@ -50,6 +264,8 @@ impl Default for ClientOptions {
             password: None,
             database: None,
             deprecate_eof: true,
+            tls: TlsMode::Disabled,
+            compression: CompressionMode::Disabled,
             connect_timeout: Duration::from_secs(5),
             max_allowed_packet: htap_sql::DEFAULT_MAX_ALLOWED_PACKET as usize,
             multi_statements: false,
@@ -99,7 +315,7 @@ pub struct MultiQueryOutcome {
 /// A connected client.
 #[derive(Debug)]
 pub struct WireClient {
-    stream: TcpStream,
+    stream: ClientStream,
     deprecate_eof: bool,
     server_version: String,
     connection_id: u32,
@@ -134,10 +350,10 @@ impl WireClient {
                 Err(e) => last_err = e,
             }
         }
-        let mut stream = stream.ok_or(WireError::Io(last_err))?;
-        let _ = stream.set_nodelay(true);
+        let mut tcp_stream = stream.ok_or(WireError::Io(last_err))?;
+        let _ = tcp_stream.set_nodelay(true);
 
-        let (seq0, payload) = read_message(&mut stream, options.max_allowed_packet)?;
+        let (seq0, payload) = read_message(&mut tcp_stream, options.max_allowed_packet)?;
         if payload.first() == Some(&ERR_HEADER) {
             let (code, sqlstate, message) = parse_err_payload(&payload)?;
             return Err(WireError::Server {
@@ -165,12 +381,47 @@ impl WireClient {
         if options.multi_statements {
             caps |= CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS;
         }
+        match &options.compression {
+            CompressionMode::Disabled => {}
+            CompressionMode::Zlib => caps |= CLIENT_COMPRESS,
+            CompressionMode::Zstd { .. } => caps |= CLIENT_ZSTD_COMPRESSION_ALGORITHM,
+        }
+        if !matches!(options.tls, TlsMode::Disabled) {
+            caps |= CLIENT_SSL;
+        }
         caps &= handshake.capabilities | CLIENT_CONNECT_WITH_DB;
         if caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA == 0 || caps & CLIENT_PLUGIN_AUTH == 0 {
             return Err(WireError::Protocol(
                 "server does not support plugin authentication".into(),
             ));
         }
+
+        let mut stream = if matches!(options.tls, TlsMode::Disabled) {
+            Conn::Plain(tcp_stream)
+        } else {
+            if caps & CLIENT_SSL == 0 {
+                return Err(WireError::Protocol("server does not support TLS".into()));
+            }
+            write_message(&mut tcp_stream, &mut seq, &encode_ssl_request(caps))?;
+            let peer = tcp_stream.peer_addr()?;
+            let server_name = match &options.tls {
+                TlsMode::Required { server_name, .. } => {
+                    tls_server_name(server_name.as_deref(), peer)?
+                }
+                TlsMode::InsecureSkipVerifyDoNotUseInProduction => tls_server_name(None, peer)?,
+                TlsMode::Disabled => unreachable!("TLS mode was checked above"),
+            };
+            let tls_connection =
+                rustls::ClientConnection::new(client_tls_config(&options.tls)?, server_name)
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid TLS client connection: {e}"),
+                        )
+                    })?;
+            perform_client_tls_handshake(tcp_stream, tls_connection)?
+        };
+
         let password = options.password.as_deref().unwrap_or("").as_bytes();
         let response = HandshakeResponse41 {
             capability_flags: caps,
@@ -180,6 +431,10 @@ impl WireClient {
             auth_response: scramble_native_password(&handshake.scramble, password),
             database: options.database.clone(),
             auth_plugin: Some(AUTH_PLUGIN_NATIVE.into()),
+            zstd_compression_level: match options.compression {
+                CompressionMode::Zstd { level } => Some(level),
+                CompressionMode::Disabled | CompressionMode::Zlib => None,
+            },
         };
         write_message(&mut stream, &mut seq, &response.encode())?;
 
@@ -213,6 +468,28 @@ impl WireClient {
             _ => return Err(WireError::Protocol("unexpected auth reply".into())),
         }
 
+        let compression = match &options.compression {
+            CompressionMode::Zlib if caps & CLIENT_COMPRESS != 0 => {
+                Some(CompressionAlgorithm::Zlib)
+            }
+            CompressionMode::Zstd { level } if caps & CLIENT_ZSTD_COMPRESSION_ALGORITHM != 0 => {
+                Some(CompressionAlgorithm::Zstd {
+                    level: i32::from(*level),
+                })
+            }
+            CompressionMode::Disabled | CompressionMode::Zlib | CompressionMode::Zstd { .. } => {
+                None
+            }
+        };
+        let stream = match compression {
+            Some(compression) => ClientStream::Compressed(CompressedStream::new(
+                stream,
+                Some(compression),
+                options.max_allowed_packet,
+            )),
+            None => ClientStream::Plain(stream),
+        };
+
         Ok(Self {
             stream,
             deprecate_eof: caps & CLIENT_DEPRECATE_EOF != 0,
@@ -239,7 +516,7 @@ impl WireClient {
 
     /// Local socket address.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.stream.local_addr()
+        self.stream.tcp().local_addr()
     }
 
     /// Sends a raw command message (split into as many physical packets as needed, Phase 11 plan
@@ -248,7 +525,9 @@ impl WireClient {
         let mut payload = Vec::with_capacity(1 + body.len());
         payload.push(command);
         payload.extend_from_slice(body);
+        self.stream.reset_sequence();
         write_message(&mut self.stream, &mut SeqCounter::new(), &payload)?;
+        self.stream.flush()?;
         Ok(self.read_response_message()?.1)
     }
 
@@ -506,7 +785,25 @@ impl WireClient {
         let mut payload = Vec::with_capacity(1 + body.len());
         payload.push(COM_STMT_CLOSE);
         payload.extend_from_slice(&body);
+        self.stream.reset_sequence();
         write_message(&mut self.stream, &mut SeqCounter::new(), &payload)?;
+        self.stream.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssl_request_has_the_required_layout() {
+        let caps = CLIENT_PROTOCOL_41 | CLIENT_SSL;
+        let request = encode_ssl_request(caps);
+        assert_eq!(request.len(), 32);
+        assert_eq!(
+            u32::from_le_bytes(request[..4].try_into().unwrap()) & CLIENT_SSL,
+            CLIENT_SSL
+        );
     }
 }

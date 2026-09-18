@@ -689,11 +689,196 @@ fn test_parse_many_propagates_syntax_errors() {
     assert!(matches!(res, Err(HtapError::InvalidArgument(_))));
 }
 
+#[test]
+fn test_bind_account_management_statements() {
+    use htap_catalog::PrivilegeSet;
+    use htap_sql::{
+        AlterUserStatement, CreateUserStatement, DropUserStatement, GrantScope, GrantStatement,
+        RevokeStatement, ShowGrantsStatement,
+    };
+
+    let catalog = make_test_catalog();
+
+    let cases = [
+        (
+            "CREATE USER 'u'@'%' IDENTIFIED BY 'p'",
+            BoundStatement::CreateUser(CreateUserStatement {
+                username: "u".into(),
+                if_not_exists: false,
+                password: Some("p".into()),
+            }),
+        ),
+        (
+            "CREATE USER IF NOT EXISTS u IDENTIFIED BY 'p'",
+            BoundStatement::CreateUser(CreateUserStatement {
+                username: "u".into(),
+                if_not_exists: true,
+                password: Some("p".into()),
+            }),
+        ),
+        (
+            "ALTER USER 'u'@'%' IDENTIFIED BY 'q'",
+            BoundStatement::AlterUser(AlterUserStatement {
+                username: "u".into(),
+                if_exists: false,
+                password: "q".into(),
+            }),
+        ),
+        (
+            "ALTER USER IF EXISTS u IDENTIFIED BY 'q'",
+            BoundStatement::AlterUser(AlterUserStatement {
+                username: "u".into(),
+                if_exists: true,
+                password: "q".into(),
+            }),
+        ),
+        (
+            "DROP USER IF EXISTS a, 'b'@'%'",
+            BoundStatement::DropUser(DropUserStatement {
+                usernames: vec!["a".into(), "b".into()],
+                if_exists: true,
+            }),
+        ),
+        (
+            "GRANT SELECT, INSERT ON *.* TO u",
+            BoundStatement::GrantPrivileges(GrantStatement {
+                privileges: PrivilegeSet(PrivilegeSet::SELECT.0 | PrivilegeSet::INSERT.0),
+                scope: GrantScope::Global,
+                grantee: "u".into(),
+            }),
+        ),
+        (
+            "GRANT ALL ON htap.* TO u",
+            BoundStatement::GrantPrivileges(GrantStatement {
+                privileges: PrivilegeSet::ALL,
+                scope: GrantScope::Global,
+                grantee: "u".into(),
+            }),
+        ),
+        (
+            "GRANT SELECT ON t TO 'u'@'%'",
+            BoundStatement::GrantPrivileges(GrantStatement {
+                privileges: PrivilegeSet::SELECT,
+                scope: GrantScope::Table("t".into()),
+                grantee: "u".into(),
+            }),
+        ),
+        (
+            "REVOKE DELETE ON htap.t FROM u",
+            BoundStatement::RevokePrivileges(RevokeStatement {
+                privileges: PrivilegeSet::DELETE,
+                scope: GrantScope::Table("t".into()),
+                grantee: "u".into(),
+            }),
+        ),
+        (
+            "SHOW GRANTS",
+            BoundStatement::ShowGrants(ShowGrantsStatement { for_username: None }),
+        ),
+        (
+            "SHOW GRANTS FOR u",
+            BoundStatement::ShowGrants(ShowGrantsStatement {
+                for_username: Some("u".into()),
+            }),
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        assert_eq!(
+            parse_and_bind(sql, &catalog).unwrap(),
+            expected,
+            "unexpected binding for {sql}"
+        );
+    }
+}
+
+#[test]
+fn test_bind_account_management_rejections() {
+    let catalog = make_test_catalog();
+
+    for sql in [
+        "CREATE USER 'u'@'localhost' IDENTIFIED BY 'p'",
+        "GRANT SELECT ON t TO u WITH GRANT OPTION",
+        "GRANT SELECT (c) ON t TO u",
+        "GRANT REFERENCES ON t TO u",
+        "GRANT SELECT ON t TO a, b",
+    ] {
+        assert!(
+            matches!(
+                parse_and_bind(sql, &catalog),
+                Err(HtapError::Unsupported(_))
+            ),
+            "expected Unsupported for {sql}"
+        );
+    }
+
+    assert!(matches!(
+        parse_and_bind("GRANT SELECT ON missing TO u", &catalog),
+        Err(HtapError::NotFound(_))
+    ));
+    assert!(matches!(
+        parse_and_bind("GRANT SELECT ON otherdb.* TO u", &catalog),
+        Err(HtapError::NotFound(_))
+    ));
+
+    let sql = "CREATE USER u PASSWORD = 'x'";
+    if let Ok(statement) = parse_one(sql) {
+        assert!(
+            matches!(bind(&statement, &catalog), Err(HtapError::Unsupported(_))),
+            "expected Unsupported for {sql}"
+        );
+    }
+}
+
 use htap_catalog::{CatalogSnapshot, TableDescriptor, TableId};
 use htap_common::types::{
     ColumnDef as CommonColumnDef, DataType as CommonDataType, Row, Schema, Value as CommonValue,
 };
 use htap_sql::{bind, BoundStatement};
+
+#[test]
+fn test_grant_table_vs_global_grantee_binding() {
+    let catalog = make_test_catalog();
+
+    for sql in [
+        "GRANT SELECT ON widgets TO alice",
+        "GRANT SELECT ON *.* TO alice",
+    ] {
+        let stmt = parse_one(sql).expect("GRANT should parse");
+        println!("parsed {sql:?}: {stmt:#?}");
+
+        let bound = bind(&stmt, &catalog).expect("GRANT should bind");
+        println!("bound {sql:?}: {bound:#?}");
+
+        match bound {
+            BoundStatement::GrantPrivileges(grant) => assert_eq!(grant.grantee, "alice"),
+            other => panic!("expected GrantPrivileges, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_grant_grantee_parsing_regression() {
+    let catalog = make_test_catalog();
+
+    let unquoted = parse_and_bind("GRANT SELECT ON widgets TO alice", &catalog)
+        .expect("unquoted GRANT should bind");
+    let quoted = parse_and_bind("GRANT SELECT ON htap.widgets TO 'alice'@'%'", &catalog)
+        .expect("quoted GRANT should bind");
+
+    let unquoted_grantee = match unquoted {
+        BoundStatement::GrantPrivileges(grant) => grant.grantee,
+        other => panic!("expected GrantPrivileges, got {other:?}"),
+    };
+    let quoted_grantee = match quoted {
+        BoundStatement::GrantPrivileges(grant) => grant.grantee,
+        other => panic!("expected GrantPrivileges, got {other:?}"),
+    };
+
+    assert_eq!(unquoted_grantee, "alice");
+    assert_eq!(quoted_grantee, "alice");
+    assert_eq!(unquoted_grantee, quoted_grantee);
+}
 
 fn make_test_catalog() -> CatalogSnapshot {
     let users_schema = Schema::new(vec![
@@ -839,9 +1024,35 @@ fn make_test_catalog() -> CatalogSnapshot {
         1,
     );
 
+    let t_schema = Schema::new(vec![CommonColumnDef {
+        name: "id".to_string(),
+        data_type: CommonDataType::Int32,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+    let t_table = TableDescriptor::new(TableId(5), "t", t_schema, vec![0], vec![], 1);
+
+    let widgets_schema = Schema::new(vec![CommonColumnDef {
+        name: "id".to_string(),
+        data_type: CommonDataType::Int32,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+    let widgets_table =
+        TableDescriptor::new(TableId(6), "widgets", widgets_schema, vec![0], vec![], 1);
+
     CatalogSnapshot::new(
         1,
-        vec![users_table, orders_table, bytes_table, all_types_table],
+        vec![
+            users_table,
+            orders_table,
+            bytes_table,
+            all_types_table,
+            t_table,
+            widgets_table,
+        ],
         vec![],
         vec![],
         vec![],

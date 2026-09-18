@@ -1,6 +1,6 @@
 //! Local filesystem implementation of [`CatalogStore`] with crash-safe atomic updates.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -18,10 +18,9 @@ pub const CATALOG_TMP_FILE_NAME: &str = "CATALOG.tmp";
 pub const HEADER_MAGIC: &[u8; 8] = b"HTAPCAT1";
 /// Catalog binary envelope format version written by this build.
 ///
-/// Version 2 added the persisted identifier high-water mark (`id_high_water`) to the JSON
-/// payload. Version 1 payloads are still decoded (the counters default to zero and the
-/// live maximum is used); a build that only knows version 1 refuses version 2 files.
-pub const FORMAT_VERSION: u16 = 2;
+/// Version 3 adds accounts and grants to the JSON payload. Version 2 added the persisted
+/// identifier high-water mark (`id_high_water`). Versions 1 and 2 remain decodable.
+pub const FORMAT_VERSION: u16 = 3;
 /// Oldest catalog envelope format version this build still decodes.
 pub const LEGACY_FORMAT_VERSION: u16 = 1;
 /// Fixed header length (8 magic + 2 version + 4 payload_len + 4 crc32c = 18 bytes).
@@ -102,11 +101,23 @@ impl CatalogStore for LocalCatalogStore {
         // Validate snapshot semantics before touching disk
         next.validate()?;
 
+        // Once account initialization completes, it must not be reverted.
+        if current
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.accounts_initialized)
+            && !next.accounts_initialized
+        {
+            return Err(HtapError::InvalidArgument(
+                "catalog accounts_initialized flag regressed from true to false".into(),
+            ));
+        }
+
         // The identifier high-water mark must never regress: a successor that lowered it
         // would let a later allocation reissue an id whose data may still exist on disk.
         if let Some(cur) = &current {
             let (before, after) = (cur.id_high_water(), next.id_high_water());
-            if after.table < before.table
+            if after.account < before.account
+                || after.table < before.table
                 || after.partition < before.partition
                 || after.tablet < before.tablet
                 || after.replica < before.replica
@@ -165,7 +176,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<CatalogSnapshot> {
     }
 
     let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    if version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION {
+    if !(LEGACY_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
         return Err(HtapError::Corruption(format!(
             "unsupported catalog format version: {version}"
         )));
@@ -208,12 +219,33 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<CatalogSnapshot> {
     let probe: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
         HtapError::Corruption(format!("failed to deserialize catalog snapshot: {e}"))
     })?;
-    // Version 2 payloads must carry the identifier high-water mark explicitly; only legacy
-    // version 1 payloads may omit it (they fall back to the live maximum).
-    if version == FORMAT_VERSION && probe.get("id_high_water").is_none() {
-        return Err(HtapError::Corruption(
-            "catalog format version 2 payload is missing id_high_water".into(),
-        ));
+    // Version 2 and later payloads must carry the identifier high-water mark explicitly;
+    // only legacy version 1 payloads may omit it (they fall back to the live maximum).
+    if version >= 2 && probe.get("id_high_water").is_none() {
+        return Err(HtapError::Corruption(format!(
+            "catalog format version {version} payload is missing id_high_water"
+        )));
+    }
+    // Version 3 introduced account security state. Unlike v1/v2 compatibility defaults, a v3
+    // payload must explicitly carry every security field so a damaged catalog cannot appear as
+    // an uninitialized account catalog and cause bootstrap to recreate root.
+    if version >= 3 {
+        for key in ["accounts", "grants", "accounts_initialized"] {
+            if probe.get(key).is_none() {
+                return Err(HtapError::Corruption(format!(
+                    "catalog format version 3 payload is missing {key}"
+                )));
+            }
+        }
+        if probe
+            .get("id_high_water")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|high_water| !high_water.contains_key("account"))
+        {
+            return Err(HtapError::Corruption(
+                "catalog format version 3 payload is missing id_high_water.account".into(),
+            ));
+        }
     }
     let snapshot: CatalogSnapshot = serde_json::from_value(probe).map_err(|e| {
         HtapError::Corruption(format!("failed to deserialize catalog snapshot: {e}"))
@@ -232,11 +264,34 @@ fn atomic_publish(dir: &Path, snapshot: &CatalogSnapshot) -> Result<()> {
     let tmp_path = dir.join(CATALOG_TMP_FILE_NAME);
     let final_path = dir.join(CATALOG_FILE_NAME);
 
+    // Remove a stale interrupted publish before creating a restricted replacement.
+    match fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(HtapError::Io(e)),
+    }
+
     let encoded = encode_snapshot(snapshot)?;
 
     // 1. Write tmp file and fsync
     let write_res = (|| -> Result<()> {
-        let mut file = File::create(&tmp_path)?;
+        let mut file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp_path)?
+            }
+            #[cfg(not(unix))]
+            {
+                File::create(&tmp_path)?
+            }
+        };
         file.write_all(&encoded)?;
         file.sync_all()?;
         Ok(())

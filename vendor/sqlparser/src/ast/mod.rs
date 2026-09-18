@@ -3912,6 +3912,15 @@ pub enum Statement {
         database_alias: Ident,
     },
     /// ```sql
+    /// DROP USER [ IF EXISTS ] user_name [, ...]
+    /// ```
+    DropUser {
+        /// `true` when `IF EXISTS` was present.
+        if_exists: bool,
+        /// User accounts to drop.
+        names: Vec<GranteeName>,
+    },
+    /// ```sql
     /// DROP [TABLE, VIEW, ...]
     /// ```
     Drop {
@@ -4924,6 +4933,13 @@ pub enum Statement {
     /// ```
     /// [Redshift](https://docs.aws.amazon.com/redshift/latest/dg/r_VACUUM_command.html)
     Vacuum(VacuumStatement),
+    /// ```sql
+    /// SHOW GRANTS [FOR <grantee>]
+    /// ```
+    ShowGrants {
+        /// Optional grantee to show grants for.
+        for_: Option<GranteeName>,
+    },
     /// Restore the value of a run-time parameter to the default value.
     ///
     /// ```sql
@@ -5629,6 +5645,14 @@ impl fmt::Display for Statement {
                     }
                 }
                 Ok(())
+            }
+            Statement::DropUser { if_exists, names } => {
+                write!(
+                    f,
+                    "DROP USER{} {}",
+                    if *if_exists { " IF EXISTS" } else { "" },
+                    display_comma_separated(names)
+                )
             }
             Statement::Drop {
                 object_type,
@@ -6387,6 +6411,13 @@ impl fmt::Display for Statement {
             Statement::Vacuum(s) => write!(f, "{s}"),
             Statement::AlterUser(s) => write!(f, "{s}"),
             Statement::Reset(s) => write!(f, "{s}"),
+            Statement::ShowGrants { for_ } => {
+                write!(f, "SHOW GRANTS")?;
+                if let Some(grantee) = for_ {
+                    write!(f, " FOR {grantee}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -11476,7 +11507,9 @@ pub struct CreateUser {
     /// Only create the user if it does not already exist.
     pub if_not_exists: bool,
     /// The name of the user to create.
-    pub name: Ident,
+    pub name: GranteeName,
+    /// Optional password or authentication string.
+    pub identified_by: Option<String>,
     /// Key/value options for user creation.
     pub options: KeyValueOptions,
     /// Whether tags are specified using `WITH TAG`.
@@ -11496,6 +11529,13 @@ impl fmt::Display for CreateUser {
             write!(f, " IF NOT EXISTS")?;
         }
         write!(f, " {}", self.name)?;
+        if let Some(password) = &self.identified_by {
+            write!(
+                f,
+                " IDENTIFIED BY '{}'",
+                value::escape_single_quote_string(password)
+            )?;
+        }
         if !self.options.options.is_empty() {
             write!(f, " {}", self.options)?;
         }
@@ -11527,7 +11567,7 @@ pub struct AlterUser {
     /// Whether to only alter the user if it exists.
     pub if_exists: bool,
     /// The name of the user to alter.
-    pub name: Ident,
+    pub name: GranteeName,
     /// Optional new name for the user (Snowflake-specific).
     /// See: <https://docs.snowflake.com/en/sql-reference/sql/alter-user#syntax>
     pub rename_to: Option<Ident>,
@@ -12381,6 +12421,8 @@ impl From<ResetStatement> for Statement {
 
 #[cfg(test)]
 mod tests {
+    use crate::dialect::GenericDialect;
+    use crate::parser::Parser;
     use crate::tokenizer::Location;
 
     use super::*;
@@ -12681,6 +12723,19 @@ mod tests {
 
     // Tests that the position in the code of an `Ident` does not affect its
     // ordering.
+    #[test]
+    fn test_user_management_password_display_escaping() {
+        let dialect = GenericDialect {};
+        for password in ["test password", "test's password", r"test\password", ""] {
+            let sql = format!(
+                "CREATE USER test_user IDENTIFIED BY '{}'",
+                value::escape_single_quote_string(password)
+            );
+            let statements = Parser::parse_sql(&dialect, &sql).unwrap();
+            assert_eq!(statements[0].to_string(), sql);
+        }
+    }
+
     #[test]
     fn test_ident_ord() {
         let mut a = Ident::with_span(Span::new(Location::new(1, 1), Location::new(1, 1)), "a");

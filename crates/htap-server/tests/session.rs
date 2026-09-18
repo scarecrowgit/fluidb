@@ -9,10 +9,11 @@ use std::sync::Arc;
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{ConversionDescriptor, ConversionPhase, StorageDescriptor, StorageFormat};
+use htap_common::password::scramble_native_password;
 use htap_common::types::{Row, Value};
 use htap_common::version::Version;
 use htap_common::HtapError;
-use htap_server::{LocalServer, Session};
+use htap_server::{LocalServer, Principal, Session};
 use htap_sql::result::StatementResult;
 use tempfile::TempDir;
 
@@ -1713,4 +1714,306 @@ fn test_select_system_variable_via_plain_execute() {
         exec_rows(&server, "SELECT @x;"),
         vec![Row::new(vec![Value::Null])]
     );
+}
+
+#[test]
+fn test_authenticate_session_returns_account_principal() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE USER alice IDENTIFIED BY 'secret';")
+        .unwrap();
+
+    let scramble = b"01234567890123456789";
+    let auth_response = scramble_native_password(scramble, "secret");
+    let session = server
+        .authenticate_session("alice", scramble, &auth_response)
+        .unwrap();
+
+    assert!(matches!(
+        session.principal(),
+        Principal::Account { username, .. } if username == "alice"
+    ));
+}
+
+#[test]
+fn test_authenticate_session_rejects_unknown_account() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+
+    let scramble = b"01234567890123456789";
+    let auth_response = scramble_native_password(scramble, "secret");
+    let error = server
+        .authenticate_session("missing", scramble, &auth_response)
+        .unwrap_err();
+
+    assert!(matches!(error, HtapError::PermissionDenied(_)));
+    assert!(error
+        .to_string()
+        .contains("access denied for user 'missing'"));
+}
+
+#[test]
+fn test_authenticate_session_rejects_wrong_password() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE USER alice IDENTIFIED BY 'secret';")
+        .unwrap();
+
+    let scramble = b"01234567890123456789";
+    let wrong_response = scramble_native_password(scramble, "wrong-password");
+    let error = server
+        .authenticate_session("alice", scramble, &wrong_response)
+        .unwrap_err();
+
+    assert!(matches!(error, HtapError::PermissionDenied(_)));
+    assert!(error.to_string().contains("access denied for user 'alice'"));
+}
+
+#[test]
+fn test_authenticate_session_locked_account_rejected() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE USER alice IDENTIFIED BY 'secret';")
+        .unwrap();
+    drop(server);
+
+    let catalog_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
+    let mut snapshot = catalog_store.load().unwrap().unwrap();
+    let expected_generation = snapshot.generation;
+    snapshot.generation += 1;
+    snapshot
+        .account_by_username("alice")
+        .expect("created account exists");
+    snapshot
+        .accounts
+        .iter_mut()
+        .find(|account| account.username == "alice")
+        .unwrap()
+        .locked = true;
+    catalog_store
+        .compare_and_set(expected_generation, snapshot)
+        .unwrap();
+
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    let scramble = b"01234567890123456789";
+    let auth_response = scramble_native_password(scramble, "secret");
+    let error = server
+        .authenticate_session("alice", scramble, &auth_response)
+        .unwrap_err();
+
+    assert!(matches!(error, HtapError::PermissionDenied(_)));
+}
+
+#[test]
+fn test_authenticate_session_unknown_user_same_error_as_wrong_password() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE USER alice IDENTIFIED BY 'secret';")
+        .unwrap();
+
+    let scramble = b"01234567890123456789";
+    let unknown_response = scramble_native_password(scramble, "secret");
+    let unknown_error = server
+        .authenticate_session("missing", scramble, &unknown_response)
+        .unwrap_err();
+
+    let wrong_response = scramble_native_password(scramble, "wrong-password");
+    let wrong_password_error = server
+        .authenticate_session("alice", scramble, &wrong_response)
+        .unwrap_err();
+
+    assert!(matches!(unknown_error, HtapError::PermissionDenied(_)));
+    assert!(matches!(
+        wrong_password_error,
+        HtapError::PermissionDenied(_)
+    ));
+
+    let unknown_message = unknown_error.to_string();
+    let wrong_password_message = wrong_password_error.to_string();
+    assert_eq!(
+        unknown_message.replace("missing", "<user>"),
+        wrong_password_message.replace("alice", "<user>")
+    );
+
+    for message in [&unknown_message, &wrong_password_message] {
+        let lower = message.to_ascii_lowercase();
+        assert!(!lower.contains("not found"));
+        assert!(!lower.contains("unknown"));
+        assert!(!lower.contains("locked"));
+        assert!(!lower.contains("password"));
+    }
+}
+
+#[test]
+fn test_authenticate_session_accepts_account_without_password() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server.bootstrap_root_account(None).unwrap();
+
+    let session = server
+        .authenticate_session("root", b"01234567890123456789", b"")
+        .unwrap();
+
+    assert!(matches!(
+        session.principal(),
+        Principal::Account { username, .. } if username == "root"
+    ));
+}
+
+#[test]
+fn test_change_user_switches_to_authenticated_account() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE USER alice IDENTIFIED BY 'secret';")
+        .unwrap();
+
+    let mut session = server.open_session();
+    let scramble = b"01234567890123456789";
+    let auth_response = scramble_native_password(scramble, "secret");
+    session
+        .change_user("alice", scramble, &auth_response)
+        .unwrap();
+
+    assert!(matches!(
+        session.principal(),
+        Principal::Account { username, .. } if username == "alice"
+    ));
+}
+
+#[test]
+fn test_change_user_resets_session_state_before_switching_principal() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("CREATE USER alice IDENTIFIED BY 'secret';")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("SET @x = 42;").unwrap();
+    session.execute("SET autocommit = 0;").unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (1, 1);")
+        .unwrap();
+    assert!(session.in_transaction());
+
+    let scramble = b"01234567890123456789";
+    let auth_response = scramble_native_password(scramble, "secret");
+    session
+        .change_user("alice", scramble, &auth_response)
+        .unwrap();
+
+    assert!(matches!(
+        session.principal(),
+        Principal::Account { username, .. } if username == "alice"
+    ));
+    assert!(!session.in_transaction());
+    assert!(session.autocommit());
+    assert_eq!(
+        session_rows(&mut session, "SELECT @x;"),
+        vec![Row::new(vec![Value::Null])]
+    );
+    assert!(exec_rows(&server, "SELECT id FROM t;").is_empty());
+}
+
+#[test]
+fn test_change_user_failure_preserves_existing_principal_and_state() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("CREATE USER alice IDENTIFIED BY 'secret';")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (1, 1);")
+        .unwrap();
+
+    let scramble = b"01234567890123456789";
+    let wrong_response = scramble_native_password(scramble, "wrong-password");
+    let error = session
+        .change_user("alice", scramble, &wrong_response)
+        .unwrap_err();
+
+    assert!(matches!(error, HtapError::PermissionDenied(_)));
+    assert!(matches!(session.principal(), Principal::Superuser));
+    assert!(session.in_transaction());
+    assert_eq!(
+        session_rows(&mut session, "SELECT id FROM t WHERE id = 1;"),
+        vec![Row::new(vec![Value::Int64(1)])]
+    );
+}
+
+#[test]
+fn test_change_user_can_switch_between_authenticated_accounts() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE USER alice IDENTIFIED BY 'alice-secret';")
+        .unwrap();
+    server
+        .execute("CREATE USER bob IDENTIFIED BY 'bob-secret';")
+        .unwrap();
+
+    let scramble = b"01234567890123456789";
+    let alice_response = scramble_native_password(scramble, "alice-secret");
+    let mut session = server
+        .authenticate_session("alice", scramble, &alice_response)
+        .unwrap();
+
+    let bob_response = scramble_native_password(scramble, "bob-secret");
+    session.change_user("bob", scramble, &bob_response).unwrap();
+
+    assert!(matches!(
+        session.principal(),
+        Principal::Account { username, .. } if username == "bob"
+    ));
+}
+
+#[test]
+fn test_account_ddl_rejected_inside_open_transaction() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    let mut session = server.open_session();
+
+    session.execute("BEGIN").unwrap();
+    assert!(session.in_transaction());
+
+    for sql in [
+        "CREATE USER 'u'@'%' IDENTIFIED BY 'p'",
+        "DROP USER u",
+        "GRANT SELECT ON *.* TO u",
+        "REVOKE SELECT ON *.* FROM u",
+        "ALTER USER u IDENTIFIED BY 'q'",
+        "SHOW GRANTS",
+    ] {
+        let error = session.execute(sql).expect_err(sql);
+        assert!(
+            matches!(error, HtapError::Unsupported(ref message) if message.contains("DDL is not supported inside an explicit transaction")),
+            "unexpected error for {sql}: {error:?}"
+        );
+        assert!(
+            session.in_transaction(),
+            "{sql} must not close the transaction"
+        );
+        session
+            .execute("SELECT 1")
+            .expect("transaction remains usable");
+    }
+
+    session.rollback().unwrap();
+    session
+        .execute("CREATE USER 'u'@'%' IDENTIFIED BY 'p'")
+        .expect("account DDL is executable outside an explicit transaction");
 }

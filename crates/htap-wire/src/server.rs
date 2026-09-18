@@ -16,13 +16,13 @@
 //!
 //! - Default bind address is `127.0.0.1:3307` (loopback only). Binding elsewhere is an
 //!   explicit opt-in via [`WireServerConfig::listen`].
-//! - One implicit user: the user name sent by the client is logged but never checked.
-//! - [`WireServerConfig::password`] is the only credential. `None` accepts any client.
-//!   `Some(pw)` verifies a `mysql_native_password` response; clients proposing another
-//!   plugin are switched to `mysql_native_password`.
-//! - No TLS. The password exchange is a challenge/response hash, but query text and result
-//!   rows travel in cleartext. Do not bind a non-loopback address without a trusted network
-//!   or an external tunnel.
+//! - Authentication uses catalog accounts. [`WireServerConfig::password`] bootstraps the root
+//!   account on first startup; later password changes are managed with `ALTER USER`.
+//! - TLS is optional. When [`WireServerConfig::tls`] is configured, clients can negotiate TLS;
+//!   [`WireServerConfig::require_secure_transport`] rejects non-TLS connections. Without TLS,
+//!   the password exchange is a challenge/response hash, but query text and result rows travel
+//!   in cleartext. Do not bind a non-loopback address without TLS, a trusted network, or an
+//!   external tunnel.
 //! - Every pre-authentication read (the handshake response, and either side of an auth-plugin
 //!   switch) is bounded by [`AUTH_PHASE_MAX_PACKET`] before anything is allocated (finding 1 of
 //!   the Phase 11 fix pass): an unauthenticated peer cannot make this server allocate more than
@@ -54,8 +54,9 @@
 //! path out of the connection thread, panics included.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -63,7 +64,7 @@ use std::time::Duration;
 
 use htap_common::types::{ColumnDef, DataType, Row, Value};
 use htap_common::HtapError;
-use htap_server::LocalServer;
+use htap_server::{LocalServer, Session as ServerSession};
 use htap_sql::{CommandResult, QueryResult, StatementResult};
 use parking_lot::Mutex;
 use sqlparser::ast::Statement as SqlStatement;
@@ -75,10 +76,11 @@ use crate::codec::{
     read_message_with_stop, read_u16, read_u32, write_lenenc_int, write_message, write_packet,
     SeqCounter, PACKET_TOO_LARGE_ERROR_KIND, SHUTDOWN_ERROR_KIND,
 };
+use crate::compression::{CompressedStream, CompressionAlgorithm};
 use crate::error_map::{build_err_payload, map_htap_error};
 use crate::handshake::{
-    generate_scramble, AuthSwitchRequest, ChangeUserRequest, HandshakeResponse41, HandshakeV10,
-    SCRAMBLE_LEN,
+    decode_ssl_request, generate_scramble, AuthSwitchRequest, ChangeUserRequest,
+    HandshakeResponse41, HandshakeV10, SCRAMBLE_LEN,
 };
 use crate::prepared::{PreparedStatementRegistry, PreparedStmt, MAX_PREPARED_STATEMENTS};
 use crate::proto::*;
@@ -87,6 +89,17 @@ use crate::result_codec::{
 };
 use crate::sha1::verify_native_password;
 use crate::shim::{is_accepted_schema, try_shim, ShimOutcome};
+use crate::tls::{perform_tls_handshake, Conn, ReloadableCertResolver};
+use rustls::server::ResolvesServerCert;
+
+/// TLS certificate and private-key files used by the listener.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// PEM-encoded server certificate chain.
+    pub cert_path: PathBuf,
+    /// PEM-encoded private key.
+    pub key_path: PathBuf,
+}
 
 /// Listener configuration.
 #[derive(Debug, Clone)]
@@ -96,8 +109,13 @@ pub struct WireServerConfig {
     /// Maximum number of simultaneously open connections; excess connections receive
     /// ERR 1040 and are closed.
     pub max_connections: usize,
-    /// Shared password. `None` disables authentication.
+    /// Password used to bootstrap the root account on first startup. `None` bootstraps root
+    /// without a password.
     pub password: Option<String>,
+    /// TLS certificate and key configuration. `None` disables TLS.
+    pub tls: Option<TlsConfig>,
+    /// Reject non-TLS authentication attempts.
+    pub require_secure_transport: bool,
     /// Read timeout used to observe shutdown between packets.
     pub read_timeout: Duration,
     /// Maximum total size, in bytes, of one logical protocol message (a `COM_QUERY`'s SQL text,
@@ -108,6 +126,9 @@ pub struct WireServerConfig {
     /// against this server (`htap_server::Session::set_max_allowed_packet`). Defaults to MySQL's
     /// own default, 64 MiB (`htap_sql::DEFAULT_MAX_ALLOWED_PACKET`).
     pub max_allowed_packet: usize,
+
+    /// Whether to enable negotiated protocol compression for client connections.
+    pub compression_enabled: bool,
 }
 
 impl Default for WireServerConfig {
@@ -116,8 +137,11 @@ impl Default for WireServerConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 3307)),
             max_connections: 64,
             password: None,
+            tls: None,
+            require_secure_transport: false,
             read_timeout: Duration::from_millis(200),
             max_allowed_packet: htap_sql::DEFAULT_MAX_ALLOWED_PACKET as usize,
+            compression_enabled: true,
         }
     }
 }
@@ -133,6 +157,7 @@ pub struct WireServer {
     /// Registry of every currently open connection's socket, keyed by connection id (Phase 11
     /// plan task 11); see the module's `# Shutdown` docs.
     live_connections: Arc<Mutex<HashMap<u32, TcpStream>>>,
+    shared: Arc<Shared>,
 }
 
 impl std::fmt::Debug for WireServer {
@@ -150,9 +175,17 @@ impl std::fmt::Debug for WireServer {
 struct Shared {
     server: Arc<LocalServer>,
     password: Option<String>,
+    tls_resolver: Option<Arc<ReloadableCertResolver>>,
+    tls_server_config: Option<Arc<rustls::ServerConfig>>,
+    tls_cert_paths: Option<(PathBuf, PathBuf)>,
+    require_secure_transport: bool,
     stop: Arc<AtomicBool>,
     read_timeout: Duration,
     max_allowed_packet: usize,
+    compression_enabled: bool,
+    // `WireServer::start` always bootstraps this before accepting connections. The legacy
+    // shared-password path remains only for manually constructed test/shared configurations.
+    accounts_initialized: bool,
     next_connection_id: AtomicU32,
 }
 
@@ -178,9 +211,54 @@ impl Drop for ConnectionGuard {
     }
 }
 
+fn load_tls_certified_key(config: &TlsConfig) -> io::Result<rustls::sign::CertifiedKey> {
+    ReloadableCertResolver::load(&config.cert_path, &config.key_path)
+}
+
 impl WireServer {
     /// Binds the listener and starts accepting connections.
     pub fn start(config: WireServerConfig, server: Arc<LocalServer>) -> io::Result<Self> {
+        if config.require_secure_transport && config.tls.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "require_secure_transport requires TLS configuration",
+            ));
+        }
+        let (tls_resolver, tls_cert_paths) = match config.tls.as_ref() {
+            Some(tls) => (
+                Some(Arc::new(ReloadableCertResolver::new(
+                    load_tls_certified_key(tls)?,
+                ))),
+                Some((tls.cert_path.clone(), tls.key_path.clone())),
+            ),
+            None => (None, None),
+        };
+        let tls_server_config = match tls_resolver.as_ref() {
+            Some(resolver) => Some(Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid TLS protocol configuration: {e}"),
+                    )
+                })?
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::clone(resolver) as Arc<dyn ResolvesServerCert>),
+            )),
+            None => None,
+        };
+        let bootstrap = server
+            .bootstrap_root_account(config.password.as_deref())
+            .map_err(|e| io::Error::other(format!("failed to bootstrap root account: {e}")))?;
+        if bootstrap.config_password_matches_root == Some(false) {
+            tracing::warn!(
+                "configured password no longer controls root login; administrators should use \
+                 ALTER USER root IDENTIFIED BY to change the persisted root password"
+            );
+        }
         let listener = TcpListener::bind(config.listen)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
@@ -192,9 +270,15 @@ impl WireServer {
         let shared = Arc::new(Shared {
             server,
             password: config.password.clone(),
+            tls_resolver,
+            tls_server_config,
+            tls_cert_paths,
+            compression_enabled: config.compression_enabled,
+            require_secure_transport: config.require_secure_transport,
             stop: Arc::clone(&stop),
             read_timeout: config.read_timeout,
             max_allowed_packet: config.max_allowed_packet,
+            accounts_initialized: true,
             next_connection_id: AtomicU32::new(1),
         });
         let max_connections = config.max_connections.max(1);
@@ -203,12 +287,13 @@ impl WireServer {
         let accept_threads = Arc::clone(&conn_threads);
         let accept_count = Arc::clone(&connection_count);
         let accept_live_connections = Arc::clone(&live_connections);
+        let accept_shared = Arc::clone(&shared);
         let accept_thread = std::thread::Builder::new()
             .name("htap-wire-accept".into())
             .spawn(move || {
                 accept_loop(
                     listener,
-                    shared,
+                    accept_shared,
                     max_connections,
                     accept_stop,
                     accept_threads,
@@ -225,12 +310,30 @@ impl WireServer {
             conn_threads,
             connection_count,
             live_connections,
+            shared,
         })
     }
 
     /// Address the listener is bound to (useful with port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Reloads the configured TLS certificate and private key for future TLS handshakes.
+    ///
+    /// Existing TLS connections retain the certificate negotiated when they connected.
+    pub fn reload_tls_certs(&self) -> io::Result<()> {
+        let resolver =
+            self.shared.tls_resolver.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Unsupported, "TLS is not configured")
+            })?;
+        let (cert_path, key_path) = self.shared.tls_cert_paths.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS certificate paths are not configured",
+            )
+        })?;
+        resolver.reload(cert_path, key_path)
     }
 
     /// Number of currently open connections.
@@ -392,12 +495,10 @@ impl Session {
     }
 }
 
-/// Verifies a `mysql_native_password` challenge/response against the connection's configured
-/// credential.
+/// Verifies a `mysql_native_password` challenge/response against a configured credential.
 ///
-/// Factored out of [`authenticate`] (Phase 11 plan task 7) as the seam a future phase's real
-/// per-user ACL will replace: today `configured_password` is always this server's single shared
-/// [`WireServerConfig::password`], but every caller already goes through this one function.
+/// This is retained only for the legacy manually constructed [`Shared`] test path. Normal
+/// listeners authenticate against catalog accounts through [`LocalServer::authenticate_session`].
 fn verify_credentials(
     scramble: &[u8; SCRAMBLE_LEN],
     configured_password: Option<&str>,
@@ -409,7 +510,7 @@ fn verify_credentials(
     }
 }
 
-fn send(stream: &mut TcpStream, seq: &mut SeqCounter, payload: &[u8]) -> io::Result<()> {
+fn send(stream: &mut impl Write, seq: &mut SeqCounter, payload: &[u8]) -> io::Result<()> {
     write_message(stream, seq, payload)
 }
 
@@ -439,12 +540,13 @@ fn session_status_flags(server_session: &htap_server::Session, more_results: boo
 }
 
 fn send_err(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     seq: &mut SeqCounter,
     (code, state): (u16, &str),
     message: &str,
 ) -> io::Result<()> {
-    send(stream, seq, &build_err_payload(code, state, message))
+    send(stream, seq, &build_err_payload(code, state, message))?;
+    stream.flush()
 }
 
 /// Cap, in bytes, on any single pre-authentication read (the initial handshake response, and
@@ -471,7 +573,7 @@ const AUTH_PHASE_MAX_PACKET: usize = 64 * 1024;
 /// bytes. [`read_message_with_stop`] checks the declared length against `max_len` *before*
 /// allocating (see its own doc comment), so the allocation this function can be made to perform
 /// is capped at `max_len`, checked before it happens.
-fn read(stream: &mut TcpStream, stop: &AtomicBool, max_len: usize) -> io::Result<(u8, Vec<u8>)> {
+fn read(stream: &mut impl Read, stop: &AtomicBool, max_len: usize) -> io::Result<(u8, Vec<u8>)> {
     read_message_with_stop(stream, max_len, Some(stop))
 }
 
@@ -484,38 +586,87 @@ fn auth_phase_max_len(shared: &Shared) -> usize {
 /// Reads one full command message (Phase 11 plan task 8), reassembling multi-packet payloads and
 /// enforcing `max_allowed_packet`; see [`crate::codec::read_message_with_stop`].
 fn read_command(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     max_allowed_packet: usize,
     stop: &AtomicBool,
 ) -> io::Result<(u8, Vec<u8>)> {
     read_message_with_stop(stream, max_allowed_packet, Some(stop))
 }
 
-fn handle_connection(mut stream: TcpStream, connection_id: u32, shared: &Shared) -> io::Result<()> {
+enum ServerStream {
+    Plain(Conn),
+    Compressed(CompressedStream<Conn>),
+}
+
+impl Read for ServerStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Compressed(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for ServerStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Compressed(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Compressed(stream) => stream.flush(),
+        }
+    }
+}
+
+impl ServerStream {
+    fn reset_sequence(&mut self) {
+        match self {
+            Self::Plain(_) => {}
+            Self::Compressed(stream) => stream.reset_sequence(),
+        }
+    }
+}
+
+fn handle_connection(stream: TcpStream, connection_id: u32, shared: &Shared) -> io::Result<()> {
     stream.set_read_timeout(Some(shared.read_timeout))?;
-    let mut session = match authenticate(&mut stream, connection_id, shared)? {
-        Some(s) => s,
-        None => return Ok(()),
-    };
+    let mut stream = Conn::Plain(stream);
+    let (mut session_struct, compression, mut server_session) =
+        match authenticate(&mut stream, connection_id, shared)? {
+            Some((s, c, server_session)) => (s, c, server_session),
+            None => return Ok(()),
+        };
     tracing::debug!(
         connection_id,
-        deprecate_eof = session.deprecate_eof,
+        deprecate_eof = session_struct.deprecate_eof,
         "authenticated"
     );
+
+    let mut stream = match compression {
+        Some(compression) => ServerStream::Compressed(CompressedStream::new(
+            stream,
+            Some(compression),
+            shared.max_allowed_packet,
+        )),
+        None => ServerStream::Plain(stream),
+    };
 
     // One `htap_server::Session` per authenticated connection (Phase 10 task 9): buffered
     // writes, autocommit state, and user/system variables all live here for the connection's
     // whole lifetime. One `PreparedStatementRegistry` per connection too (Phase 11 plan task 4):
     // unlike `htap_server::Session`, prepared statements have no counterpart inside `htap-server`
     // at all, since they are a wire-protocol concept.
-    let mut server_session = shared.server.open_session();
     server_session.set_max_allowed_packet(shared.max_allowed_packet as u64);
     let mut registry =
         PreparedStatementRegistry::new(MAX_PREPARED_STATEMENTS, shared.max_allowed_packet);
     let result = run_commands(
         &mut stream,
         shared,
-        &mut session,
+        &mut session_struct,
         &mut server_session,
         &mut registry,
     );
@@ -530,13 +681,14 @@ fn handle_connection(mut stream: TcpStream, connection_id: u32, shared: &Shared)
 /// The connection's command loop, run after authentication with one `htap_server::Session`
 /// owned by the caller for the connection's whole lifetime.
 fn run_commands(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     shared: &Shared,
     session: &mut Session,
     server_session: &mut htap_server::Session,
     registry: &mut PreparedStatementRegistry,
 ) -> io::Result<()> {
     loop {
+        stream.reset_sequence();
         let (pkt_seq, payload) = match read_command(stream, shared.max_allowed_packet, &shared.stop)
         {
             Ok(p) => p,
@@ -561,6 +713,7 @@ fn run_commands(
                         shared.max_allowed_packet
                     ),
                 );
+                stream.flush()?;
                 return Ok(());
             }
             // Framing errors (e.g. a sequence-id mismatch across chunks) desynchronize the
@@ -643,6 +796,7 @@ fn run_commands(
                     registry,
                 )?;
                 if !keep_open {
+                    stream.flush()?;
                     return Ok(());
                 }
             }
@@ -655,24 +809,40 @@ fn run_commands(
                 )?;
             }
         }
+        stream.flush()?;
     }
 }
 
+fn advertised_capabilities(shared: &Shared) -> u32 {
+    let mut capabilities = SERVER_CAPABILITIES;
+    if shared.compression_enabled {
+        capabilities |= CLIENT_COMPRESS | CLIENT_ZSTD_COMPRESSION_ALGORITHM;
+    }
+    if shared.tls_resolver.is_some() {
+        capabilities |= CLIENT_SSL;
+    }
+    capabilities
+}
+
 fn authenticate(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     connection_id: u32,
     shared: &Shared,
-) -> io::Result<Option<Session>> {
+) -> io::Result<Option<(Session, Option<CompressionAlgorithm>, ServerSession)>> {
     let mut seq = SeqCounter::new();
     let mut scramble = generate_scramble()?;
     send(
         stream,
         &mut seq,
-        &HandshakeV10::new(connection_id, scramble).encode(),
+        &HandshakeV10 {
+            capabilities: advertised_capabilities(shared),
+            ..HandshakeV10::new(connection_id, scramble)
+        }
+        .encode(),
     )?;
 
     let auth_max_len = auth_phase_max_len(shared);
-    let (pkt_seq, payload) = match read(stream, &shared.stop, auth_max_len) {
+    let (pkt_seq, mut payload) = match read(stream, &shared.stop, auth_max_len) {
         Ok(p) => p,
         Err(e) if e.kind() == SHUTDOWN_ERROR_KIND => return Ok(None),
         // An oversize handshake response (finding 1): close the connection without ever having
@@ -681,15 +851,55 @@ fn authenticate(
     };
     seq.continue_after(pkt_seq);
 
+    let mut secure_transport = false;
     match HandshakeResponse41::peek_capabilities(&payload) {
         Some(caps) if caps & CLIENT_SSL != 0 => {
-            send_err(
-                stream,
-                &mut seq,
-                ER_UNKNOWN,
-                "TLS is not supported by this server",
-            )?;
-            return Ok(None);
+            // The resolver establishes that TLS credentials are configured; the shared server
+            // config uses that resolver so future handshakes see reloaded certificates.
+            if shared.tls_resolver.is_none() {
+                send_err(
+                    stream,
+                    &mut seq,
+                    ER_UNKNOWN,
+                    "TLS is not supported by this server",
+                )?;
+                return Ok(None);
+            }
+            let Some(tls_server_config) = shared.tls_server_config.as_ref() else {
+                send_err(
+                    stream,
+                    &mut seq,
+                    ER_UNKNOWN,
+                    "TLS is not supported by this server",
+                )?;
+                return Ok(None);
+            };
+            if let Err(e) = decode_ssl_request(&payload) {
+                send_err(
+                    stream,
+                    &mut seq,
+                    ER_UNKNOWN,
+                    &format!("Malformed SSL request: {e}"),
+                )?;
+                return Ok(None);
+            }
+            let conn =
+                rustls::ServerConnection::new(Arc::clone(tls_server_config)).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("failed to create TLS server connection: {e}"),
+                    )
+                })?;
+            let tcp = stream.tcp().try_clone()?;
+            *stream = perform_tls_handshake(&mut tcp.try_clone()?, conn, &shared.stop)?;
+            secure_transport = true;
+            let (response_seq, response_payload) = match read(stream, &shared.stop, auth_max_len) {
+                Ok(p) => p,
+                Err(e) if e.kind() == SHUTDOWN_ERROR_KIND => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            seq.continue_after(response_seq);
+            payload = response_payload;
         }
         Some(_) => {}
         None => {
@@ -697,6 +907,7 @@ fn authenticate(
             return Ok(None);
         }
     }
+
     let response = match HandshakeResponse41::decode(&payload) {
         Ok(r) => r,
         Err(e) => {
@@ -715,6 +926,16 @@ fn authenticate(
             &mut seq,
             ER_NOT_SUPPORTED_AUTH_MODE,
             "Client does not support secure authentication",
+        )?;
+        return Ok(None);
+    }
+
+    if shared.require_secure_transport && !secure_transport {
+        send_err(
+            stream,
+            &mut seq,
+            ER_ACCESS_DENIED,
+            "Secure transport required",
         )?;
         return Ok(None);
     }
@@ -740,29 +961,51 @@ fn authenticate(
         auth_response = switch_payload;
     }
 
-    let authorized = verify_credentials(
-        &scramble_array(&scramble),
-        shared.password.as_deref(),
-        &auth_response,
-    );
-    if !authorized {
-        tracing::warn!(connection_id, user = %response.username, "access denied");
-        send_err(
-            stream,
-            &mut seq,
-            ER_ACCESS_DENIED,
-            &format!(
-                "Access denied for user '{}' (using password: {})",
-                response.username,
-                if auth_response.is_empty() {
-                    "NO"
-                } else {
-                    "YES"
-                }
-            ),
-        )?;
-        return Ok(None);
-    }
+    let server_session = if shared.accounts_initialized {
+        match shared
+            .server
+            .authenticate_session(&response.username, &scramble, &auth_response)
+        {
+            Ok(session) => session,
+            Err(_) => {
+                tracing::warn!(connection_id, user = %response.username, "access denied");
+                send_err(
+                    stream,
+                    &mut seq,
+                    ER_ACCESS_DENIED,
+                    &format!("Access denied for user '{}'", response.username),
+                )?;
+                return Ok(None);
+            }
+        }
+    } else {
+        // `WireServer::start` bootstraps catalog accounts before listening, so this legacy
+        // shared-password fallback is unreachable in normal operation.
+        let authorized = verify_credentials(
+            &scramble_array(&scramble),
+            shared.password.as_deref(),
+            &auth_response,
+        );
+        if !authorized {
+            tracing::warn!(connection_id, user = %response.username, "access denied");
+            send_err(
+                stream,
+                &mut seq,
+                ER_ACCESS_DENIED,
+                &format!(
+                    "Access denied for user '{}' (using password: {})",
+                    response.username,
+                    if auth_response.is_empty() {
+                        "NO"
+                    } else {
+                        "YES"
+                    }
+                ),
+            )?;
+            return Ok(None);
+        }
+        shared.server.open_session()
+    };
 
     if let Some(db) = response.database.as_deref() {
         if !db.is_empty() && !is_accepted_schema(db) {
@@ -784,14 +1027,31 @@ fn authenticate(
         &mut seq,
         &build_command_ok(0, "", SERVER_STATUS_AUTOCOMMIT),
     )?;
+    stream.flush()?;
     tracing::debug!(connection_id, user = %response.username, "connection authenticated");
     let negotiated_capabilities = response.capability_flags & SERVER_CAPABILITIES;
-    Ok(Some(Session {
-        deprecate_eof: negotiated_capabilities & CLIENT_DEPRECATE_EOF != 0,
-        negotiated_capabilities,
-        capability_flags: response.capability_flags,
-        scramble,
-    }))
+    let compression = if shared.compression_enabled
+        && response.capability_flags & CLIENT_ZSTD_COMPRESSION_ALGORITHM != 0
+    {
+        Some(CompressionAlgorithm::Zstd {
+            level: response.zstd_compression_level.unwrap_or(3).clamp(1, 3) as i32,
+        })
+    } else if shared.compression_enabled && response.capability_flags & CLIENT_COMPRESS != 0 {
+        Some(CompressionAlgorithm::Zlib)
+    } else {
+        None
+    };
+
+    Ok(Some((
+        Session {
+            deprecate_eof: negotiated_capabilities & CLIENT_DEPRECATE_EOF != 0,
+            negotiated_capabilities,
+            capability_flags: response.capability_flags,
+            scramble,
+        },
+        compression,
+        server_session,
+    )))
 }
 
 fn scramble_array(s: &[u8; SCRAMBLE_LEN]) -> [u8; SCRAMBLE_LEN] {
@@ -799,7 +1059,7 @@ fn scramble_array(s: &[u8; SCRAMBLE_LEN]) -> [u8; SCRAMBLE_LEN] {
 }
 
 fn respond_use_db(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     seq: &mut SeqCounter,
     name: &str,
     server_session: &htap_server::Session,
@@ -919,7 +1179,7 @@ pub fn encode_statement_result(
 /// `SERVER_MORE_RESULTS_EXISTS`. Without that capability, behavior is unchanged from before this
 /// task: `server_session.execute(sql)` itself rejects multi-statement text via `parse_one`.
 fn respond_query(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     seq: &mut SeqCounter,
     sql: &str,
     session: &Session,
@@ -974,7 +1234,7 @@ fn respond_query(
 /// `SERVER_STATUS_*` bitmask to report on success (Phase 11 fix pass, finding 8; see
 /// `session_status_flags`).
 fn write_query_response(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     seq: &mut SeqCounter,
     outcome: Result<StatementResult, HtapError>,
     deprecate_eof: bool,
@@ -1033,7 +1293,7 @@ fn generic_param_column_def() -> ColumnDef {
 }
 
 fn respond_stmt_prepare(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     seq: &mut SeqCounter,
     body: &[u8],
     session: &Session,
@@ -1060,12 +1320,14 @@ fn respond_stmt_prepare(
         let statement = htap_sql::parse_one(sql)?;
         check_preparable(&statement)?;
         let num_params = htap_sql::checked_placeholder_count(sql, &statement)?;
+        // PREPARE checks catalog visibility before registration, just as EXECUTE enforces
+        // privileges through `Session::execute_statement`.
+        let catalog = server_session.check_statement_visible(&statement)?;
         let num_params = u16::try_from(num_params).map_err(|_| {
             HtapError::Unsupported(format!(
                 "too many placeholders ({num_params}) in a single prepared statement"
             ))
         })?;
-        let catalog = server_session.catalog_snapshot()?;
         let output_schema = htap_sql::resolve_prepare_output_schema(&statement, &catalog)?;
         let stmt = PreparedStmt::new(statement, num_params, output_schema.clone());
         let stmt_id = registry.insert(stmt).map_err(HtapError::Unsupported)?;
@@ -1146,7 +1408,7 @@ fn is_textual_param_type(mysql_type: u8) -> bool {
 }
 
 fn respond_stmt_execute(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     seq: &mut SeqCounter,
     body: &[u8],
     session: &Session,
@@ -1264,6 +1526,7 @@ fn respond_stmt_execute(
         return send_err(stream, seq, (code, state), &e.to_string());
     }
 
+    // Privileges are enforced by `Session::execute_statement` for every prepared execution.
     let outcome = server_session.execute_statement(stmt_clone);
     // Computed after `execute_statement`, exactly like `respond_query`: a statement can itself
     // change autocommit/transaction state.
@@ -1342,7 +1605,7 @@ fn encode_execute_query_result(
 }
 
 fn respond_stmt_reset(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     seq: &mut SeqCounter,
     body: &[u8],
     registry: &mut PreparedStatementRegistry,
@@ -1380,7 +1643,7 @@ fn respond_stmt_reset(
 // -------------------------------------------------------------------------------------------
 
 fn respond_reset_connection(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     seq: &mut SeqCounter,
     server_session: &mut htap_server::Session,
     registry: &mut PreparedStatementRegistry,
@@ -1413,7 +1676,7 @@ fn respond_reset_connection(
 /// or an authenticated-but-quarantined failure), `Ok(false)` if the caller must close the
 /// connection (malformed request or access denied).
 fn respond_change_user(
-    stream: &mut TcpStream,
+    stream: &mut ServerStream,
     seq: &mut SeqCounter,
     body: &[u8],
     shared: &Shared,
@@ -1469,6 +1732,7 @@ fn respond_change_user(
             scramble,
         };
         send(stream, seq, &switch.encode())?;
+        stream.flush()?;
         let (pkt_seq, switch_payload) = match read(stream, &shared.stop, auth_phase_max_len(shared))
         {
             Ok(p) => p,
@@ -1479,42 +1743,66 @@ fn respond_change_user(
         auth_response = switch_payload;
     }
 
-    let authorized = verify_credentials(&scramble, shared.password.as_deref(), &auth_response);
-    if !authorized {
-        tracing::warn!(user = %request.username, "COM_CHANGE_USER access denied");
-        send_err(
+    if shared.accounts_initialized {
+        match server_session.change_user(&request.username, &scramble, &auth_response) {
+            Ok(()) => {}
+            Err(HtapError::DurablePending { .. }) => {
+                send_err(stream, seq, ER_UNKNOWN, "resource busy")?;
+                return Ok(true);
+            }
+            Err(_) => {
+                tracing::warn!(user = %request.username, "COM_CHANGE_USER access denied");
+                send_err(
+                    stream,
+                    seq,
+                    ER_ACCESS_DENIED,
+                    &format!("Access denied for user '{}'", request.username),
+                )?;
+                return Ok(false);
+            }
+        }
+        registry.clear();
+        send(
             stream,
             seq,
-            ER_ACCESS_DENIED,
-            &format!(
-                "Access denied for user '{}' (using password: {})",
-                request.username,
-                if auth_response.is_empty() {
-                    "NO"
-                } else {
-                    "YES"
-                }
-            ),
+            &build_command_ok(0, "", session_status_flags(server_session, false)),
         )?;
-        return Ok(false);
-    }
-
-    match server_session.reset() {
-        Ok(()) => {
-            registry.clear();
-            // Post-reset state, exactly like `respond_reset_connection`.
-            send(
+    } else {
+        // `WireServer::start` bootstraps catalog accounts before listening, so this legacy
+        // shared-password fallback is unreachable in normal operation.
+        let authorized = verify_credentials(&scramble, shared.password.as_deref(), &auth_response);
+        if !authorized {
+            tracing::warn!(user = %request.username, "COM_CHANGE_USER access denied");
+            send_err(
                 stream,
                 seq,
-                &build_command_ok(0, "", session_status_flags(server_session, false)),
+                ER_ACCESS_DENIED,
+                &format!(
+                    "Access denied for user '{}' (using password: {})",
+                    request.username,
+                    if auth_response.is_empty() {
+                        "NO"
+                    } else {
+                        "YES"
+                    }
+                ),
             )?;
+            return Ok(false);
         }
-        Err(err) => {
-            // Quarantine (`CommitOutcomePending`) is respected exactly like `COM_RESET_CONNECTION`
-            // (task 6): the registry stays intact and the connection stays open, reporting the
-            // original error rather than pretending the user change happened.
-            let (code, state) = map_htap_error(&err);
-            send_err(stream, seq, (code, state), &err.to_string())?;
+
+        match server_session.reset() {
+            Ok(()) => {
+                registry.clear();
+                send(
+                    stream,
+                    seq,
+                    &build_command_ok(0, "", session_status_flags(server_session, false)),
+                )?;
+            }
+            Err(err) => {
+                let (code, state) = map_htap_error(&err);
+                send_err(stream, seq, (code, state), &err.to_string())?;
+            }
         }
     }
     Ok(true)
@@ -1531,6 +1819,41 @@ mod tests {
         assert!(cfg.listen.ip().is_loopback());
         assert_eq!(cfg.max_connections, 64);
         assert!(cfg.password.is_none());
+    }
+
+    #[test]
+    fn advertised_capabilities_include_ssl_only_with_tls_config() {
+        let server = Arc::new(LocalServer::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let plain = Shared {
+            server: Arc::clone(&server),
+            password: None,
+            tls_resolver: None,
+            tls_server_config: None,
+            tls_cert_paths: None,
+            require_secure_transport: false,
+            stop: Arc::new(AtomicBool::new(false)),
+            read_timeout: Duration::from_millis(1),
+            max_allowed_packet: 1024,
+            compression_enabled: true,
+            accounts_initialized: false,
+            next_connection_id: AtomicU32::new(1),
+        };
+        assert_eq!(advertised_capabilities(&plain) & CLIENT_SSL, 0);
+        assert_ne!(advertised_capabilities(&plain) & CLIENT_COMPRESS, 0);
+        assert_ne!(
+            advertised_capabilities(&plain) & CLIENT_ZSTD_COMPRESSION_ALGORITHM,
+            0
+        );
+
+        let disabled = Shared {
+            compression_enabled: false,
+            ..plain
+        };
+        assert_eq!(advertised_capabilities(&disabled) & CLIENT_COMPRESS, 0);
+        assert_eq!(
+            advertised_capabilities(&disabled) & CLIENT_ZSTD_COMPRESSION_ALGORITHM,
+            0
+        );
     }
 
     #[test]

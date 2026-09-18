@@ -9,19 +9,26 @@ use htap_common::types::{
     ColumnDef as CommonColumnDef, DataType as CommonDataType, Row, Schema, Value,
 };
 use sqlparser::ast::{
-    AlterTable as SqlAlterTable, AlterTableOperation, BinaryOperator, ColumnOption,
+    Action, AlterTable as SqlAlterTable, AlterTableOperation, BinaryOperator, ColumnOption,
     CreateTable as SqlCreateTable, CreateTableOptions, Delete as SqlDelete, DuplicateTreatment,
-    Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
-    IndexColumn, Insert as SqlInsert, MysqlLessThanBound, MysqlPartitionBy, MysqlPartitionDef,
-    MysqlPartitionValues, ObjectName, ObjectNamePart, OrderByExpr, PrimaryKeyConstraint, Query,
-    SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject, UnaryOperator,
+    Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GrantObjects, Grantee,
+    GranteeName, GranteesType, GroupByExpr, Ident, IndexColumn, Insert as SqlInsert,
+    MysqlLessThanBound, MysqlPartitionBy, MysqlPartitionDef, MysqlPartitionValues, ObjectName,
+    ObjectNamePart, OrderByExpr, PrimaryKeyConstraint, Privileges, Query, SelectItem, SetExpr,
+    Statement, TableConstraint, TableFactor, TableObject, UnaryOperator,
 };
 
-use crate::ast::{
-    AggregateFunction, AlterPartitions, AnalyticExpr, AnalyticFilter, AnalyticOrderBy,
-    AnalyticSelect, BoundListPartition, BoundPartitioning, BoundRangePartition, BoundStatement,
-    ComparisonOp, CreateTable, DeleteByPrimaryKey, Insert, PointSelect,
+use crate::{
+    ast::{
+        AggregateFunction, AlterPartitions, AlterUserStatement, AnalyticExpr, AnalyticFilter,
+        AnalyticOrderBy, AnalyticSelect, BoundListPartition, BoundPartitioning,
+        BoundRangePartition, BoundStatement, ComparisonOp, CreateTable, CreateUserStatement,
+        DeleteByPrimaryKey, DropUserStatement, GrantScope, GrantStatement, Insert, PointSelect,
+        RevokeStatement, ShowGrantsStatement,
+    },
+    table_not_found,
 };
+use htap_catalog::PrivilegeSet;
 
 /// Binds an AST [`Statement`] against the [`CatalogSnapshot`], performing strict semantic
 /// validation and type checking, and returning a [`BoundStatement`].
@@ -42,6 +49,36 @@ pub fn bind(statement: &Statement, catalog: &CatalogSnapshot) -> Result<BoundSta
         Statement::Query(query) => bind_select(query, catalog),
         Statement::AlterTable(alter_table) => bind_alter_table(alter_table, catalog),
         Statement::Update(update) => crate::binder_query::bind_update(update, catalog),
+        Statement::CreateUser(create) => bind_create_user(create),
+        Statement::AlterUser(alter) => bind_alter_user(alter),
+        Statement::DropUser { if_exists, names } => bind_drop_user(*if_exists, names),
+        Statement::Grant(grant) => {
+            if grant.with_grant_option
+                || grant.as_grantor.is_some()
+                || grant.granted_by.is_some()
+                || grant.current_grants.is_some()
+            {
+                return Err(HtapError::Unsupported("unsupported GRANT option".into()));
+            }
+            bind_grant(
+                &grant.privileges,
+                grant.objects.as_ref(),
+                &grant.grantees,
+                catalog,
+            )
+        }
+        Statement::Revoke(revoke) => {
+            if revoke.granted_by.is_some() || revoke.cascade.is_some() {
+                return Err(HtapError::Unsupported("unsupported REVOKE option".into()));
+            }
+            bind_revoke(
+                &revoke.privileges,
+                revoke.objects.as_ref(),
+                &revoke.grantees,
+                catalog,
+            )
+        }
+        Statement::ShowGrants { for_ } => bind_show_grants(for_.as_ref()),
         Statement::Drop { .. } => crate::binder_query::bind_drop(statement),
         Statement::ShowTables { .. }
         | Statement::ShowDatabases { .. }
@@ -51,6 +88,226 @@ pub fn bind(statement: &Statement, catalog: &CatalogSnapshot) -> Result<BoundSta
             "unsupported statement: {other}"
         ))),
     }
+}
+
+fn bind_grantee_name(name: &GranteeName) -> Result<String> {
+    match name {
+        GranteeName::ObjectName(name) => extract_unqualified_name(name),
+        GranteeName::UserHost { user, host } => {
+            if host.value != "%" {
+                return Err(HtapError::Unsupported("only '%' host is supported".into()));
+            }
+            Ok(user.value.clone())
+        }
+    }
+}
+
+fn bind_create_user(stmt: &sqlparser::ast::CreateUser) -> Result<BoundStatement> {
+    if stmt.or_replace
+        || !stmt.options.options.is_empty()
+        || stmt.with_tags
+        || !stmt.tags.options.is_empty()
+    {
+        return Err(HtapError::Unsupported(
+            "unsupported CREATE USER options".into(),
+        ));
+    }
+    let password = stmt
+        .identified_by
+        .clone()
+        .ok_or_else(|| HtapError::InvalidArgument("CREATE USER requires IDENTIFIED BY".into()))?;
+    Ok(BoundStatement::CreateUser(CreateUserStatement {
+        username: bind_grantee_name(&stmt.name)?,
+        if_not_exists: stmt.if_not_exists,
+        password: Some(password),
+    }))
+}
+
+fn bind_alter_user(stmt: &sqlparser::ast::AlterUser) -> Result<BoundStatement> {
+    let password = stmt
+        .password
+        .as_ref()
+        .and_then(|password| {
+            if password.encrypted {
+                None
+            } else {
+                password.password.clone()
+            }
+        })
+        .ok_or_else(|| HtapError::InvalidArgument("ALTER USER requires IDENTIFIED BY".into()))?;
+    Ok(BoundStatement::AlterUser(AlterUserStatement {
+        username: bind_grantee_name(&stmt.name)?,
+        if_exists: stmt.if_exists,
+        password,
+    }))
+}
+
+fn bind_drop_user(if_exists: bool, names: &[GranteeName]) -> Result<BoundStatement> {
+    if names.is_empty() {
+        return Err(HtapError::InvalidArgument(
+            "DROP USER requires at least one user".into(),
+        ));
+    }
+    Ok(BoundStatement::DropUser(DropUserStatement {
+        usernames: names
+            .iter()
+            .map(bind_grantee_name)
+            .collect::<Result<Vec<_>>>()?,
+        if_exists,
+    }))
+}
+
+fn bind_privileges(privileges: &Privileges) -> Result<PrivilegeSet> {
+    match privileges {
+        Privileges::All { .. } => Ok(PrivilegeSet::ALL),
+        Privileges::Actions(actions) => {
+            let mut bits: u16 = 0;
+            for action in actions {
+                bits |= match action {
+                    Action::Select { columns: None } => PrivilegeSet::SELECT.0,
+                    Action::Insert { columns: None } => PrivilegeSet::INSERT.0,
+                    Action::Update { columns: None } => PrivilegeSet::UPDATE.0,
+                    Action::Delete => PrivilegeSet::DELETE.0,
+                    Action::Create { .. } => PrivilegeSet::CREATE.0,
+                    Action::Drop => PrivilegeSet::DROP.0,
+                    Action::Select { columns: Some(_) }
+                    | Action::Insert { columns: Some(_) }
+                    | Action::Update { columns: Some(_) } => {
+                        return Err(HtapError::Unsupported(
+                            "column-level privileges are not supported".into(),
+                        ));
+                    }
+                    other => {
+                        return Err(HtapError::Unsupported(format!(
+                            "unsupported privilege: {other}"
+                        )));
+                    }
+                };
+            }
+            Ok(PrivilegeSet(bits))
+        }
+    }
+}
+
+fn bind_grantee(grantees: &[Grantee]) -> Result<String> {
+    let [grantee] = grantees else {
+        return Err(HtapError::Unsupported(
+            "exactly one USER grantee is required".into(),
+        ));
+    };
+    if !matches!(
+        grantee.grantee_type,
+        GranteesType::None | GranteesType::User
+    ) {
+        return Err(HtapError::Unsupported(
+            "only USER grantees are supported".into(),
+        ));
+    }
+    bind_grantee_name(
+        grantee
+            .name
+            .as_ref()
+            .ok_or_else(|| HtapError::InvalidArgument("USER grantee requires a username".into()))?,
+    )
+}
+
+fn bind_grant_scope(
+    objects: Option<&GrantObjects>,
+    catalog: &CatalogSnapshot,
+) -> Result<GrantScope> {
+    match objects {
+        None => Ok(GrantScope::Global),
+        Some(GrantObjects::Databases(databases)) if databases.is_empty() => Ok(GrantScope::Global),
+        Some(GrantObjects::AllTablesInSchema { schemas }) if schemas.len() == 1 => {
+            let schema = extract_unqualified_name(&schemas[0])?;
+            if schema == "htap" {
+                Ok(GrantScope::Global)
+            } else {
+                Err(HtapError::NotFound(format!("schema '{schema}' not found")))
+            }
+        }
+        Some(GrantObjects::Tables(tables)) if tables.len() == 1 => {
+            if matches!(
+                tables[0].0.as_slice(),
+                [
+                    ObjectNamePart::Identifier(schema),
+                    ObjectNamePart::Identifier(table)
+                ] if schema.value == "*" && table.value == "*"
+            ) {
+                return Ok(GrantScope::Global);
+            }
+
+            if let [ObjectNamePart::Identifier(schema), ObjectNamePart::Identifier(table)] =
+                tables[0].0.as_slice()
+            {
+                if table.value == "*" {
+                    return if schema.value == "htap" {
+                        Ok(GrantScope::Global)
+                    } else {
+                        Err(HtapError::NotFound(format!(
+                            "schema '{}' not found",
+                            schema.value
+                        )))
+                    };
+                }
+
+                if schema.value != "htap" {
+                    return Err(HtapError::NotFound(format!(
+                        "schema '{}' not found",
+                        schema.value
+                    )));
+                }
+
+                let table_name = table.value.clone();
+                if catalog.table_by_name(&table_name).is_none() {
+                    return Err(table_not_found(&table_name));
+                }
+                return Ok(GrantScope::Table(table_name));
+            }
+
+            let table = extract_unqualified_name(&tables[0])?;
+            if catalog.table_by_name(&table).is_none() {
+                return Err(table_not_found(&table));
+            }
+            Ok(GrantScope::Table(table))
+        }
+        Some(GrantObjects::Tables(_)) => Err(HtapError::Unsupported(
+            "multiple tables in GRANT scope are not supported".into(),
+        )),
+        _ => Err(HtapError::Unsupported("unsupported GRANT scope".into())),
+    }
+}
+
+fn bind_grant(
+    privileges: &Privileges,
+    objects: Option<&GrantObjects>,
+    grantees: &[Grantee],
+    catalog: &CatalogSnapshot,
+) -> Result<BoundStatement> {
+    Ok(BoundStatement::GrantPrivileges(GrantStatement {
+        privileges: bind_privileges(privileges)?,
+        scope: bind_grant_scope(objects, catalog)?,
+        grantee: bind_grantee(grantees)?,
+    }))
+}
+
+fn bind_revoke(
+    privileges: &Privileges,
+    objects: Option<&GrantObjects>,
+    grantees: &[Grantee],
+    catalog: &CatalogSnapshot,
+) -> Result<BoundStatement> {
+    Ok(BoundStatement::RevokePrivileges(RevokeStatement {
+        privileges: bind_privileges(privileges)?,
+        scope: bind_grant_scope(objects, catalog)?,
+        grantee: bind_grantee(grantees)?,
+    }))
+}
+
+fn bind_show_grants(for_username: Option<&GranteeName>) -> Result<BoundStatement> {
+    Ok(BoundStatement::ShowGrants(ShowGrantsStatement {
+        for_username: for_username.map(bind_grantee_name).transpose()?,
+    }))
 }
 
 fn extract_unqualified_name(name: &ObjectName) -> Result<String> {
@@ -745,7 +1002,7 @@ fn bind_alter_table(stmt: &SqlAlterTable, catalog: &CatalogSnapshot) -> Result<B
     let table_name = extract_unqualified_name(&stmt.name)?;
     let table_desc = catalog
         .table_by_name(&table_name)
-        .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' does not exist")))?;
+        .ok_or_else(|| table_not_found(&table_name))?;
 
     if stmt.operations.is_empty() {
         return Err(HtapError::Unsupported(
@@ -1561,7 +1818,7 @@ fn bind_insert(insert: &SqlInsert, catalog: &CatalogSnapshot) -> Result<BoundSta
 
     let table_desc = catalog
         .table_by_name(&table_name)
-        .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))?;
+        .ok_or_else(|| table_not_found(&table_name))?;
 
     validate_table_descriptor_primary_key(table_desc)?;
 
@@ -1907,7 +2164,7 @@ fn bind_delete(delete: &SqlDelete, catalog: &CatalogSnapshot) -> Result<BoundSta
 
     let table_desc = catalog
         .table_by_name(&table_name)
-        .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))?;
+        .ok_or_else(|| table_not_found(&table_name))?;
 
     validate_table_descriptor_primary_key(table_desc)?;
 
@@ -2228,7 +2485,7 @@ fn bind_narrow_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundS
 
     let table_desc = catalog
         .table_by_name(&table_name)
-        .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))?;
+        .ok_or_else(|| table_not_found(&table_name))?;
 
     validate_table_descriptor_primary_key(table_desc)?;
 

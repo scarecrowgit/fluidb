@@ -22,6 +22,7 @@
 pub mod binary_codec;
 pub mod client;
 pub mod codec;
+pub mod compression;
 pub mod error_map;
 pub mod handshake;
 pub mod prepared;
@@ -30,10 +31,12 @@ pub mod result_codec;
 pub mod server;
 pub mod sha1;
 pub mod shim;
+pub mod tls;
 
 pub use client::{
-    ClientOptions, ClientPreparedStatement, MultiQueryOutcome, WireClient, WireResult,
+    ClientOptions, ClientPreparedStatement, CompressionMode, MultiQueryOutcome, TlsMode,
+    WireClient, WireResult,
 };
 pub use error_map::{map_htap_error, wire_error_to_htap, WireError};
 pub use result_codec::OkPacket;
-pub use server::{WireServer, WireServerConfig};
+pub use server::{TlsConfig, WireServer, WireServerConfig};

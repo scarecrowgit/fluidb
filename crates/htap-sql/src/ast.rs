@@ -1,6 +1,6 @@
 //! SQL Abstract Syntax Tree and bound statement definitions.
 
-use htap_catalog::PartitionAlteration;
+use htap_catalog::{PartitionAlteration, PrivilegeSet};
 use htap_common::error::{HtapError, Result};
 use htap_common::types::{ColumnDef, DataType, Row, Schema, Value};
 use sqlparser::ast::Statement;
@@ -81,6 +81,87 @@ pub enum BoundStatement {
     DropTable(DropTableStatement),
     /// SHOW / DESCRIBE statement (catalog metadata read).
     Show(ShowStatement),
+    /// CREATE USER statement.
+    CreateUser(CreateUserStatement),
+    /// ALTER USER statement.
+    AlterUser(AlterUserStatement),
+    /// DROP USER statement.
+    DropUser(DropUserStatement),
+    /// GRANT privileges statement.
+    GrantPrivileges(GrantStatement),
+    /// REVOKE privileges statement.
+    RevokePrivileges(RevokeStatement),
+    /// SHOW GRANTS statement.
+    ShowGrants(ShowGrantsStatement),
+}
+
+/// Scope to which a GRANT or REVOKE applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantScope {
+    /// All objects in the default `htap` schema.
+    Global,
+    /// One table.
+    Table(String),
+}
+
+/// Bound representation of CREATE USER.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateUserStatement {
+    /// Account username.
+    pub username: String,
+    /// Whether `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+    /// Plaintext password, hashed immediately before persistence by htap-server.
+    pub password: Option<String>,
+}
+
+/// Bound representation of ALTER USER.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterUserStatement {
+    /// Account username.
+    pub username: String,
+    /// Whether `IF EXISTS` was specified.
+    pub if_exists: bool,
+    /// Plaintext replacement password, hashed immediately before persistence by htap-server.
+    pub password: String,
+}
+
+/// Bound representation of DROP USER.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropUserStatement {
+    /// Account usernames.
+    pub usernames: Vec<String>,
+    /// Whether `IF EXISTS` was specified.
+    pub if_exists: bool,
+}
+
+/// Bound representation of GRANT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantStatement {
+    /// Privileges to grant.
+    pub privileges: PrivilegeSet,
+    /// Object scope.
+    pub scope: GrantScope,
+    /// Account receiving the privileges.
+    pub grantee: String,
+}
+
+/// Bound representation of REVOKE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeStatement {
+    /// Privileges to revoke.
+    pub privileges: PrivilegeSet,
+    /// Object scope.
+    pub scope: GrantScope,
+    /// Account losing the privileges.
+    pub grantee: String,
+}
+
+/// Bound representation of SHOW GRANTS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowGrantsStatement {
+    /// Account whose grants are displayed; `None` means the current account.
+    pub for_username: Option<String>,
 }
 
 /// Bound representation of an UPDATE statement.

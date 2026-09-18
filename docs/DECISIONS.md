@@ -728,7 +728,13 @@ Updated by ADR-019: Phase 11 added the binary protocol/prepared statements, `COM
 `COM_CHANGE_USER`, ≥16 MiB message reassembly with a real `max_allowed_packet`, a CSPRNG handshake scramble,
 negotiated `CLIENT_MULTI_STATEMENTS`, and shutdown force-close on top of the same thread-per-connection
 framing decided here; the "text protocol only"/"no prepared statements" and "non-cryptographic scramble RNG"
-framing below describes this ADR's scope at the time it was made, not the current wire contract.)
+framing below describes this ADR's scope at the time it was made, not the current wire contract. Updated by
+ADR-020: Phase 12 added TLS (rustls 0.23, `ring` provider, `htap_wire::tls::Conn`) and MySQL compressed-packet
+framing (zlib/zstd, `htap_wire::compression::CompressedStream`) layered under `ServerStream` on top of the
+same thread-per-connection design, and by ADR-021: Phase 12 replaced the single shared password with
+catalog-backed per-user accounts and privileges; the "no TLS"/"no compression"/"one implicit user, single
+shared credential" framing below describes this ADR's scope at the time it was made, not the current wire
+contract.)
 
 ### Options considered
 
@@ -1036,8 +1042,9 @@ executor, since `UPDATE`'s scan form is the only part that depends on `query_exe
   `test_catalog_id_high_water_prevents_reuse_after_removal` (no-reuse guarantee),
   `test_catalog_cas_rejects_regressing_id_high_water` (decision 5, CAS regression guard),
   `test_catalog_v2_payload_without_id_high_water_is_rejected` (decision 4, fail-loud missing field),
-  `test_corruption_and_truncation` (updated to use format version 3 as the unsupported/future version,
-  proving the fail-loud refusal path).
+  `test_corruption_and_truncation` (proving the fail-loud refusal path; as of ADR-021's Phase 12 catalog
+  format v3 bump, this test uses format version 4 as the unsupported/future version — it used version 3 for
+  that role at the time this ADR was written, before version 3 became the current format).
 - `crates/htap-coord/tests/placement_movement.rs::test_plan_placement_allocates_above_id_high_water`
   (decision 5, replica id allocation from the persisted mark).
 - `crates/htap-client/tests/embedded_client.rs::test_embedded_client_unsupported_sql_preserves_error_categories`,
@@ -1457,7 +1464,13 @@ scope, with seams left for them: a capability struct, a `Read`/`Write`-generic p
 `verify_credentials` auth hook). None of this touches the rowstore, catalog, or on-disk envelope formats;
 CLAUDE.md's durability invariants (one MVCC version domain, `CommitOutcomePending` quarantine, R5) had to be
 preserved unchanged. Consulted a panel (`reasoner`+`gemini`) on the five hardest design questions, then had
-`architect` approve decisions 1-4 below with refinements before implementation began.
+`architect` approve decisions 1-4 below with refinements before implementation began. (Updated by ADR-020:
+Phase 12 replaced the `verify_credentials`-only seam this ADR left for TLS/compression with a real `Conn`
+abstraction (`htap_wire::tls::Conn`) and a `CompressedStream` transport layer, and by ADR-021: Phase 12
+replaced `verify_credentials` itself with `LocalServer::authenticate_session` against catalog-backed accounts;
+"TLS, compression, and per-user ACL remain Phase 12 scope" below is this ADR's framing at the time it was
+made, not the current
+contract.)
 
 ### Options considered
 
@@ -1722,3 +1735,419 @@ directly amend that ADR's "no prepared statements"/"non-cryptographic scramble"/
 (`CommitOutcomePending` quarantine and the `RecoveryLatch` — decisions 5-7 above are new callers of exactly
 that existing gate, not new gates), and ADR-017 (general query executor — `Session::execute_statement` is the
 same single entry point Phase 9/10 already funnel every statement kind through).
+
+---
+
+## ADR-020: rustls TLS and MySQL compressed-packet framing on a shared `Conn`/`ServerStream` transport layer
+
+`Status: Accepted`
+`Date: 2026-09-18`
+
+### Context
+
+ADR-016 and ADR-019 both deferred TLS and protocol compression to Phase 12, leaving `htap-wire`'s connection
+functions typed concretely as `&mut TcpStream`. The user explicitly lifted this deferred item. Two independent
+requirements had to be satisfied without touching the rowstore/catalog/MVCC invariants in CLAUDE.md: (1) a real
+TLS upgrade negotiated via the MySQL protocol's `SSLRequest`/`CLIENT_SSL` handshake, transparent to every
+existing command handler; (2) MySQL compressed-packet framing (`CLIENT_COMPRESS`/
+`CLIENT_ZSTD_COMPRESSION_ALGORITHM`) layered *underneath* the existing packet codec, transparent to it in the
+same way. Consulted a panel (`reasoner` + `gemini`) and `architect` per the phase plan; both flagged that a
+naive byte-level compression adapter is unsafe (a crafted frame's declared uncompressed length must never be
+trusted for allocation) and that TLS/`aws-lc-rs` needs `cmake`, which this environment does not have.
+
+### Options considered
+
+1. **`rustls` 0.23 with the `ring` crypto provider, explicit `default-features = false, features = ["ring"]`.**
+   Verified in a scratch build that `ring` compiles here with only `gcc`; `aws-lc-rs` (rustls's other provider,
+   and the `mysql` crate's `rustls-tls` feature) needs `cmake`, confirmed absent in this environment. Enabling
+   both providers at once panics at runtime ("no process-level `CryptoProvider`"), so the workspace dependency
+   pins `ring` only. **Chosen.**
+2. **A native-TLS wrapper (`native-tls`/`openssl`) instead of `rustls`.** Rejected: pulls in a system OpenSSL
+   dependency, which is exactly the kind of environment-fragile build requirement `rustls`+`ring` avoids, and
+   gives up `rustls`'s pure-Rust, `unsafe`-free (from this crate's point of view) posture.
+3. **A single `Conn` enum (`Plain(TcpStream)` / `Tls(StreamOwned<ServerConnection, TcpStream>)`) implementing
+   `Read`/`Write`, with every `server.rs` function signature converted from `&mut TcpStream` to `&mut Conn`.**
+   **Chosen** — a pure refactor (task A2) that had to compile and pass every existing test unchanged before any
+   TLS behavior was added, isolating "plumbing changed" from "behavior changed" as two separate, separately
+   verifiable steps.
+4. **A stateful `CompressedStream<S: Read + Write>` wrapper (task B3) sitting directly beneath the packet codec
+   (`TCP -> Conn -> CompressedStream<Conn> -> codec.rs`), rather than a naive pass-through adapter.** Reads are
+   framed per the MySQL 7-byte compressed-packet header (3-byte compressed length, 1-byte independent sequence
+   id, 3-byte uncompressed length) and decompressed with three independent bounds, not just the declared
+   header length: originally, a hard byte-count cap of `max_allowed_packet + 1` read via `.take()`; a
+   follow-up fix pass tightened this to the frame's own declared `uncompressed_length + 1` instead, so
+   decoding stops the instant one byte past *that* frame's declared length would be produced, not just once
+   `max_allowed_packet` is crossed (see "Fix pass" below); an exact-length check (decoded length must equal
+   the declared `uncompressed_length`, not merely fit under it); and a codec-level window-size cap
+   (`zstd::stream::read::Decoder::window_log_max(24)`, 16 MiB, independent of `max_allowed_packet`) so a
+   crafted frame cannot force an oversized decode window before the byte-count cap even applies. **Chosen**
+   over trusting the header (rejected outright by the panel) and over per-packet (rather than per-frame,
+   multi-packet-capable) compression (rejected: MySQL packs multiple ordinary packets into one compressed
+   frame and splits one packet across frames; a naive 1:1 mapping cannot express either).
+5. **`mysql_native_password` only for authentication over TLS; no `caching_sha2_password`.** Same call as
+   ADR-019's decision to defer it; `architect` reconfirmed for Phase 12. Compression and TLS activate only
+   *after* the authentication OK packet (never during the handshake, `SSLRequest`, an `AuthSwitchRequest`
+   round trip, or `COM_CHANGE_USER`'s re-authentication, which does not renegotiate either), matching real
+   MySQL and keeping the auth-plugin question orthogonal to this ADR.
+6. **TLS cert hot-reload via `ResolvesServerCert` over a `parking_lot::RwLock<Arc<CertifiedKey>>`
+   (`ReloadableCertResolver`), not `ArcSwap` (no new dependency needed for this).** `WireServer::reload_tls_certs()`
+   loads and validates a new cert/key pair (including that the key matches the certificate,
+   `CertifiedKey::keys_match()`) before swapping; a failed reload leaves the previously active certificate
+   serving both existing and new connections. There is no `SIGHUP` or other automatic trigger — reload is an
+   explicit `WireServer` method call only, cutting the last item DECISIONS-NEEDED-#6 flagged as optionally
+   cuttable down to what the plan actually needed rather than adding a signal-handling surface nothing asked
+   for.
+
+### Decision
+
+Implemented options 1, 3, 4, 5, and 6 as described above. `SERVER_CAPABILITIES` is no longer a bare constant on
+the connection path: `CLIENT_SSL` is advertised only when `WireServerConfig::tls` is configured, computed
+per-connection from `Shared`. An `SSLRequest` is decoded strictly as a fixed 32-byte payload
+(`decode_ssl_request`, rejecting any other length) — never as a truncated `HandshakeResponse41` — and after the
+TLS handshake completes, a full second `HandshakeResponse41` is read over the new TLS stream and *its*
+capability flags are used for everything downstream; the pre-TLS `SSLRequest`'s flags are never trusted beyond
+the `CLIENT_SSL` bit itself. `require_secure_transport` rejects a plaintext login before `verify_credentials`/
+`authenticate_session` ever runs. Compression negotiates zstd (`CLIENT_ZSTD_COMPRESSION_ALGORITHM =
+0x0400_0000`, verified against `mysql_common`'s constant, not the value in an earlier phase-plan draft) over
+zlib (`CLIENT_COMPRESS = 0x0000_0020`) when the client offers both and the server has `compression_enabled`;
+the server clamps a client-requested zstd level to `1..=3` (`response.zstd_compression_level.unwrap_or(3).clamp(1, 3)`)
+rather than passing through the full MySQL 1-5 range. Payloads at or below 50 bytes (`MIN_COMPRESS_LENGTH`,
+MySQL's own default) are sent uncompressed (`uncompressed_length = 0`) rather than paying compression overhead
+for no gain. `WireClient`/`RemoteClient` gained a symmetric client-side `TlsMode` (`Disabled` / `Required {
+ca_cert: PathBuf, server_name: Option<String> }` / `InsecureSkipVerifyDoNotUseInProduction`, explicitly named
+per panel feedback — `Required` always performs the upgrade and fails closed, there is no silent
+"try TLS, fall back to plaintext" mode) and `CompressionMode` (`Disabled` / `Zlib` / `Zstd { level: u8 }`).
+
+### Consequences
+
+- No on-disk, WAL, catalog, or MVCC format changed; this ADR is transport-layer-only (`htap-wire::{tls,
+  compression}`, `crates/htapd`, `htap-client`/`htap-wire::client`).
+- TLS's raw-socket handshake loop (`perform_tls_handshake`, driving `rustls::ServerConnection::complete_io`
+  directly against the accepted `TcpStream` before a `Conn` exists) is a bespoke polling loop parallel to, not
+  reusing, the existing stop-flag-polling `server::read()` helper — flagged in the plan as needing extra
+  review because a bug here could hang shutdown or busy-loop; covered by
+  `test_wire_shutdown_force_closes_idle_tls_connection`.
+- A decompression bomb is bounded by three independent limits (byte-count cap, exact-length check, codec
+  window cap), not by trusting any single header field, per the panel's explicit rejection of allocating off
+  a declared length.
+- `htapd --tls-cert`/`--tls-key` must be supplied together; `--require-secure-transport` without `--tls-cert`/
+  `--tls-key` (or the `HTAPD_TLS_CERT`/`HTAPD_TLS_KEY` env equivalents) fails `WireServer::start` outright
+  rather than silently serving plaintext.
+- No `SIGHUP`-triggered reload, no `caching_sha2_password`-over-TLS story beyond what ADR-019's
+  `AuthSwitchRequest` machinery already provides, and the zstd level clamp (`1..=3`, not MySQL's full `1..=5`)
+  are documented as current gaps in `docs/LIMITATIONS.md`, not silently under-implemented.
+
+### How to reverse it
+
+TLS and compression are each independently revertible without touching the other or any on-disk format:
+removing `crates/htap-wire/src/tls.rs`'s `ReloadableCertResolver`/`perform_tls_handshake` and the `Conn::Tls`
+variant collapses `Conn` back to a thin `TcpStream` wrapper (ADR-016's original shape); removing
+`crates/htap-wire/src/compression.rs` and the `ServerStream::Compressed` variant returns to always-plaintext
+framing. Neither touches `htap-sql`, `htap-catalog`, `htap-rowstore`, or `htap-txn`.
+
+### Test Evidence
+
+- `crates/htap-wire/tests/tls.rs` (11 tests): `test_wire_tls_handshake_round_trip`,
+  `test_wire_require_secure_transport_rejects_plaintext_login`,
+  `test_wire_client_tls_required_against_non_tls_server_fails`, `test_wire_tls_ca_mismatch_rejected`,
+  `test_mysql_crate_driver_interop_over_tls`, `test_wire_shutdown_force_closes_idle_tls_connection`,
+  `test_wire_tls_invalid_cert_path_fails_start`, `test_wire_tls_start_with_mismatched_cert_and_key_fails`,
+  `test_wire_tls_cert_reload_serves_new_cert_to_new_connections`,
+  `test_wire_tls_cert_reload_failure_keeps_old_cert`,
+  `test_wire_tls_cert_reload_mismatched_key_rejected_keeps_old_cert`.
+- `crates/htap-wire/tests/compression.rs` (10 tests): `test_wire_compression_zlib_round_trip`,
+  `test_wire_compression_zstd_round_trip`, `test_wire_compression_zstd_level_22_round_trip`,
+  `test_wire_compression_large_payload_over_16mb_round_trip`,
+  `test_wire_compression_decompression_bomb_closes_connection`,
+  `test_wire_compression_disabled_by_server_config`,
+  `test_compression_request_to_disabled_server_uses_uncompressed_connection`,
+  `test_change_user_over_compressed_connection`, `test_mysql_crate_driver_interop_with_compression`,
+  `test_mysql_crate_driver_interop_with_tls_and_compression`.
+- `crates/htap-wire/src/compression.rs` unit tests: `test_below_threshold_round_trip`,
+  `test_zlib_above_threshold_round_trip`, `test_zstd_above_threshold_round_trip`, and further round-trip/
+  resumable-read/oversize-rejection cases in the same module.
+- `crates/htap-wire/src/handshake.rs::decode_ssl_request` unit tests (exact-32-byte acceptance, 31/33-byte
+  rejection).
+- `crates/htap-wire/src/server.rs` unit tests covering `advertised_capabilities`/`CLIENT_SSL` toggling with
+  TLS configuration.
+
+### Fix pass: 16 MiB zstd window, stricter framing invariants
+
+A follow-up fix pass corrected the zstd decoder window and hardened the compressed-stream framing beyond what
+the original decision implemented:
+
+- **Window cap corrected to 16 MiB.** The zstd window cap is `window_log_max(24)` (16 MiB), not
+  `window_log_max(27)` (128 MiB) as originally implemented and originally documented above — a frame whose
+  window log exceeds 16 MiB is rejected (`test_zstd_window_larger_than_16mb_is_rejected`).
+- **A framing error latches the stream permanently failed.** A bad sequence id, a truncated or corrupt frame,
+  or an empty raw frame now sets a `failed` flag on the `CompressedStream`; every subsequent `read` call fails
+  immediately rather than attempting to resynchronize on framing that is no longer trustworthy. A read timeout
+  (`io::ErrorKind::TimedOut`) from the underlying transport does **not** latch the stream — it resumes on the
+  next call, including mid-header and mid-payload for both zlib and zstd
+  (`test_zstd_read_resumes_after_timeout_in_header`, `test_zstd_read_resumes_after_timeout_in_payload`).
+- **The sequence counter advances only on a match.** A mismatched compressed-packet sequence id is rejected
+  outright rather than resynchronized to the value actually received (`test_sequence_id_mismatch_rejected`).
+- **Zero-length raw frames are rejected.** A raw (`uncompressed_length == 0`) frame with an empty payload is
+  now an error instead of silently producing zero decoded bytes (`test_empty_raw_frame_rejected`).
+- **Decompression output is capped at the frame's own declared length, not a fixed bound.** The `.take()` cap
+  during decode is `uncompressed_length + 1` (the frame's own declared length), so decoding stops the instant
+  one byte past *that* frame's declared length would be produced — in addition to the pre-existing upfront
+  rejection of a declared length exceeding the connection's configured maximum, and the exact-length check
+  after decode.
+
+`docs/ARCHITECTURE.md`'s "TLS and compression (Phase 12)" section and `docs/PROGRESS.md`'s Phase 12 row are
+corrected to match; both previously stated `window_log_max(27)`/128 MiB.
+
+Cross-references: ADR-016 (hand-written synchronous wire protocol — TLS/compression layer under the same
+thread-per-connection design, per-connection `Conn`/`ServerStream` replacing the bare `TcpStream`), ADR-019
+(the `verify_credentials`/capability-struct seams this ADR consumes), ADR-021 (per-user accounts — compression
+and TLS both activate strictly after the authentication this ADR hands off to).
+
+---
+
+## ADR-021: Catalog-backed per-user accounts and privileges (`HTAPCAT1` format v3), `accounts_initialized` bootstrap latch, existence-masking privilege errors
+
+`Status: Accepted`
+`Date: 2026-09-18`
+
+### Context
+
+ADR-016 through ADR-019 all deferred per-user ACL, leaving `htapd` with one shared `--password` and an
+unchecked username. The user explicitly lifted this deferred item for Phase 12. The design had to add a
+credential/privilege model without weakening any durability invariant in CLAUDE.md (one MVCC version domain,
+`DurablePending`/R5 unchanged) and without letting an authorization check leak table existence through an
+error-message oracle. Consulted a panel (`reasoner` + `gemini`) and `architect` per the phase plan; the panel
+flagged five load-bearing corrections to the original draft (folding accounts into the existing catalog CAS,
+a scramble/response-based `authenticate_session` signature rather than a plaintext-password one, a stable
+`AccountId` rather than raw-username-keyed grants, an `accounts_initialized` one-shot latch rather than an
+`accounts.is_empty()` check, and existence-masking privilege errors placed inside `check_privileges` itself
+rather than threading `Principal` into account-agnostic `htap_sql::bind()`).
+
+### Options considered
+
+1. **Fold `accounts: Vec<Account>`, `grants: Vec<Grant>`, and `accounts_initialized: bool` into the existing
+   `CatalogSnapshot` and its single CAS, bumping `HTAPCAT1` to format version 3, rather than a separate
+   envelope/file.** **Chosen** — both panel members and `architect` converged on this: `DROP TABLE`'s grant
+   cleanup (removing every `Grant{scope: Table(dropped_id), ..}` row) must be atomic with the table removal
+   itself, which a separate envelope with its own CAS could not guarantee without a second, unrelated
+   consistency mechanism. Precedent: the v1-to-v2 `id_high_water` bump (ADR-017) already established the
+   pattern (old files decode with defaults via `#[serde(default)]`, an old binary refuses a newer file). Unlike
+   that bump, this build's `LEGACY_FORMAT_VERSION` stayed at `1` rather than advancing to `2` — a v1, v2, or v3
+   payload all decode under `FORMAT_VERSION = 3` (`(LEGACY_FORMAT_VERSION..=FORMAT_VERSION).contains(&version)`),
+   because unlike the v1 payload's genuinely different `id_high_water`-omission handling, a v1 or v2 payload
+   omitting `accounts`/`grants`/`accounts_initialized` needs no special-cased fallback logic beyond
+   `#[serde(default)]` — there is no legacy-omission case to guard against the way there was for
+   `id_high_water`, so widening the accepted window costs nothing extra in decode-path complexity.
+2. **A stable `AccountId(u64)` (same newtype pattern as `TableId`), with `Grant::account: AccountId`, not a raw
+   username string.** **Chosen** per the panel's finding (c): prevents a dropped-then-recreated username from
+   silently resurrecting a stale grant that was never explicitly re-issued to the new account.
+3. **`accounts_initialized: bool` one-shot latch, checked and set exactly once by `bootstrap_root_account` at
+   `WireServer::start`, never re-checked against `accounts.is_empty()`.** **Chosen** per the panel's finding
+   (d): an `is_empty()` check cannot distinguish "fresh install" from "every account was deliberately dropped"
+   from "mid-migration," and would resurrect `root` after an administrator intentionally removed every account.
+   The catalog CAS (`compare_and_set`) additionally rejects any successor snapshot where `accounts_initialized`
+   would regress from `true` to `false`, and any successor whose account id high-water mark would regress —
+   the same regression-guard pattern ADR-017 established for `id_high_water`. Recovery from a full lockout is
+   exclusively the embedded `LocalServer::execute` API (already an unchecked implicit superuser, no wire
+   exposure), analogous to `--skip-grant-tables`; there is no wire-reachable break-glass path, by design.
+4. **`authenticate_session(username, scramble, auth_response)` — the challenge and response, never a plaintext
+   password.** **Chosen**, correcting the original draft per the panel's finding (a): `mysql_native_password`
+   never gives the server a plaintext password to compare, only a client-side hash of one. Verification is
+   `verify_native_password_hash(scramble, stored_hash, auth_response)` against the stored
+   `SHA1(SHA1(password))` double-hash, never needing the plaintext at verify time. On any failure — unknown
+   user, locked account, or wrong password — the caller sees exactly one `HtapError::PermissionDenied("access
+   denied")`, never a variant that would let a client enumerate valid usernames.
+5. **No delegation: `CREATE/ALTER/DROP USER`, `GRANT`, `REVOKE` all require `Principal::Superuser` outright;
+   `WITH GRANT OPTION` parses (a disclosed vendor patch to `sqlparser`) but is rejected at bind time as
+   `HtapError::Unsupported` rather than persisted as an inert bit; only the `%` host is accepted, a
+   `'user'@'host'` with `host != "%"` is a bind-time `Unsupported` rejection.** **Chosen** per the panel's
+   finding (b), which flagged the original draft's self-contradiction between "account management is
+   superuser-only" and "`WITH GRANT OPTION` governs delegation" — resolved by cutting delegation entirely
+   rather than half-implementing it.
+6. **Existence-masking privilege errors, applied uniformly inside `check_privileges` for every statement
+   kind.** A principal holding *zero* privileges on a table (not just missing the one a statement needs) sees
+   `HtapError::NotFound` — the identical error a genuinely absent table would produce — for every statement
+   kind including `DROP TABLE`/`ALTER TABLE`, not just reads; a principal holding *some* privilege but not the
+   required one sees the new `HtapError::PermissionDenied` (MySQL 1142, uniformly, not 1227). **Chosen** over
+   the panel's alternative (finding (f): threading `Principal` into `htap_sql::bind()` itself so a table could
+   report `NotFound` before ever being resolved) because that would add a new dependency edge from `htap-sql`
+   to account/grant types for no benefit `check_privileges`-side masking doesn't already give, at the cost of
+   `DROP TABLE`/`ALTER TABLE` on a real-but-invisible table also reporting "doesn't exist" — matching real
+   MySQL's own object-visibility behavior, not a new problem this ADR introduces.
+7. **`mysql_native_password` only, no `caching_sha2_password`.** Same call as ADR-019 reconfirmed the third
+   time by `architect`: MySQL 8.4 clients still support the plugin opt-in and this server's existing
+   `AuthSwitchRequest` machinery (ADR-016/019) is exactly the fallback path a modern client needs; MySQL 9.x
+   client tooling that removed the plugin entirely cannot connect, documented as a limitation rather than
+   silently broken.
+8. **Password hashes redacted from `Debug` output; catalog file mode `0600` on Unix.** `Account` has a manual
+   `Debug` impl printing `password_hash: "<redacted>"` so a hash never reaches logs via `{:?}`; `architect`
+   flagged that the catalog file now carries offline-crackable `SHA1(SHA1(password))` material for the first
+   time, so `atomic_publish`'s temp file is created with `OpenOptionsExt::mode(0o600)` before the rename that
+   publishes it (Unix only; no equivalent primitive exists cross-platform).
+
+### Decision
+
+Implemented options 1-8. `PrivilegeSet` is a hand-rolled `u16` bitflag type (`SELECT, INSERT, UPDATE, DELETE,
+CREATE, DROP, ALTER` — no `GRANT_OPTION` bit, since option 5 rejects grant delegation outright rather than
+persisting an inert one) with no new `bitflags` crate dependency. `GRANT`/`REVOKE` scope binds `ON *.*` and
+`ON htap.*` (the single database this server reports) to `GrantScope::Global`; any other named database is
+`NotFound`; `ON tbl`/`ON htap.tbl` binds to `GrantScope::Table`, resolved against the catalog at bind time (a
+non-existent table is `NotFound` — table-existence disclosure to a superuser-only statement is acceptable,
+since only a superuser reaches `execute_grant`). A `Global` grant is treated as "every table" when
+`check_privileges` unions an account's applicable grants (`GRANT SELECT ON *.*` behaves like real MySQL).
+`CREATE TABLE` by a non-superuser holding a global `CREATE` grant does **not** auto-grant privileges on the
+newly created table (matches MySQL; documented explicitly, not an oversight) — the creator needs a subsequent
+`GRANT` or a `Global` grant to see the table it just made. Enforcement (`htap-server::privilege::check_privileges`)
+runs in two passes under the same `execution_lock`-held catalog snapshot as bind+dispatch: a pre-bind
+visibility check (masking schema-probing errors before the AST is even bound) and a full privilege check after
+bind, both re-resolved from the just-loaded snapshot on every statement — authorization state is never cached
+across statements, so a mid-session `REVOKE` or account lock takes effect on the very next statement. `SHOW
+TABLES` filters its result set to tables the caller holds at least one privilege on; `PREPARE` applies the same
+existence-masking visibility check via an AST table walker (following CTE definition order so a CTE cannot
+mask a real base-table reference) before resolving output-schema metadata, and `EXECUTE` re-checks privileges
+independently since a `REVOKE` may have landed between `PREPARE` and `EXECUTE`; a multi-statement batch and
+`COM_STMT_EXECUTE` both inherit enforcement because both still funnel through `Session::execute_statement`
+(ADR-018/019's existing single entry point — no new bypass). `LocalServer::execute` (no session) does not call
+`check_privileges` at all — it is the pre-existing, wire-unreachable implicit-superuser embedded path, and
+this ADR does not change that. `execute_drop_user`/`execute_drop_table` both remove every `Grant` row scoped
+to the dropped account/table in the same CAS as the drop; dropping the last remaining superuser account is
+rejected (`HtapError::InvalidArgument`) as a cheap extra guard against self-inflicted total lockout (the
+embedded break-glass path still exists regardless). `--password`/`HTAPD_PASSWORD` becomes a bootstrap seed
+only: `WireServer::start` calls `bootstrap_root_account` once, before accepting connections; if the catalog
+already has `accounts_initialized == true`, it adopts the existing `root` account (or logs a warning,
+`BootstrapReport::config_password_matches_root == Some(false)`, if a still-configured password no longer
+matches the stored hash) rather than resurrecting or overwriting it.
+
+### Consequences
+
+- `HTAPCAT1` format version bumped 2 -> 3 (`crates/htap-catalog/src/local.rs`); `LEGACY_FORMAT_VERSION`
+  remains `1`, so this build decodes v1, v2, and v3 catalogs, all with `#[serde(default)]` accounts/grants/
+  `accounts_initialized` for anything older than v3. A v2-only (or v1-only) binary still refuses a v3 file,
+  per the existing `version != FORMAT_VERSION && version != LEGACY_FORMAT_VERSION`-style fail-loud check.
+- Password hashes are new security-sensitive material in the catalog file for the first time; mitigated by
+  `0600` file permissions (Unix) and `Debug` redaction, but the hash itself is a plain `SHA1(SHA1(password))`
+  with no per-account salt or KDF work factor — offline-crackable if the catalog file leaks. (A follow-up fix
+  pass below made the comparison itself constant-time; the missing salt/KDF is unchanged and still
+  documented in `docs/LIMITATIONS.md`, not silently accepted as equivalent to a modern KDF.)
+- No roles, no delegated administration, no host matching beyond `%`, no `ACCOUNT LOCK`/`UNLOCK` SQL syntax
+  (an account's `locked` field exists in the model and is enforced at authentication, but nothing sets it via
+  SQL yet), and no `caching_sha2_password` remain documented gaps, not silent omissions.
+- `check_privileges`'s existence-masking rule is a deliberate, user-visible error-message change from "a
+  superuser always sees the real error" (the only principal that existed before this ADR): a non-superuser's
+  `DROP TABLE`/`ALTER TABLE` on a real-but-invisible table now also reports `NotFound`. No existing test
+  asserted different semantics here (there was no non-superuser principal before this ADR), so this is a new
+  contract, not a regression.
+
+### How to reverse it
+
+The account/privilege model is additive and layered strictly above the pre-existing always-superuser
+`LocalServer::execute`/`Session` execution paths: removing `crates/htap-server/src/privilege.rs`'s call site in
+`Session::execute_statement`, the six new `BoundStatement` variants, and the `accounts`/`grants`/
+`accounts_initialized` catalog fields would return to ADR-016's single-shared-password model without touching
+the rowstore, colstore, or 2PC transaction paths. The `HTAPCAT1` v3 format bump is additive
+(`#[serde(default)]`) and does not need reverting for old files to keep decoding.
+
+### Test Evidence
+
+- `crates/htap-catalog/tests/catalog_recovery.rs`: `test_catalog_v3_round_trip_with_accounts_and_grants`,
+  `test_catalog_v2_envelope_decodes_with_empty_accounts`, `test_catalog_v2_envelope_without_account_fields_decodes`,
+  `test_catalog_v3_rejects_dangling_grant`, `test_catalog_v3_rejects_duplicate_username`,
+  `test_catalog_cas_rejects_accounts_initialized_regression`,
+  `test_catalog_cas_rejects_regressing_account_high_water`, `test_catalog_future_version_rejected`,
+  `test_catalog_file_permissions_restricted_after_publish`, `test_partition_alterations_preserve_account_state`.
+- `crates/htap-catalog/src/model.rs` unit tests: `test_account_and_grant_validation_failures`,
+  `test_allocate_account_and_account_debug_redaction`.
+- `vendor/sqlparser/src/parser/mod.rs::tests::test_user_management_statements` (the disclosed vendor patch:
+  `IDENTIFIED BY`, `'user'@'host'` in `DROP USER`, and `SHOW GRANTS`).
+- `crates/htap-sql/tests/parse_bind.rs`: `test_bind_account_management_statements`,
+  `test_bind_account_management_rejections`, `test_grant_table_vs_global_grantee_binding`,
+  `test_grant_grantee_parsing_regression`.
+- `crates/htap-server/tests/accounts.rs` (16 tests): `test_bootstrap_creates_root_when_uninitialized`,
+  `test_bootstrap_is_idempotent`, `test_bootstrap_is_noop_after_root_dropped`,
+  `test_bootstrap_reports_config_password_mismatch`, `test_cannot_drop_last_superuser`,
+  `test_create_alter_drop_user_persists_across_reopen`, `test_create_user_duplicate_conflict_and_if_not_exists`,
+  `test_create_user_sql_creates_an_account`, `test_drop_table_removes_table_grants_and_catalog_still_valid_after_reopen`,
+  `test_drop_user_removes_its_grants`, `test_empty_password_accounts`,
+  `test_grant_revoke_merge_and_remove_rows_and_show_grants_format`,
+  `test_partition_alterations_preserve_accounts_and_grants`, `test_revoke_never_granted_is_noop`,
+  `test_table_scoped_grant_after_create_user`, `test_account_debug_output_redacts_password_hash`.
+- `crates/htap-server/tests/bootstrap.rs::bootstrap_adopts_existing_root_account`.
+- `crates/htap-server/tests/privileges.rs` (20 tests): `test_account_ddl_requires_superuser`,
+  `test_account_without_grants_gets_identical_error_to_missing_table`,
+  `test_check_statement_visible_allows_placeholders`, `test_check_statement_visible_masks_invisible_table`,
+  `test_create_table_requires_global_create_and_creator_gets_no_implicit_privileges`,
+  `test_delete_requires_delete`, `test_global_grant_applies_to_all_tables`,
+  `test_join_with_ungranted_table_is_masked`, `test_locked_or_dropped_account_mid_session_fails_closed`,
+  `test_prebind_visibility_masks_alter_table_targets`,
+  `test_prebind_visibility_masks_schema_errors_and_cte_self_references`,
+  `test_prepared_style_execute_statement_rechecks_privileges`,
+  `test_revoke_takes_effect_on_next_statement_in_same_session`,
+  `test_select_grant_allows_point_analytic_and_general_query_but_not_insert`,
+  `test_show_grants_self_allowed_other_denied`, `test_show_grants_without_for_uses_calling_account`,
+  `test_show_tables_filtered_for_account`, `test_subquery_and_cte_referencing_ungranted_table_masked`,
+  `test_superuser_session_unrestricted`, `test_update_requires_update_and_select_when_where_present`.
+- `crates/htap-server/tests/session.rs`: `test_authenticate_session_accepts_account_without_password`,
+  `test_authenticate_session_locked_account_rejected`, `test_authenticate_session_rejects_unknown_account`,
+  `test_authenticate_session_rejects_wrong_password`, `test_authenticate_session_returns_account_principal`,
+  `test_authenticate_session_unknown_user_same_error_as_wrong_password`,
+  `test_change_user_can_switch_between_authenticated_accounts`,
+  `test_change_user_failure_preserves_existing_principal_and_state`,
+  `test_change_user_resets_session_state_before_switching_principal`,
+  `test_change_user_switches_to_authenticated_account`, `test_account_ddl_rejected_inside_open_transaction`.
+- `crates/htap-wire/tests/accounts.rs` (10 tests): `test_mysql_crate_login_as_catalog_account`,
+  `test_wire_change_user_to_different_account_switches_privileges`, `test_wire_execute_after_revoke_denied`,
+  `test_wire_login_uses_catalog_account_not_shared_password`, `test_wire_prepare_masks_invisible_table`,
+  `test_wire_prepare_with_placeholders_works_for_granted_table`,
+  `test_wire_privileges_enforced_in_multi_statement_batch`, `test_wire_privileges_enforced_over_text_protocol`,
+  `test_wire_root_login_with_bootstrap_password`, `test_wire_unknown_user_and_wrong_password_same_error`.
+- `crates/htap-common/src/error.rs`/`crates/htap-wire/src/error_map.rs` unit tests covering
+  `HtapError::PermissionDenied` -> MySQL 1142/`42000` and the reverse client-side mapping.
+
+### Fix pass: constant-time comparison, timing-safe failure paths, earlier account-statement rejection, stricter v3 decode, and one consistent `PREPARE` snapshot
+
+A follow-up fix pass closed several gaps left open by the original decision above:
+
+- **Constant-time hash comparison.** `htap_common::password::constant_time_eq_20` (XOR-and-OR over all 20
+  bytes, no early exit) replaces the plain `==` byte comparison in `verify_native_password_hash` and in the
+  empty-password acceptance check. The hash itself is still an unsalted `SHA1(SHA1(password))` with no KDF
+  work factor and remains offline-crackable if the catalog file leaks (unchanged from "Consequences" above) —
+  only the comparison step is now constant-time.
+- **Timing-safe authentication failure paths.** `authenticate_principal` now runs the same dummy
+  `verify_native_password_hash` call (against a fixed dummy hash) on the unknown-user, locked-account, and
+  no-password-account/non-empty-response paths that a genuine wrong-password attempt runs, so the time taken
+  by a failed login does not itself reveal whether the attempted username exists.
+- **Earlier rejection of account statements.** `check_statement_visible` now rejects `CREATE/ALTER/DROP USER`,
+  `GRANT`, and `REVOKE` from a non-superuser with `PermissionDenied` before the statement is ever bound,
+  closing a gap where binding first (and only checking superuser status in `check_privileges` afterward) could
+  let `GRANT`/`REVOKE` double as a schema-probing oracle. The same pre-bind visibility walker
+  (`referenced_table_names`) was extended to cover `ALTER TABLE` and `DROP TABLE` targets, not just
+  `SELECT`/`INSERT`/`UPDATE`/`DELETE`
+  (`crates/htap-server/tests/privileges.rs::test_prebind_visibility_masks_alter_table_targets`, and
+  `test_account_ddl_requires_superuser` extended to assert `GRANT`/`REVOKE` against a missing table and an
+  existing-but-invisible table produce identical errors).
+- **Strict v3 catalog decode.** A payload tagged format version 3 must actually contain `accounts`, `grants`,
+  `accounts_initialized`, and `id_high_water.account`; a v3-tagged payload missing any of them is now rejected
+  as `HtapError::Corruption` rather than silently decoding with empty defaults. v1 and v2 payloads are
+  unaffected and still decode via `#[serde(default)]`, since they were never expected to carry these fields
+  (`crates/htap-catalog/tests/catalog_recovery.rs::test_catalog_v3_payload_missing_security_fields_is_rejected`).
+- **`PREPARE` uses one catalog snapshot for both the visibility check and schema resolution.**
+  `Session::check_statement_visible` now returns the `CatalogSnapshot` it checked against, and
+  `htap-wire::server`'s `COM_STMT_PREPARE` handler reuses that same snapshot for
+  `htap_sql::resolve_prepare_output_schema` instead of loading the catalog a second time, so a concurrent
+  `GRANT`/`DROP TABLE` cannot land between the visibility check and schema resolution within one `PREPARE`
+  call.
+- **`SET @x = expr` visibility check now runs under `execution_lock`.** `Session::eval_scalar_expr` takes the
+  server's execution lock before loading the catalog and calling `check_statement_visible`, matching every
+  other statement path instead of checking visibility outside the lock other statements hold.
+- **Vendored `sqlparser` prints `IDENTIFIED BY` passwords as escaped, quoted literals.** The `Display` impl
+  for `CREATE/ALTER USER ... IDENTIFIED BY '<password>'` now round-trips a password containing a single quote
+  or backslash instead of emitting an unescaped literal
+  (`vendor/sqlparser/src/ast/mod.rs::tests::test_user_management_password_display_escaping`).
+
+`docs/LIMITATIONS.md` and `docs/PROGRESS.md`'s Phase 12 rows are corrected to remove the "non-constant-time
+hash comparison" limitation; the missing-salt/KDF gap is unchanged and remains documented.
+
+Cross-references: ADR-017 (the `id_high_water`/format-version-bump precedent this ADR's v2-to-v3 bump follows),
+ADR-018 (`Session::execute_statement` as the single enforcement point, reused unchanged as the privilege-check
+call site), ADR-020 (TLS/compression activate strictly after the authentication this ADR replaces
+`verify_credentials` with).

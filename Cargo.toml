@@ -41,12 +41,16 @@ zstd = "0.13"
 async-trait = "0.1"
 futures = "0.3"
 getrandom = "0.3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sqlparser = { path = "vendor/sqlparser" }
 proptest = "1"
 tempfile = "3"
 fs2 = "0.4.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 csv = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
 
 [profile.release]
 opt-level = 3

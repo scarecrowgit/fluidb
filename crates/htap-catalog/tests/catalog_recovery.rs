@@ -464,7 +464,7 @@ fn test_corruption_and_truncation() {
 
     // 4. Unsupported version (neither current nor legacy)
     let mut encoded = encode_snapshot(&snap).unwrap();
-    encoded[8..10].copy_from_slice(&3u16.to_le_bytes());
+    encoded[8..10].copy_from_slice(&4u16.to_le_bytes());
     fs::write(&catalog_path, &encoded).unwrap();
     let err = LocalCatalogStore::open(temp.path()).unwrap_err();
     assert!(matches!(err, HtapError::Corruption(_)));
@@ -2981,6 +2981,7 @@ fn test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max() {
     assert_eq!(
         decoded.id_high_water(),
         IdHighWater {
+            account: 0,
             table: 3,
             partition: 10,
             tablet: 100,
@@ -3003,7 +3004,7 @@ fn test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max() {
     store.compare_and_set(1, next.clone()).unwrap();
     let bytes = fs::read(temp.path().join("CATALOG")).unwrap();
     assert_eq!(&bytes[8..10], &FORMAT_VERSION.to_le_bytes());
-    assert_eq!(FORMAT_VERSION, 2);
+    assert_eq!(FORMAT_VERSION, 3);
     let reloaded = LocalCatalogStore::open(temp.path())
         .unwrap()
         .load()
@@ -3022,6 +3023,7 @@ fn test_catalog_id_high_water_prevents_reuse_after_removal() {
     let temp = TempDir::new().unwrap();
     let store = LocalCatalogStore::open(temp.path()).unwrap();
     let snap = make_valid_snapshot(1).with_id_high_water(IdHighWater {
+        account: 0,
         table: 1,
         partition: 10,
         tablet: 100,
@@ -3065,6 +3067,7 @@ fn test_catalog_cas_rejects_regressing_id_high_water() {
     let temp = TempDir::new().unwrap();
     let store = LocalCatalogStore::open(temp.path()).unwrap();
     let snap = make_valid_snapshot(1).with_id_high_water(IdHighWater {
+        account: 0,
         table: 7,
         partition: 70,
         tablet: 700,
@@ -3105,6 +3108,420 @@ fn test_catalog_cas_rejects_regressing_id_high_water() {
 
 /// A version-2 envelope must carry `id_high_water`; a CRC-valid v2 payload without it is
 /// rejected instead of silently decoding as zeros.
+#[test]
+fn test_catalog_v2_envelope_decodes_with_empty_accounts() {
+    use htap_catalog::local::{decode_snapshot, HEADER_LEN};
+
+    let snap = make_valid_snapshot(1);
+    let payload = serde_json::to_vec(&snap).unwrap();
+    let mut raw = Vec::new();
+    raw.extend_from_slice(HEADER_MAGIC);
+    raw.extend_from_slice(&2u16.to_le_bytes());
+    raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+    raw.extend_from_slice(&payload);
+
+    assert_eq!(raw.len(), HEADER_LEN + payload.len());
+    let decoded = decode_snapshot(&raw).unwrap();
+    assert!(decoded.accounts.is_empty());
+    assert!(decoded.grants.is_empty());
+    assert!(!decoded.accounts_initialized);
+}
+
+#[test]
+fn test_catalog_v2_envelope_without_account_fields_decodes() {
+    use htap_catalog::local::decode_snapshot;
+
+    let snapshot = make_valid_snapshot(1);
+    let mut json: serde_json::Value = serde_json::to_value(snapshot).unwrap();
+    let object = json.as_object_mut().unwrap();
+    object.remove("accounts");
+    object.remove("grants");
+    object.remove("accounts_initialized");
+    object
+        .get_mut("id_high_water")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("account");
+
+    let payload = serde_json::to_vec(&json).unwrap();
+    let mut raw = Vec::new();
+    raw.extend_from_slice(HEADER_MAGIC);
+    raw.extend_from_slice(&2u16.to_le_bytes());
+    raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+    raw.extend_from_slice(&payload);
+
+    let decoded = decode_snapshot(&raw).unwrap();
+    assert!(decoded.accounts.is_empty());
+    assert!(decoded.grants.is_empty());
+    assert!(!decoded.accounts_initialized);
+    assert_eq!(decoded.id_high_water.account, 0);
+}
+
+#[test]
+fn test_catalog_v3_payload_missing_security_fields_is_rejected() {
+    use htap_catalog::local::decode_snapshot;
+
+    for missing in ["accounts", "grants", "accounts_initialized", "account"] {
+        let snapshot = make_valid_snapshot(1);
+        let mut json: serde_json::Value = serde_json::to_value(snapshot).unwrap();
+        let object = json.as_object_mut().unwrap();
+        if missing == "account" {
+            object
+                .get_mut("id_high_water")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+        } else {
+            object.remove(missing);
+        }
+
+        let payload = serde_json::to_vec(&json).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(HEADER_MAGIC);
+        raw.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+        raw.extend_from_slice(&payload);
+
+        let err = decode_snapshot(&raw).unwrap_err();
+        assert!(matches!(err, HtapError::Corruption(_)), "{err}");
+        if missing == "account" {
+            assert!(err.to_string().contains("id_high_water.account"));
+        } else {
+            assert!(err.to_string().contains(missing));
+        }
+    }
+}
+
+#[test]
+fn test_catalog_v3_round_trip_with_accounts_and_grants() {
+    use htap_catalog::IdHighWater;
+
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    let mut snap = make_valid_snapshot(1).with_id_high_water(IdHighWater {
+        account: 1,
+        table: 1,
+        partition: 10,
+        tablet: 100,
+        replica: 1000,
+    });
+    snap.accounts_initialized = true;
+    snap.accounts.push(Account {
+        id: AccountId::new(1),
+        username: "admin".into(),
+        password_hash: Some([7; 20]),
+        locked: false,
+        is_superuser: true,
+    });
+    snap.grants = vec![
+        Grant {
+            account: AccountId::new(1),
+            scope: PrivilegeScope::Global,
+            privileges: PrivilegeSet::CREATE.union(PrivilegeSet::DROP),
+        },
+        Grant {
+            account: AccountId::new(1),
+            scope: PrivilegeScope::Table(TableId::new(1)),
+            privileges: PrivilegeSet::SELECT,
+        },
+    ];
+
+    store.compare_and_set(0, snap.clone()).unwrap();
+    let reopened = LocalCatalogStore::open(temp.path()).unwrap();
+    let decoded = reopened.load().unwrap().unwrap();
+    assert_eq!(decoded, snap);
+    assert_eq!(
+        decoded.effective_privileges(AccountId::new(1), TableId::new(1)),
+        PrivilegeSet::CREATE
+            .union(PrivilegeSet::DROP)
+            .union(PrivilegeSet::SELECT)
+    );
+    assert!(decoded.has_any_privilege_on(AccountId::new(1), TableId::new(1)));
+}
+
+#[test]
+fn test_catalog_v3_rejects_dangling_grant() {
+    use htap_catalog::IdHighWater;
+
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    let mut snap = make_valid_snapshot(1).with_id_high_water(IdHighWater {
+        account: 1,
+        ..IdHighWater::default()
+    });
+    snap.grants.push(Grant {
+        account: AccountId::new(1),
+        scope: PrivilegeScope::Global,
+        privileges: PrivilegeSet::SELECT,
+    });
+
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("nonexistent account"));
+}
+
+#[test]
+fn test_catalog_v3_rejects_duplicate_username() {
+    use htap_catalog::IdHighWater;
+
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    let mut snap = make_valid_snapshot(1).with_id_high_water(IdHighWater {
+        account: 2,
+        ..IdHighWater::default()
+    });
+    snap.accounts = vec![
+        Account {
+            id: AccountId::new(1),
+            username: "admin".into(),
+            password_hash: None,
+            locked: false,
+            is_superuser: false,
+        },
+        Account {
+            id: AccountId::new(2),
+            username: "admin".into(),
+            password_hash: None,
+            locked: false,
+            is_superuser: false,
+        },
+    ];
+
+    let err = store.compare_and_set(0, snap).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("duplicate account username"));
+}
+
+#[test]
+fn test_partition_alterations_preserve_account_state() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let p0 = PartitionId::new(10);
+    let p1 = PartitionId::new(11);
+    let p2 = PartitionId::new(12);
+    let t0 = TabletId::new(100);
+    let t1 = TabletId::new(101);
+    let t2 = TabletId::new(102);
+    let r0 = ReplicaId::new(1000);
+    let r1 = ReplicaId::new(1001);
+    let r2 = ReplicaId::new(1002);
+
+    let table = TableDescriptor::new(TableId::new(1), "t", schema, vec![0], vec![p0, p1, p2], 1)
+        .with_partitioning(PartitioningDescriptor::new(0, PartitioningMethod::Range));
+
+    let partitions = vec![
+        PartitionDescriptor::new(
+            p0,
+            TableId::new(1),
+            "p0",
+            StorageDescriptor::Row,
+            vec![t0],
+            1,
+        )
+        .with_range(RangeBound::new(Value::Int64(0), Value::Int64(100))),
+        PartitionDescriptor::new(
+            p1,
+            TableId::new(1),
+            "p1",
+            StorageDescriptor::Row,
+            vec![t1],
+            1,
+        )
+        .with_range(RangeBound::new(Value::Int64(100), Value::Int64(200))),
+        PartitionDescriptor::new(
+            p2,
+            TableId::new(1),
+            "p2",
+            StorageDescriptor::Row,
+            vec![t2],
+            1,
+        )
+        .with_range(RangeBound::new(Value::Int64(200), Value::Int64(300))),
+    ];
+
+    let tablets = vec![
+        TabletDescriptor::new(t0, p0, 0, vec![r0], 1),
+        TabletDescriptor::new(t1, p1, 0, vec![r1], 1),
+        TabletDescriptor::new(t2, p2, 0, vec![r2], 1),
+    ];
+    let replicas = vec![
+        ReplicaDescriptor::new(r0, t0, NodeId::new(1), true, true, 1),
+        ReplicaDescriptor::new(r1, t1, NodeId::new(1), true, true, 1),
+        ReplicaDescriptor::new(r2, t2, NodeId::new(1), true, true, 1),
+    ];
+
+    let mut snapshot = CatalogSnapshot::new(1, vec![table], partitions, tablets, replicas)
+        .with_id_high_water(IdHighWater {
+            account: 1,
+            table: 1,
+            partition: 12,
+            tablet: 102,
+            replica: 1002,
+        });
+    snapshot.accounts_initialized = true;
+    snapshot.accounts.push(Account {
+        id: AccountId::new(1),
+        username: "alice".into(),
+        password_hash: None,
+        locked: false,
+        is_superuser: false,
+    });
+    snapshot.grants.push(Grant {
+        account: AccountId::new(1),
+        scope: PrivilegeScope::Table(TableId::new(1)),
+        privileges: PrivilegeSet::SELECT,
+    });
+
+    let expected_accounts = snapshot.accounts.clone();
+    let expected_grants = snapshot.grants.clone();
+
+    let reorganized = snapshot
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::reorganize(
+                vec!["p0", "p1"],
+                vec![
+                    RangePartitionDefinition::new("p01a", Value::Int64(0), Value::Int64(150)),
+                    RangePartitionDefinition::new("p01b", Value::Int64(150), Value::Int64(200)),
+                ],
+            ),
+        )
+        .unwrap();
+    assert_eq!(reorganized.accounts, expected_accounts);
+    assert_eq!(reorganized.grants, expected_grants);
+    assert!(reorganized.accounts_initialized);
+
+    let added = reorganized
+        .apply_partition_alteration(
+            "t",
+            &PartitionAlteration::add(vec![RangePartitionDefinition::new(
+                "p3",
+                Value::Int64(300),
+                Value::Int64(400),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(added.accounts, expected_accounts);
+    assert_eq!(added.grants, expected_grants);
+    assert!(added.accounts_initialized);
+
+    let dropped = added
+        .apply_partition_alteration("t", &PartitionAlteration::drop(vec!["p3"]))
+        .unwrap();
+    assert_eq!(dropped.accounts, expected_accounts);
+    assert_eq!(dropped.grants, expected_grants);
+    assert!(dropped.accounts_initialized);
+    dropped.validate().unwrap();
+}
+
+#[test]
+fn test_catalog_cas_rejects_accounts_initialized_regression() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+
+    let mut current = make_valid_snapshot(1);
+    current.accounts_initialized = true;
+    store.compare_and_set(0, current).unwrap();
+
+    let next = make_valid_snapshot(2);
+    let err = store.compare_and_set(1, next).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err
+        .to_string()
+        .contains("accounts_initialized flag regressed"));
+    assert!(store.load().unwrap().unwrap().accounts_initialized);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_catalog_publish_replaces_stale_world_readable_temp_with_owner_only_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let tmp_path = temp.path().join("CATALOG.tmp");
+    fs::write(&tmp_path, b"stale catalog data").unwrap();
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    store.compare_and_set(0, make_valid_snapshot(1)).unwrap();
+
+    assert!(!tmp_path.exists());
+    let mode = fs::metadata(temp.path().join("CATALOG"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn test_catalog_cas_rejects_regressing_account_high_water() {
+    use htap_catalog::IdHighWater;
+
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    let snap = make_valid_snapshot(1).with_id_high_water(IdHighWater {
+        account: 7,
+        table: 1,
+        partition: 10,
+        tablet: 100,
+        replica: 1000,
+    });
+    store.compare_and_set(0, snap.clone()).unwrap();
+
+    let regressed = CatalogSnapshot::new(
+        2,
+        snap.tables.clone(),
+        snap.partitions.clone(),
+        snap.tablets.clone(),
+        snap.replicas.clone(),
+    );
+    let err = store.compare_and_set(1, regressed).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("high-water mark regressed"));
+}
+
+#[test]
+fn test_catalog_future_version_rejected() {
+    let snap = make_valid_snapshot(1);
+    let mut encoded = encode_snapshot(&snap).unwrap();
+    encoded[8..10].copy_from_slice(&4u16.to_le_bytes());
+
+    let err = htap_catalog::local::decode_snapshot(&encoded).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err
+        .to_string()
+        .contains("unsupported catalog format version"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_catalog_file_permissions_restricted_after_publish() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    store.compare_and_set(0, make_valid_snapshot(1)).unwrap();
+
+    let mode = fs::metadata(temp.path().join("CATALOG"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
 #[test]
 fn test_catalog_v2_payload_without_id_high_water_is_rejected() {
     use htap_catalog::local::decode_snapshot;

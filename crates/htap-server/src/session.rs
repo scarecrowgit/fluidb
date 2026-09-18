@@ -54,6 +54,10 @@ use std::sync::Arc;
 use htap_catalog::store::CatalogStore;
 use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
+use htap_common::password::{
+    constant_time_eq_20, hash_native_password, verify_empty_password_response,
+    verify_native_password_hash,
+};
 use htap_common::types::{Mutation, Row, Value};
 use htap_common::Version;
 use htap_rowstore::Snapshot;
@@ -73,7 +77,25 @@ use sqlparser::ast::{
     TransactionAccessMode, TransactionMode,
 };
 
-use crate::{CatalogSnapshot, ExecMode, LocalServer, PartitionId, TableId};
+use crate::{
+    privilege::{check_privileges, check_statement_visible},
+    CatalogSnapshot, ExecMode, LocalServer, PartitionId, TableId,
+};
+use htap_catalog::AccountId;
+
+/// Authenticated identity associated with a server session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Principal {
+    /// The embedded/default session identity, which retains existing unrestricted behavior.
+    Superuser,
+    /// An authenticated catalog account.
+    Account {
+        /// Stable catalog account identifier.
+        id: AccountId,
+        /// Account login name.
+        username: String,
+    },
+}
 
 /// Unique, process-lifetime-monotonic identifier for a [`Session`].
 ///
@@ -91,6 +113,15 @@ impl SessionId {
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("principal", &self.principal)
+            .finish()
     }
 }
 
@@ -423,6 +454,12 @@ fn is_ddl(bound: &BoundStatement) -> bool {
         BoundStatement::CreateTable(_)
             | BoundStatement::DropTable(_)
             | BoundStatement::AlterPartitions(_)
+            | BoundStatement::CreateUser(_)
+            | BoundStatement::AlterUser(_)
+            | BoundStatement::DropUser(_)
+            | BoundStatement::GrantPrivileges(_)
+            | BoundStatement::RevokePrivileges(_)
+            | BoundStatement::ShowGrants(_)
     )
 }
 
@@ -435,6 +472,56 @@ fn is_write(bound: &BoundStatement) -> bool {
     )
 }
 
+fn access_denied(username: &str) -> HtapError {
+    HtapError::PermissionDenied(format!("access denied for user '{username}'"))
+}
+
+/// Authenticates a catalog account and returns its session principal.
+pub(crate) fn authenticate_principal(
+    server: &LocalServer,
+    username: &str,
+    scramble: &[u8],
+    auth_response: &[u8],
+) -> Result<Principal> {
+    let catalog = server
+        .catalog
+        .load()?
+        .unwrap_or_else(CatalogSnapshot::empty);
+    // Keep unknown, locked, and malformed-password failures on the same SHA-1 verification
+    // path as an ordinary failed password attempt.
+    let dummy_hash = hash_native_password("htap authentication dummy verifier");
+    let Some(account) = catalog.account_by_username(username) else {
+        let _ = verify_native_password_hash(scramble, &dummy_hash, auth_response);
+        return Err(access_denied(username));
+    };
+
+    if account.locked {
+        let _ = verify_native_password_hash(scramble, &dummy_hash, auth_response);
+        return Err(access_denied(username));
+    }
+
+    let verified = match &account.password_hash {
+        None if auth_response.is_empty() => true,
+        None => {
+            let _ = verify_native_password_hash(scramble, &dummy_hash, auth_response);
+            false
+        }
+        Some(hash) if auth_response.is_empty() => {
+            verify_empty_password_response(auth_response)
+                && constant_time_eq_20(hash, &hash_native_password(""))
+        }
+        Some(hash) => verify_native_password_hash(scramble, hash, auth_response),
+    };
+    if !verified {
+        return Err(access_denied(username));
+    }
+
+    Ok(Principal::Account {
+        id: account.id,
+        username: account.username.clone(),
+    })
+}
+
 /// A server-side session: sequential SQL execution against a [`LocalServer`], with at most one
 /// open explicit transaction at a time.
 ///
@@ -445,6 +532,7 @@ fn is_write(bound: &BoundStatement) -> bool {
 pub struct Session {
     id: SessionId,
     server: Arc<LocalServer>,
+    principal: Principal,
     state: SessionState,
     /// `@name` user variables set by `SET @name = expr`, scoped to this session for its
     /// lifetime. An unset user variable reads as `NULL` (see [`SessionVariables::lookup`]).
@@ -468,6 +556,33 @@ impl Session {
     /// Returns this session's unique identifier.
     pub fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// Returns the identity authenticated for this session.
+    pub fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
+    /// Replaces this session's identity after successful authentication.
+    pub(crate) fn set_principal(&mut self, principal: Principal) {
+        self.principal = principal;
+    }
+
+    /// Authenticates and switches this session to `username`.
+    ///
+    /// A successful switch resets session state before replacing the principal. If the session is
+    /// waiting for an ambiguous commit outcome, [`Session::reset`] rejects the request and the
+    /// existing principal remains unchanged.
+    pub fn change_user(
+        &mut self,
+        username: &str,
+        scramble: &[u8],
+        auth_response: &[u8],
+    ) -> Result<()> {
+        let principal = authenticate_principal(&self.server, username, scramble, auth_response)?;
+        self.reset()?;
+        self.principal = principal;
+        Ok(())
     }
 
     /// Returns `true` if a transaction is currently open.
@@ -498,6 +613,22 @@ impl Session {
             .catalog
             .load()?
             .unwrap_or_else(CatalogSnapshot::empty))
+    }
+
+    /// Checks a parsed statement's visibility and returns the catalog snapshot checked.
+    ///
+    /// Prepared-statement callers must use the returned snapshot for all metadata resolution so
+    /// visibility and schema information cannot be resolved against different catalog versions.
+    /// This deliberately does not bind: a prepared statement still contains `?` placeholders.
+    /// Execution performs the authoritative bound-statement privilege check after substitution.
+    pub fn check_statement_visible(&self, statement: &SqlStatement) -> Result<CatalogSnapshot> {
+        let catalog = self
+            .server
+            .catalog
+            .load()?
+            .unwrap_or_else(CatalogSnapshot::empty);
+        check_statement_visible(&self.principal, statement, &catalog)?;
+        Ok(catalog)
     }
 
     /// Sets this session's reported `@@max_allowed_packet` (Phase 11 plan task 8).
@@ -689,7 +820,9 @@ impl Session {
             .catalog
             .load()?
             .unwrap_or_else(CatalogSnapshot::empty);
+        check_statement_visible(&self.principal, &statement, &catalog)?;
         let bound = htap_sql::bind(&statement, &catalog)?;
+        check_privileges(&self.principal, &bound, &catalog)?;
 
         // DDL is rejected inside any open transaction, explicit or implicit (autocommit off);
         // the transaction, if any, survives untouched (not poisoned).
@@ -713,10 +846,13 @@ impl Session {
         };
 
         let outcome = match &mut self.state {
-            SessionState::Idle => {
-                self.server
-                    .dispatch_bound(bound, &catalog, ExecMode::Autocommit, &vars)
-            }
+            SessionState::Idle => self.server.dispatch_bound(
+                bound,
+                &catalog,
+                ExecMode::Autocommit,
+                &vars,
+                &self.principal,
+            ),
             SessionState::InTxn(open_txn) => {
                 if let Some(reason) = &open_txn.poisoned {
                     return Err(HtapError::Conflict(reason.clone()));
@@ -732,7 +868,8 @@ impl Session {
                     snapshot: open_txn.snapshot,
                     write_set: &mut open_txn.write_set,
                 };
-                self.server.dispatch_bound(bound, &catalog, mode, &vars)
+                self.server
+                    .dispatch_bound(bound, &catalog, mode, &vars, &self.principal)
             }
             SessionState::CommitOutcomePending { .. } => {
                 unreachable!("checked and rejected at the top of `execute` before parsing")
@@ -943,6 +1080,8 @@ impl Session {
     /// evaluates the single projected value with this session as the [`VariableLookup`], so `SET
     /// @b = @a + 1` reads `@a` back from this same session.
     fn eval_scalar_expr(&self, expr: &SqlExpr) -> Result<Value> {
+        let server = Arc::clone(&self.server);
+        let _guard = server.execution_lock.lock();
         let sql = format!("SELECT {expr}");
         let statement = htap_sql::parse_one(&sql)?;
         let catalog = self
@@ -950,6 +1089,7 @@ impl Session {
             .catalog
             .load()?
             .unwrap_or_else(CatalogSnapshot::empty);
+        check_statement_visible(&self.principal, &statement, &catalog)?;
         let bound = htap_sql::bind(&statement, &catalog)?;
         let query = match bound {
             BoundStatement::Query(query) => query,
@@ -1390,6 +1530,7 @@ impl LocalServer {
         Session {
             id,
             server: Arc::clone(self),
+            principal: Principal::Superuser,
             state: SessionState::Idle,
             user_vars: BTreeMap::new(),
             autocommit: true,

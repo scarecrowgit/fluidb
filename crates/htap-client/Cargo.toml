@@ -9,6 +9,10 @@ htap-common = { path = "../htap-common" }
 htap-server = { path = "../htap-server" }
 htap-sql = { path = "../htap-sql" }
 htap-wire = { path = "../htap-wire" }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = { workspace = true }

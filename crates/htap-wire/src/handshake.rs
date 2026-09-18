@@ -149,6 +149,19 @@ pub struct HandshakeResponse41 {
     pub database: Option<String>,
     /// Authentication plugin proposed by the client, if any.
     pub auth_plugin: Option<String>,
+    /// Zstandard compression level requested by the client, if negotiated.
+    pub zstd_compression_level: Option<u8>,
+}
+
+/// Validates an SSLRequest packet sent before the TLS upgrade.
+pub fn decode_ssl_request(payload: &[u8]) -> io::Result<()> {
+    if payload.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SSL request has {} bytes, expected 32", payload.len()),
+        ));
+    }
+    Ok(())
 }
 
 impl HandshakeResponse41 {
@@ -196,7 +209,14 @@ impl HandshakeResponse41 {
         } else {
             None
         };
-        // Connection attributes (CLIENT_CONNECT_ATTRS), if present, are ignored.
+        if capability_flags & CLIENT_CONNECT_ATTRS != 0 && pos < payload.len() {
+            let _attributes = read_lenenc_str(payload, &mut pos)?;
+        }
+        let zstd_compression_level = if capability_flags & CLIENT_ZSTD_COMPRESSION_ALGORITHM != 0 {
+            Some(read_fixed(payload, &mut pos, 1)?[0])
+        } else {
+            None
+        };
         Ok(Self {
             capability_flags,
             max_packet_size,
@@ -205,6 +225,7 @@ impl HandshakeResponse41 {
             auth_response,
             database,
             auth_plugin,
+            zstd_compression_level,
         })
     }
 
@@ -227,6 +248,9 @@ impl HandshakeResponse41 {
                 &mut buf,
                 self.auth_plugin.as_deref().unwrap_or("").as_bytes(),
             );
+        }
+        if self.capability_flags & CLIENT_ZSTD_COMPRESSION_ALGORITHM != 0 {
+            buf.push(self.zstd_compression_level.unwrap_or(0));
         }
         buf
     }
@@ -383,6 +407,7 @@ mod tests {
             auth_response: vec![1, 2, 3],
             database: None,
             auth_plugin: Some(AUTH_PLUGIN_NATIVE.into()),
+            zstd_compression_level: None,
         };
         let bytes = base.encode();
         assert_eq!(
@@ -430,6 +455,30 @@ mod tests {
     }
 
     #[test]
+    fn test_handshake_response41_with_zstd_compression_level() {
+        let response = HandshakeResponse41 {
+            capability_flags: CLIENT_PROTOCOL_41
+                | CLIENT_SECURE_CONNECTION
+                | CLIENT_PLUGIN_AUTH
+                | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+                | CLIENT_ZSTD_COMPRESSION_ALGORITHM,
+            max_packet_size: 1 << 24,
+            charset: COLLATION_UTF8MB4 as u8,
+            username: "root".into(),
+            auth_response: vec![1, 2, 3],
+            database: None,
+            auth_plugin: Some(AUTH_PLUGIN_NATIVE.into()),
+            zstd_compression_level: Some(3),
+        };
+
+        let decoded = HandshakeResponse41::decode(&response.encode()).unwrap();
+        assert_eq!(decoded.zstd_compression_level, Some(3));
+        assert_eq!(decoded.username, "root");
+        assert_eq!(decoded.auth_response, vec![1, 2, 3]);
+        assert_eq!(decoded.auth_plugin.as_deref(), Some(AUTH_PLUGIN_NATIVE));
+    }
+
+    #[test]
     fn auth_switch_round_trip() {
         let req = AuthSwitchRequest {
             plugin: AUTH_PLUGIN_NATIVE.into(),
@@ -439,6 +488,13 @@ mod tests {
         assert_eq!(bytes[0], EOF_HEADER);
         assert_eq!(AuthSwitchRequest::decode(&bytes).unwrap(), req);
         assert!(AuthSwitchRequest::decode(&bytes[..10]).is_err());
+    }
+
+    #[test]
+    fn ssl_request_requires_exactly_32_bytes() {
+        assert!(decode_ssl_request(&[0; 32]).is_ok());
+        assert!(decode_ssl_request(&[0; 31]).is_err());
+        assert!(decode_ssl_request(&[0; 33]).is_err());
     }
 
     #[test]

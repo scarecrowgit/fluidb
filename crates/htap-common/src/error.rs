@@ -25,6 +25,9 @@ pub enum HtapError {
     #[error("Fenced: expected token >= {expected}, got {got}")]
     Fenced { expected: u64, got: u64 },
 
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("Counter overflow: {counter}")]
     CounterOverflow { counter: &'static str },
 
@@ -64,6 +67,11 @@ impl HtapError {
     /// Returns true if this error is [`HtapError::RecoveryRequired`].
     pub fn is_recovery_required(&self) -> bool {
         matches!(self, Self::RecoveryRequired { .. })
+    }
+
+    /// Returns true if this error is [`HtapError::PermissionDenied`].
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self, Self::PermissionDenied(_))
     }
 }
 

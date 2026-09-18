@@ -59,6 +59,130 @@ define_id!(PartitionId, "Unique identifier for a table partition.");
 define_id!(TabletId, "Unique identifier for a partition tablet.");
 define_id!(ReplicaId, "Unique identifier for a tablet replica.");
 define_id!(NodeId, "Unique identifier for a cluster node.");
+define_id!(AccountId, "Unique identifier for a catalog account.");
+
+/// Bit set of privileges granted to an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct PrivilegeSet(pub u16);
+
+impl PrivilegeSet {
+    pub const SELECT: Self = Self(1 << 0);
+    pub const INSERT: Self = Self(1 << 1);
+    pub const UPDATE: Self = Self(1 << 2);
+    pub const DELETE: Self = Self(1 << 3);
+    pub const CREATE: Self = Self(1 << 4);
+    pub const DROP: Self = Self(1 << 5);
+    pub const ALTER: Self = Self(1 << 6);
+    pub const ALL: Self = Self(
+        Self::SELECT.0
+            | Self::INSERT.0
+            | Self::UPDATE.0
+            | Self::DELETE.0
+            | Self::CREATE.0
+            | Self::DROP.0
+            | Self::ALTER.0,
+    );
+
+    /// Returns an empty privilege set.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Returns true when this set includes every privilege in `other`.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Returns the union of this set and `other`.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns privileges in this set that are absent from `other`.
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Returns true when this set has no privileges.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::fmt::Display for PrivilegeSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let privileges = [
+            (Self::SELECT, "SELECT"),
+            (Self::INSERT, "INSERT"),
+            (Self::UPDATE, "UPDATE"),
+            (Self::DELETE, "DELETE"),
+            (Self::CREATE, "CREATE"),
+            (Self::DROP, "DROP"),
+            (Self::ALTER, "ALTER"),
+        ];
+
+        let mut first = true;
+        for (privilege, name) in privileges {
+            if self.contains(privilege) {
+                if !first {
+                    f.write_str(",")?;
+                }
+                f.write_str(name)?;
+                first = false;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Catalog account metadata.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    /// Unique account identifier.
+    pub id: AccountId,
+    /// Account login name.
+    pub username: String,
+    /// SHA-1 password hash. `None` represents an account without a password.
+    pub password_hash: Option<[u8; 20]>,
+    /// Whether login is disabled for this account.
+    pub locked: bool,
+    /// Whether this account bypasses ordinary privilege checks.
+    pub is_superuser: bool,
+}
+
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("password_hash", &"<redacted>")
+            .field("locked", &self.locked)
+            .field("is_superuser", &self.is_superuser)
+            .finish()
+    }
+}
+
+/// Scope to which a privilege grant applies.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PrivilegeScope {
+    /// Applies to every table.
+    Global,
+    /// Applies to one table.
+    Table(TableId),
+}
+
+/// Privileges granted to an account within one scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    /// Account receiving the privileges.
+    pub account: AccountId,
+    /// Scope covered by this grant.
+    pub scope: PrivilegeScope,
+    /// Granted privileges.
+    pub privileges: PrivilegeSet,
+}
 
 /// Storage format of data inside a partition or tablet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -708,6 +832,15 @@ impl ReplicaDescriptor {
 pub struct CatalogSnapshot {
     /// Monotonically increasing snapshot generation counter.
     pub generation: u64,
+    /// All catalog accounts.
+    #[serde(default)]
+    pub accounts: Vec<Account>,
+    /// All account privilege grants.
+    #[serde(default)]
+    pub grants: Vec<Grant>,
+    /// Whether bootstrap account initialization has completed.
+    #[serde(default)]
+    pub accounts_initialized: bool,
     /// All relational tables.
     pub tables: Vec<TableDescriptor>,
     /// All partitions across tables.
@@ -730,6 +863,9 @@ pub struct CatalogSnapshot {
 /// [`CatalogSnapshot::id_high_water`] and [`IdHighWater::allocate`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdHighWater {
+    /// Highest account id ever allocated.
+    #[serde(default)]
+    pub account: u64,
     /// Highest table id ever allocated.
     pub table: u64,
     /// Highest partition id ever allocated.
@@ -744,6 +880,7 @@ impl IdHighWater {
     /// Merges two high-water marks by taking the maximum of each counter.
     pub fn max(self, other: IdHighWater) -> IdHighWater {
         IdHighWater {
+            account: self.account.max(other.account),
             table: self.table.max(other.table),
             partition: self.partition.max(other.partition),
             tablet: self.tablet.max(other.tablet),
@@ -756,6 +893,11 @@ impl IdHighWater {
             .checked_add(1)
             .ok_or(HtapError::CounterOverflow { counter: name })?;
         Ok(*counter)
+    }
+
+    /// Allocates the next account id.
+    pub fn allocate_account(&mut self) -> Result<AccountId> {
+        Self::bump(&mut self.account, "account_id").map(AccountId::new)
     }
 
     /// Allocates the next table id.
@@ -910,6 +1052,9 @@ impl CatalogSnapshot {
     pub fn empty() -> Self {
         Self {
             generation: 0,
+            accounts: Vec::new(),
+            grants: Vec::new(),
+            accounts_initialized: false,
             tables: Vec::new(),
             partitions: Vec::new(),
             tablets: Vec::new(),
@@ -918,7 +1063,11 @@ impl CatalogSnapshot {
         }
     }
 
-    /// Create a new catalog snapshot with the provided elements.
+    /// Create a new catalog snapshot with the provided storage elements.
+    ///
+    /// This constructor initializes the account model as empty and uninitialized. It is intended
+    /// for initial catalog creation; successors of an existing snapshot must preserve its account
+    /// state, for example with [`CatalogSnapshot::with_account_state_from`].
     pub fn new(
         generation: u64,
         tables: Vec<TableDescriptor>,
@@ -928,6 +1077,9 @@ impl CatalogSnapshot {
     ) -> Self {
         Self {
             generation,
+            accounts: Vec::new(),
+            grants: Vec::new(),
+            accounts_initialized: false,
             tables,
             partitions,
             tablets,
@@ -942,11 +1094,25 @@ impl CatalogSnapshot {
         self
     }
 
+    /// Copies account metadata from an existing catalog snapshot when deriving a successor.
+    pub fn with_account_state_from(mut self, source: &CatalogSnapshot) -> Self {
+        self.accounts = source.accounts.clone();
+        self.grants = source.grants.clone();
+        self.accounts_initialized = source.accounts_initialized;
+        self
+    }
+
     /// Effective identifier high-water mark: the maximum of the persisted counters and the
     /// highest id of every live table, partition, tablet, and replica. New identifiers must be
     /// allocated above this mark so that ids of dropped objects are never reused.
     pub fn id_high_water(&self) -> IdHighWater {
         let live = IdHighWater {
+            account: self
+                .accounts
+                .iter()
+                .map(|a| a.id.as_u64())
+                .max()
+                .unwrap_or(0),
             table: self.tables.iter().map(|t| t.id.as_u64()).max().unwrap_or(0),
             partition: self
                 .partitions
@@ -968,6 +1134,45 @@ impl CatalogSnapshot {
                 .unwrap_or(0),
         };
         self.id_high_water.max(live)
+    }
+
+    /// Find an account by account ID.
+    pub fn account_by_id(&self, id: AccountId) -> Option<&Account> {
+        self.accounts.iter().find(|account| account.id == id)
+    }
+
+    /// Find an account by username.
+    pub fn account_by_username(&self, username: &str) -> Option<&Account> {
+        self.accounts
+            .iter()
+            .find(|account| account.username == username)
+    }
+
+    /// Get all grants belonging to an account.
+    pub fn grants_for(&self, account: AccountId) -> Vec<&Grant> {
+        self.grants
+            .iter()
+            .filter(|grant| grant.account == account)
+            .collect()
+    }
+
+    /// Returns the effective global and table-specific privileges for an account.
+    pub fn effective_privileges(&self, account: AccountId, table: TableId) -> PrivilegeSet {
+        self.grants
+            .iter()
+            .filter(|grant| {
+                grant.account == account
+                    && (matches!(grant.scope, PrivilegeScope::Global)
+                        || matches!(grant.scope, PrivilegeScope::Table(id) if id == table))
+            })
+            .fold(PrivilegeSet::empty(), |privileges, grant| {
+                privileges.union(grant.privileges)
+            })
+    }
+
+    /// Returns true when an account has any global or table-specific privilege.
+    pub fn has_any_privilege_on(&self, account: AccountId, table: TableId) -> bool {
+        !self.effective_privileges(account, table).is_empty()
     }
 
     /// Find a table descriptor by table ID.
@@ -1307,7 +1512,8 @@ impl CatalogSnapshot {
 
                 let candidate =
                     CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas)
-                        .with_id_high_water(high_water);
+                        .with_id_high_water(high_water)
+                        .with_account_state_from(self);
                 candidate.validate()?;
                 Ok(candidate)
             }
@@ -1417,7 +1623,8 @@ impl CatalogSnapshot {
                     remaining_tablets,
                     remaining_replicas,
                 )
-                .with_id_high_water(high_water);
+                .with_id_high_water(high_water)
+                .with_account_state_from(self);
                 candidate.validate()?;
                 Ok(candidate)
             }
@@ -1615,7 +1822,8 @@ impl CatalogSnapshot {
 
                 let candidate =
                     CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas)
-                        .with_id_high_water(high_water);
+                        .with_id_high_water(high_water)
+                        .with_account_state_from(self);
                 candidate.validate()?;
                 Ok(candidate)
             }
@@ -1637,6 +1845,60 @@ impl CatalogSnapshot {
     ///   - Each tablet references exactly the replicas that claim it.
     ///   - No orphaned or duplicate entity references.
     pub fn validate(&self) -> Result<()> {
+        let mut seen_account_ids = HashSet::with_capacity(self.accounts.len());
+        let mut seen_usernames = HashSet::with_capacity(self.accounts.len());
+
+        for account in &self.accounts {
+            if !seen_account_ids.insert(account.id) {
+                return Err(HtapError::InvalidArgument(format!(
+                    "duplicate account id: {}",
+                    account.id
+                )));
+            }
+            if !seen_usernames.insert(account.username.as_str()) {
+                return Err(HtapError::InvalidArgument(format!(
+                    "duplicate account username: '{}'",
+                    account.username
+                )));
+            }
+            if account.id.as_u64() > self.id_high_water.account {
+                return Err(HtapError::InvalidArgument(format!(
+                    "account id {} exceeds account id high-water mark {}",
+                    account.id, self.id_high_water.account
+                )));
+            }
+        }
+
+        let mut seen_grants = HashSet::with_capacity(self.grants.len());
+        for grant in &self.grants {
+            if !seen_account_ids.contains(&grant.account) {
+                return Err(HtapError::InvalidArgument(format!(
+                    "grant references nonexistent account {}",
+                    grant.account
+                )));
+            }
+            if let PrivilegeScope::Table(table_id) = grant.scope {
+                if self.table(table_id).is_none() {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "grant references nonexistent table {}",
+                        table_id
+                    )));
+                }
+            }
+            if grant.privileges.is_empty() {
+                return Err(HtapError::InvalidArgument(format!(
+                    "grant for account {} has an empty privilege set",
+                    grant.account
+                )));
+            }
+            if !seen_grants.insert((grant.account, &grant.scope)) {
+                return Err(HtapError::InvalidArgument(format!(
+                    "duplicate grant for account {} and scope {:?}",
+                    grant.account, grant.scope
+                )));
+            }
+        }
+
         // 1. Validate tables: unique IDs, unique non-empty names, valid schemas and primary keys.
         let mut seen_table_ids = HashSet::with_capacity(self.tables.len());
         let mut seen_table_names = HashSet::with_capacity(self.tables.len());
@@ -2409,6 +2671,168 @@ mod tests {
         let empty = CatalogSnapshot::empty();
         assert_eq!(empty.generation, 0);
         assert!(empty.validate().is_ok());
+    }
+
+    #[test]
+    fn test_privilege_set_operations_and_display() {
+        let read_write = PrivilegeSet::SELECT.union(PrivilegeSet::UPDATE);
+        assert!(read_write.contains(PrivilegeSet::SELECT));
+        assert!(read_write.contains(PrivilegeSet::UPDATE));
+        assert!(!read_write.contains(PrivilegeSet::DELETE));
+        assert_eq!(
+            read_write.difference(PrivilegeSet::SELECT),
+            PrivilegeSet::UPDATE
+        );
+        assert!(PrivilegeSet::empty().is_empty());
+        assert_eq!(read_write.to_string(), "SELECT,UPDATE");
+        assert!(PrivilegeSet::ALL.contains(read_write));
+    }
+
+    #[test]
+    fn test_allocate_account_and_account_debug_redaction() {
+        let mut high_water = IdHighWater::default();
+        assert_eq!(high_water.allocate_account().unwrap(), AccountId::new(1));
+
+        let account = Account {
+            id: AccountId::new(1),
+            username: "admin".into(),
+            password_hash: Some([42; 20]),
+            locked: false,
+            is_superuser: true,
+        };
+        let debug = format!("{account:?}");
+        assert!(debug.contains("password_hash: \"<redacted>\""));
+        assert!(!debug.contains("42"));
+    }
+
+    #[test]
+    fn test_account_and_grant_validation_failures() {
+        let valid = || {
+            CatalogSnapshot::empty().with_id_high_water(IdHighWater {
+                account: 1,
+                ..IdHighWater::default()
+            })
+        };
+
+        let mut snapshot = valid();
+        snapshot.accounts = vec![
+            Account {
+                id: AccountId::new(1),
+                username: "one".into(),
+                password_hash: None,
+                locked: false,
+                is_superuser: false,
+            },
+            Account {
+                id: AccountId::new(1),
+                username: "two".into(),
+                password_hash: None,
+                locked: false,
+                is_superuser: false,
+            },
+        ];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate account id"));
+
+        let mut snapshot = valid();
+        snapshot.accounts = vec![
+            Account {
+                id: AccountId::new(1),
+                username: "same".into(),
+                password_hash: None,
+                locked: false,
+                is_superuser: false,
+            },
+            Account {
+                id: AccountId::new(0),
+                username: "same".into(),
+                password_hash: None,
+                locked: false,
+                is_superuser: false,
+            },
+        ];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate account username"));
+
+        let mut snapshot = CatalogSnapshot::empty();
+        snapshot.accounts = vec![Account {
+            id: AccountId::new(1),
+            username: "one".into(),
+            password_hash: None,
+            locked: false,
+            is_superuser: false,
+        }];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds account id high-water"));
+
+        let mut snapshot = valid();
+        snapshot.grants = vec![Grant {
+            account: AccountId::new(1),
+            scope: PrivilegeScope::Global,
+            privileges: PrivilegeSet::SELECT,
+        }];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nonexistent account"));
+
+        let mut snapshot = valid();
+        snapshot.accounts = vec![Account {
+            id: AccountId::new(1),
+            username: "one".into(),
+            password_hash: None,
+            locked: false,
+            is_superuser: false,
+        }];
+        snapshot.grants = vec![Grant {
+            account: AccountId::new(1),
+            scope: PrivilegeScope::Table(TableId::new(1)),
+            privileges: PrivilegeSet::SELECT,
+        }];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nonexistent table"));
+
+        snapshot.grants = vec![Grant {
+            account: AccountId::new(1),
+            scope: PrivilegeScope::Global,
+            privileges: PrivilegeSet::empty(),
+        }];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("empty privilege set"));
+
+        snapshot.grants = vec![
+            Grant {
+                account: AccountId::new(1),
+                scope: PrivilegeScope::Global,
+                privileges: PrivilegeSet::SELECT,
+            },
+            Grant {
+                account: AccountId::new(1),
+                scope: PrivilegeScope::Global,
+                privileges: PrivilegeSet::INSERT,
+            },
+        ];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate grant"));
     }
 
     #[test]

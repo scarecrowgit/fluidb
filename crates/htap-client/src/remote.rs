@@ -44,8 +44,9 @@ pub struct PreparedStatement {
 /// lifetime (Phase 10): sending `BEGIN`/`COMMIT`/`ROLLBACK` or `SET autocommit = 0` as ordinary
 /// SQL through [`RemoteClient::execute`] opens and manages an explicit transaction exactly as
 /// it would for an embedded session, with the transaction's buffered writes visible only to
-/// statements sent over this same connection until `COMMIT`. There is still no TLS; query text
-/// and results travel in cleartext unless the connection is otherwise tunneled.
+/// statements sent over this same connection until `COMMIT`. TLS is available through
+/// [`ClientOptions::tls`], and protocol compression is available through
+/// [`ClientOptions::compression`].
 #[derive(Debug)]
 pub struct RemoteClient {
     client: WireClient,
@@ -56,8 +57,9 @@ impl RemoteClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HtapError::Io`] if the connection fails and [`HtapError::Internal`] if
-    /// the server rejects the credentials (MySQL error 1045) or the handshake.
+    /// Returns [`HtapError::Io`] if the connection fails, [`HtapError::PermissionDenied`]
+    /// if the server rejects the credentials (MySQL error 1045), and possibly
+    /// [`HtapError::Internal`] for handshake issues.
     pub fn connect<A: ToSocketAddrs>(addr: A, password: Option<&str>) -> Result<Self> {
         let client = WireClient::connect(addr, password)?;
         Ok(Self { client })
@@ -73,9 +75,10 @@ impl RemoteClient {
     ///
     /// # Errors
     ///
-    /// Server errors are mapped by code: 1064 → [`HtapError::InvalidArgument`],
-    /// 1146 → [`HtapError::NotFound`], 1213 → [`HtapError::Conflict`],
-    /// 1235 → [`HtapError::Unsupported`], anything else → [`HtapError::Internal`].
+    /// Server errors are mapped by code: 1045/1142 → [`HtapError::PermissionDenied`],
+    /// 1064 → [`HtapError::InvalidArgument`], 1146 → [`HtapError::NotFound`],
+    /// 1213 → [`HtapError::Conflict`], 1235 → [`HtapError::Unsupported`],
+    /// anything else → [`HtapError::Internal`].
     pub fn execute(&mut self, sql: &str) -> Result<StatementResult> {
         match self.client.query(sql)? {
             WireResult::Ok(ok) => Ok(decode_command(ok.affected_rows, &ok.info)?),

@@ -1,67 +1,22 @@
-//! Minimal SHA-1 implementation for `mysql_native_password` authentication.
+//! Minimal SHA-1 helpers for `mysql_native_password` authentication.
 //!
-//! SHA-1 is not collision resistant and is used here only because the MySQL native
-//! password exchange mandates it. It is not used for any other purpose.
+//! The implementation now lives in `htap_common::password`; this module
+//! re-exports the canonical functions and preserves all pre-existing public
+//! signatures so that the rest of `htap-wire` compiles unchanged.
+
+/// Uses the canonical SHA-1 implementation from `htap_common`.
+use htap_common::password::sha1 as common_sha1;
 
 /// Computes the SHA-1 digest of `data`.
+///
+/// Delegates to [`htap_common::password::sha1`].
 pub fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [
-        0x6745_2301,
-        0xEFCD_AB89,
-        0x98BA_DCFE,
-        0x1032_5476,
-        0xC3D2_E1F0,
-    ];
+    common_sha1(data)
+}
 
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    let mut w = [0u32; 80];
-    for chunk in msg.chunks_exact(64) {
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-
-        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
-                _ => (b ^ c ^ d, 0xCA62_C1D6),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-    }
-
-    let mut out = [0u8; 20];
-    for (i, v) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
-    }
-    out
+/// Computes the SHA-1 digest of `data`.
+pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    sha1(data)
 }
 
 /// Computes the `mysql_native_password` client response:
@@ -152,5 +107,22 @@ mod tests {
         assert!(!verify_native_password(&scramble, "wrong", &resp));
         assert!(!verify_native_password(&scramble, "password", &resp[..19]));
         assert!(scramble_native_password(&scramble, b"").is_empty());
+    }
+
+    #[test]
+    fn wire_sha1_agrees_with_htap_common_password() {
+        // Confirm the local sha1() delegates correctly to htap_common::password::sha1.
+        let data = b"hello world";
+        assert_eq!(sha1(data), htap_common::password::sha1(data));
+
+        // Confirm verify_native_password is consistent with htap_common::verify_native_password_hash.
+        let scramble: [u8; 20] = *b"01234567890123456789";
+        let password = "password";
+        let stored = htap_common::hash_native_password(password);
+        let resp = scramble_native_password(&scramble, password.as_bytes());
+        assert!(verify_native_password(&scramble, password, &resp));
+        assert!(htap_common::verify_native_password_hash(
+            &scramble, &stored, &resp
+        ));
     }
 }

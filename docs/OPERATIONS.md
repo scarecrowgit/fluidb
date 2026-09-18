@@ -27,9 +27,10 @@ The following operational facilities and production features are **explicitly no
 
 - **No Daemon Supervisor Management:** No `systemd` units or init scripts are provided; `htapd` (below) is a
   plain foreground process with no signal handler beyond the OS default (Ctrl-C/SIGTERM stop it hard).
-- **No TLS or Per-User Security Boundary on the Network Server:** `htapd`/`htap-wire` has no TLS, no
-  per-user credentials, and no role-based access control (RBAC); see "Running `htapd`" below for the full
-  security contract.
+- **TLS and per-user accounts are implemented (Phase 12), but not roles or delegated administration:**
+  `htapd`/`htap-wire` support optional TLS and catalog-backed per-user accounts/privileges; see "Running
+  `htapd`" below for the full security contract. There is no role-based access control (RBAC), no delegation
+  (`WITH GRANT OPTION` is rejected), and only the `%` host is accepted.
 - **No Authentication or Security Boundary for In-Process Use:** `LocalServer`/`EmbeddedClient` calls have no
   user credentials, authentication handshakes, or RBAC — the caller is trusted the way any embedded library
   is trusted.
@@ -60,6 +61,14 @@ The following operational facilities and production features are **explicitly no
   replica ids removed by a pre-Phase-9 `ALTER TABLE ... DROP PARTITION`; a reissued replica id could in
   principle collide with a stale movement snapshot package directory under `movement/tablets/`, though this
   requires also reusing the same movement job id and is narrow in practice.
+- **Catalog Format Version 3 (Phase 12) — Accounts, Grants, and File Permissions:** `HTAPCAT1`
+  `FORMAT_VERSION` bumped again, 2 -> 3, to add `accounts`, `grants`, and an `accounts_initialized` latch (see
+  "Accounts and per-user privileges" under section 6 below). A v1 or v2 catalog still decodes with empty
+  accounts/grants; a v2-only (or older) binary refuses a v3 file. Because the catalog file now carries
+  password hashes (`SHA1(SHA1(password))`, offline-crackable if leaked), `CATALOG.tmp` is created with Unix
+  file mode `0600` before the atomic rename that publishes it — operators should still treat the whole root
+  directory as access-restricted, the same as any other single-owner embedded database, not rely on the file
+  mode alone.
 - **Table Partitioning & Multi-Partition Execution Operational Boundary:**
   - `LocalServer` supports partitioned tables defined via SQL DDL (`CREATE TABLE ... PARTITION BY RANGE/LIST`) or through the native non-SQL API (`LocalServer::create_partitioned_table`) using `PartitionedTableDefinition` with finite `PartitionTopology::Range` (half-open `[lower, upper)` intervals with optional `MAXVALUE`) or `PartitionTopology::List` (disjoint value sets).
   - Unpartitioned SQL DDL (`CREATE TABLE`) creates tables with a default single partition `p0`. Typed MySQL partition DDL is supported via vendored `sqlparser`, while unsupported forms (options, subpartitions, expressions, multi-column COLUMNS, non-final MAXVALUE) are rejected.
@@ -323,7 +332,8 @@ CHARACTER SET`/`SET CHARSET` positional forms `vendor/sqlparser` cannot parse; e
 
 ```text
 htapd --root <dir> [--listen 127.0.0.1:3307] [--max-connections 64] [--password <pw>]
-       [--max-allowed-packet 67108864]
+       [--max-allowed-packet 67108864] [--tls-cert <path> --tls-key <path>]
+       [--require-secure-transport] [--disable-compression]
 ```
 
 `--max-allowed-packet` (default 64 MiB, MySQL's own default) bounds every protocol message — including a
@@ -331,13 +341,37 @@ prepared statement's buffered `COM_STMT_SEND_LONG_DATA` bytes — and can also b
 `HTAPD_MAX_ALLOWED_PACKET`; the flag wins if both are set. It is reported dynamically to clients as
 `@@max_allowed_packet`.
 
+### TLS certificate provisioning and reload (Phase 12)
+
+- `--tls-cert <path>`/`--tls-key <path>` (or `HTAPD_TLS_CERT`/`HTAPD_TLS_KEY`) must both be set together;
+  either PEM file missing, unreadable, malformed, or a cert/key pair that don't match each other fails
+  `WireServer::start` outright with a clear `io::Error` — TLS is never silently disabled because of a bad
+  cert.
+- **Non-loopback binds should set `--require-secure-transport`/`HTAPD_REQUIRE_SECURE_TRANSPORT`.** This
+  rejects a plaintext login before credentials are ever checked, and itself fails startup if TLS isn't
+  configured — it exists specifically so an operator binding `htapd` beyond `127.0.0.1` has a way to refuse
+  cleartext connections outright rather than relying on every client remembering to opt into TLS.
+- **Reload:** `WireServer::reload_tls_certs()` loads and validates a new cert/key pair (including that they
+  match) and, only if that succeeds, atomically swaps the certificate served to new TLS handshakes; a failed
+  reload leaves the previously active certificate in place and does not affect already-open connections
+  either way. There is no `SIGHUP` handler or file-watcher wired into the `htapd` binary itself — calling
+  `reload_tls_certs()` is only reachable by an embedding host process holding the `WireServer` (e.g. a
+  supervisor that owns the daemon as a library, not the standalone `htapd` binary as shipped). Rotating a
+  certificate against the standalone `htapd` binary today means restarting the process with the new
+  `--tls-cert`/`--tls-key` paths.
+- **Compression toggle:** MySQL protocol compression (zlib/zstd) is negotiated automatically and is
+  independent of TLS; `--disable-compression`/`HTAPD_DISABLE_COMPRESSION` turns off advertisement entirely (a
+  compression-requesting client's capability bits are then simply ignored).
+
 ### Lifecycle
 
 1. **Startup:** `htapd` parses arguments, opens `LocalServer::open(root)` (identical root layout and
-   recovery guarantees to any other `LocalServer` — see sections 1-5 above), starts a `WireServer` bound to
-   `--listen`, logs `"htapd ready"` (via `tracing`, controlled by `RUST_LOG`), and then parks the main thread
-   until the process is killed. There is no signal handler; Ctrl-C or SIGTERM stops the process
-   unconditionally.
+   recovery guarantees to any other `LocalServer` — see sections 1-5 above), then starts a `WireServer` bound
+   to `--listen`; `WireServer::start` itself calls `bootstrap_root_account` once, before spawning the accept
+   thread (see "Root account lifecycle and break-glass recovery" below). It then logs `"htapd ready"` (via
+   `tracing`, controlled by `RUST_LOG`), and parks the main thread until the process is killed. There is no
+   signal handler; Ctrl-C or SIGTERM stops the
+   process unconditionally.
 2. **Root lock is exclusive:** `LocalServer::open` acquires the same `<root>/LOCK` advisory lock as any other
    caller (section 3.0 above). A second `htapd` (or `EmbeddedClient`) pointed at the same root fails to start
    with `HtapError::Conflict` — this is the existing one-owner-per-root invariant, not a network-specific
@@ -355,20 +389,55 @@ prepared statement's buffered `COM_STMT_SEND_LONG_DATA` bytes — and can also b
    (defaults to `info`). `htapd` logs the listen address, root path, whether a password is required, and
    warns if bound to a non-loopback address.
 
+### Root account lifecycle and break-glass recovery (Phase 12)
+
+- **First start:** `bootstrap_root_account` runs once, from `WireServer::start` — not from bare
+  `LocalServer::open` — before `htapd` accepts any connection. The first time it runs against a root
+  directory, it creates one superuser `root` account from `--password`/`HTAPD_PASSWORD` (or an empty password
+  if neither is set) and sets the catalog's `accounts_initialized` latch. This is the only time `--password`
+  seeds a login credential. (An embedded-only caller that never starts a `WireServer` — i.e. `EmbeddedClient`/
+  `LocalServer::execute` with no `htapd` — never bootstraps an account and keeps using the pre-Phase-12
+  implicit-superuser behavior for every session it opens.)
+- **Every later open:** the latch is already set, so `bootstrap_root_account` adopts the existing `root`
+  account unchanged — it does **not** reset `root`'s password to match a currently configured `--password`,
+  and it does **not** recreate `root` if an administrator has since dropped it. If a still-configured
+  `--password`/`HTAPD_PASSWORD` no longer matches the stored `root` password hash, `htapd` logs a warning
+  explaining that the config password no longer controls login and pointing at `ALTER USER root IDENTIFIED
+  BY '<new password>'` to change it instead.
+- **Changing `root`'s password operationally:** connect as `root` (or any other superuser) and run `ALTER
+  USER root IDENTIFIED BY '<new password>'`; `--password`/`HTAPD_PASSWORD` is not consulted again after the
+  first bootstrap.
+- **Break-glass recovery from a full lockout** (every account dropped or locked, or the `root` password
+  lost): there is **no wire-reachable recovery path** by design — a wire connection is always authenticated
+  against a catalog account. Recovery is the embedded, in-process `LocalServer::execute` API run directly
+  against the same root directory (e.g. a short Rust program or `cargo run` against a debug binary that opens
+  `LocalServer::open(root)` and calls `.execute("ALTER USER root IDENTIFIED BY '...'")` or
+  `.execute("CREATE USER ...")` as needed) — this path is always an implicit, unchecked superuser and has no
+  `check_privileges` gate, analogous to MySQL's `--skip-grant-tables`. It requires filesystem access to the
+  root directory and cannot be done from a running `htapd` process at the same time (the root lock is
+  exclusive — stop `htapd` first).
+- **Catalog file permissions:** the catalog file now carries password hashes; `CATALOG`/`CATALOG.tmp` are
+  created with Unix mode `0600`. This does not substitute for restricting access to the whole root directory
+  (the process's own working data), which should remain readable only by the account `htapd` runs as.
+
 ### Security contract
 
-Identical to the "Security model" subsection of `docs/ARCHITECTURE.md`:
+Identical to the "Security model", "TLS and compression (Phase 12)", and "Accounts and privileges (Phase 12)"
+subsections of `docs/ARCHITECTURE.md`:
 
 - Default bind is `127.0.0.1:3307` (loopback only); binding elsewhere is an explicit `--listen` opt-in and
-  triggers a startup warning.
-- One implicit user: the client-supplied username is logged but never checked. `COM_CHANGE_USER` (Phase 11)
-  re-authenticates against this same single shared password via a `verify_credentials` seam, not a per-user
-  credential store — per-user ACL remains Phase 12 scope.
-- Credential precedence: `--password` overrides `HTAPD_PASSWORD`; with neither set, no password is required.
-- No TLS: the `mysql_native_password` handshake hashes the password exchange, but query text and result rows
-  are cleartext. Do not bind a non-loopback address without a trusted network or an SSH tunnel.
-- The handshake scramble now comes from the OS CSPRNG (`getrandom::fill`, no fallback; Phase 11), replacing
-  the previously seeded xorshift generator.
+  triggers a startup warning. Prefer also setting `--require-secure-transport` for a non-loopback bind (see
+  above).
+- Per-user accounts (Phase 12): the client-supplied username is authenticated against a catalog account, not
+  logged-but-unchecked. `COM_CHANGE_USER` re-authenticates against the account store and can switch principal.
+  See "Root account lifecycle and break-glass recovery" above and "Accounts and privileges (Phase 12)" in
+  `docs/ARCHITECTURE.md` for the full model (only the `%` host, no roles, no delegated administration,
+  `mysql_native_password` only).
+- TLS (Phase 12) is opt-in via `--tls-cert`/`--tls-key`; without it, the `mysql_native_password` handshake
+  still hashes the password exchange, but query text and result rows are cleartext. Do not bind a
+  non-loopback address without either TLS or a trusted network/SSH tunnel.
+- The handshake scramble comes from the OS CSPRNG (`getrandom::fill`, no fallback; Phase 11), replacing the
+  previously seeded xorshift generator.
 - Every pre-authentication read (the handshake response, either side of an auth-plugin switch, and a
   `COM_CHANGE_USER` auth-switch reply) is bounded by `min(max_allowed_packet, 64 KiB)`, checked against the
   message's declared length before anything is allocated: an unauthenticated peer cannot make a connection
@@ -379,5 +448,8 @@ Verified in `crates/htap-wire/tests/wire_server.rs` (`test_handshake_empty_passw
 `test_shutdown_joins_and_frees_port`, `test_shutdown_force_closes_connection_blocked_mid_packet`,
 `test_shutdown_force_close_rolls_back_open_transaction`, `test_wire_change_user_reauth_and_reset`,
 `test_wire_reset_connection_clears_state_and_prepared_statements`,
-`test_pre_auth_oversize_handshake_rejected_before_allocation`) and `crates/htap-wire/src/server.rs`
-(`config_defaults_are_loopback_only`), and `crates/htap-wire/src/handshake.rs::scramble_is_printable_and_varies`.
+`test_pre_auth_oversize_handshake_rejected_before_allocation`), `crates/htap-wire/src/server.rs`
+(`config_defaults_are_loopback_only`), `crates/htap-wire/src/handshake.rs::scramble_is_printable_and_varies`,
+`crates/htap-wire/tests/tls.rs`, `crates/htap-wire/tests/compression.rs`,
+`crates/htap-wire/tests/accounts.rs`, and `crates/htap-server/tests/{accounts,bootstrap}.rs` (root bootstrap,
+adoption, and no-resurrection-after-drop).

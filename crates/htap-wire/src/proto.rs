@@ -31,6 +31,8 @@ pub const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
 pub const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 /// `CLIENT_CONNECT_WITH_DB`.
 pub const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+/// `CLIENT_COMPRESS`.
+pub const CLIENT_COMPRESS: u32 = 0x0000_0020;
 /// `CLIENT_PROTOCOL_41`.
 pub const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
 /// `CLIENT_SSL`.
@@ -47,6 +49,8 @@ pub const CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
 pub const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 /// `CLIENT_DEPRECATE_EOF`.
 pub const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
+/// `CLIENT_ZSTD_COMPRESSION_ALGORITHM`.
+pub const CLIENT_ZSTD_COMPRESSION_ALGORITHM: u32 = 0x0400_0000;
 /// `CLIENT_MULTI_STATEMENTS` (Phase 11 plan task 10): advertised by the server and honored by
 /// [`crate::server::respond_query`] only for a connection whose handshake response negotiated it
 /// (see `Session::multi_statements`); a `COM_QUERY` containing more than one statement is still

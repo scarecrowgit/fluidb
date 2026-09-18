@@ -215,6 +215,50 @@ fn test_route_classification() {
 /// the narrow point/analytic binders have no notion of `Expr::Variable` and would otherwise try
 /// (and fail) to resolve `@x` as a column.
 #[test]
+fn test_bind_account_management_route_classification() {
+    use htap_catalog::PrivilegeSet;
+    use htap_sql::{
+        AlterUserStatement, CreateUserStatement, DropUserStatement, GrantScope, GrantStatement,
+        RevokeStatement, ShowGrantsStatement,
+    };
+
+    let statements = [
+        BoundStatement::CreateUser(CreateUserStatement {
+            username: "u".into(),
+            if_not_exists: false,
+            password: Some("p".into()),
+        }),
+        BoundStatement::AlterUser(AlterUserStatement {
+            username: "u".into(),
+            password: "q".into(),
+            if_exists: false,
+        }),
+        BoundStatement::DropUser(DropUserStatement {
+            usernames: vec!["u".into()],
+            if_exists: false,
+        }),
+        BoundStatement::GrantPrivileges(GrantStatement {
+            privileges: PrivilegeSet::SELECT,
+            scope: GrantScope::Global,
+            grantee: "u".into(),
+        }),
+        BoundStatement::RevokePrivileges(RevokeStatement {
+            privileges: PrivilegeSet::SELECT,
+            scope: GrantScope::Global,
+            grantee: "u".into(),
+        }),
+        BoundStatement::ShowGrants(ShowGrantsStatement { for_username: None }),
+    ];
+
+    for statement in statements {
+        assert_eq!(
+            classify_route(&statement, &StorageDescriptor::Row).unwrap(),
+            Route::CatalogDdl
+        );
+    }
+}
+
+#[test]
 fn test_narrow_shape_gate_excludes_variables() {
     let ddl = "CREATE TABLE t (pk INT PRIMARY KEY, c INT)";
     let parsed_ddl = parse_one(ddl).expect("parse CREATE TABLE");

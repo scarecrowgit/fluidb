@@ -5,14 +5,20 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+flate2 = { workspace = true }
 getrandom = { workspace = true }
 htap-common = { path = "../htap-common" }
 htap-server = { path = "../htap-server" }
 htap-sql = { path = "../htap-sql" }
 parking_lot = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 sqlparser = { workspace = true }
 tracing = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
-mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
+rcgen = "0.13"
 tempfile = { workspace = true }

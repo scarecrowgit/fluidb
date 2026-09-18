@@ -32,6 +32,7 @@ use crate::query::{
     BoundQuery, JoinKind, JoinSpec, OrderItem, ProjectionItem, QueryBody, SelectBody, SetOpKind,
     TableSlot,
 };
+use crate::table_not_found;
 
 fn unsupported(msg: impl Into<String>) -> HtapError {
     HtapError::Unsupported(msg.into())
@@ -855,7 +856,7 @@ fn bind_table_factor(
             }
             let table_desc = catalog
                 .table_by_name(&table_name)
-                .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))?;
+                .ok_or_else(|| table_not_found(&table_name))?;
             crate::binder::validate_table_descriptor_primary_key(table_desc)?;
             Ok(TableSlot::Base {
                 table: table_name,
@@ -2105,7 +2106,7 @@ pub(crate) fn bind_update(
     };
     let table_desc = catalog
         .table_by_name(&table_name)
-        .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))?;
+        .ok_or_else(|| table_not_found(&table_name))?;
     crate::binder::validate_table_descriptor_primary_key(table_desc)?;
 
     let slot = SlotInfo {
@@ -2247,7 +2248,7 @@ pub(crate) fn bind_show(
         let t = object_name_single(name)?;
         let _desc: &TableDescriptor = catalog
             .table_by_name(&t)
-            .ok_or_else(|| HtapError::NotFound(format!("table '{t}' not found")))?;
+            .ok_or_else(|| table_not_found(&t))?;
         Ok(t)
     };
     match statement {

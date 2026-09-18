@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 pub mod olap;
+mod privilege;
 mod query_exec;
 mod session;
 
@@ -17,6 +18,7 @@ use std::sync::Arc;
 
 use htap_catalog::local::LocalCatalogStore;
 use htap_catalog::store::CatalogStore;
+use htap_catalog::{Account, Grant, PrivilegeScope};
 pub use htap_catalog::{
     CatalogSnapshot, ColumnManifestRef, ConversionDescriptor, ConversionPhase, IdHighWater,
     ListPartitionDefinition, NodeId, PartitionAlteration, PartitionDefinition, PartitionDescriptor,
@@ -27,6 +29,7 @@ pub use htap_catalog::{
 use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
 use htap_common::lock::ProcessLock;
+use htap_common::password::{constant_time_eq_20, hash_native_password};
 use htap_common::types::{ColumnDef, Mutation, Row, Schema, Value};
 pub use htap_convert::{
     ConversionAction, ConversionErrorCategory, ConversionPolicy, ConversionTarget,
@@ -51,7 +54,7 @@ use htap_txn::{
 };
 use parking_lot::Mutex;
 use session::{DefaultVariables, WriteSet};
-pub use session::{Session, SessionId};
+pub use session::{Principal, Session, SessionId};
 
 /// Definition of a partitioned table to be created via [`LocalServer::create_partitioned_table`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +107,17 @@ pub enum PartitionTopology {
 
 /// Default bounded worker count for concurrent analytical partition scans.
 pub const DEFAULT_SCAN_WORKERS: usize = 4;
+
+/// Result of [`LocalServer::bootstrap_root_account`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapReport {
+    /// Whether this invocation created the root account.
+    pub created_root: bool,
+    /// Whether the supplied configured password matches the persisted root password.
+    ///
+    /// `None` means no password was supplied by the caller.
+    pub config_password_matches_root: Option<bool>,
+}
 
 /// Synchronous local database server.
 ///
@@ -254,6 +268,77 @@ impl LocalServer {
         })
     }
 
+    /// Initializes the root superuser account once.
+    ///
+    /// When accounts have already been initialized, this does not change the catalog. If
+    /// `password` is supplied, the report indicates whether it matches the persisted root
+    /// password so callers can warn about configuration drift.
+    pub fn bootstrap_root_account(&self, password: Option<&str>) -> Result<BootstrapReport> {
+        let _guard = self.execution_lock.lock();
+        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+
+        if catalog.accounts_initialized {
+            let config_password_matches_root = password.map(|password| {
+                catalog.account_by_username("root").is_some_and(|root| {
+                    root.password_hash.as_ref().is_some_and(|hash| {
+                        constant_time_eq_20(hash, &hash_native_password(password))
+                    })
+                })
+            });
+            return Ok(BootstrapReport {
+                created_root: false,
+                config_password_matches_root,
+            });
+        }
+
+        let existing_root = catalog.account_by_username("root");
+        let config_password_matches_root = password.map(|password| {
+            existing_root
+                .is_some_and(|root| root.password_hash == Some(hash_native_password(password)))
+        });
+        let mut next = catalog.clone();
+        next.generation = catalog
+            .generation
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "catalog_generation",
+            })?;
+        next.accounts_initialized = true;
+
+        let created_root = match next
+            .accounts
+            .iter_mut()
+            .find(|account| account.username == "root")
+        {
+            Some(root) => {
+                root.is_superuser = true;
+                false
+            }
+            None => {
+                let mut high_water = catalog.id_high_water();
+                next.accounts.push(Account {
+                    id: high_water.allocate_account()?,
+                    username: "root".to_string(),
+                    password_hash: password.map(hash_native_password),
+                    locked: false,
+                    is_superuser: true,
+                });
+                next.id_high_water = high_water;
+                true
+            }
+        };
+        self.catalog.compare_and_set(catalog.generation, next)?;
+
+        Ok(BootstrapReport {
+            created_root,
+            config_password_matches_root: if created_root {
+                password.map(|_| true)
+            } else {
+                config_password_matches_root
+            },
+        })
+    }
+
     /// Configures the maximum number of worker threads used for concurrent partition scans.
     ///
     /// Must be at least 1; values less than 1 are clamped to 1.
@@ -286,8 +371,9 @@ impl LocalServer {
 
     /// Synchronously executes a single SQL statement against the local database.
     ///
-    /// All operations are serialized via internal locking to guarantee dense,
-    /// monotonically contiguous transaction versions.
+    /// This embedded entry point executes as an implicit superuser and therefore does not run
+    /// session privilege checks. All operations are serialized via internal locking to guarantee
+    /// dense, monotonically contiguous transaction versions.
     ///
     /// # Errors
     ///
@@ -300,7 +386,29 @@ impl LocalServer {
         let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
         let bound = htap_sql::bind(&statement, &catalog)?;
 
-        self.dispatch_bound(bound, &catalog, ExecMode::Autocommit, &DefaultVariables)
+        self.dispatch_bound(
+            bound,
+            &catalog,
+            ExecMode::Autocommit,
+            &DefaultVariables,
+            &Principal::Superuser,
+        )
+    }
+
+    /// Authenticates a catalog account and opens a session bound to that account principal.
+    ///
+    /// Authentication failures deliberately use one generic permission-denied response so callers
+    /// cannot distinguish unknown, locked, and incorrectly authenticated accounts.
+    pub fn authenticate_session(
+        self: &Arc<Self>,
+        username: &str,
+        scramble: &[u8],
+        auth_response: &[u8],
+    ) -> Result<Session> {
+        let principal = session::authenticate_principal(self, username, scramble, auth_response)?;
+        let mut session = self.open_session();
+        session.set_principal(principal);
+        Ok(session)
     }
 
     /// Returns the server's transaction manager.
@@ -329,6 +437,7 @@ impl LocalServer {
         catalog: &CatalogSnapshot,
         mut mode: ExecMode,
         variables: &dyn VariableLookup,
+        principal: &Principal,
     ) -> Result<StatementResult> {
         match bound {
             BoundStatement::CreateTable(create) => {
@@ -457,7 +566,15 @@ impl LocalServer {
             BoundStatement::Show(show) => {
                 let _route =
                     classify_route(&BoundStatement::Show(show.clone()), &StorageDescriptor::Row)?;
-                Self::execute_show(&show, catalog)
+                Self::execute_show(&show, catalog, principal)
+            }
+            BoundStatement::CreateUser(create) => self.execute_create_user(&create, catalog),
+            BoundStatement::AlterUser(alter) => self.execute_alter_user(&alter, catalog),
+            BoundStatement::DropUser(drop) => self.execute_drop_user(&drop, catalog),
+            BoundStatement::GrantPrivileges(grant) => self.execute_grant(&grant, catalog),
+            BoundStatement::RevokePrivileges(revoke) => self.execute_revoke(&revoke, catalog),
+            BoundStatement::ShowGrants(show) => {
+                Self::execute_show_grants(&show, catalog, principal)
             }
         }
     }
@@ -491,6 +608,301 @@ impl LocalServer {
         let mut out = Vec::new();
         walk(query, &mut out);
         out
+    }
+
+    /// Creates a catalog account.
+    fn execute_create_user(
+        &self,
+        create: &htap_sql::ast::CreateUserStatement,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        if catalog.account_by_username(&create.username).is_some() {
+            if create.if_not_exists {
+                return Ok(StatementResult::ddl(0));
+            }
+            return Err(HtapError::Conflict(format!(
+                "user '{}' already exists",
+                create.username
+            )));
+        }
+
+        let mut high_water = catalog.id_high_water();
+        let account = Account {
+            id: high_water.allocate_account()?,
+            username: create.username.clone(),
+            password_hash: create
+                .password
+                .as_ref()
+                .map(|password| hash_native_password(password)),
+            locked: false,
+            is_superuser: false,
+        };
+        let mut next = catalog.clone();
+        next.generation = catalog
+            .generation
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "catalog_generation",
+            })?;
+        next.accounts.push(account);
+        next.id_high_water = high_water;
+        self.catalog.compare_and_set(catalog.generation, next)?;
+        Ok(StatementResult::ddl(1))
+    }
+
+    /// Updates an account password.
+    fn execute_alter_user(
+        &self,
+        alter: &htap_sql::ast::AlterUserStatement,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        let Some(account_idx) = catalog
+            .accounts
+            .iter()
+            .position(|account| account.username == alter.username)
+        else {
+            if alter.if_exists {
+                return Ok(StatementResult::ddl(0));
+            }
+            return Err(HtapError::NotFound(format!(
+                "user '{}' not found",
+                alter.username
+            )));
+        };
+
+        let mut next = catalog.clone();
+        next.generation = catalog
+            .generation
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "catalog_generation",
+            })?;
+        next.accounts[account_idx].password_hash = Some(hash_native_password(&alter.password));
+        self.catalog.compare_and_set(catalog.generation, next)?;
+        Ok(StatementResult::ddl(1))
+    }
+
+    /// Drops accounts and their grants.
+    fn execute_drop_user(
+        &self,
+        drop: &htap_sql::ast::DropUserStatement,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        let mut account_ids = std::collections::HashSet::new();
+        for username in &drop.usernames {
+            match catalog.account_by_username(username) {
+                Some(account) => {
+                    account_ids.insert(account.id);
+                }
+                None if !drop.if_exists => {
+                    return Err(HtapError::NotFound(format!("user '{username}' not found")));
+                }
+                None => {}
+            }
+        }
+
+        if account_ids.is_empty() {
+            return Ok(StatementResult::ddl(0));
+        }
+
+        let dropping_superuser = catalog
+            .accounts
+            .iter()
+            .any(|account| account.is_superuser && account_ids.contains(&account.id));
+        let remaining_superusers = catalog
+            .accounts
+            .iter()
+            .filter(|account| account.is_superuser && !account_ids.contains(&account.id))
+            .count();
+        if dropping_superuser && remaining_superusers == 0 {
+            return Err(HtapError::InvalidArgument(
+                "cannot drop the last superuser account".to_string(),
+            ));
+        }
+
+        let affected = account_ids.len() as u64;
+        let mut next = catalog.clone();
+        next.generation = catalog
+            .generation
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "catalog_generation",
+            })?;
+        next.accounts
+            .retain(|account| !account_ids.contains(&account.id));
+        next.grants
+            .retain(|grant| !account_ids.contains(&grant.account));
+        self.catalog.compare_and_set(catalog.generation, next)?;
+        Ok(StatementResult::ddl(affected))
+    }
+
+    /// Grants privileges to an account.
+    fn execute_grant(
+        &self,
+        grant: &htap_sql::ast::GrantStatement,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        let account = catalog
+            .account_by_username(&grant.grantee)
+            .ok_or_else(|| HtapError::NotFound(format!("user '{}' not found", grant.grantee)))?;
+        let scope = match &grant.scope {
+            htap_sql::ast::GrantScope::Global => PrivilegeScope::Global,
+            htap_sql::ast::GrantScope::Table(name) => PrivilegeScope::Table(
+                catalog
+                    .table_by_name(name)
+                    .ok_or_else(|| HtapError::NotFound(format!("table '{name}' not found")))?
+                    .id,
+            ),
+        };
+
+        let mut next = catalog.clone();
+        next.generation = catalog
+            .generation
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "catalog_generation",
+            })?;
+        if let Some(existing) = next
+            .grants
+            .iter_mut()
+            .find(|existing| existing.account == account.id && existing.scope == scope)
+        {
+            existing.privileges = existing.privileges.union(grant.privileges);
+        } else {
+            next.grants.push(Grant {
+                account: account.id,
+                scope,
+                privileges: grant.privileges,
+            });
+        }
+        self.catalog.compare_and_set(catalog.generation, next)?;
+        Ok(StatementResult::ddl(1))
+    }
+
+    /// Revokes privileges from an account.
+    fn execute_revoke(
+        &self,
+        revoke: &htap_sql::ast::RevokeStatement,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        let account = catalog
+            .account_by_username(&revoke.grantee)
+            .ok_or_else(|| HtapError::NotFound(format!("user '{}' not found", revoke.grantee)))?;
+        let scope = match &revoke.scope {
+            htap_sql::ast::GrantScope::Global => PrivilegeScope::Global,
+            htap_sql::ast::GrantScope::Table(name) => PrivilegeScope::Table(
+                catalog
+                    .table_by_name(name)
+                    .ok_or_else(|| HtapError::NotFound(format!("table '{name}' not found")))?
+                    .id,
+            ),
+        };
+
+        let mut next = catalog.clone();
+        next.generation = catalog
+            .generation
+            .checked_add(1)
+            .ok_or(HtapError::CounterOverflow {
+                counter: "catalog_generation",
+            })?;
+        if let Some(existing) = next
+            .grants
+            .iter_mut()
+            .find(|existing| existing.account == account.id && existing.scope == scope)
+        {
+            existing.privileges = existing.privileges.difference(revoke.privileges);
+        }
+        next.grants.retain(|grant| !grant.privileges.is_empty());
+        self.catalog.compare_and_set(catalog.generation, next)?;
+        Ok(StatementResult::ddl(1))
+    }
+
+    /// Returns grants for a named account, or for the calling account when no account is named.
+    ///
+    /// `LocalServer::execute` has no authenticated principal, so `SHOW GRANTS` without a
+    /// `FOR` clause continues to use `root` for its implicit superuser principal.
+    fn execute_show_grants(
+        show: &htap_sql::ast::ShowGrantsStatement,
+        catalog: &CatalogSnapshot,
+        principal: &Principal,
+    ) -> Result<StatementResult> {
+        let username = match show.for_username.as_deref() {
+            Some(username) => username,
+            None => match principal {
+                Principal::Superuser => "root",
+                Principal::Account { username, .. } => username,
+            },
+        };
+        let account = catalog
+            .account_by_username(username)
+            .ok_or_else(|| HtapError::NotFound(format!("user '{username}' not found")))?;
+        let column = ColumnDef {
+            name: format!("Grants for {}@%", account.username),
+            data_type: htap_common::types::DataType::String,
+            nullable: false,
+            primary_key: false,
+        };
+        let mut grants = Vec::new();
+
+        if account.is_superuser {
+            grants.push(format!(
+                "GRANT ALL PRIVILEGES ON *.* TO '{}'@'%'",
+                account.username
+            ));
+        }
+
+        let mut account_grants: Vec<&Grant> = catalog.grants_for(account.id);
+        account_grants.sort_by(|left, right| {
+            let left_scope = match &left.scope {
+                PrivilegeScope::Global => "*.*".to_string(),
+                PrivilegeScope::Table(table_id) => catalog
+                    .table(*table_id)
+                    .map(|table| format!("htap.{}", table.name))
+                    .unwrap_or_else(|| format!("htap.{table_id}")),
+            };
+            let right_scope = match &right.scope {
+                PrivilegeScope::Global => "*.*".to_string(),
+                PrivilegeScope::Table(table_id) => catalog
+                    .table(*table_id)
+                    .map(|table| format!("htap.{}", table.name))
+                    .unwrap_or_else(|| format!("htap.{table_id}")),
+            };
+            left_scope.cmp(&right_scope).then_with(|| {
+                left.privileges
+                    .to_string()
+                    .cmp(&right.privileges.to_string())
+            })
+        });
+
+        for grant in account_grants {
+            let object = match grant.scope {
+                PrivilegeScope::Global => "*.*".to_string(),
+                PrivilegeScope::Table(table_id) => {
+                    let table = catalog.table(table_id).ok_or_else(|| {
+                        HtapError::Internal(format!(
+                            "grant references table {table_id} missing from catalog"
+                        ))
+                    })?;
+                    format!("htap.{}", table.name)
+                }
+            };
+            grants.push(format!(
+                "GRANT {} ON {} TO '{}'@'%'",
+                grant.privileges, object, account.username
+            ));
+        }
+
+        if grants.is_empty() {
+            grants.push(format!("GRANT USAGE ON *.* TO '{}'@'%'", account.username));
+        }
+
+        Ok(StatementResult::query(
+            vec![column],
+            grants
+                .into_iter()
+                .map(|grant| Row::new(vec![Value::String(grant)]))
+                .collect(),
+        ))
     }
 
     /// Internal lock-safe helper for table creation (unpartitioned and partitioned).
@@ -592,13 +1004,20 @@ impl LocalServer {
         let mut replicas = catalog.replicas.clone();
         replicas.extend(new_replicas);
 
-        let next_snapshot =
-            CatalogSnapshot::new(next_generation, tables, partitions, tablets, replicas)
-                .with_id_high_water(high_water);
+        // Preserve account and grant metadata while replacing only table topology.
+        let mut next_snapshot = catalog.clone();
+        next_snapshot.generation = next_generation;
+        next_snapshot.tables = tables;
+        next_snapshot.partitions = partitions;
+        next_snapshot.tablets = tablets;
+        next_snapshot.replicas = replicas;
+        next_snapshot.id_high_water = high_water;
 
         self.catalog
             .compare_and_set(catalog.generation, next_snapshot)?;
 
+        // A CREATE privilege authorizes creation only; it does not grant the creator access to
+        // the newly created table.
         Ok(StatementResult::ddl(1))
     }
 
@@ -1051,40 +1470,31 @@ impl LocalServer {
                 .ok_or(HtapError::CounterOverflow {
                     counter: "catalog_generation",
                 })?;
-        let next = CatalogSnapshot::new(
-            next_generation,
-            catalog
-                .tables
-                .iter()
-                .filter(|t| t.id != table_id)
-                .cloned()
-                .collect(),
-            catalog
-                .partitions
-                .iter()
-                .filter(|p| p.table_id != table_id)
-                .cloned()
-                .collect(),
-            catalog
-                .tablets
-                .iter()
-                .filter(|t| !tablet_ids.contains(&t.id))
-                .cloned()
-                .collect(),
-            catalog
-                .replicas
-                .iter()
-                .filter(|r| !replica_ids.contains(&r.id))
-                .cloned()
-                .collect(),
-        )
-        .with_id_high_water(catalog.id_high_water());
+        let mut next = catalog.clone();
+        next.generation = next_generation;
+        next.tables.retain(|table| table.id != table_id);
+        next.partitions
+            .retain(|partition| partition.table_id != table_id);
+        next.tablets
+            .retain(|tablet| !tablet_ids.contains(&tablet.id));
+        next.replicas
+            .retain(|replica| !replica_ids.contains(&replica.id));
+        next.grants.retain(|grant| {
+            !matches!(
+                &grant.scope,
+                PrivilegeScope::Table(granted_table_id) if *granted_table_id == table_id
+            )
+        });
         self.catalog.compare_and_set(catalog.generation, next)?;
         Ok(StatementResult::ddl(1))
     }
 
     /// `SHOW TABLES / DATABASES / COLUMNS` and `DESCRIBE`, answered from the catalog.
-    fn execute_show(show: &ShowStatement, catalog: &CatalogSnapshot) -> Result<StatementResult> {
+    fn execute_show(
+        show: &ShowStatement,
+        catalog: &CatalogSnapshot,
+        principal: &Principal,
+    ) -> Result<StatementResult> {
         let string_col = |name: &str, nullable: bool| ColumnDef {
             name: name.to_string(),
             data_type: htap_common::types::DataType::String,
@@ -1096,6 +1506,19 @@ impl LocalServer {
                 let mut names: Vec<&str> = catalog
                     .tables
                     .iter()
+                    .filter(|table| {
+                        matches!(principal, Principal::Superuser)
+                            || matches!(
+                                principal,
+                                Principal::Account { id, .. }
+                                    if catalog.account_by_id(*id).is_some_and(|account| account.is_superuser)
+                            )
+                            || matches!(
+                                principal,
+                                Principal::Account { id, .. }
+                                    if catalog.has_any_privilege_on(*id, table.id)
+                            )
+                    })
                     .map(|t| t.name.as_str())
                     .filter(|n| {
                         like.as_deref()

@@ -5217,9 +5217,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_drop_user(&mut self, if_exists: bool) -> Result<Statement, ParserError> {
+        let names = self.parse_comma_separated(Parser::parse_grantee_name)?;
+        Ok(Statement::DropUser { if_exists, names })
+    }
+
     fn parse_create_user(&mut self, or_replace: bool) -> Result<CreateUser, ParserError> {
         let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-        let name = self.parse_identifier()?;
+        let name = self.parse_grantee_name()?;
+        let identified_by = if self.parse_keywords(&[Keyword::IDENTIFIED, Keyword::BY]) {
+            Some(self.parse_literal_string()?)
+        } else {
+            None
+        };
         let options = self
             .parse_key_value_options(false, &[Keyword::WITH, Keyword::TAG])?
             .options;
@@ -5233,6 +5243,7 @@ impl<'a> Parser<'a> {
             or_replace,
             if_not_exists,
             name,
+            identified_by,
             options: KeyValueOptions {
                 options,
                 delimiter: KeyValueOptionsDelimiter::Space,
@@ -7417,6 +7428,11 @@ impl<'a> Parser<'a> {
         // Many dialects support the non-standard `IF EXISTS` clause and allow
         // specifying multiple objects to delete in a single statement
         let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+
+        if object_type == ObjectType::User {
+            return self.parse_drop_user(if_exists);
+        }
+
         let names = self.parse_comma_separated(|p| p.parse_object_name(false))?;
 
         let loc = self.peek_token_ref().span.start;
@@ -15662,11 +15678,22 @@ impl<'a> Parser<'a> {
             self.parse_show_charset(false)
         } else if self.parse_keyword(Keyword::CHARSET) {
             self.parse_show_charset(true)
+        } else if self.parse_keyword(Keyword::GRANTS) {
+            self.parse_show_grants()
         } else {
             Ok(Statement::ShowVariable {
                 variable: self.parse_identifiers()?,
             })
         }
+    }
+
+    fn parse_show_grants(&mut self) -> Result<Statement, ParserError> {
+        let for_ = if self.parse_keyword(Keyword::FOR) {
+            Some(self.parse_grantee_name()?)
+        } else {
+            None
+        };
+        Ok(Statement::ShowGrants { for_ })
     }
 
     fn parse_show_charset(&mut self, is_shorthand: bool) -> Result<Statement, ParserError> {
@@ -21516,6 +21543,35 @@ mod tests {
         for w in ["  ", "/*invalid*/"] {
             let sql = format!("\nSELECT\n  :{w}fooBar");
             assert!(Parser::parse_sql(&GenericDialect, &sql).is_err());
+        }
+    }
+
+    #[test]
+    fn test_user_management_statements() {
+        let dialect = MySqlDialect {};
+
+        // Parse and verify round-trip
+        for sql in [
+            "CREATE USER 'u'@'%' IDENTIFIED BY 'x'",
+            "CREATE USER IF NOT EXISTS u IDENTIFIED BY 'x'",
+            "ALTER USER 'u'@'%' IDENTIFIED BY 'y'",
+            "DROP USER 'u'@'%'",
+            "DROP USER IF EXISTS 'a'@'%', 'b'@'%'",
+            "SHOW GRANTS",
+            "SHOW GRANTS FOR 'u'@'%'",
+            "GRANT SELECT ON *.* TO 'u'@'%'",
+            "GRANT SELECT ON db.* TO 'u'@'%'",
+            "GRANT SELECT, INSERT ON db.t TO 'u'@'%'",
+            "REVOKE SELECT ON db.t FROM 'u'@'%'",
+        ] {
+            let parsed = Parser::parse_sql(&dialect, sql);
+            assert!(parsed.is_ok(), "failed to parse: {}", sql);
+        }
+
+        // These should fail to parse
+        for sql in ["CREATE USER foo IDENTIFIED BY", "SHOW GRANTS FOR"] {
+            let parsed = Parser::parse_sql(&dialect, sql);
+            assert!(parsed.is_err(), "should not parse: {}", sql);
         }
     }
 

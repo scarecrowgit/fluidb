@@ -150,7 +150,7 @@ impl Parser<'_> {
     /// ```
     pub fn parse_alter_user(&mut self) -> Result<AlterUser, ParserError> {
         let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        let name = self.parse_identifier()?;
+        let name = self.parse_grantee_name()?;
         let _ = self.parse_keyword(Keyword::WITH);
         let rename_to = if self.parse_keywords(&[Keyword::RENAME, Keyword::TO]) {
             Some(self.parse_identifier()?)
@@ -295,7 +295,9 @@ impl Parser<'_> {
         };
 
         let encrypted = self.parse_keyword(Keyword::ENCRYPTED);
-        let password = if self.parse_keyword(Keyword::PASSWORD) {
+        let password = if self.parse_keyword(Keyword::PASSWORD)
+            || self.parse_keywords(&[Keyword::IDENTIFIED, Keyword::BY])
+        {
             let password = if self.parse_keyword(Keyword::NULL) {
                 None
             } else {

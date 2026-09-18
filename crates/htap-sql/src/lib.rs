@@ -15,10 +15,17 @@ pub mod result;
 pub mod route;
 pub mod variables;
 
+/// Constructs the canonical missing-table error used by binding and privilege masking.
+pub fn table_not_found(name: &str) -> htap_common::error::HtapError {
+    htap_common::error::HtapError::NotFound(format!("table '{name}' not found"))
+}
+
 pub use ast::{
-    parse_many, parse_one, AggregateFunction, AlterPartitions, AnalyticExpr, AnalyticFilter,
-    AnalyticOrderBy, AnalyticSelect, BoundStatement, ComparisonOp, CreateTable, DeleteByPrimaryKey,
-    DropTableStatement, Insert, PointSelect, ShowStatement, UpdateStatement, UpdateTarget,
+    parse_many, parse_one, AggregateFunction, AlterPartitions, AlterUserStatement, AnalyticExpr,
+    AnalyticFilter, AnalyticOrderBy, AnalyticSelect, BoundStatement, ComparisonOp, CreateTable,
+    CreateUserStatement, DeleteByPrimaryKey, DropTableStatement, DropUserStatement, GrantScope,
+    GrantStatement, Insert, PointSelect, RevokeStatement, ShowGrantsStatement, ShowStatement,
+    UpdateStatement, UpdateTarget,
 };
 pub use binder::bind;
 pub use expr::{
@@ -26,8 +33,8 @@ pub use expr::{
 };
 pub use prepare::{
     checked_placeholder_count, count_placeholders, infer_placeholder_type_hints,
-    resolve_prepare_output_schema, substitute_placeholders, substitute_placeholders_ext,
-    tokenizer_placeholder_count, ParamLiteral,
+    referenced_table_names, resolve_prepare_output_schema, substitute_placeholders,
+    substitute_placeholders_ext, tokenizer_placeholder_count, ParamLiteral,
 };
 pub use query::{
     BoundQuery, JoinKind, JoinSpec, OrderItem, ProjectionItem, QueryBody, SelectBody, SetOpKind,

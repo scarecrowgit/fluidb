@@ -14,6 +14,7 @@ pub fn map_htap_error(err: &HtapError) -> (u16, &'static str) {
         HtapError::InvalidArgument(_) => (1064, "42000"),
         HtapError::NotFound(_) => (1146, "42S02"),
         HtapError::Conflict(_) => (1213, "40001"),
+        HtapError::PermissionDenied(_) => (1142, "42000"),
         HtapError::Unsupported(_) => (1235, "42000"),
         HtapError::Io(_)
         | HtapError::Corruption(_)
@@ -34,6 +35,7 @@ pub fn wire_error_to_htap(code: u16, message: String) -> HtapError {
         1064 => HtapError::InvalidArgument(message),
         1146 => HtapError::NotFound(message),
         1213 => HtapError::Conflict(message),
+        1142 | 1045 => HtapError::PermissionDenied(message),
         1235 => HtapError::Unsupported(message),
         _ => HtapError::Internal(format!("server error {code}: {message}")),
     }
@@ -133,6 +135,7 @@ mod tests {
             (HtapError::InvalidArgument("x".into()), 1064),
             (HtapError::NotFound("x".into()), 1146),
             (HtapError::Conflict("x".into()), 1213),
+            (HtapError::PermissionDenied("x".into()), 1142),
             (HtapError::Unsupported("x".into()), 1235),
             (HtapError::Io(io::Error::other("x")), 1105),
             (HtapError::Corruption("x".into()), 1105),
@@ -182,7 +185,7 @@ mod tests {
         ));
         assert!(matches!(
             wire_error_to_htap(1045, "m".into()),
-            HtapError::Internal(_)
+            HtapError::PermissionDenied(_)
         ));
     }
 
