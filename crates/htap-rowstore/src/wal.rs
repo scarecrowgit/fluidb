@@ -63,7 +63,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-use htap_common::{HtapError, Result, Row, Version};
+use htap_common::{
+    bytecursor::ByteReader, envelope::encode_bare_frame, HtapError, Result, Row, Version,
+};
 use serde::{Deserialize, Serialize};
 
 /// Size of the fixed record header: `payload_len: u32` + `crc32c: u32`.
@@ -644,12 +646,7 @@ fn encode_frame(rec: &WalRecord) -> Result<Vec<u8>> {
             payload.len()
         )));
     }
-    let crc = crc32c::crc32c(&payload);
-    let mut frame = Vec::with_capacity(HEADER_BYTES as usize + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&crc.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    Ok(encode_bare_frame(&payload))
 }
 
 /// Result of scanning one segment file.
@@ -698,8 +695,13 @@ fn read_segment(path: &Path, first_lsn: Lsn) -> Result<SegmentScan> {
         let mut header = [0u8; HEADER_BYTES as usize];
         reader.read_exact(&mut header)?;
         pos += HEADER_BYTES;
-        let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as u64;
-        let expected_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let mut header_reader = ByteReader::new(&header);
+        let payload_len = header_reader
+            .read_u32_le()
+            .expect("fixed-size WAL frame header") as u64;
+        let expected_crc = header_reader
+            .read_u32_le()
+            .expect("fixed-size WAL frame header");
 
         // Validate the length *before* allocating. A zero length is never
         // produced by the writer, and anything above the cap is a garbled
@@ -782,6 +784,9 @@ fn list_segments(dir: &Path) -> Result<Vec<(Lsn, PathBuf)>> {
 }
 
 /// fsync a directory so that entries created or removed in it are durable.
+// Deliberately not moved to the shared helper: unlike the five migrated
+// callers, this function is not Unix-gated, so migrating it in either
+// direction would change untested non-Unix behaviour.
 fn fsync_dir(dir: &Path) -> Result<()> {
     let handle = File::open(dir)?;
     handle.sync_all()?;
@@ -1310,5 +1315,67 @@ mod tests {
         let replay = Wal::replay(dir.path()).unwrap();
         assert_eq!(replay.records.len(), 2);
         assert_eq!(replay.committed_records().len(), 1);
+    }
+
+    fn scan_frame_bytes(bytes: &[u8]) -> SegmentScan {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(segment_file_name(Lsn::ZERO));
+        std::fs::write(&path, bytes).unwrap();
+        read_segment(&path, Lsn::ZERO).unwrap()
+    }
+
+    #[test]
+    fn wal_frame_golden_bytes() {
+        let frame = encode_frame(&commit(7, 9)).unwrap();
+        assert_eq!(&frame[..8], &[35, 0, 0, 0, 135, 62, 109, 27]);
+    }
+
+    #[test]
+    fn wal_frame_bad_magic_and_oversized() {
+        // Bare WAL frames have no magic; corrupting the length field is the equivalent header test.
+        let mut bad_header = encode_frame(&commit(7, 9)).unwrap();
+        bad_header[0..4].copy_from_slice(&0u32.to_le_bytes());
+        let scan = scan_frame_bytes(&bad_header);
+        assert_eq!(scan.stopped, Some(Lsn::ZERO));
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&((MAX_PAYLOAD_BYTES + 1) as u32).to_le_bytes());
+        oversized.extend_from_slice(&0u32.to_le_bytes());
+        let scan = scan_frame_bytes(&oversized);
+        assert_eq!(scan.stopped, Some(Lsn::ZERO));
+    }
+
+    #[test]
+    fn wal_frame_bad_version_and_crc() {
+        // Bare WAL frames have no version; an undecodable CRC-clean payload covers format drift.
+        let payload = b"not-a-wal-record";
+        let mut bad_format = Vec::new();
+        bad_format.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bad_format.extend_from_slice(&crc32c::crc32c(payload).to_le_bytes());
+        bad_format.extend_from_slice(payload);
+        let scan = scan_frame_bytes(&bad_format);
+        assert_eq!(scan.stopped, Some(Lsn::ZERO));
+
+        let mut bad_crc = encode_frame(&commit(7, 9)).unwrap();
+        bad_crc[4] ^= 0xff;
+        let scan = scan_frame_bytes(&bad_crc);
+        assert_eq!(scan.stopped, Some(Lsn::ZERO));
+    }
+
+    #[test]
+    fn wal_frame_size_check_truncated() {
+        let mut frame = encode_frame(&commit(7, 9)).unwrap();
+        frame.pop();
+        let scan = scan_frame_bytes(&frame);
+        assert_eq!(scan.stopped, Some(Lsn::ZERO));
+    }
+
+    #[test]
+    fn wal_frame_size_check_trailing() {
+        let mut frame = encode_frame(&commit(7, 9)).unwrap();
+        frame.push(0);
+        let scan = scan_frame_bytes(&frame);
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.stopped, Some(Lsn::new(1)));
     }
 }

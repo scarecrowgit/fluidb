@@ -518,56 +518,35 @@ impl SegmentReader {
         }
 
         // 4. Parse footer payload
-        let mut cursor = 0;
-        if cursor + 2 > footer_payload.len() {
-            return Err(HtapError::Corruption(
-                "unexpected EOF reading format version".into(),
-            ));
-        }
-        let format_version =
-            u16::from_le_bytes(footer_payload[cursor..cursor + 2].try_into().unwrap());
-        cursor += 2;
+        let mut reader = htap_common::bytecursor::ByteReader::new(&footer_payload);
+        let format_version = reader
+            .read_u16_le()
+            .map_err(|_| HtapError::Corruption("unexpected EOF reading format version".into()))?;
         if format_version != FORMAT_VERSION {
             return Err(HtapError::Corruption(format!(
                 "unsupported format version {format_version} (expected {FORMAT_VERSION})"
             )));
         }
 
-        if cursor + 4 > footer_payload.len() {
-            return Err(HtapError::Corruption(
-                "unexpected EOF reading schema length".into(),
-            ));
-        }
-        let schema_len =
-            u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        if cursor + schema_len > footer_payload.len() {
-            return Err(HtapError::Corruption(
-                "unexpected EOF reading schema payload".into(),
-            ));
-        }
-        let schema: Schema =
-            serde_json::from_slice(&footer_payload[cursor..cursor + schema_len])
-                .map_err(|e| HtapError::Corruption(format!("failed to deserialize schema: {e}")))?;
-        cursor += schema_len;
+        let schema_len = reader
+            .read_u32_le()
+            .map_err(|_| HtapError::Corruption("unexpected EOF reading schema length".into()))?
+            as usize;
+        let schema_payload = reader
+            .read_bytes(schema_len)
+            .map_err(|_| HtapError::Corruption("unexpected EOF reading schema payload".into()))?;
+        let schema: Schema = serde_json::from_slice(schema_payload)
+            .map_err(|e| HtapError::Corruption(format!("failed to deserialize schema: {e}")))?;
         validate_segment_schema(&schema)?;
 
-        if cursor + 8 > footer_payload.len() {
-            return Err(HtapError::Corruption(
-                "unexpected EOF reading total rows".into(),
-            ));
-        }
-        let total_rows = u64::from_le_bytes(footer_payload[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
+        let total_rows = reader
+            .read_u64_le()
+            .map_err(|_| HtapError::Corruption("unexpected EOF reading total rows".into()))?;
 
-        if cursor + 4 > footer_payload.len() {
-            return Err(HtapError::Corruption(
-                "unexpected EOF reading column count".into(),
-            ));
-        }
-        let column_count =
-            u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
+        let column_count = reader
+            .read_u32_le()
+            .map_err(|_| HtapError::Corruption("unexpected EOF reading column count".into()))?
+            as usize;
         if column_count != schema.len() {
             return Err(HtapError::Corruption(format!(
                 "column count {column_count} does not match schema column count {}",
@@ -585,28 +564,19 @@ impl SegmentReader {
         let mut total_frames_count: usize = 0;
 
         for (expected_col_idx, col_def) in schema.columns().iter().enumerate() {
-            if cursor + 4 > footer_payload.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF reading column index".into(),
-                ));
-            }
-            let col_idx =
-                u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
+            let col_idx = reader
+                .read_u32_le()
+                .map_err(|_| HtapError::Corruption("unexpected EOF reading column index".into()))?
+                as usize;
             if col_idx != expected_col_idx {
                 return Err(HtapError::Corruption(format!(
                     "column index mismatch in footer: expected {expected_col_idx}, got {col_idx}"
                 )));
             }
 
-            if cursor + 4 > footer_payload.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF reading column block count".into(),
-                ));
-            }
-            let block_count =
-                u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
+            let block_count = reader.read_u32_le().map_err(|_| {
+                HtapError::Corruption("unexpected EOF reading column block count".into())
+            })? as usize;
 
             total_frames_count += block_count;
             if total_frames_count > MAX_SEGMENT_BLOCKS {
@@ -642,25 +612,25 @@ impl SegmentReader {
 
             #[allow(clippy::needless_range_loop)]
             for b_idx in 0..block_count {
-                if cursor + 8 + 4 + 8 + 4 + 1 + 4 + 4 + 4 + 1 + 1 > footer_payload.len() {
-                    return Err(HtapError::Corruption(
-                        "unexpected EOF reading block entry header".into(),
-                    ));
-                }
-                let offset =
-                    u64::from_le_bytes(footer_payload[cursor..cursor + 8].try_into().unwrap());
-                cursor += 8;
-                let frame_len =
-                    u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
-                let row_start =
-                    u64::from_le_bytes(footer_payload[cursor..cursor + 8].try_into().unwrap());
-                cursor += 8;
-                let row_count =
-                    u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
-                let enc_byte = footer_payload[cursor];
-                cursor += 1;
+                let block_header = reader.read_bytes(39).map_err(|_| {
+                    HtapError::Corruption("unexpected EOF reading block entry header".into())
+                })?;
+                let mut block_reader = htap_common::bytecursor::ByteReader::new(block_header);
+                let offset = block_reader
+                    .read_u64_le()
+                    .expect("fixed-size block entry header");
+                let frame_len = block_reader
+                    .read_u32_le()
+                    .expect("fixed-size block entry header");
+                let row_start = block_reader
+                    .read_u64_le()
+                    .expect("fixed-size block entry header");
+                let row_count = block_reader
+                    .read_u32_le()
+                    .expect("fixed-size block entry header");
+                let enc_byte = block_reader
+                    .read_u8()
+                    .expect("fixed-size block entry header");
                 let encoding = match enc_byte {
                     0 => ColumnEncoding::Plain,
                     1 => ColumnEncoding::Dictionary,
@@ -681,19 +651,21 @@ impl SegmentReader {
                     )));
                 }
 
-                let raw_bytes =
-                    u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
-                let stored_bytes =
-                    u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
-                let crc32c =
-                    u32::from_le_bytes(footer_payload[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
-                let has_null_byte = footer_payload[cursor];
-                cursor += 1;
-                let has_not_null_byte = footer_payload[cursor];
-                cursor += 1;
+                let raw_bytes = block_reader
+                    .read_u32_le()
+                    .expect("fixed-size block entry header");
+                let stored_bytes = block_reader
+                    .read_u32_le()
+                    .expect("fixed-size block entry header");
+                let crc32c = block_reader
+                    .read_u32_le()
+                    .expect("fixed-size block entry header");
+                let has_null_byte = block_reader
+                    .read_u8()
+                    .expect("fixed-size block entry header");
+                let has_not_null_byte = block_reader
+                    .read_u8()
+                    .expect("fixed-size block entry header");
 
                 let has_null = match has_null_byte {
                     0 => false,
@@ -727,10 +699,18 @@ impl SegmentReader {
                 }
 
                 let (min_val, max_val) = if has_not_null {
+                    let mut typed_cursor = reader.position();
                     let min_v =
-                        decode_typed_value(col_def.data_type, &footer_payload, &mut cursor)?;
+                        decode_typed_value(col_def.data_type, &footer_payload, &mut typed_cursor)?;
                     let max_v =
-                        decode_typed_value(col_def.data_type, &footer_payload, &mut cursor)?;
+                        decode_typed_value(col_def.data_type, &footer_payload, &mut typed_cursor)?;
+                    reader
+                        .read_bytes(typed_cursor - reader.position())
+                        .map_err(|_| {
+                            HtapError::Corruption(
+                                "unexpected EOF reading block zone map values".into(),
+                            )
+                        })?;
                     if min_v.data_type() != Some(col_def.data_type)
                         || max_v.data_type() != Some(col_def.data_type)
                     {
@@ -836,9 +816,10 @@ impl SegmentReader {
             column_blocks.push(blocks);
         }
 
-        if cursor != footer_payload.len() {
+        if reader.expect_exhausted().is_err() {
             return Err(HtapError::Corruption(format!(
-                "trailing bytes in footer payload: consumed {cursor}, total {}",
+                "trailing bytes in footer payload: consumed {}, total {}",
+                reader.position(),
                 footer_payload.len()
             )));
         }

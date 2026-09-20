@@ -16,12 +16,15 @@
 //!   the containing directory). Multi-process concurrent access is not supported.
 
 use std::fmt;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use htap_catalog::{TableId, TabletId};
-use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Version};
+use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::{
+    atomic_publish as publish_file, read_file_exact_bounded, sync_dir as sync_directory,
+};
+use htap_common::{HtapError, Result, Row, Version};
 use serde::{Deserialize, Serialize};
 
 /// Catalog file name inside `<movement_root>/jobs/<job-id>/`.
@@ -599,75 +602,45 @@ pub fn encode_job(job: &MovementJob) -> Result<Vec<u8>> {
         )));
     }
 
-    let payload_len = payload.len() as u32;
-    let checksum = crc32c::crc32c(&payload);
-
-    let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
-    buf.extend_from_slice(HEADER_MAGIC);
-    buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.extend_from_slice(&checksum.to_le_bytes());
-    buf.extend_from_slice(&payload);
-
-    Ok(buf)
+    Ok(encode_envelope(HEADER_MAGIC, FORMAT_VERSION, &payload))
 }
 
 /// Decode and validate a movement job entity from a versioned binary envelope.
 pub fn decode_job(bytes: &[u8]) -> Result<MovementJob> {
-    if bytes.len() < HEADER_LEN {
-        return Err(HtapError::Corruption(format!(
-            "job file too small: {} bytes, minimum header length is {}",
-            bytes.len(),
-            HEADER_LEN
-        )));
-    }
-
-    if &bytes[0..8] != HEADER_MAGIC {
-        return Err(HtapError::Corruption(
-            "invalid movement job header magic bytes".into(),
-        ));
-    }
-
-    let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    if version != FORMAT_VERSION {
-        return Err(HtapError::Corruption(format!(
-            "unsupported movement job format version: {version}"
-        )));
-    }
-
-    let payload_len = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
-    let expected_crc = u32::from_le_bytes(bytes[14..18].try_into().unwrap());
-
-    if payload_len > MAX_JOB_PAYLOAD_BYTES {
-        return Err(HtapError::Corruption(format!(
-            "job payload length {} exceeds maximum limit {}",
-            payload_len, MAX_JOB_PAYLOAD_BYTES
-        )));
-    }
-
-    let expected_total = HEADER_LEN + payload_len as usize;
-    if bytes.len() < expected_total {
-        return Err(HtapError::Corruption(format!(
-            "truncated movement job file: expected {} bytes, found {}",
-            expected_total,
-            bytes.len()
-        )));
-    }
-
-    if bytes.len() > expected_total {
-        return Err(HtapError::Corruption(format!(
-            "job file has {} trailing leftover bytes",
-            bytes.len() - expected_total
-        )));
-    }
-
-    let payload = &bytes[HEADER_LEN..expected_total];
-    let computed_crc = crc32c::crc32c(payload);
-    if computed_crc != expected_crc {
-        return Err(HtapError::Corruption(format!(
-            "job checksum mismatch: expected {expected_crc:#010x}, got {computed_crc:#010x}"
-        )));
-    }
+    let (_, payload) = decode_envelope(
+        bytes,
+        HEADER_MAGIC,
+        FORMAT_VERSION..=FORMAT_VERSION,
+        MAX_JOB_PAYLOAD_BYTES,
+        SizeCheckMode::TruncatedThenTrailing,
+    )
+    .map_err(|err| {
+        let message = match err {
+            EnvelopeError::TooSmall { found, min } => {
+                format!("job file too small: {found} bytes, minimum header length is {min}")
+            }
+            EnvelopeError::BadMagic => "invalid movement job header magic bytes".into(),
+            EnvelopeError::UnsupportedVersion(version) => {
+                format!("unsupported movement job format version: {version}")
+            }
+            EnvelopeError::PayloadTooLarge { len, max } => {
+                format!("job payload length {len} exceeds maximum limit {max}")
+            }
+            EnvelopeError::Truncated { expected, found } => {
+                format!("truncated movement job file: expected {expected} bytes, found {found}")
+            }
+            EnvelopeError::TrailingBytes { extra } => {
+                format!("job file has {extra} trailing leftover bytes")
+            }
+            EnvelopeError::SizeMismatch { expected, found } => {
+                format!("truncated movement job file: expected {expected} bytes, found {found}")
+            }
+            EnvelopeError::ChecksumMismatch { expected, actual } => {
+                format!("job checksum mismatch: expected {expected:#010x}, got {actual:#010x}")
+            }
+        };
+        HtapError::Corruption(message)
+    })?;
 
     let job: MovementJob = serde_json::from_slice(payload).map_err(|e| {
         HtapError::Corruption(format!("failed to deserialize movement job JSON: {e}"))
@@ -680,16 +653,7 @@ pub fn decode_job(bytes: &[u8]) -> Result<MovementJob> {
 
 /// Durable fsync on directory metadata.
 pub fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let f = File::open(path)?;
-        f.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    sync_directory(path)
 }
 
 /// Local synchronous data mover managing single-tablet data movement jobs.
@@ -1189,34 +1153,150 @@ impl LocalDataMover {
         let job_dir = self.job_dir(&job.request.job_id)?;
         fs::create_dir_all(&job_dir)?;
 
-        let tmp_path = self.job_tmp_file_path(&job.request.job_id)?;
-        let final_path = self.job_file_path(&job.request.job_id)?;
-
         let encoded = encode_job(job)?;
 
-        // 1. Write tmp file and fsync
-        let write_res = (|| -> Result<()> {
-            let mut file = File::create(&tmp_path)?;
-            file.write_all(&encoded)?;
-            file.sync_all()?;
-            Ok(())
-        })();
+        publish_file(
+            &job_dir,
+            JOB_TMP_FILE_NAME,
+            JOB_FILE_NAME,
+            &encoded,
+            None,
+            true,
+        )?;
 
-        if let Err(e) = write_res {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-
-        // 2. Atomic rename
-        if let Err(e) = fs::rename(&tmp_path, &final_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(HtapError::Io(e));
-        }
-
-        // 3. Fsync job directory and jobs directory
-        sync_dir(&job_dir)?;
+        // Fsync jobs directory
         let _ = sync_dir(&self.jobs_dir());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_job() -> MovementJob {
+        MovementJob::new(MovementJobRequest {
+            job_id: "test-job".to_string(),
+            kind: MovementJobKind::Import,
+            table_id: TableId(1),
+            tablet_id: TabletId(1),
+            format: DataFormat::Csv,
+            path: PathBuf::from("input.csv"),
+            batch_rows: CopyOptions::DEFAULT_BATCH_ROWS,
+            max_errors: 0,
+            delimiter: b',',
+            has_header: true,
+            pinned_version: None,
+        })
+    }
+
+    #[test]
+    fn test_job_envelope_golden_bytes() {
+        let job = minimal_job();
+        let bytes = encode_job(&job).expect("encode minimal movement job");
+        assert_eq!(
+            bytes.as_slice(),
+            &[
+                72, 84, 65, 80, 74, 79, 66, 49, 1, 0, 158, 1, 0, 0, 176, 96, 177, 190, 123, 34,
+                114, 101, 113, 117, 101, 115, 116, 34, 58, 123, 34, 106, 111, 98, 95, 105, 100, 34,
+                58, 34, 116, 101, 115, 116, 45, 106, 111, 98, 34, 44, 34, 107, 105, 110, 100, 34,
+                58, 34, 73, 109, 112, 111, 114, 116, 34, 44, 34, 116, 97, 98, 108, 101, 95, 105,
+                100, 34, 58, 49, 44, 34, 116, 97, 98, 108, 101, 116, 95, 105, 100, 34, 58, 49, 44,
+                34, 102, 111, 114, 109, 97, 116, 34, 58, 34, 67, 115, 118, 34, 44, 34, 112, 97,
+                116, 104, 34, 58, 34, 105, 110, 112, 117, 116, 46, 99, 115, 118, 34, 44, 34, 98,
+                97, 116, 99, 104, 95, 114, 111, 119, 115, 34, 58, 49, 48, 48, 48, 44, 34, 109, 97,
+                120, 95, 101, 114, 114, 111, 114, 115, 34, 58, 48, 44, 34, 100, 101, 108, 105, 109,
+                105, 116, 101, 114, 34, 58, 52, 52, 44, 34, 104, 97, 115, 95, 104, 101, 97, 100,
+                101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 112, 105, 110, 110, 101, 100, 95,
+                118, 101, 114, 115, 105, 111, 110, 34, 58, 110, 117, 108, 108, 125, 44, 34, 112,
+                104, 97, 115, 101, 34, 58, 34, 82, 117, 110, 110, 105, 110, 103, 34, 44, 34, 116,
+                97, 98, 108, 101, 95, 105, 100, 34, 58, 49, 44, 34, 116, 97, 98, 108, 101, 116, 95,
+                105, 100, 34, 58, 49, 44, 34, 102, 111, 114, 109, 97, 116, 34, 58, 34, 67, 115,
+                118, 34, 44, 34, 99, 111, 117, 110, 116, 101, 114, 115, 34, 58, 123, 34, 114, 101,
+                99, 111, 114, 100, 115, 95, 114, 101, 97, 100, 34, 58, 48, 44, 34, 114, 101, 99,
+                111, 114, 100, 115, 95, 99, 111, 109, 109, 105, 116, 116, 101, 100, 34, 58, 48, 44,
+                34, 114, 111, 119, 115, 95, 119, 114, 105, 116, 116, 101, 110, 34, 58, 48, 44, 34,
+                114, 101, 99, 111, 114, 100, 115, 95, 115, 107, 105, 112, 112, 101, 100, 34, 58,
+                48, 125, 44, 34, 99, 104, 101, 99, 107, 112, 111, 105, 110, 116, 34, 58, 110, 117,
+                108, 108, 44, 34, 112, 105, 110, 110, 101, 100, 95, 118, 101, 114, 115, 105, 111,
+                110, 34, 58, 110, 117, 108, 108, 44, 34, 114, 101, 112, 111, 114, 116, 34, 58, 110,
+                117, 108, 108, 44, 34, 101, 114, 114, 111, 114, 34, 58, 110, 117, 108, 108, 125,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_job_envelope_bad_magic_and_oversized() {
+        let mut bad_magic = encode_job(&minimal_job()).expect("encode minimal movement job");
+        bad_magic[0] ^= 0xff;
+        let err = decode_job(&bad_magic).expect_err("bad magic must fail");
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: invalid movement job header magic bytes"
+        );
+
+        let mut oversized = Vec::with_capacity(HEADER_LEN);
+        oversized.extend_from_slice(HEADER_MAGIC);
+        oversized.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        oversized.extend_from_slice(&(MAX_JOB_PAYLOAD_BYTES + 1).to_le_bytes());
+        oversized.extend_from_slice(&0_u32.to_le_bytes());
+        let err = decode_job(&oversized).expect_err("oversized payload must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Corruption error: job payload length {} exceeds maximum limit {}",
+                MAX_JOB_PAYLOAD_BYTES + 1,
+                MAX_JOB_PAYLOAD_BYTES
+            )
+        );
+    }
+
+    #[test]
+    fn test_job_envelope_bad_version_and_crc() {
+        let mut bad_version = encode_job(&minimal_job()).expect("encode minimal movement job");
+        bad_version[8..10].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+        let err = decode_job(&bad_version).expect_err("unsupported version must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Corruption error: unsupported movement job format version: {}",
+                FORMAT_VERSION + 1
+            )
+        );
+
+        let mut bad_crc = encode_job(&minimal_job()).expect("encode minimal movement job");
+        bad_crc[14] ^= 0xff;
+        let err = decode_job(&bad_crc).expect_err("bad CRC must fail");
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: job checksum mismatch: expected 0xbeb1604f, got 0xbeb160b0"
+        );
+    }
+
+    #[test]
+    fn test_job_envelope_size_check_truncated() {
+        let mut bytes = encode_job(&minimal_job()).expect("encode minimal movement job");
+        let expected = bytes.len();
+        bytes.pop();
+        let found = bytes.len();
+        let err = decode_job(&bytes).expect_err("truncated payload must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Corruption error: truncated movement job file: expected {expected} bytes, found {found}"
+            )
+        );
+    }
+
+    #[test]
+    fn test_job_envelope_size_check_trailing() {
+        let mut bytes = encode_job(&minimal_job()).expect("encode minimal movement job");
+        bytes.push(0);
+        let err = decode_job(&bytes).expect_err("trailing byte must fail");
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: job file has 1 trailing leftover bytes"
+        );
     }
 }

@@ -39,7 +39,6 @@
 //! consulted, preventing resurrection of deleted rows.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -48,7 +47,9 @@ use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Version};
 use parking_lot::{Mutex, RwLock};
 
 pub use crate::manifest::MAX_APPLIED_EXTERNAL_TXNS;
-use crate::manifest::{sync_dir, Manifest, ManifestLedgerEntry, ManifestSstEntry};
+use htap_common::fs::{atomic_publish, sync_dir};
+
+use crate::manifest::{Manifest, ManifestLedgerEntry, ManifestSstEntry};
 use crate::memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
 use crate::sst::{SstOptions, SstReader, SstWriter};
 use crate::wal::{Wal, WalOptions, WalRecord};
@@ -229,28 +230,13 @@ fn write_visible_version(
     version: Version,
     fault_hook: Option<&IoFaultHook>,
 ) -> Result<()> {
-    if let Some(hook) = fault_hook {
-        hook(EngineIoOp::VisibleMarkerWrite)?;
-    }
-    let tmp_path = dir.join("VISIBLE.tmp");
-    let target_path = dir.join("VISIBLE");
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(VISIBLE_MAGIC);
     buf[8..16].copy_from_slice(&version.get().to_le_bytes());
-    let write_res = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(&buf)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp_path, &target_path)?;
-        Ok(())
-    })();
-    if let Err(e) = write_res {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(HtapError::Io(e));
+    if let Some(hook) = fault_hook {
+        hook(EngineIoOp::VisibleMarkerWrite)?;
     }
-    sync_dir(dir)?;
-    Ok(())
+    atomic_publish(dir, "VISIBLE.tmp", "VISIBLE", &buf, None, true)
 }
 
 /// Read visible version marker file from disk, if present.

@@ -31,12 +31,13 @@
 //!   storage engines, Raft/Paxos consensus, placement drivers, leader election, or live
 //!   serving replica traffic handoffs.
 
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::time::Instant;
 
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{PartitionId, ReplicaDescriptor, ReplicaId, TableDescriptor, TableId, TabletId};
+use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::write_new_tmp_file;
 use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Schema, Version};
 use htap_rowstore::{Engine, Snapshot};
 use serde::{Deserialize, Serialize};
@@ -155,75 +156,49 @@ pub fn encode_manifest(manifest: &TabletPackageManifest) -> Result<Vec<u8>> {
         )));
     }
 
-    let payload_len = payload.len() as u32;
-    let checksum = crc32c::crc32c(&payload);
-
-    let mut buf = Vec::with_capacity(MANIFEST_HEADER_LEN + payload.len());
-    buf.extend_from_slice(MANIFEST_HEADER_MAGIC);
-    buf.extend_from_slice(&MANIFEST_FORMAT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.extend_from_slice(&checksum.to_le_bytes());
-    buf.extend_from_slice(&payload);
-
-    Ok(buf)
+    Ok(encode_envelope(
+        MANIFEST_HEADER_MAGIC,
+        MANIFEST_FORMAT_VERSION,
+        &payload,
+    ))
 }
 
 /// Decode and validate a [`TabletPackageManifest`] from a versioned binary envelope.
 pub fn decode_manifest(bytes: &[u8]) -> Result<TabletPackageManifest> {
-    if bytes.len() < MANIFEST_HEADER_LEN {
-        return Err(HtapError::Corruption(format!(
-            "manifest file too small: {} bytes, minimum header length is {}",
-            bytes.len(),
-            MANIFEST_HEADER_LEN
-        )));
-    }
-
-    if &bytes[0..8] != MANIFEST_HEADER_MAGIC {
-        return Err(HtapError::Corruption(
-            "invalid tablet package manifest header magic bytes".into(),
-        ));
-    }
-
-    let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    if version != MANIFEST_FORMAT_VERSION {
-        return Err(HtapError::Corruption(format!(
-            "unsupported tablet package manifest format version: {version}"
-        )));
-    }
-
-    let payload_len = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
-    let expected_crc = u32::from_le_bytes(bytes[14..18].try_into().unwrap());
-
-    if payload_len > MAX_MANIFEST_PAYLOAD_BYTES {
-        return Err(HtapError::Corruption(format!(
-            "manifest payload length {} exceeds maximum limit {}",
-            payload_len, MAX_MANIFEST_PAYLOAD_BYTES
-        )));
-    }
-
-    let expected_total = MANIFEST_HEADER_LEN + payload_len as usize;
-    if bytes.len() < expected_total {
-        return Err(HtapError::Corruption(format!(
-            "truncated manifest file: expected {} bytes, found {}",
-            expected_total,
-            bytes.len()
-        )));
-    }
-
-    if bytes.len() > expected_total {
-        return Err(HtapError::Corruption(format!(
-            "manifest file has {} trailing leftover bytes",
-            bytes.len() - expected_total
-        )));
-    }
-
-    let payload = &bytes[MANIFEST_HEADER_LEN..expected_total];
-    let computed_crc = crc32c::crc32c(payload);
-    if computed_crc != expected_crc {
-        return Err(HtapError::Corruption(format!(
-            "manifest checksum mismatch: expected {expected_crc:#010x}, got {computed_crc:#010x}"
-        )));
-    }
+    let (_, payload) = decode_envelope(
+        bytes,
+        MANIFEST_HEADER_MAGIC,
+        MANIFEST_FORMAT_VERSION..=MANIFEST_FORMAT_VERSION,
+        MAX_MANIFEST_PAYLOAD_BYTES,
+        SizeCheckMode::TruncatedThenTrailing,
+    )
+    .map_err(|err| {
+        let message = match err {
+            EnvelopeError::TooSmall { found, min } => {
+                format!("manifest file too small: {found} bytes, minimum header length is {min}")
+            }
+            EnvelopeError::BadMagic => "invalid tablet package manifest header magic bytes".into(),
+            EnvelopeError::UnsupportedVersion(version) => {
+                format!("unsupported tablet package manifest format version: {version}")
+            }
+            EnvelopeError::PayloadTooLarge { len, max } => {
+                format!("manifest payload length {len} exceeds maximum limit {max}")
+            }
+            EnvelopeError::Truncated { expected, found } => {
+                format!("truncated manifest file: expected {expected} bytes, found {found}")
+            }
+            EnvelopeError::TrailingBytes { extra } => {
+                format!("manifest file has {extra} trailing leftover bytes")
+            }
+            EnvelopeError::SizeMismatch { expected, found } => {
+                format!("truncated manifest file: expected {expected} bytes, found {found}")
+            }
+            EnvelopeError::ChecksumMismatch { expected, actual } => {
+                format!("manifest checksum mismatch: expected {expected:#010x}, got {actual:#010x}")
+            }
+        };
+        HtapError::Corruption(message)
+    })?;
 
     let manifest: TabletPackageManifest = serde_json::from_slice(payload)
         .map_err(|e| HtapError::Corruption(format!("failed to deserialize manifest JSON: {e}")))?;
@@ -488,12 +463,7 @@ pub fn clone_tablet(
     let manifest_tmp_path = package_dir.join("MANIFEST.tmp");
 
     // 1. Write DATA.tmp and fsync
-    let write_data_res = (|| -> Result<()> {
-        let mut f = File::create(&data_tmp_path)?;
-        f.write_all(&data_bytes)?;
-        f.sync_all()?;
-        Ok(())
-    })();
+    let write_data_res = write_new_tmp_file(&data_tmp_path, &data_bytes, None);
     if let Err(e) = write_data_res {
         let _ = fs::remove_file(&data_tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
@@ -508,12 +478,7 @@ pub fn clone_tablet(
     }
 
     // 3. Write MANIFEST.tmp and fsync
-    let write_manifest_res = (|| -> Result<()> {
-        let mut f = File::create(&manifest_tmp_path)?;
-        f.write_all(&manifest_bytes)?;
-        f.sync_all()?;
-        Ok(())
-    })();
+    let write_manifest_res = write_new_tmp_file(&manifest_tmp_path, &manifest_bytes, None);
     if let Err(e) = write_manifest_res {
         let _ = fs::remove_file(&manifest_tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
@@ -835,5 +800,119 @@ pub fn repair_tablet(
             Err(HtapError::Conflict(_)) if attempts < 5 => continue,
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_manifest() -> TabletPackageManifest {
+        TabletPackageManifest {
+            job_id: "test-job".into(),
+            table_id: TableId::new(1),
+            partition_id: PartitionId::new(1),
+            source_tablet_id: TabletId::new(1),
+            target_replica_id: ReplicaId::new(1),
+            schema: Schema::new(vec![htap_common::ColumnDef {
+                name: "id".into(),
+                data_type: htap_common::DataType::Int64,
+                nullable: false,
+                primary_key: true,
+            }])
+            .unwrap(),
+            base_version: Version::new(1),
+            row_count: 0,
+            payload_checksum: crc32c::crc32c(b""),
+            payload_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn test_manifest_envelope_golden_bytes() {
+        let bytes = encode_manifest(&minimal_manifest()).unwrap();
+        assert_eq!(
+            bytes.as_slice(),
+            &[
+                72, 84, 65, 80, 77, 78, 70, 49, 1, 0, 1, 1, 0, 0, 169, 59, 204, 46, 123, 34, 106,
+                111, 98, 95, 105, 100, 34, 58, 34, 116, 101, 115, 116, 45, 106, 111, 98, 34, 44,
+                34, 116, 97, 98, 108, 101, 95, 105, 100, 34, 58, 49, 44, 34, 112, 97, 114, 116,
+                105, 116, 105, 111, 110, 95, 105, 100, 34, 58, 49, 44, 34, 115, 111, 117, 114, 99,
+                101, 95, 116, 97, 98, 108, 101, 116, 95, 105, 100, 34, 58, 49, 44, 34, 116, 97,
+                114, 103, 101, 116, 95, 114, 101, 112, 108, 105, 99, 97, 95, 105, 100, 34, 58, 49,
+                44, 34, 115, 99, 104, 101, 109, 97, 34, 58, 123, 34, 99, 111, 108, 117, 109, 110,
+                115, 34, 58, 91, 123, 34, 110, 97, 109, 101, 34, 58, 34, 105, 100, 34, 44, 34, 100,
+                97, 116, 97, 95, 116, 121, 112, 101, 34, 58, 34, 73, 110, 116, 54, 52, 34, 44, 34,
+                110, 117, 108, 108, 97, 98, 108, 101, 34, 58, 102, 97, 108, 115, 101, 44, 34, 112,
+                114, 105, 109, 97, 114, 121, 95, 107, 101, 121, 34, 58, 116, 114, 117, 101, 125,
+                93, 125, 44, 34, 98, 97, 115, 101, 95, 118, 101, 114, 115, 105, 111, 110, 34, 58,
+                49, 44, 34, 114, 111, 119, 95, 99, 111, 117, 110, 116, 34, 58, 48, 44, 34, 112, 97,
+                121, 108, 111, 97, 100, 95, 99, 104, 101, 99, 107, 115, 117, 109, 34, 58, 48, 44,
+                34, 112, 97, 121, 108, 111, 97, 100, 95, 98, 121, 116, 101, 115, 34, 58, 48, 125,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_manifest_envelope_bad_magic_and_oversized() {
+        let mut bad_magic = encode_manifest(&minimal_manifest()).unwrap();
+        bad_magic[0] ^= 0xff;
+        let error = decode_manifest(&bad_magic).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Corruption error: invalid tablet package manifest header magic bytes"
+        );
+
+        let mut oversized = Vec::with_capacity(MANIFEST_HEADER_LEN);
+        oversized.extend_from_slice(MANIFEST_HEADER_MAGIC);
+        oversized.extend_from_slice(&MANIFEST_FORMAT_VERSION.to_le_bytes());
+        oversized.extend_from_slice(&(MAX_MANIFEST_PAYLOAD_BYTES + 1).to_le_bytes());
+        oversized.extend_from_slice(&0_u32.to_le_bytes());
+        let error = decode_manifest(&oversized).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Corruption error: manifest payload length 16777217 exceeds maximum limit 16777216"
+        );
+    }
+
+    #[test]
+    fn test_manifest_envelope_bad_version_and_crc() {
+        let mut bad_version = encode_manifest(&minimal_manifest()).unwrap();
+        bad_version[8..10].copy_from_slice(&(MANIFEST_FORMAT_VERSION + 1).to_le_bytes());
+        let error = decode_manifest(&bad_version).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Corruption error: unsupported tablet package manifest format version: 2"
+        );
+
+        let mut bad_crc = encode_manifest(&minimal_manifest()).unwrap();
+        bad_crc[14] ^= 0xff;
+        let error = decode_manifest(&bad_crc).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Corruption error: manifest checksum mismatch: expected 0x2ecc3b56, got 0x2ecc3ba9"
+        );
+    }
+
+    #[test]
+    fn test_manifest_envelope_size_check_truncated() {
+        let mut truncated = encode_manifest(&minimal_manifest()).unwrap();
+        truncated.pop();
+        let error = decode_manifest(&truncated).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Corruption error: truncated manifest file: expected 275 bytes, found 274"
+        );
+    }
+
+    #[test]
+    fn test_manifest_envelope_size_check_trailing() {
+        let mut trailing = encode_manifest(&minimal_manifest()).unwrap();
+        trailing.push(0);
+        let error = decode_manifest(&trailing).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Corruption error: manifest file has 1 trailing leftover bytes"
+        );
     }
 }

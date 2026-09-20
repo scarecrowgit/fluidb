@@ -118,19 +118,17 @@ pub fn encode_plain(data_type: DataType, non_null_values: &[Value]) -> Result<Ve
 /// Returns [`HtapError::Corruption`] if the byte buffer is truncated, has trailing bytes,
 /// or contains invalid boolean or UTF-8 values.
 pub fn decode_plain(data_type: DataType, bytes: &[u8], count: usize) -> Result<Vec<Value>> {
-    let mut cursor = 0;
+    use htap_common::bytecursor::ByteReader;
+
+    let mut reader = ByteReader::new(bytes);
     let mut values = Vec::with_capacity(count);
 
     for _ in 0..count {
         match data_type {
             DataType::Bool => {
-                if cursor >= bytes.len() {
-                    return Err(HtapError::Corruption(
-                        "unexpected EOF decoding plain bool".into(),
-                    ));
-                }
-                let b = bytes[cursor];
-                cursor += 1;
+                let b = reader.read_u8().map_err(|_| {
+                    HtapError::Corruption("unexpected EOF decoding plain bool".into())
+                })?;
                 match b {
                     0 => values.push(Value::Bool(false)),
                     1 => values.push(Value::Bool(true)),
@@ -142,92 +140,73 @@ pub fn decode_plain(data_type: DataType, bytes: &[u8], count: usize) -> Result<V
                 }
             }
             DataType::Int32 => {
-                if cursor + 4 > bytes.len() {
-                    return Err(HtapError::Corruption(
-                        "unexpected EOF decoding plain int32".into(),
-                    ));
-                }
-                let v = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
+                let v = reader.read_i32_le().map_err(|_| {
+                    HtapError::Corruption("unexpected EOF decoding plain int32".into())
+                })?;
                 values.push(Value::Int32(v));
             }
             DataType::Int64 => {
-                if cursor + 8 > bytes.len() {
-                    return Err(HtapError::Corruption(
-                        "unexpected EOF decoding plain int64".into(),
-                    ));
-                }
-                let v = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-                cursor += 8;
+                let v = reader.read_i64_le().map_err(|_| {
+                    HtapError::Corruption("unexpected EOF decoding plain int64".into())
+                })?;
                 values.push(Value::Int64(v));
             }
             DataType::Timestamp => {
-                if cursor + 8 > bytes.len() {
-                    return Err(HtapError::Corruption(
-                        "unexpected EOF decoding plain timestamp".into(),
-                    ));
-                }
-                let v = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-                cursor += 8;
+                let v = reader.read_i64_le().map_err(|_| {
+                    HtapError::Corruption("unexpected EOF decoding plain timestamp".into())
+                })?;
                 values.push(Value::Timestamp(v));
             }
             DataType::Float64 => {
-                if cursor + 8 > bytes.len() {
-                    return Err(HtapError::Corruption(
-                        "unexpected EOF decoding plain float64".into(),
-                    ));
-                }
-                let bits = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-                cursor += 8;
-                values.push(Value::Float64(f64::from_bits(bits)));
+                let v = reader.read_f64_le().map_err(|_| {
+                    HtapError::Corruption("unexpected EOF decoding plain float64".into())
+                })?;
+                values.push(Value::Float64(v));
             }
             DataType::String => {
-                if cursor + 4 > bytes.len() {
-                    return Err(HtapError::Corruption(
-                        "unexpected EOF decoding plain string length".into(),
-                    ));
-                }
-                let len =
-                    u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-                cursor += 4;
-                if len > MAX_VALUE_BYTES || cursor + len > bytes.len() {
+                let len = reader.read_u32_le().map_err(|_| {
+                    HtapError::Corruption("unexpected EOF decoding plain string length".into())
+                })? as usize;
+                if len > MAX_VALUE_BYTES {
                     return Err(HtapError::Corruption(format!(
                         "invalid plain string byte length {len}"
                     )));
                 }
-                let s = std::str::from_utf8(&bytes[cursor..cursor + len]).map_err(|e| {
+                let string_bytes = reader.read_bytes(len).map_err(|_| {
+                    HtapError::Corruption(format!("invalid plain string byte length {len}"))
+                })?;
+                let s = std::str::from_utf8(string_bytes).map_err(|e| {
                     HtapError::Corruption(format!("invalid UTF-8 in plain string: {e}"))
                 })?;
-                cursor += len;
                 values.push(Value::String(s.to_string()));
             }
             DataType::Bytes => {
-                if cursor + 4 > bytes.len() {
-                    return Err(HtapError::Corruption(
-                        "unexpected EOF decoding plain bytes length".into(),
-                    ));
-                }
-                let len =
-                    u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-                cursor += 4;
-                if len > MAX_VALUE_BYTES || cursor + len > bytes.len() {
+                let len = reader.read_u32_le().map_err(|_| {
+                    HtapError::Corruption("unexpected EOF decoding plain bytes length".into())
+                })? as usize;
+                if len > MAX_VALUE_BYTES {
                     return Err(HtapError::Corruption(format!(
                         "invalid plain bytes length {len}"
                     )));
                 }
-                let b = bytes[cursor..cursor + len].to_vec();
-                cursor += len;
+                let b = reader
+                    .read_bytes(len)
+                    .map_err(|_| {
+                        HtapError::Corruption(format!("invalid plain bytes length {len}"))
+                    })?
+                    .to_vec();
                 values.push(Value::Bytes(b));
             }
         }
     }
 
-    if cursor != bytes.len() {
-        return Err(HtapError::Corruption(format!(
-            "trailing bytes in plain block payload: consumed {cursor}, total {}",
+    reader.expect_exhausted().map_err(|_| {
+        HtapError::Corruption(format!(
+            "trailing bytes in plain block payload: consumed {}, total {}",
+            reader.position(),
             bytes.len()
-        )));
-    }
+        ))
+    })?;
 
     Ok(values)
 }
@@ -303,21 +282,18 @@ pub fn encode_dictionary(data_type: DataType, non_null_values: &[Value]) -> Resu
 /// # Errors
 /// Returns [`HtapError::Corruption`] if dictionary structure or codes are malformed.
 pub fn decode_dictionary(data_type: DataType, bytes: &[u8], count: usize) -> Result<Vec<Value>> {
+    use htap_common::bytecursor::ByteReader;
+
     if data_type != DataType::String && data_type != DataType::Bytes {
         return Err(HtapError::Corruption(format!(
             "dictionary encoding only valid for String and Bytes, got {data_type}"
         )));
     }
 
-    let mut cursor = 0;
-    if cursor + 4 > bytes.len() {
-        return Err(HtapError::Corruption(
-            "unexpected EOF reading dictionary entry count".into(),
-        ));
-    }
-    let dict_entry_count =
-        u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-    cursor += 4;
+    let mut reader = ByteReader::new(bytes);
+    let dict_entry_count = reader.read_u32_le().map_err(|_| {
+        HtapError::Corruption("unexpected EOF reading dictionary entry count".into())
+    })? as usize;
 
     if dict_entry_count > MAX_BLOCK_ROWS {
         return Err(HtapError::Corruption(format!(
@@ -327,20 +303,17 @@ pub fn decode_dictionary(data_type: DataType, bytes: &[u8], count: usize) -> Res
 
     let mut dict = Vec::with_capacity(dict_entry_count);
     for _ in 0..dict_entry_count {
-        if cursor + 4 > bytes.len() {
-            return Err(HtapError::Corruption(
-                "unexpected EOF reading dictionary entry length".into(),
-            ));
-        }
-        let entry_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        if entry_len > MAX_VALUE_BYTES || cursor + entry_len > bytes.len() {
+        let entry_len = reader.read_u32_le().map_err(|_| {
+            HtapError::Corruption("unexpected EOF reading dictionary entry length".into())
+        })? as usize;
+        if entry_len > MAX_VALUE_BYTES {
             return Err(HtapError::Corruption(format!(
                 "invalid dictionary entry length {entry_len}"
             )));
         }
-        let entry_slice = &bytes[cursor..cursor + entry_len];
-        cursor += entry_len;
+        let entry_slice = reader.read_bytes(entry_len).map_err(|_| {
+            HtapError::Corruption(format!("invalid dictionary entry length {entry_len}"))
+        })?;
 
         if data_type == DataType::String {
             let s = std::str::from_utf8(entry_slice).map_err(|e| {
@@ -352,13 +325,9 @@ pub fn decode_dictionary(data_type: DataType, bytes: &[u8], count: usize) -> Res
         }
     }
 
-    if cursor + 4 > bytes.len() {
-        return Err(HtapError::Corruption(
-            "unexpected EOF reading dictionary value count".into(),
-        ));
-    }
-    let value_count = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-    cursor += 4;
+    let value_count = reader.read_u32_le().map_err(|_| {
+        HtapError::Corruption("unexpected EOF reading dictionary value count".into())
+    })? as usize;
 
     if value_count != count {
         return Err(HtapError::Corruption(format!(
@@ -368,13 +337,10 @@ pub fn decode_dictionary(data_type: DataType, bytes: &[u8], count: usize) -> Res
 
     let mut values = Vec::with_capacity(value_count);
     for _ in 0..value_count {
-        if cursor + 4 > bytes.len() {
-            return Err(HtapError::Corruption(
-                "unexpected EOF reading dictionary code".into(),
-            ));
-        }
-        let code = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
+        let code = reader
+            .read_u32_le()
+            .map_err(|_| HtapError::Corruption("unexpected EOF reading dictionary code".into()))?
+            as usize;
         if code >= dict.len() {
             return Err(HtapError::Corruption(format!(
                 "dictionary code {code} out of bounds for dictionary of size {}",
@@ -384,12 +350,13 @@ pub fn decode_dictionary(data_type: DataType, bytes: &[u8], count: usize) -> Res
         values.push(dict[code].clone());
     }
 
-    if cursor != bytes.len() {
-        return Err(HtapError::Corruption(format!(
-            "trailing bytes in dictionary payload: consumed {cursor}, total {}",
+    reader.expect_exhausted().map_err(|_| {
+        HtapError::Corruption(format!(
+            "trailing bytes in dictionary payload: consumed {}, total {}",
+            reader.position(),
             bytes.len()
-        )));
-    }
+        ))
+    })?;
 
     Ok(values)
 }
@@ -515,15 +482,24 @@ pub fn encode_typed_value(val: &Value, buf: &mut Vec<u8>) -> Result<()> {
 /// # Errors
 /// Returns [`HtapError::Corruption`] if buffer is truncated or data is invalid.
 pub fn decode_typed_value(dt: DataType, bytes: &[u8], cursor: &mut usize) -> Result<Value> {
+    use htap_common::bytecursor::ByteReader;
+
+    macro_rules! reader_from_cursor {
+        ($message:literal) => {{
+            let remaining = bytes
+                .get(*cursor..)
+                .ok_or_else(|| HtapError::Corruption($message.into()))?;
+            ByteReader::new(remaining)
+        }};
+    }
+
     match dt {
         DataType::Bool => {
-            if *cursor >= bytes.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF decoding zone map bool".into(),
-                ));
-            }
-            let byte = bytes[*cursor];
-            *cursor += 1;
+            let mut reader = reader_from_cursor!("unexpected EOF decoding zone map bool");
+            let byte = reader.read_u8().map_err(|_| {
+                HtapError::Corruption("unexpected EOF decoding zone map bool".into())
+            })?;
+            *cursor += reader.position();
             match byte {
                 0 => Ok(Value::Bool(false)),
                 1 => Ok(Value::Bool(true)),
@@ -533,78 +509,76 @@ pub fn decode_typed_value(dt: DataType, bytes: &[u8], cursor: &mut usize) -> Res
             }
         }
         DataType::Int32 => {
-            if *cursor + 4 > bytes.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF decoding zone map int32".into(),
-                ));
-            }
-            let v = i32::from_le_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap());
-            *cursor += 4;
+            let mut reader = reader_from_cursor!("unexpected EOF decoding zone map int32");
+            let v = reader.read_i32_le().map_err(|_| {
+                HtapError::Corruption("unexpected EOF decoding zone map int32".into())
+            })?;
+            *cursor += reader.position();
             Ok(Value::Int32(v))
         }
         DataType::Int64 => {
-            if *cursor + 8 > bytes.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF decoding zone map int64".into(),
-                ));
-            }
-            let v = i64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
-            *cursor += 8;
+            let mut reader = reader_from_cursor!("unexpected EOF decoding zone map int64");
+            let v = reader.read_i64_le().map_err(|_| {
+                HtapError::Corruption("unexpected EOF decoding zone map int64".into())
+            })?;
+            *cursor += reader.position();
             Ok(Value::Int64(v))
         }
         DataType::Timestamp => {
-            if *cursor + 8 > bytes.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF decoding zone map timestamp".into(),
-                ));
-            }
-            let v = i64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
-            *cursor += 8;
+            let mut reader = reader_from_cursor!("unexpected EOF decoding zone map timestamp");
+            let v = reader.read_i64_le().map_err(|_| {
+                HtapError::Corruption("unexpected EOF decoding zone map timestamp".into())
+            })?;
+            *cursor += reader.position();
             Ok(Value::Timestamp(v))
         }
         DataType::Float64 => {
-            if *cursor + 8 > bytes.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF decoding zone map float64".into(),
-                ));
-            }
-            let bits = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
-            *cursor += 8;
-            Ok(Value::Float64(f64::from_bits(bits)))
+            let mut reader = reader_from_cursor!("unexpected EOF decoding zone map float64");
+            let v = reader.read_f64_le().map_err(|_| {
+                HtapError::Corruption("unexpected EOF decoding zone map float64".into())
+            })?;
+            *cursor += reader.position();
+            Ok(Value::Float64(v))
         }
         DataType::String => {
-            if *cursor + 4 > bytes.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF decoding zone map string len".into(),
-                ));
-            }
-            let len = u32::from_le_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap()) as usize;
-            *cursor += 4;
-            if len > MAX_VALUE_BYTES || *cursor + len > bytes.len() {
+            let mut reader = reader_from_cursor!("unexpected EOF decoding zone map string len");
+            let len = reader.read_u32_le().map_err(|_| {
+                HtapError::Corruption("unexpected EOF decoding zone map string len".into())
+            })? as usize;
+            *cursor += reader.position();
+
+            if len > MAX_VALUE_BYTES {
                 return Err(HtapError::Corruption(
                     "invalid string len in zone map".into(),
                 ));
             }
-            let s = std::str::from_utf8(&bytes[*cursor..*cursor + len]).map_err(|e| {
+
+            let string_bytes = reader
+                .read_bytes(len)
+                .map_err(|_| HtapError::Corruption("invalid string len in zone map".into()))?;
+            let s = std::str::from_utf8(string_bytes).map_err(|e| {
                 HtapError::Corruption(format!("invalid UTF-8 in zone map string: {e}"))
             })?;
             *cursor += len;
             Ok(Value::String(s.to_string()))
         }
         DataType::Bytes => {
-            if *cursor + 4 > bytes.len() {
-                return Err(HtapError::Corruption(
-                    "unexpected EOF decoding zone map bytes len".into(),
-                ));
-            }
-            let len = u32::from_le_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap()) as usize;
-            *cursor += 4;
-            if len > MAX_VALUE_BYTES || *cursor + len > bytes.len() {
+            let mut reader = reader_from_cursor!("unexpected EOF decoding zone map bytes len");
+            let len = reader.read_u32_le().map_err(|_| {
+                HtapError::Corruption("unexpected EOF decoding zone map bytes len".into())
+            })? as usize;
+            *cursor += reader.position();
+
+            if len > MAX_VALUE_BYTES {
                 return Err(HtapError::Corruption(
                     "invalid bytes len in zone map".into(),
                 ));
             }
-            let b = bytes[*cursor..*cursor + len].to_vec();
+
+            let b = reader
+                .read_bytes(len)
+                .map_err(|_| HtapError::Corruption("invalid bytes len in zone map".into()))?
+                .to_vec();
             *cursor += len;
             Ok(Value::Bytes(b))
         }

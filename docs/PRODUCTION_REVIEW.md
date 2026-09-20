@@ -70,7 +70,7 @@ The following critical and high-severity architectural issues have been verified
 
 ### H5/M2 — Owned Persistence Bounds and Internal Path Validation (Fixed: `b7ff200`)
 - **Verified Code Paths:**
-  - `crates/htap-common/src/fs.rs` (`read_exact_bounded`)
+  - `crates/htap-common/src/fs.rs` (`read_file_exact_bounded`)
   - `crates/htap-catalog/src/local.rs`, `crates/htap-coord/src/lib.rs`
   - `crates/htap-convert/src/lib.rs`, `crates/htap-movement/src/job.rs`, `crates/htap-movement/src/tablet.rs`
   - `crates/htap-rowstore/src/manifest.rs`, `crates/htap-rowstore/src/engine.rs`
@@ -78,7 +78,7 @@ The following critical and high-severity architectural issues have been verified
 - **Scenario:**
   Persistence envelopes (`CATALOG`, `COORDINATOR`, `jobs.json` (historical pre-hardening finding; current layout uses `movement/jobs/<job-id>/JOB`), tablet manifests, `MANIFEST`, `VISIBLE`, `txn.journal`) used unbounded file reads, exposing the engine to memory exhaustion attacks from maliciously enlarged or corrupted files. Internal movement job IDs, package IDs, and conversion segment paths lacked strict validation.
 - **Resolution:**
-  Added a shared metadata-bounded exact-file reader (`read_exact_bounded`) enforcing explicit size caps on all owned persistence envelopes before memory allocation, rejecting oversized, truncated, trailing, or growth-raced files. Bounded the transaction journal total size and stream frame validation with fixed probe buffers. Validated internal movement job/package IDs and conversion segment relative paths. (External `CopyOptions` paths remain caller-controlled by design.)
+  Added a shared metadata-bounded exact-file reader (`read_file_exact_bounded`) enforcing explicit size caps on all owned persistence envelopes before memory allocation, rejecting oversized, truncated, trailing, or growth-raced files. Bounded the transaction journal total size and stream frame validation with fixed probe buffers. Validated internal movement job/package IDs and conversion segment relative paths. (External `CopyOptions` paths remain caller-controlled by design.)
 
 ### Exclusive Root Ownership (Fixed: `1083fbd`)
 - **Verified Code Paths:**

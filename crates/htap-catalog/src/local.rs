@@ -1,10 +1,13 @@
 //! Local filesystem implementation of [`CatalogStore`] with crash-safe atomic updates.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::{
+    atomic_publish as publish_file, remove_file_if_exists, sync_dir as sync_directory,
+};
 use htap_common::{read_file_exact_bounded, HtapError, Result};
 
 use crate::model::CatalogSnapshot;
@@ -148,73 +151,45 @@ pub fn encode_snapshot(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
         )));
     }
 
-    let payload_len = payload.len() as u32;
-    let checksum = crc32c::crc32c(&payload);
-
-    let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
-    buf.extend_from_slice(HEADER_MAGIC);
-    buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.extend_from_slice(&checksum.to_le_bytes());
-    buf.extend_from_slice(&payload);
-
-    Ok(buf)
+    Ok(encode_envelope(HEADER_MAGIC, FORMAT_VERSION, &payload))
 }
 
 /// Decode and validate a catalog snapshot from binary envelope bytes.
 pub fn decode_snapshot(bytes: &[u8]) -> Result<CatalogSnapshot> {
-    if bytes.len() < HEADER_LEN {
-        return Err(HtapError::Corruption(format!(
-            "catalog file too small: {} bytes, minimum header size is {}",
-            bytes.len(),
-            HEADER_LEN
-        )));
-    }
-
-    if &bytes[0..8] != HEADER_MAGIC {
-        return Err(HtapError::Corruption("invalid catalog header magic".into()));
-    }
-
-    let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    if !(LEGACY_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
-        return Err(HtapError::Corruption(format!(
-            "unsupported catalog format version: {version}"
-        )));
-    }
-
-    let payload_len = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
-    let expected_crc = u32::from_le_bytes(bytes[14..18].try_into().unwrap());
-
-    if payload_len > MAX_CATALOG_PAYLOAD_BYTES {
-        return Err(HtapError::Corruption(format!(
-            "catalog payload length {} exceeds maximum limit {}",
-            payload_len, MAX_CATALOG_PAYLOAD_BYTES
-        )));
-    }
-
-    let expected_total = HEADER_LEN + payload_len as usize;
-    if bytes.len() < expected_total {
-        return Err(HtapError::Corruption(format!(
-            "truncated catalog file: expected {} bytes, found {}",
-            expected_total,
-            bytes.len()
-        )));
-    }
-
-    if bytes.len() > expected_total {
-        return Err(HtapError::Corruption(format!(
-            "catalog file has {} trailing leftover bytes",
-            bytes.len() - expected_total
-        )));
-    }
-
-    let payload = &bytes[HEADER_LEN..expected_total];
-    let computed_crc = crc32c::crc32c(payload);
-    if computed_crc != expected_crc {
-        return Err(HtapError::Corruption(format!(
-            "catalog checksum mismatch: expected {expected_crc:#010x}, got {computed_crc:#010x}"
-        )));
-    }
+    let (version, payload) = decode_envelope(
+        bytes,
+        HEADER_MAGIC,
+        LEGACY_FORMAT_VERSION..=FORMAT_VERSION,
+        MAX_CATALOG_PAYLOAD_BYTES,
+        SizeCheckMode::TruncatedThenTrailing,
+    )
+    .map_err(|err| {
+        let message = match err {
+            EnvelopeError::TooSmall { found, min } => {
+                format!("catalog file too small: {found} bytes, minimum header size is {min}")
+            }
+            EnvelopeError::BadMagic => "invalid catalog header magic".into(),
+            EnvelopeError::UnsupportedVersion(version) => {
+                format!("unsupported catalog format version: {version}")
+            }
+            EnvelopeError::PayloadTooLarge { len, max } => {
+                format!("catalog payload length {len} exceeds maximum limit {max}")
+            }
+            EnvelopeError::Truncated { expected, found } => {
+                format!("truncated catalog file: expected {expected} bytes, found {found}")
+            }
+            EnvelopeError::TrailingBytes { extra } => {
+                format!("catalog file has {extra} trailing leftover bytes")
+            }
+            EnvelopeError::SizeMismatch { expected, found } => {
+                format!("truncated catalog file: expected {expected} bytes, found {found}")
+            }
+            EnvelopeError::ChecksumMismatch { expected, actual } => {
+                format!("catalog checksum mismatch: expected {expected:#010x}, got {actual:#010x}")
+            }
+        };
+        HtapError::Corruption(message)
+    })?;
 
     let probe: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
         HtapError::Corruption(format!("failed to deserialize catalog snapshot: {e}"))
@@ -262,70 +237,25 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<CatalogSnapshot> {
 /// Atomically publish a catalog snapshot: write `CATALOG.tmp` -> fsync -> rename -> fsync directory.
 fn atomic_publish(dir: &Path, snapshot: &CatalogSnapshot) -> Result<()> {
     let tmp_path = dir.join(CATALOG_TMP_FILE_NAME);
-    let final_path = dir.join(CATALOG_FILE_NAME);
 
     // Remove a stale interrupted publish before creating a restricted replacement.
-    match fs::remove_file(&tmp_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(HtapError::Io(e)),
-    }
+    remove_file_if_exists(&tmp_path)?;
 
     let encoded = encode_snapshot(snapshot)?;
 
-    // 1. Write tmp file and fsync
-    let write_res = (|| -> Result<()> {
-        let mut file = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp_path)?
-            }
-            #[cfg(not(unix))]
-            {
-                File::create(&tmp_path)?
-            }
-        };
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_res {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    // 2. Atomic rename
-    if let Err(e) = fs::rename(&tmp_path, &final_path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(HtapError::Io(e));
-    }
-
-    // 3. Fsync parent directory
-    sync_dir(dir)?;
-
-    Ok(())
+    publish_file(
+        dir,
+        CATALOG_TMP_FILE_NAME,
+        CATALOG_FILE_NAME,
+        &encoded,
+        Some(0o600),
+        true,
+    )
 }
 
 /// Fsync a directory to ensure metadata operations like rename are durable.
 pub fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let f = File::open(path)?;
-        f.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    sync_directory(path)
 }
 
 #[cfg(test)]
@@ -378,11 +308,250 @@ mod tests {
         CatalogSnapshot::new(1, vec![table], vec![part], vec![tab], vec![rep])
     }
 
+    // Frozen copy, do not refactor: reference encoder for the v1 payload shape.
+    fn encode_v1(snapshot: &CatalogSnapshot) -> Vec<u8> {
+        let mut payload = serde_json::to_value(snapshot).unwrap();
+        let object = payload.as_object_mut().unwrap();
+        object.remove("id_high_water");
+        object.remove("accounts");
+        object.remove("grants");
+        object.remove("accounts_initialized");
+        encode_reference_payload(1, &payload)
+    }
+
+    // Frozen copy, do not refactor: reference encoder for the v2 payload shape.
+    fn encode_v2(snapshot: &CatalogSnapshot) -> Vec<u8> {
+        let mut payload = serde_json::to_value(snapshot).unwrap();
+        let object = payload.as_object_mut().unwrap();
+        object.remove("accounts");
+        object.remove("grants");
+        object.remove("accounts_initialized");
+        if let Some(high_water) = object
+            .get_mut("id_high_water")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            high_water.remove("account");
+        }
+        encode_reference_payload(2, &payload)
+    }
+
+    // Frozen copy, do not refactor: v1/v2 envelope framing.
+    fn encode_reference_payload(version: u16, value: &serde_json::Value) -> Vec<u8> {
+        let payload = serde_json::to_vec(value).unwrap();
+        let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+        bytes.extend_from_slice(HEADER_MAGIC);
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
     #[test]
     fn test_envelope_roundtrip() {
         let snap = test_snapshot();
         let bytes = encode_snapshot(&snap).unwrap();
         let decoded = decode_snapshot(&bytes).unwrap();
         assert_eq!(decoded, snap);
+    }
+
+    #[test]
+    fn catalog_envelope_golden_bytes() {
+        let snapshot = test_snapshot();
+        let v1 = encode_v1(&snapshot);
+        let v2 = encode_v2(&snapshot);
+        let v3 = encode_snapshot(&snapshot).unwrap();
+
+        assert_eq!(
+            v1,
+            vec![
+                72, 84, 65, 80, 67, 65, 84, 49, 1, 0, 210, 1, 0, 0, 141, 99, 75, 186, 123, 34, 103,
+                101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34, 112, 97, 114, 116,
+                105, 116, 105, 111, 110, 115, 34, 58, 91, 123, 34, 103, 101, 110, 101, 114, 97,
+                116, 105, 111, 110, 34, 58, 49, 44, 34, 105, 100, 34, 58, 49, 44, 34, 110, 97, 109,
+                101, 34, 58, 34, 112, 48, 34, 44, 34, 115, 116, 111, 114, 97, 103, 101, 34, 58, 34,
+                82, 111, 119, 34, 44, 34, 116, 97, 98, 108, 101, 95, 105, 100, 34, 58, 49, 44, 34,
+                116, 97, 98, 108, 101, 116, 115, 34, 58, 91, 49, 93, 125, 93, 44, 34, 114, 101,
+                112, 108, 105, 99, 97, 115, 34, 58, 91, 123, 34, 103, 101, 110, 101, 114, 97, 116,
+                105, 111, 110, 34, 58, 49, 44, 34, 104, 101, 97, 108, 116, 104, 121, 34, 58, 116,
+                114, 117, 101, 44, 34, 105, 100, 34, 58, 49, 44, 34, 105, 115, 95, 108, 101, 97,
+                100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 110, 111, 100, 101, 95, 105,
+                100, 34, 58, 49, 44, 34, 116, 97, 98, 108, 101, 116, 95, 105, 100, 34, 58, 49, 125,
+                93, 44, 34, 116, 97, 98, 108, 101, 115, 34, 58, 91, 123, 34, 103, 101, 110, 101,
+                114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34, 105, 100, 34, 58, 49, 44, 34, 110,
+                97, 109, 101, 34, 58, 34, 116, 101, 115, 116, 95, 116, 97, 98, 108, 101, 34, 44,
+                34, 112, 97, 114, 116, 105, 116, 105, 111, 110, 115, 34, 58, 91, 49, 93, 44, 34,
+                112, 114, 105, 109, 97, 114, 121, 95, 107, 101, 121, 34, 58, 91, 48, 93, 44, 34,
+                115, 99, 104, 101, 109, 97, 34, 58, 123, 34, 99, 111, 108, 117, 109, 110, 115, 34,
+                58, 91, 123, 34, 100, 97, 116, 97, 95, 116, 121, 112, 101, 34, 58, 34, 73, 110,
+                116, 54, 52, 34, 44, 34, 110, 97, 109, 101, 34, 58, 34, 107, 34, 44, 34, 110, 117,
+                108, 108, 97, 98, 108, 101, 34, 58, 102, 97, 108, 115, 101, 44, 34, 112, 114, 105,
+                109, 97, 114, 121, 95, 107, 101, 121, 34, 58, 116, 114, 117, 101, 125, 93, 125,
+                125, 93, 44, 34, 116, 97, 98, 108, 101, 116, 115, 34, 58, 91, 123, 34, 98, 117, 99,
+                107, 101, 116, 34, 58, 48, 44, 34, 103, 101, 110, 101, 114, 97, 116, 105, 111, 110,
+                34, 58, 49, 44, 34, 105, 100, 34, 58, 49, 44, 34, 112, 97, 114, 116, 105, 116, 105,
+                111, 110, 95, 105, 100, 34, 58, 49, 44, 34, 114, 101, 112, 108, 105, 99, 97, 115,
+                34, 58, 91, 49, 93, 125, 93, 125,
+            ]
+        );
+        assert_eq!(
+            v2,
+            vec![
+                72, 84, 65, 80, 67, 65, 84, 49, 2, 0, 19, 2, 0, 0, 173, 42, 182, 184, 123, 34, 103,
+                101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34, 105, 100, 95, 104,
+                105, 103, 104, 95, 119, 97, 116, 101, 114, 34, 58, 123, 34, 112, 97, 114, 116, 105,
+                116, 105, 111, 110, 34, 58, 48, 44, 34, 114, 101, 112, 108, 105, 99, 97, 34, 58,
+                48, 44, 34, 116, 97, 98, 108, 101, 34, 58, 48, 44, 34, 116, 97, 98, 108, 101, 116,
+                34, 58, 48, 125, 44, 34, 112, 97, 114, 116, 105, 116, 105, 111, 110, 115, 34, 58,
+                91, 123, 34, 103, 101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34,
+                105, 100, 34, 58, 49, 44, 34, 110, 97, 109, 101, 34, 58, 34, 112, 48, 34, 44, 34,
+                115, 116, 111, 114, 97, 103, 101, 34, 58, 34, 82, 111, 119, 34, 44, 34, 116, 97,
+                98, 108, 101, 95, 105, 100, 34, 58, 49, 44, 34, 116, 97, 98, 108, 101, 116, 115,
+                34, 58, 91, 49, 93, 125, 93, 44, 34, 114, 101, 112, 108, 105, 99, 97, 115, 34, 58,
+                91, 123, 34, 103, 101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34,
+                104, 101, 97, 108, 116, 104, 121, 34, 58, 116, 114, 117, 101, 44, 34, 105, 100, 34,
+                58, 49, 44, 34, 105, 115, 95, 108, 101, 97, 100, 101, 114, 34, 58, 116, 114, 117,
+                101, 44, 34, 110, 111, 100, 101, 95, 105, 100, 34, 58, 49, 44, 34, 116, 97, 98,
+                108, 101, 116, 95, 105, 100, 34, 58, 49, 125, 93, 44, 34, 116, 97, 98, 108, 101,
+                115, 34, 58, 91, 123, 34, 103, 101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58,
+                49, 44, 34, 105, 100, 34, 58, 49, 44, 34, 110, 97, 109, 101, 34, 58, 34, 116, 101,
+                115, 116, 95, 116, 97, 98, 108, 101, 34, 44, 34, 112, 97, 114, 116, 105, 116, 105,
+                111, 110, 115, 34, 58, 91, 49, 93, 44, 34, 112, 114, 105, 109, 97, 114, 121, 95,
+                107, 101, 121, 34, 58, 91, 48, 93, 44, 34, 115, 99, 104, 101, 109, 97, 34, 58, 123,
+                34, 99, 111, 108, 117, 109, 110, 115, 34, 58, 91, 123, 34, 100, 97, 116, 97, 95,
+                116, 121, 112, 101, 34, 58, 34, 73, 110, 116, 54, 52, 34, 44, 34, 110, 97, 109,
+                101, 34, 58, 34, 107, 34, 44, 34, 110, 117, 108, 108, 97, 98, 108, 101, 34, 58,
+                102, 97, 108, 115, 101, 44, 34, 112, 114, 105, 109, 97, 114, 121, 95, 107, 101,
+                121, 34, 58, 116, 114, 117, 101, 125, 93, 125, 125, 93, 44, 34, 116, 97, 98, 108,
+                101, 116, 115, 34, 58, 91, 123, 34, 98, 117, 99, 107, 101, 116, 34, 58, 48, 44, 34,
+                103, 101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34, 105, 100, 34,
+                58, 49, 44, 34, 112, 97, 114, 116, 105, 116, 105, 111, 110, 95, 105, 100, 34, 58,
+                49, 44, 34, 114, 101, 112, 108, 105, 99, 97, 115, 34, 58, 91, 49, 93, 125, 93, 125,
+            ]
+        );
+        assert_eq!(
+            v3,
+            vec![
+                72, 84, 65, 80, 67, 65, 84, 49, 3, 0, 86, 2, 0, 0, 11, 97, 133, 107, 123, 34, 103,
+                101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34, 97, 99, 99, 111,
+                117, 110, 116, 115, 34, 58, 91, 93, 44, 34, 103, 114, 97, 110, 116, 115, 34, 58,
+                91, 93, 44, 34, 97, 99, 99, 111, 117, 110, 116, 115, 95, 105, 110, 105, 116, 105,
+                97, 108, 105, 122, 101, 100, 34, 58, 102, 97, 108, 115, 101, 44, 34, 116, 97, 98,
+                108, 101, 115, 34, 58, 91, 123, 34, 105, 100, 34, 58, 49, 44, 34, 110, 97, 109,
+                101, 34, 58, 34, 116, 101, 115, 116, 95, 116, 97, 98, 108, 101, 34, 44, 34, 115,
+                99, 104, 101, 109, 97, 34, 58, 123, 34, 99, 111, 108, 117, 109, 110, 115, 34, 58,
+                91, 123, 34, 110, 97, 109, 101, 34, 58, 34, 107, 34, 44, 34, 100, 97, 116, 97, 95,
+                116, 121, 112, 101, 34, 58, 34, 73, 110, 116, 54, 52, 34, 44, 34, 110, 117, 108,
+                108, 97, 98, 108, 101, 34, 58, 102, 97, 108, 115, 101, 44, 34, 112, 114, 105, 109,
+                97, 114, 121, 95, 107, 101, 121, 34, 58, 116, 114, 117, 101, 125, 93, 125, 44, 34,
+                112, 114, 105, 109, 97, 114, 121, 95, 107, 101, 121, 34, 58, 91, 48, 93, 44, 34,
+                112, 97, 114, 116, 105, 116, 105, 111, 110, 115, 34, 58, 91, 49, 93, 44, 34, 103,
+                101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 125, 93, 44, 34, 112, 97,
+                114, 116, 105, 116, 105, 111, 110, 115, 34, 58, 91, 123, 34, 105, 100, 34, 58, 49,
+                44, 34, 116, 97, 98, 108, 101, 95, 105, 100, 34, 58, 49, 44, 34, 110, 97, 109, 101,
+                34, 58, 34, 112, 48, 34, 44, 34, 115, 116, 111, 114, 97, 103, 101, 34, 58, 34, 82,
+                111, 119, 34, 44, 34, 116, 97, 98, 108, 101, 116, 115, 34, 58, 91, 49, 93, 44, 34,
+                103, 101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 125, 93, 44, 34, 116,
+                97, 98, 108, 101, 116, 115, 34, 58, 91, 123, 34, 105, 100, 34, 58, 49, 44, 34, 112,
+                97, 114, 116, 105, 116, 105, 111, 110, 95, 105, 100, 34, 58, 49, 44, 34, 98, 117,
+                99, 107, 101, 116, 34, 58, 48, 44, 34, 114, 101, 112, 108, 105, 99, 97, 115, 34,
+                58, 91, 49, 93, 44, 34, 103, 101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58,
+                49, 125, 93, 44, 34, 114, 101, 112, 108, 105, 99, 97, 115, 34, 58, 91, 123, 34,
+                105, 100, 34, 58, 49, 44, 34, 116, 97, 98, 108, 101, 116, 95, 105, 100, 34, 58, 49,
+                44, 34, 110, 111, 100, 101, 95, 105, 100, 34, 58, 49, 44, 34, 105, 115, 95, 108,
+                101, 97, 100, 101, 114, 34, 58, 116, 114, 117, 101, 44, 34, 104, 101, 97, 108, 116,
+                104, 121, 34, 58, 116, 114, 117, 101, 44, 34, 103, 101, 110, 101, 114, 97, 116,
+                105, 111, 110, 34, 58, 49, 125, 93, 44, 34, 105, 100, 95, 104, 105, 103, 104, 95,
+                119, 97, 116, 101, 114, 34, 58, 123, 34, 97, 99, 99, 111, 117, 110, 116, 34, 58,
+                48, 44, 34, 116, 97, 98, 108, 101, 34, 58, 48, 44, 34, 112, 97, 114, 116, 105, 116,
+                105, 111, 110, 34, 58, 48, 44, 34, 116, 97, 98, 108, 101, 116, 34, 58, 48, 44, 34,
+                114, 101, 112, 108, 105, 99, 97, 34, 58, 48, 125, 125,
+            ]
+        );
+
+        assert_eq!(
+            decode_snapshot(&v1).unwrap().generation,
+            snapshot.generation
+        );
+        assert_eq!(
+            decode_snapshot(&v2).unwrap().generation,
+            snapshot.generation
+        );
+        assert_eq!(decode_snapshot(&v3).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn catalog_envelope_bad_magic_and_oversized() {
+        let mut bad_magic = encode_snapshot(&test_snapshot()).unwrap();
+        bad_magic[0] ^= 0xff;
+        bad_magic[10..14].copy_from_slice(&(MAX_CATALOG_PAYLOAD_BYTES + 1).to_le_bytes());
+        let err = decode_snapshot(&bad_magic).expect_err("bad magic must fail");
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: invalid catalog header magic"
+        );
+
+        let mut oversized = vec![0; HEADER_LEN];
+        oversized[..8].copy_from_slice(HEADER_MAGIC);
+        oversized[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        oversized[10..14].copy_from_slice(&(MAX_CATALOG_PAYLOAD_BYTES + 1).to_le_bytes());
+        let err = decode_snapshot(&oversized).expect_err("oversized payload must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Corruption error: catalog payload length {} exceeds maximum limit {}",
+                MAX_CATALOG_PAYLOAD_BYTES + 1,
+                MAX_CATALOG_PAYLOAD_BYTES
+            )
+        );
+    }
+
+    #[test]
+    fn catalog_envelope_bad_version_and_crc() {
+        let mut bad_version = encode_snapshot(&test_snapshot()).unwrap();
+        bad_version[8..10].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+        bad_version[14] ^= 0xff;
+        let err = decode_snapshot(&bad_version).expect_err("unsupported version must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Corruption error: unsupported catalog format version: {}",
+                FORMAT_VERSION + 1
+            )
+        );
+
+        let mut bad_crc = encode_snapshot(&test_snapshot()).unwrap();
+        bad_crc[14] ^= 0xff;
+        let err = decode_snapshot(&bad_crc).expect_err("bad CRC must fail");
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: catalog checksum mismatch: expected 0x6b8561f4, got 0x6b85610b"
+        );
+    }
+
+    #[test]
+    fn catalog_envelope_size_check_truncated() {
+        let mut bytes = encode_snapshot(&test_snapshot()).unwrap();
+        let expected = bytes.len();
+        bytes.pop();
+        let found = bytes.len();
+        let err = decode_snapshot(&bytes).expect_err("truncated envelope must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Corruption error: truncated catalog file: expected {expected} bytes, found {found}"
+            )
+        );
+    }
+
+    #[test]
+    fn catalog_envelope_size_check_trailing() {
+        let mut bytes = encode_snapshot(&test_snapshot()).unwrap();
+        bytes.push(0);
+        let err = decode_snapshot(&bytes).expect_err("trailing byte must fail");
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: catalog file has 1 trailing leftover bytes"
+        );
     }
 }

@@ -50,9 +50,10 @@
 //! 3. Atomic rename of `MANIFEST.tmp` to `MANIFEST`.
 //! 4. Fsync the parent directory.
 
-use std::io::{Read, Write};
 use std::path::Path;
 
+use htap_common::envelope::{decode_envelope, encode_envelope, SizeCheckMode};
+use htap_common::fs::{atomic_publish, read_file_exact_bounded_from_file};
 use htap_common::{HtapError, Result, Version};
 
 use crate::sst::SstMetadata;
@@ -204,15 +205,7 @@ impl Manifest {
                 "manifest payload length {payload_len} exceeds maximum {MAX_MANIFEST_PAYLOAD_BYTES}"
             )));
         }
-        let crc = crc32c::crc32c(&payload);
-
-        let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
-        buf.extend_from_slice(HEADER_MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION_V2.to_le_bytes());
-        buf.extend_from_slice(&payload_len.to_le_bytes());
-        buf.extend_from_slice(&crc.to_le_bytes());
-        buf.extend_from_slice(&payload);
-        Ok(buf)
+        Ok(encode_envelope(HEADER_MAGIC, FORMAT_VERSION_V2, &payload))
     }
 
     /// Encode the manifest to bytes in legacy format v1 (SST sequence only, no external ledger).
@@ -236,64 +229,51 @@ impl Manifest {
             }
         }
 
-        let payload_len = payload.len() as u32;
-        let crc = crc32c::crc32c(&payload);
-
-        let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
-        buf.extend_from_slice(HEADER_MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
-        buf.extend_from_slice(&payload_len.to_le_bytes());
-        buf.extend_from_slice(&crc.to_le_bytes());
-        buf.extend_from_slice(&payload);
-        buf
+        encode_envelope(HEADER_MAGIC, FORMAT_VERSION_V1, &payload)
     }
 
     /// Decode a manifest from serialized bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_LEN {
-            return Err(HtapError::Corruption(format!(
-                "manifest too short: {} bytes (minimum {HEADER_LEN})",
-                bytes.len()
-            )));
-        }
+        let (version, payload) = decode_envelope(
+            bytes,
+            HEADER_MAGIC,
+            FORMAT_VERSION_V1..=FORMAT_VERSION_V2,
+            MAX_MANIFEST_PAYLOAD_BYTES,
+            SizeCheckMode::ExactMatch,
+        )
+        .map_err(|err| {
+            use htap_common::envelope::EnvelopeError;
 
-        if &bytes[0..8] != HEADER_MAGIC {
-            return Err(HtapError::Corruption(
-                "invalid manifest magic header".into(),
-            ));
-        }
-
-        let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-        if version != FORMAT_VERSION_V1 && version != FORMAT_VERSION_V2 {
-            return Err(HtapError::Corruption(format!(
-                "unsupported manifest format version: {version}"
-            )));
-        }
-
-        let payload_len = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
-        let expected_crc = u32::from_le_bytes(bytes[14..18].try_into().unwrap());
-
-        if payload_len > MAX_MANIFEST_PAYLOAD_BYTES {
-            return Err(HtapError::Corruption(format!(
-                "manifest payload length {payload_len} exceeds maximum {MAX_MANIFEST_PAYLOAD_BYTES}"
-            )));
-        }
-
-        let total_expected = HEADER_LEN + payload_len as usize;
-        if bytes.len() != total_expected {
-            return Err(HtapError::Corruption(format!(
-                "manifest size mismatch: expected {total_expected} bytes, got {}",
-                bytes.len()
-            )));
-        }
-
-        let payload = &bytes[HEADER_LEN..total_expected];
-        let actual_crc = crc32c::crc32c(payload);
-        if actual_crc != expected_crc {
-            return Err(HtapError::Corruption(format!(
-                "manifest CRC mismatch: expected {expected_crc:#010x}, calculated {actual_crc:#010x}"
-            )));
-        }
+            let message = match err {
+                EnvelopeError::TooSmall { found, min } => {
+                    format!("manifest too short: {found} bytes (minimum {min})")
+                }
+                EnvelopeError::BadMagic => "invalid manifest magic header".into(),
+                EnvelopeError::UnsupportedVersion(version) => {
+                    format!("unsupported manifest format version: {version}")
+                }
+                EnvelopeError::PayloadTooLarge { len, max } => {
+                    format!("manifest payload length {len} exceeds maximum {max}")
+                }
+                EnvelopeError::SizeMismatch { expected, found }
+                | EnvelopeError::Truncated { expected, found } => {
+                    format!("manifest size mismatch: expected {expected} bytes, got {found}")
+                }
+                EnvelopeError::TrailingBytes { extra } => {
+                    let expected = bytes.len() - extra;
+                    format!(
+                        "manifest size mismatch: expected {expected} bytes, got {}",
+                        bytes.len()
+                    )
+                }
+                EnvelopeError::ChecksumMismatch { expected, actual } => {
+                    format!(
+                        "manifest CRC mismatch: expected {expected:#010x}, calculated {actual:#010x}"
+                    )
+                }
+            };
+            HtapError::Corruption(message)
+        })?;
 
         let mut cursor = payload;
         if cursor.len() < 4 {
@@ -471,44 +451,46 @@ impl Manifest {
 
     /// Read a manifest from a file path. Returns `Ok(None)` if file does not exist.
     pub fn read_from_file(path: &Path) -> Result<Option<Self>> {
-        let mut file = match std::fs::File::open(path) {
+        let file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(HtapError::Io(e)),
         };
 
-        let meta = file.metadata()?;
-        let len = meta.len();
-        let max_allowed = (HEADER_LEN as u64) + (MAX_MANIFEST_PAYLOAD_BYTES as u64);
-        if len > max_allowed {
-            return Err(HtapError::Corruption(format!(
-                "manifest file size {len} exceeds maximum allowed {max_allowed}"
-            )));
-        }
+        let len = file.metadata()?.len();
         if len < HEADER_LEN as u64 {
             return Err(HtapError::Corruption(format!(
                 "manifest file too short: {len} bytes (minimum {HEADER_LEN})"
             )));
         }
-
-        let mut bytes = vec![0u8; len as usize];
-        file.read_exact(&mut bytes).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                HtapError::Corruption(format!(
-                    "manifest file short read: expected {len} bytes, encountered EOF"
-                ))
-            } else {
-                HtapError::Io(e)
-            }
-        })?;
-
-        let mut trailing = [0u8; 1];
-        let n = file.read(&mut trailing)?;
-        if n != 0 {
-            return Err(HtapError::Corruption(
-                "manifest file has trailing content beyond metadata length".into(),
-            ));
-        }
+        let max_allowed = (HEADER_LEN as u64) + (MAX_MANIFEST_PAYLOAD_BYTES as u64);
+        let bytes = read_file_exact_bounded_from_file(file, path, max_allowed as usize).map_err(
+            |err| match err {
+                HtapError::Corruption(message)
+                    if message
+                        == format!(
+                            "file size {len} for '{}' exceeds maximum allowed bound {max_allowed}",
+                            path.display()
+                        ) =>
+                {
+                    HtapError::Corruption(format!(
+                        "manifest file size {len} exceeds maximum allowed {max_allowed}"
+                    ))
+                }
+                HtapError::Corruption(message)
+                    if message
+                        == format!(
+                            "file '{}' truncated while reading: expected {len} bytes, encountered EOF",
+                            path.display()
+                        ) =>
+                {
+                    HtapError::Corruption(format!(
+                        "manifest file short read: expected {len} bytes, encountered EOF"
+                    ))
+                }
+                other => other,
+            },
+        )?;
 
         let manifest = Self::decode(&bytes)?;
         Ok(Some(manifest))
@@ -516,34 +498,9 @@ impl Manifest {
 
     /// Atomically publish the manifest: write `dir/MANIFEST.tmp` -> fsync -> rename -> fsync `dir`.
     pub fn atomic_publish(dir: &Path, manifest: &Manifest) -> Result<()> {
-        let tmp_path = dir.join("MANIFEST.tmp");
-        let final_path = dir.join("MANIFEST");
-
         let encoded = manifest.encode()?;
-        {
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(&encoded)?;
-            file.sync_all()?;
-        }
-
-        std::fs::rename(&tmp_path, &final_path)?;
-        sync_dir(dir)?;
-        Ok(())
+        atomic_publish(dir, "MANIFEST.tmp", "MANIFEST", &encoded, None, false)
     }
-}
-
-/// Fsync a directory to ensure metadata operations like renames are durable.
-pub fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let f = std::fs::File::open(path)?;
-        f.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -912,5 +869,133 @@ mod tests {
 
         let err = Manifest::read_from_file(&path).unwrap_err();
         assert!(matches!(err, HtapError::Corruption(_)));
+    }
+
+    #[test]
+    fn test_manifest_v1_golden_bytes() {
+        let manifest = Manifest::new();
+        let bytes = manifest.encode_v1();
+        assert_eq!(
+            bytes,
+            [72, 84, 65, 80, 77, 65, 78, 49, 1, 0, 4, 0, 0, 0, 199, 75, 103, 72, 0, 0, 0, 0,]
+        );
+    }
+
+    #[test]
+    fn test_manifest_v2_golden_bytes() {
+        let manifest = Manifest::new();
+        let bytes = manifest.encode().unwrap();
+        assert_eq!(
+            bytes,
+            [
+                72, 84, 65, 80, 77, 65, 78, 49, 2, 0, 8, 0, 0, 0, 138, 178, 40, 140, 0, 0, 0, 0, 0,
+                0, 0, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_manifest_v1_bad_magic_and_oversized() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"BADMAGIC");
+        bytes.extend_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let bad_magic = Manifest::decode(&bytes).unwrap_err();
+        assert_eq!(
+            bad_magic.to_string(),
+            "Corruption error: invalid manifest magic header"
+        );
+
+        bytes[..8].copy_from_slice(HEADER_MAGIC);
+        let oversized = Manifest::decode(&bytes).unwrap_err();
+        assert_eq!(
+            oversized.to_string(),
+            format!(
+                "Corruption error: manifest payload length {} exceeds maximum {}",
+                u32::MAX,
+                MAX_MANIFEST_PAYLOAD_BYTES
+            )
+        );
+    }
+
+    #[test]
+    fn test_manifest_v1_bad_version_and_crc() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(HEADER_MAGIC);
+        bytes.extend_from_slice(&99u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let bad_version = Manifest::decode(&bytes).unwrap_err();
+        assert_eq!(
+            bad_version.to_string(),
+            "Corruption error: unsupported manifest format version: 99"
+        );
+
+        bytes[8..10].copy_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
+        bytes[10..14].copy_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let bad_crc = Manifest::decode(&bytes).unwrap_err();
+        assert_eq!(
+            bad_crc.to_string(),
+            format!(
+                "Corruption error: manifest CRC mismatch: expected {:#010x}, calculated {:#010x}",
+                0,
+                crc32c::crc32c(&0u32.to_le_bytes())
+            )
+        );
+    }
+
+    #[test]
+    fn test_manifest_v1_size_check_truncated() {
+        let payload = 0u32.to_le_bytes();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(HEADER_MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload[..payload.len() - 1]);
+
+        let err = Manifest::decode(&bytes).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: manifest size mismatch: expected 22 bytes, got 21"
+        );
+    }
+
+    #[test]
+    fn test_manifest_v1_size_check_trailing() {
+        let payload = 0u32.to_le_bytes();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(HEADER_MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.push(0);
+
+        let err = Manifest::decode(&bytes).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: manifest size mismatch: expected 22 bytes, got 23"
+        );
+    }
+
+    #[test]
+    fn test_manifest_read_from_file_reports_trailing_probe_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let mut bytes = Manifest::new().encode().unwrap();
+        bytes.push(0xff);
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = Manifest::read_from_file(&path).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: manifest size mismatch: expected 26 bytes, got 27"
+        );
     }
 }

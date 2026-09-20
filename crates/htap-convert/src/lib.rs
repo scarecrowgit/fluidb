@@ -8,8 +8,6 @@
 #![warn(missing_docs)]
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,6 +19,8 @@ use htap_catalog::{
 pub use htap_catalog::{MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS};
 use htap_colstore::{validate_segment_schema, ScanRequest, SegmentReader, SegmentWriter};
 pub use htap_colstore::{Predicate, ScanStats, SegmentOptions};
+use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::atomic_publish;
 use htap_common::{
     encode_key, read_file_exact_bounded, HtapError, Result, Row, Schema, Value, Version,
 };
@@ -380,16 +380,7 @@ pub fn validate_segment_path(path_str: &str) -> Result<()> {
 
 /// Fsync a directory to ensure metadata operations like renames are durable.
 pub fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let f = std::fs::File::open(path)?;
-        f.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    htap_common::fs::sync_dir(path)
 }
 
 /// Resolves the tablet-specific directory inside `root_dir`.
@@ -579,72 +570,53 @@ impl TabletColumnManifest {
             )));
         }
 
-        let payload_len = payload.len() as u32;
-        let checksum = crc32c::crc32c(&payload);
-
-        let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
-        buf.extend_from_slice(HEADER_MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&payload_len.to_le_bytes());
-        buf.extend_from_slice(&checksum.to_le_bytes());
-        buf.extend_from_slice(&payload);
-
-        Ok(buf)
+        Ok(encode_envelope(HEADER_MAGIC, FORMAT_VERSION, &payload))
     }
 
     /// Decode and validate a manifest from binary envelope bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_LEN {
-            return Err(HtapError::Corruption(format!(
-                "manifest too short: {} bytes (minimum {HEADER_LEN})",
-                bytes.len()
-            )));
-        }
-
-        if &bytes[0..8] != HEADER_MAGIC {
-            return Err(HtapError::Corruption(
-                "invalid manifest magic header".into(),
-            ));
-        }
-
-        let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-        if version != FORMAT_VERSION {
-            return Err(HtapError::Corruption(format!(
-                "unsupported manifest format version: {version}"
-            )));
-        }
-
-        let payload_len = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
-        let expected_crc = u32::from_le_bytes(bytes[14..18].try_into().unwrap());
-
-        if payload_len > MAX_MANIFEST_PAYLOAD_BYTES {
-            return Err(HtapError::Corruption(format!(
-                "manifest payload length {payload_len} exceeds maximum {MAX_MANIFEST_PAYLOAD_BYTES}"
-            )));
-        }
-
-        let expected_total = HEADER_LEN + payload_len as usize;
-        if bytes.len() < expected_total {
-            return Err(HtapError::Corruption(format!(
-                "truncated manifest file: expected {expected_total} bytes, found {}",
-                bytes.len()
-            )));
-        }
-
-        if bytes.len() > expected_total {
-            return Err(HtapError::Corruption(format!(
-                "manifest file has {} trailing leftover bytes",
-                bytes.len() - expected_total
-            )));
-        }
-
-        let payload = &bytes[HEADER_LEN..expected_total];
-        let computed_crc = crc32c::crc32c(payload);
-        if computed_crc != expected_crc {
-            return Err(HtapError::Corruption(format!(
-                "manifest checksum mismatch: expected {expected_crc:#010x}, got {computed_crc:#010x}"
-            )));
-        }
+        let (_, payload) = decode_envelope(
+            bytes,
+            HEADER_MAGIC,
+            FORMAT_VERSION..=FORMAT_VERSION,
+            MAX_MANIFEST_PAYLOAD_BYTES,
+            SizeCheckMode::TruncatedThenTrailing,
+        )
+        .map_err(|err| {
+            let message = match err {
+                EnvelopeError::TooSmall { found, min } => {
+                    format!("manifest too short: {found} bytes (minimum {min})")
+                }
+                EnvelopeError::BadMagic => "invalid manifest magic header".into(),
+                EnvelopeError::UnsupportedVersion(version) => {
+                    format!("unsupported manifest format version: {version}")
+                }
+                EnvelopeError::PayloadTooLarge { len, max } => {
+                    format!("manifest payload length {len} exceeds maximum {max}")
+                }
+                EnvelopeError::Truncated { expected, found } => {
+                    format!("truncated manifest file: expected {expected} bytes, found {found}")
+                }
+                EnvelopeError::TrailingBytes { extra } => {
+                    format!("manifest file has {extra} trailing leftover bytes")
+                }
+                EnvelopeError::SizeMismatch { expected, found } if found < expected => {
+                    format!("truncated manifest file: expected {expected} bytes, found {found}")
+                }
+                EnvelopeError::SizeMismatch { expected, found } => {
+                    format!(
+                        "manifest file has {} trailing leftover bytes",
+                        found - expected
+                    )
+                }
+                EnvelopeError::ChecksumMismatch { expected, actual } => {
+                    format!(
+                        "manifest checksum mismatch: expected {expected:#010x}, got {actual:#010x}"
+                    )
+                }
+            };
+            HtapError::Corruption(message)
+        })?;
 
         let manifest: TabletColumnManifest = serde_json::from_slice(payload)
             .map_err(|e| HtapError::Corruption(format!("failed to parse manifest JSON: {e}")))?;
@@ -717,18 +689,15 @@ pub fn write_atomic(root_dir: &Path, manifest: &TabletColumnManifest) -> Result<
     let t_dir = tablet_dir(root_dir, manifest.tablet_id);
     std::fs::create_dir_all(&t_dir)?;
 
-    let tmp_path = t_dir.join(MANIFEST_TMP_FILE_NAME);
-    let final_path = t_dir.join(MANIFEST_FILE_NAME);
-
     let bytes = manifest.encode()?;
-    {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-
-    std::fs::rename(&tmp_path, &final_path)?;
-    sync_dir(&t_dir)?;
+    atomic_publish(
+        &t_dir,
+        MANIFEST_TMP_FILE_NAME,
+        MANIFEST_FILE_NAME,
+        &bytes,
+        None,
+        false,
+    )?;
     sync_dir(root_dir)?;
     Ok(())
 }
@@ -853,10 +822,7 @@ pub fn write_segment(
     };
 
     // 2. Explicitly fsync the written tmp file
-    {
-        let file = std::fs::File::open(&tmp_path)?;
-        file.sync_all()?;
-    }
+    htap_common::fs::fsync_file(&tmp_path)?;
 
     // 3. Rename tmp to final
     std::fs::rename(&tmp_path, &final_path)?;
@@ -2774,4 +2740,200 @@ impl LocalConverter {
 /// Module providing re-exports matching module path conventions.
 pub mod manifest {
     pub use super::*;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope(
+        magic: &[u8; 8],
+        version: u16,
+        declared_payload_len: u32,
+        checksum: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+        bytes.extend_from_slice(magic);
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&declared_payload_len.to_le_bytes());
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn corruption_message(result: Result<TabletColumnManifest>) -> String {
+        match result {
+            Err(HtapError::Corruption(message)) => message,
+            Err(other) => panic!("expected corruption error, got {other}"),
+            Ok(_) => panic!("expected manifest decoding to fail"),
+        }
+    }
+
+    #[test]
+    fn htaptbm1_rejects_invalid_magic() {
+        let payload = b"{}";
+        let bytes = envelope(
+            b"NOTTBM01",
+            FORMAT_VERSION,
+            payload.len() as u32,
+            crc32c::crc32c(payload),
+            payload,
+        );
+
+        let message = corruption_message(TabletColumnManifest::decode(&bytes));
+        assert!(message.contains("invalid manifest magic header"));
+    }
+
+    #[test]
+    fn htaptbm1_rejects_unsupported_format_version() {
+        let payload = b"{}";
+        let bytes = envelope(
+            HEADER_MAGIC,
+            FORMAT_VERSION + 1,
+            payload.len() as u32,
+            crc32c::crc32c(payload),
+            payload,
+        );
+
+        let message = corruption_message(TabletColumnManifest::decode(&bytes));
+        assert!(message.contains("unsupported manifest format version"));
+    }
+
+    #[test]
+    fn htaptbm1_rejects_truncated_payload() {
+        let payload = b"{}";
+        let bytes = envelope(
+            HEADER_MAGIC,
+            FORMAT_VERSION,
+            payload.len() as u32 + 1,
+            crc32c::crc32c(payload),
+            payload,
+        );
+
+        let message = corruption_message(TabletColumnManifest::decode(&bytes));
+        assert!(message.contains("truncated manifest file"));
+    }
+
+    #[test]
+    fn htaptbm1_rejects_trailing_bytes() {
+        let payload = b"{}x";
+        let declared_payload = &payload[..2];
+        let bytes = envelope(
+            HEADER_MAGIC,
+            FORMAT_VERSION,
+            declared_payload.len() as u32,
+            crc32c::crc32c(declared_payload),
+            payload,
+        );
+
+        let message = corruption_message(TabletColumnManifest::decode(&bytes));
+        assert!(message.contains("trailing leftover bytes"));
+    }
+
+    #[test]
+    fn htaptbm1_rejects_checksum_mismatch() {
+        let payload = b"{}";
+        let bytes = envelope(
+            HEADER_MAGIC,
+            FORMAT_VERSION,
+            payload.len() as u32,
+            crc32c::crc32c(payload) ^ u32::MAX,
+            payload,
+        );
+
+        let message = corruption_message(TabletColumnManifest::decode(&bytes));
+        assert!(message.contains("manifest checksum mismatch"));
+    }
+
+    #[test]
+    fn test_tablet_column_manifest_golden_bytes() {
+        use htap_common::ColumnDef;
+
+        let manifest = TabletColumnManifest::new(
+            1,
+            TabletId::new(1),
+            Schema::new(vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: htap_common::DataType::Int64,
+                nullable: false,
+                primary_key: true,
+            }])
+            .unwrap(),
+            Version::new(1),
+            Vec::new(),
+        );
+
+        let bytes = manifest.encode().expect("manifest should encode");
+        assert_eq!(
+            bytes.as_slice(),
+            &[
+                72, 84, 65, 80, 84, 66, 77, 49, 1, 0, 154, 0, 0, 0, 98, 177, 29, 175, 123, 34, 103,
+                101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34, 116, 97, 98, 108,
+                101, 116, 95, 105, 100, 34, 58, 49, 44, 34, 115, 99, 104, 101, 109, 97, 34, 58,
+                123, 34, 99, 111, 108, 117, 109, 110, 115, 34, 58, 91, 123, 34, 110, 97, 109, 101,
+                34, 58, 34, 105, 100, 34, 44, 34, 100, 97, 116, 97, 95, 116, 121, 112, 101, 34, 58,
+                34, 73, 110, 116, 54, 52, 34, 44, 34, 110, 117, 108, 108, 97, 98, 108, 101, 34, 58,
+                102, 97, 108, 115, 101, 44, 34, 112, 114, 105, 109, 97, 114, 121, 95, 107, 101,
+                121, 34, 58, 116, 114, 117, 101, 125, 93, 125, 44, 34, 98, 97, 115, 101, 95, 118,
+                101, 114, 115, 105, 111, 110, 34, 58, 49, 44, 34, 115, 101, 103, 109, 101, 110,
+                116, 115, 34, 58, 91, 93, 125,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tablet_column_manifest_bad_magic_and_oversized() {
+        let bad_magic = envelope(
+            b"NOTTBM01",
+            FORMAT_VERSION,
+            MAX_MANIFEST_PAYLOAD_BYTES + 1,
+            0,
+            &[],
+        );
+        assert_eq!(
+            corruption_message(TabletColumnManifest::decode(&bad_magic)),
+            "invalid manifest magic header"
+        );
+
+        let oversized = envelope(
+            HEADER_MAGIC,
+            FORMAT_VERSION,
+            MAX_MANIFEST_PAYLOAD_BYTES + 1,
+            0,
+            &[],
+        );
+        assert_eq!(
+            corruption_message(TabletColumnManifest::decode(&oversized)),
+            "manifest payload length 67108865 exceeds maximum 67108864"
+        );
+    }
+
+    #[test]
+    fn test_tablet_column_manifest_bad_version_and_crc() {
+        let payload = b"{}";
+        let bad_version = envelope(
+            HEADER_MAGIC,
+            FORMAT_VERSION + 1,
+            payload.len() as u32,
+            crc32c::crc32c(payload),
+            payload,
+        );
+        assert_eq!(
+            corruption_message(TabletColumnManifest::decode(&bad_version)),
+            "unsupported manifest format version: 2"
+        );
+
+        let bad_crc = envelope(
+            HEADER_MAGIC,
+            FORMAT_VERSION,
+            payload.len() as u32,
+            crc32c::crc32c(payload) ^ u32::MAX,
+            payload,
+        );
+        assert_eq!(
+            corruption_message(TabletColumnManifest::decode(&bad_crc)),
+            "manifest checksum mismatch: expected 0xd6842f55, got 0x297bd0aa"
+        );
+    }
 }

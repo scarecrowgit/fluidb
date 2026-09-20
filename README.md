@@ -405,7 +405,7 @@ The workspace consists of 14 modular crates (plus the vendored `vendor/sqlparser
 
 | Crate | Role & Status |
 | ----- | ------------- |
-| `crates/htap-common` | Common types (`Value`, `Row`, `Schema`, `Mutation`), MVCC `Version`, `FencingToken`, key encoding/decoding, and error models. |
+| `crates/htap-common` | Common types (`Value`, `Row`, `Schema`, `Mutation`), MVCC `Version`, `FencingToken`, key encoding/decoding, error models, and the shared durability module (`fs::{sync_dir, atomic_publish, ...}`, `envelope::{encode_envelope, decode_envelope, ...}`, `bytecursor::ByteReader`) used by every crate below that publishes a durable file. |
 | `crates/htap-rowstore` | LSM-tree rowstore engine with WAL, memtable, immutable SSTables, block index, Bloom filter, CRC checks, and snapshot isolation. |
 | `crates/htap-colstore` | Columnar storage engine with binary segment layout, dictionary/plain encoding, optional zstd compression, and zone-map block pruning. |
 | `crates/htap-catalog` | Durable local catalog store (`LocalCatalogStore`) persisting versioned schema, table, partition, and tablet topology snapshots. |

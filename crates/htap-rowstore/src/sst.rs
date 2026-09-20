@@ -898,45 +898,36 @@ fn encode_entry(entry: &MemtableEntry) -> Result<Vec<u8>> {
 
 /// Decode a single entry from a byte cursor.
 fn decode_entry(cursor: &mut &[u8]) -> Result<MemtableEntry> {
-    if cursor.len() < 8 + 4 {
-        return Err(HtapError::Corruption(
-            "unexpected end of entry buffer".into(),
-        ));
-    }
-    let partition_id = u64::from_le_bytes(cursor[..8].try_into().unwrap());
-    let user_key_len = u32::from_le_bytes(cursor[8..12].try_into().unwrap()) as usize;
-    *cursor = &cursor[12..];
+    let input = *cursor;
+    let mut reader = htap_common::bytecursor::ByteReader::new(input);
+    let entry_eof = || HtapError::Corruption("unexpected end of entry buffer".into());
+
+    let partition_id = reader.read_u64_le().map_err(|_| entry_eof())?;
+    let user_key_len = reader.read_u32_le().map_err(|_| entry_eof())? as usize;
 
     if user_key_len as u32 > MAX_USER_KEY_BYTES {
         return Err(HtapError::Corruption(format!(
             "user key length {user_key_len} exceeds maximum {MAX_USER_KEY_BYTES}"
         )));
     }
-    if cursor.len() < user_key_len + 8 + 1 + 4 {
-        return Err(HtapError::Corruption(
-            "unexpected end of entry buffer".into(),
-        ));
-    }
-    let user_key = cursor[..user_key_len].to_vec();
-    *cursor = &cursor[user_key_len..];
 
-    let version = Version::new(u64::from_le_bytes(cursor[..8].try_into().unwrap()));
-    let kind_byte = cursor[8];
-    let row_json_len = u32::from_le_bytes(cursor[9..13].try_into().unwrap()) as usize;
-    *cursor = &cursor[13..];
+    let user_key = reader
+        .read_bytes(user_key_len)
+        .map_err(|_| entry_eof())?
+        .to_vec();
+    let version = Version::new(reader.read_u64_le().map_err(|_| entry_eof())?);
+    let kind_byte = reader.read_u8().map_err(|_| entry_eof())?;
+    let row_json_len = reader.read_u32_le().map_err(|_| entry_eof())? as usize;
 
     if row_json_len as u32 > MAX_ROW_JSON_BYTES {
         return Err(HtapError::Corruption(format!(
             "row JSON length {row_json_len} exceeds maximum {MAX_ROW_JSON_BYTES}"
         )));
     }
-    if cursor.len() < row_json_len {
-        return Err(HtapError::Corruption(
-            "unexpected end of entry buffer for row JSON".into(),
-        ));
-    }
-    let row_json = &cursor[..row_json_len];
-    *cursor = &cursor[row_json_len..];
+
+    let row_json = reader
+        .read_bytes(row_json_len)
+        .map_err(|_| HtapError::Corruption("unexpected end of entry buffer for row JSON".into()))?;
 
     let value = match kind_byte {
         0 => {
@@ -959,6 +950,8 @@ fn decode_entry(cursor: &mut &[u8]) -> Result<MemtableEntry> {
         }
     };
 
+    *cursor = &input[reader.position()..];
+
     Ok(MemtableEntry {
         key: InternalKey {
             partition_id,
@@ -971,13 +964,12 @@ fn decode_entry(cursor: &mut &[u8]) -> Result<MemtableEntry> {
 
 /// Decode all entries from a block's payload bytes.
 fn decode_block_payload(payload: &[u8]) -> Result<Vec<MemtableEntry>> {
-    if payload.len() < 4 {
-        return Err(HtapError::Corruption(
-            "block payload too short for entry count".into(),
-        ));
-    }
-    let entry_count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-    let mut cursor = &payload[4..];
+    let mut reader = htap_common::bytecursor::ByteReader::new(payload);
+    let entry_count = reader
+        .read_u32_le()
+        .map_err(|_| HtapError::Corruption("block payload too short for entry count".into()))?
+        as usize;
+    let mut cursor = &payload[reader.position()..];
 
     let mut entries = Vec::with_capacity(entry_count.min(65536));
     let mut prev_key: Option<InternalKey> = None;
@@ -1011,8 +1003,10 @@ fn read_block_at(file: &mut File, block: &BlockIndexEntry) -> Result<Vec<Memtabl
     file.seek(SeekFrom::Start(block.block_offset))?;
     let mut header = [0u8; BLOCK_FRAME_HEADER_LEN];
     file.read_exact(&mut header)?;
-    let payload_len = u32::from_le_bytes(header[0..4].try_into().unwrap());
-    let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+
+    let mut reader = htap_common::bytecursor::ByteReader::new(&header);
+    let payload_len = reader.read_u32_le().expect("fixed-size block frame header");
+    let expected_crc = reader.read_u32_le().expect("fixed-size block frame header");
 
     if (BLOCK_FRAME_HEADER_LEN as u32) + payload_len != block.block_frame_len {
         return Err(HtapError::Corruption(format!(

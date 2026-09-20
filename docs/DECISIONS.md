@@ -2414,3 +2414,75 @@ Cross-references: ADR-017 (the general query executor and R5's syntactic shape g
 weakening), ADR-018 (the snapshot-pinning/self-write-visibility invariant every new write and re-execution
 path in this ADR preserves), ADR-004/008/009 (durability invariants — unaffected: no on-disk envelope, WAL
 record, or catalog format changed anywhere in this ADR).
+
+---
+
+## Note: Stage R — shared durability primitives module in `htap-common` (not a numbered ADR)
+
+`Status: Accepted`
+`Date: 2026-09-20`
+
+This is recorded as a short note rather than a numbered ADR: stage R is a pure code-organization refactor.
+It introduces no new on-disk format, no new format version, no new accepted-version set, no CRC-scope change,
+and no new durability or recovery semantics anywhere — the only in-scope question was how to remove
+duplication, not what the system's behavior should be. `docs/PROBLEMS.md` P1 already recorded the "why" (the
+same crash-safety code, hand-written seven times, has to be right seven times for the CLAUDE.md durability
+invariants to hold); this note records the "how," for a cold reader who needs to check the diff against a
+contract rather than re-derive it.
+
+**What moved.** One shared module, `htap-common::{fs, envelope, bytecursor}`:
+- `fs::{sync_dir, write_new_tmp_file, remove_file_if_exists, fsync_file, atomic_publish}` — a three-tier API
+  (bare `sync_dir`; a `write_new_tmp_file` write-and-fsync leaf; an `atomic_publish` convenience composing
+  write, rename, and directory sync for the common "one buffer, one dir sync" shape), deliberately **not** one
+  universal "publish a file" function with a growing options struct, because several call sites (the movement
+  tablet package's DATA/MANIFEST pair, `htap-convert`'s two-directory-sync `write_atomic`) have branch-specific
+  error typing and side effects (`mover.fail_job`) that a single generic wrapper would blur or erase. Those
+  sites use only the `write_new_tmp_file` leaf and keep their own rename/cleanup/dir-sync control flow.
+- `envelope::{encode_envelope, decode_envelope, encode_bare_frame, EnvelopeError, SizeCheckMode}` — one
+  magic+version+length+CRC32C codec for the six whole-file envelopes, returning a structured `EnvelopeError`
+  enum (not a formatted string) so each of the six call sites can still produce its own historical message
+  text and none of the existing message-asserting tests had to change. `SizeCheckMode` has no default: a new
+  envelope's author must pick `TruncatedThenTrailing` or `ExactMatch` explicitly rather than silently
+  inheriting one.
+- `bytecursor::ByteReader` — a bounds-checked little-endian cursor replacing hand-rolled
+  `if cursor+N > len { Corruption } else { from_le_bytes(...) }` sites in `htap-colstore` and
+  `htap-rowstore/src/sst.rs`, returning a structured error and leaving the reader's position unchanged on a
+  failed read instead of relying on `unwrap()`.
+
+**What deliberately did not move.**
+- `htap-rowstore/src/wal.rs::fsync_dir`: a sixth `sync_dir`-shaped function found during the migration audit
+  (`docs/PROBLEMS.md` P1 previously counted five). Unlike the five migrated copies, it is not `cfg(unix)`-gated
+  — it runs unconditionally on every platform. Migrating it onto the shared `sync_dir` (Unix-only real fsync,
+  silent no-op elsewhere) or unifying the other five onto its unconditional behavior would each change
+  non-Unix behavior that no test in this repository exercises. Approved by the validator as an explicit,
+  documented non-migration rather than a silent choice; a comment at its definition says so.
+- `HTAPMAN1`'s single exact-size check (`SizeCheckMode::ExactMatch`): the other five envelopes report a
+  truncated and a trailing-bytes input as two distinct messages; the rowstore manifest reports both as one
+  "size mismatch" message. `HTAPMAN1` gates WAL/SST manifest recovery, the single most crash-critical file in
+  the repository, so this stage preserved its narrower check exactly rather than unifying it onto the more
+  permissive two-message shape.
+- Stale-temp-file removal before encoding (catalog only), per-branch `HtapError`-vs-raw-`io::Error` typing
+  feeding `mover.fail_job` (movement tablet manifest), and which directory syncs are propagated versus
+  swallowed (`let _ = ...`) at each site: all are load-bearing, call-site-specific choices about what counts
+  as a hard failure on that path, not incidental duplication, so they were left untouched rather than folded
+  into a shared default.
+
+**One accepted message-text change.** `Manifest::read_from_file`'s trailing-probe error text changed, because
+delegating its bounded-read logic to the shared `read_file_exact_bounded` (which already existed and was the
+one real near-duplicate found in this audit) produces slightly different wording on that one untested
+corruption path. No test asserted the old text; a new test (`test_manifest_read_from_file_trailing_content_rejected`)
+pins the new one so it cannot silently drift again.
+
+**Consequences.** Seven crates now share one implementation of each migrated durability primitive — except the
+deliberately retained `htap-rowstore/src/wal.rs::fsync_dir`, which stays a second, non-identical directory-sync
+implementation for the reason above. A future format
+(Phase 15 journal compaction, Phase 16 multiprocess ownership) gets `atomic_publish`/`decode_envelope`/
+`ByteReader` for free instead of a new hand-rolled copy. The eventual power-loss safety audit now has one
+implementation per primitive to audit instead of five to seven. No on-disk format changed, so this note does
+not update the storage-format compatibility table's "versions accepted"/"CRC scope" columns — see the table in
+`docs/ARCHITECTURE.md` ("Dual-format storage") for the format facts themselves, and `docs/PROGRESS.md`'s
+Stage R row for the full test list.
+
+**How to reverse it.** Inline each shared function back into its call sites; every call site's own control
+flow (error typing, cleanup policy, dir-sync propagation) was preserved unchanged, so reversal is a pure
+mechanical inlining with no format or behavior consequence.

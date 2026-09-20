@@ -9,6 +9,9 @@
 //! - [`version`]: [`Version`] (MVCC) and [`FencingToken`] (leadership).
 //! - [`types`]: [`DataType`], [`Value`], [`ColumnDef`], [`Schema`], [`Row`].
 //! - [`keycodec`]: order-preserving composite key encoding.
+//! - [`fs`]: bounded I/O and durable atomic publication.
+//! - [`envelope`]: versioned CRC32-C envelope framing.
+//! - [`bytecursor`]: checked little-endian byte reads.
 //!
 //! ```
 //! use htap_common::{FencingToken, HtapError, Result, Value, Version};
@@ -31,6 +34,8 @@
 //! ```
 #![forbid(unsafe_code)]
 
+pub mod bytecursor;
+pub mod envelope;
 pub mod error;
 pub mod fs;
 pub mod keycodec;

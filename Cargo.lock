@@ -605,6 +605,7 @@ dependencies = [
 name = "htap-common"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "fs2",
  "proptest",
  "serde",

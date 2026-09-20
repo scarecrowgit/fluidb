@@ -7,7 +7,10 @@ This document describes the intended system. Every component carries a status:
 - `planned` / `deferred` — designed, not yet built in the local slice.
 
 **Current state of the repository.** The cargo workspace skeleton, `htap-common`
-(the `Version` MVCC domain, `FencingToken`, and shared error types),
+(the `Version` MVCC domain, `FencingToken`, shared error types, and — since stage R — the shared durability
+module: `fs::{sync_dir, atomic_publish, write_new_tmp_file, remove_file_if_exists, fsync_file,
+read_file_exact_bounded}`, `envelope::{encode_envelope, decode_envelope, encode_bare_frame}`, and the checked
+`bytecursor::ByteReader`, used by every crate below that publishes a durable file),
 `htap-rowstore` (WAL, memtable, SST writer/reader, and LSM row-store engine), and
 `htap-colstore` (immutable encoded/compressed segments, typed zone maps, and vectorized scans)
 are `implemented`. Phase 3 has a completed narrow local slice: sqlparser MySQL dialect,
@@ -866,6 +869,40 @@ planned/deferred.
 
 This separation preserves a unified MVCC version domain across storage formats without requiring
 distributed two-phase commit between independent version spaces (see [ADR-004](./DECISIONS.md)).
+
+### Storage-format compatibility matrix (stage R)
+
+**Status: `implemented`.** All six whole-file envelopes share one wire layout — `magic[8] |
+format_version:u16 LE | payload_len:u32 LE | crc32c:u32 LE | payload[payload_len]` — decoded and encoded
+through `htap_common::envelope::{encode_envelope, decode_envelope}` (`crates/htap-common/src/envelope.rs`).
+The WAL and the txn journal use a separate, header-less bare frame (`payload_len:u32 LE | crc32c:u32 LE |
+payload`, `encode_bare_frame`) with their own, deliberately different, recovery semantics. This table is the
+compatibility contract stage R's refactor was built to preserve byte-for-byte; every row is a runtime constant
+in the named source file, not an assertion.
+
+| Magic | Crate / file | Versions written | Versions accepted on read | CRC covers | Size-check mode | Payload cap | Truncated-tail behavior |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `HTAPCAT1` | `htap-catalog/src/local.rs` (catalog snapshot) | 3 | 1..=3 | payload only | `TruncatedThenTrailing` (two distinct errors) | 64 MiB | Rejected as `HtapError::Corruption` with a truncated- or trailing-bytes message; version 1/2 payloads missing newer fields decode via `#[serde(default)]`. |
+| `HTAPCRD1` | `htap-coord/src/lib.rs` (coordinator state) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 64 MiB | Rejected as `HtapError::Corruption`. |
+| `HTAPJOB1` | `htap-movement/src/job.rs` (movement job) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 16 MiB | Rejected as `HtapError::Corruption`. |
+| `HTAPMNF1` | `htap-movement/src/tablet.rs` (tablet package manifest) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 16 MiB | Rejected as `HtapError::Corruption`. |
+| `HTAPTBM1` | `htap-convert/src/lib.rs` (tablet column manifest) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 64 MiB | Rejected as `HtapError::Corruption`. |
+| `HTAPMAN1` | `htap-rowstore/src/manifest.rs` (rowstore manifest) | 2 (v1 legacy still written by `encode_v1`, used only in tests) | 1..=2 | payload only | **`ExactMatch`** (one "manifest size mismatch" error, no separate truncated/trailing message) | 64 MiB | Rejected as `HtapError::Corruption("manifest size mismatch: ...")`; this is the one envelope that gates WAL/SST manifest recovery and deliberately kept its stricter, single-message check instead of being unified onto the other five's two-step check. |
+| Bare frame (WAL) | `htap-rowstore/src/wal.rs::{encode_frame, read_segment}` | n/a (no magic/version) | n/a | payload only | n/a (length-vs-remaining-bytes check) | 64 MiB (`MAX_PAYLOAD_BYTES`) | `read_segment` stops at the first bad frame with no torn-vs-mid-log distinction; everything before the bad frame is kept. |
+| Bare frame (journal) | `htap-txn/src/journal.rs::{encode_frame, decode_frame_slice}` | n/a | n/a | payload only | n/a | 16 MiB default (`DEFAULT_MAX_FRAME_SIZE`, configurable via `JournalOptions::with_max_frame_size`) | Distinguishes a repairable torn final frame (`FrameStatus::TornFinal`, safe to truncate-and-repair) from mid-log corruption (`FrameStatus::Corrupt`, refused) via `has_valid_frame_ahead` look-ahead. |
+
+`htap-colstore/src/segment.rs` (`HTAPCOL1`) and `htap-rowstore/src/sst.rs` (`HTAPSST1`) are not whole-file
+envelopes in this shape (magic-only header, format version in a trailing footer, per-block framing) and were
+not migrated onto `decode_envelope`; stage R only replaced their hand-written little-endian field reads with
+`htap_common::bytecursor::ByteReader`, leaving their header/footer/block control flow untouched.
+
+`htap-rowstore/src/wal.rs::fsync_dir` is a directory-fsync helper with the same intent as the five migrated
+`sync_dir` copies but is not `cfg(unix)`-gated (unconditional on every platform); it was deliberately left
+un-migrated rather than unified onto either behavior, since non-Unix targets are untested here (see
+[`docs/PROBLEMS.md`](./PROBLEMS.md) P1).
+
+Verified against a golden-bytes test per envelope (see [`docs/PROGRESS.md`](./PROGRESS.md), Stage R row) and
+`docs/DECISIONS.md`'s stage R note.
 
 ---
 

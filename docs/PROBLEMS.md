@@ -9,29 +9,43 @@ design (ADR-004, ADR-008, ADR-009) hold up. The problems are duplicated low-leve
 paths through the query layer. Both grow with every phase, so they are fixed in a planned order (see
 [Schedule](#schedule)) rather than all at once.
 
-## P1 — Duplicated durability primitives (fix next: stage R)
+## P1 — Duplicated durability primitives (addressed: stage R)
 
-The same crash-safety building blocks are written separately in each storage crate:
+**Status: addressed.** The same crash-safety building blocks used to be written separately in each storage
+crate:
 
 | Primitive | Copies |
 |---|---|
-| `sync_dir` | `htap-catalog/src/local.rs`, `htap-coord/src/lib.rs`, `htap-movement/src/job.rs`, `htap-convert/src/lib.rs`, `htap-rowstore/src/manifest.rs` |
+| `sync_dir` | Six copies, not five as originally counted: `htap-catalog/src/local.rs`, `htap-coord/src/lib.rs`, `htap-movement/src/job.rs` (reused by `htap-movement/src/tablet.rs`), `htap-convert/src/lib.rs`, `htap-rowstore/src/manifest.rs` (reused by `htap-rowstore/src/engine.rs`) — all five byte-identical and `cfg(unix)`-gated — plus a sixth, non-identical copy, `htap-rowstore/src/wal.rs::fsync_dir`, which is unconditional (not `cfg(unix)`-gated). |
 | atomic publish (temp → `sync_all` → `rename` → `sync_dir`) | `htap-catalog/src/local.rs` (`atomic_publish`), `htap-coord/src/lib.rs` (`atomic_publish`), `htap-convert/src/lib.rs` (`write_atomic`, `write_atomic_to`), `htap-rowstore/src/manifest.rs` (`atomic_publish`) |
 | envelope framing (magic + format version + CRC32C) | about 10 files: rowstore `wal.rs`, `sst.rs`, `manifest.rs`; colstore `segment.rs`; catalog `local.rs`; txn `journal.rs`; movement `job.rs`, `tablet.rs`; coord `lib.rs`; convert `lib.rs` |
 | little-endian byte decoding with manual bounds checks | each of the files above, e.g. `htap-colstore/src/encoding.rs` and `htap-rowstore/src/sst.rs` |
 
-**Why it matters.** Every copy has to be right for the CLAUDE.md durability invariants to hold. Phase 15 (DROP
+**Why it mattered.** Every copy had to be right for the CLAUDE.md durability invariants to hold. Phase 15 (DROP
 reclaim, journal compaction) and Phase 16 (multiprocess ownership) add more durable files. The power-loss safety
-phase would have to audit every copy.
+phase would have had to audit every copy.
 
-**Fix.** Add one shared module to `htap-common` providing:
-- directory sync;
-- atomic publish of a file;
-- envelope encode/decode (magic, version, CRC32C, with explicit rejection of unknown versions);
-- a checked byte reader that returns `HtapError::Corruption` instead of slicing with `unwrap()`.
+**Fix (shipped, stage R).** Added one shared module to `htap-common` (`fs.rs`, `envelope.rs`, `bytecursor.rs`)
+providing:
+- directory sync (`sync_dir`) and atomic publish of a file (`write_new_tmp_file`, `remove_file_if_exists`,
+  `fsync_file`, `atomic_publish`);
+- envelope encode/decode (`encode_envelope`/`decode_envelope`, magic + version + CRC32C, explicit rejection of
+  unknown versions via `EnvelopeError::UnsupportedVersion`) plus a bare length+CRC frame (`encode_bare_frame`)
+  for the WAL and the txn journal;
+- a checked little-endian byte reader (`ByteReader`) that returns a structured error instead of slicing with
+  `unwrap()`.
 
-Migrate every crate to it without changing behaviour. On-disk formats must stay **byte-identical**: no magic or
-version changes, existing recovery tests unchanged and passing, plus a golden-bytes test per envelope.
+Migrated all seven crates (`htap-catalog`, `htap-coord`, `htap-movement`, `htap-convert`, `htap-rowstore`,
+`htap-txn`, `htap-colstore`) onto it with **zero on-disk byte changes and zero pre-existing test edits**: every
+existing recovery/crash test still passes unchanged, plus a golden-bytes test per envelope and per-fault-class
+error-text tests. `htap-rowstore/src/wal.rs::fsync_dir` — the sixth, non-`cfg(unix)`-gated `sync_dir` copy found
+during this stage — was deliberately **not** migrated: unlike the five identical copies, moving it in either
+direction would change untested non-Unix behavior, so it was left in place with a comment explaining why. One
+message text legitimately changed as part of this stage: `Manifest::read_from_file`'s untested trailing-probe
+error text, now produced by the shared `read_file_exact_bounded` and pinned by a new test. See
+[`docs/PROGRESS.md`](./PROGRESS.md) (Stage R row), the storage-format compatibility table in
+[`docs/ARCHITECTURE.md`](./ARCHITECTURE.md#dual-format-storage), and [`docs/DECISIONS.md`](./DECISIONS.md) for
+the full record.
 
 ## P2 — Parallel paths through the query layer (fix in Phase 14)
 
@@ -89,14 +103,14 @@ dedicated stage.
 
 | Order | Stage | Problems addressed |
 |---|---|---|
-| now | Phase 13 — SQL breadth | — |
-| **next** | **Stage R — shared durability primitives** | P1 |
-| then | Phase 14 — CBO, spill, parallelism | P2, P4 where touched |
+| done | Phase 13 — SQL breadth | — |
+| **done** | **Stage R — shared durability primitives** | P1 |
+| **next** | **Phase 14 — CBO, spill, parallelism** | P2, P4 where touched |
 | then | Phase 15 — DROP reclaim, journal compaction | P4 where touched (uses R's helpers) |
 | then | Phase 16 — multiprocess owner + IPC | P3, P4 where touched (uses R's helpers) |
 | then | Phases 17–18 — TPC-H, TPC-C | — |
 | then | Power-loss safety | audits R's single implementation |
 | then | Docker | — |
 
-Stage R follows the normal non-trivial workflow: researcher plan, validator plan gate, implementer, **storage-reviewer**,
+Stage R followed the normal non-trivial workflow: researcher plan, validator plan gate, implementer, **storage-reviewer**,
 docs-keeper, ext review, `./ci.sh`, validator diff gate.

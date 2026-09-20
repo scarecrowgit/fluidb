@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use htap_common::bytecursor::ByteReader;
 use htap_common::{HtapError, Result, Version};
 use serde::{Deserialize, Serialize};
 
@@ -215,12 +216,7 @@ pub fn encode_frame(record: &JournalRecord, max_frame_size: usize) -> Result<Vec
         )));
     }
 
-    let crc = crc32c::crc32c(&payload);
-    let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&crc.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    Ok(htap_common::envelope::encode_bare_frame(&payload))
 }
 
 /// Internal status when decoding an individual frame from bytes.
@@ -260,8 +256,9 @@ pub fn decode_frame_slice(
         };
     }
 
-    let payload_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let expected_crc = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let mut header = ByteReader::new(&data[..HEADER_SIZE]);
+    let payload_len = header.read_u32_le().expect("length-checked header") as usize;
+    let expected_crc = header.read_u32_le().expect("length-checked header");
 
     if payload_len == 0 {
         if offset + (remaining as u64) == total_len {
@@ -1055,6 +1052,22 @@ mod tests {
     }
 
     #[test]
+    fn journal_and_wal_frame_encoders_produce_identical_bytes() {
+        let payload = b"abc";
+        let record = JournalRecord::Intent {
+            txn_id: TransactionId::new(1),
+            snapshot: Version::new(2),
+            participants: vec![ParticipantWork::new(3, payload.to_vec())],
+        };
+
+        let serialized_payload = serde_json::to_vec(&record).unwrap();
+        let wal_frame = htap_common::envelope::encode_bare_frame(&serialized_payload);
+        let journal_frame = encode_frame(&record, DEFAULT_MAX_FRAME_SIZE).unwrap();
+
+        assert_eq!(journal_frame, wal_frame);
+    }
+
+    #[test]
     fn test_bounded_frames() {
         let rec = JournalRecord::Intent {
             txn_id: TransactionId::new(10),
@@ -1145,5 +1158,105 @@ mod tests {
         // Reopening with auto-repair should refuse to truncate middle corruption
         let res = Journal::open_with_options(JournalOptions::new(&path).with_auto_repair(true));
         assert!(res.is_err());
+    }
+
+    fn baseline_record() -> JournalRecord {
+        JournalRecord::Commit {
+            txn_id: TransactionId::new(7),
+            version: Version::new(9),
+        }
+    }
+
+    #[test]
+    fn journal_frame_golden_bytes() {
+        let record = baseline_record();
+        let frame = encode_frame(&record, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let expected_header: [u8; HEADER_SIZE] = [35, 0, 0, 0, 135, 62, 109, 27];
+
+        assert_eq!(&frame[..HEADER_SIZE], &expected_header);
+    }
+
+    #[test]
+    fn journal_frame_bad_magic_and_oversized() {
+        // Bare journal frames have no magic; zero length is the equivalent invalid-header case.
+        let mut bad_header = encode_frame(&baseline_record(), DEFAULT_MAX_FRAME_SIZE).unwrap();
+        bad_header[0..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            decode_frame_slice(
+                &bad_header,
+                0,
+                bad_header.len() as u64,
+                DEFAULT_MAX_FRAME_SIZE,
+            ),
+            FrameStatus::TornFinal { .. }
+        ));
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&((DEFAULT_MAX_FRAME_SIZE + 1) as u32).to_le_bytes());
+        oversized.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            decode_frame_slice(
+                &oversized,
+                0,
+                oversized.len() as u64,
+                DEFAULT_MAX_FRAME_SIZE,
+            ),
+            FrameStatus::TornFinal { .. }
+        ));
+    }
+
+    #[test]
+    fn journal_frame_bad_version_and_crc() {
+        // Bare journal frames have no version; an undecodable CRC-clean payload covers format drift.
+        let payload = b"not-a-journal-record";
+        let mut bad_format = Vec::new();
+        bad_format.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bad_format.extend_from_slice(&crc32c::crc32c(payload).to_le_bytes());
+        bad_format.extend_from_slice(payload);
+        assert!(matches!(
+            decode_frame_slice(
+                &bad_format,
+                0,
+                bad_format.len() as u64,
+                DEFAULT_MAX_FRAME_SIZE,
+            ),
+            FrameStatus::TornFinal { .. }
+        ));
+
+        let mut bad_crc = encode_frame(&baseline_record(), DEFAULT_MAX_FRAME_SIZE).unwrap();
+        bad_crc[4] ^= 0xff;
+        assert!(matches!(
+            decode_frame_slice(&bad_crc, 0, bad_crc.len() as u64, DEFAULT_MAX_FRAME_SIZE,),
+            FrameStatus::TornFinal { .. }
+        ));
+    }
+
+    #[test]
+    fn journal_frame_size_check_truncated() {
+        let mut frame = encode_frame(&baseline_record(), DEFAULT_MAX_FRAME_SIZE).unwrap();
+        frame.pop();
+        assert!(matches!(
+            decode_frame_slice(&frame, 0, frame.len() as u64, DEFAULT_MAX_FRAME_SIZE),
+            FrameStatus::TornFinal { .. }
+        ));
+    }
+
+    #[test]
+    fn journal_frame_size_check_trailing() {
+        let mut frame = encode_frame(&baseline_record(), DEFAULT_MAX_FRAME_SIZE).unwrap();
+        frame.push(0);
+        assert!(matches!(
+            decode_frame_slice(&frame, 0, frame.len() as u64, DEFAULT_MAX_FRAME_SIZE),
+            FrameStatus::Valid { .. }
+        ));
+
+        let frame_len = frame.len() - 1;
+        let trailing = decode_frame_slice(
+            &frame[frame_len..],
+            frame_len as u64,
+            frame.len() as u64,
+            DEFAULT_MAX_FRAME_SIZE,
+        );
+        assert!(matches!(trailing, FrameStatus::TornFinal { .. }));
     }
 }

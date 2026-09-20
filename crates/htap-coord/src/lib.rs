@@ -7,12 +7,13 @@
 #![warn(missing_docs)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{CatalogSnapshot, NodeId};
+use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::{atomic_publish as publish_file, sync_dir as sync_directory};
 use htap_common::lock::ProcessLock;
 use htap_common::{read_file_exact_bounded, FencingToken, HtapError, Result};
 use parking_lot::Mutex;
@@ -418,74 +419,47 @@ pub fn encode_state(state: &CoordinatorState) -> Result<Vec<u8>> {
         )));
     }
 
-    let payload_len = payload.len() as u32;
-    let checksum = crc32c::crc32c(&payload);
-
-    let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
-    buf.extend_from_slice(HEADER_MAGIC);
-    buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.extend_from_slice(&checksum.to_le_bytes());
-    buf.extend_from_slice(&payload);
-
-    Ok(buf)
+    Ok(encode_envelope(HEADER_MAGIC, FORMAT_VERSION, &payload))
 }
 
 /// Decode and validate coordinator state from a binary envelope.
 pub fn decode_state(bytes: &[u8]) -> Result<CoordinatorState> {
-    if bytes.len() < HEADER_LEN {
-        return Err(HtapError::Corruption(format!(
-            "coordinator file too small: {} bytes, minimum header size is {}",
-            bytes.len(),
-            HEADER_LEN
-        )));
-    }
-
-    if &bytes[0..8] != HEADER_MAGIC {
-        return Err(HtapError::Corruption(
-            "invalid coordinator header magic".into(),
-        ));
-    }
-
-    let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    if version != FORMAT_VERSION {
-        return Err(HtapError::Corruption(format!(
-            "unsupported coordinator format version: {version}"
-        )));
-    }
-
-    let payload_len = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
-    let expected_crc = u32::from_le_bytes(bytes[14..18].try_into().unwrap());
-
-    if payload_len > MAX_COORDINATOR_PAYLOAD_BYTES {
-        return Err(HtapError::Corruption(format!(
-            "coordinator payload length {payload_len} exceeds maximum limit {MAX_COORDINATOR_PAYLOAD_BYTES}"
-        )));
-    }
-
-    let expected_total = HEADER_LEN + payload_len as usize;
-    if bytes.len() < expected_total {
-        return Err(HtapError::Corruption(format!(
-            "truncated coordinator file: expected {} bytes, found {}",
-            expected_total,
-            bytes.len()
-        )));
-    }
-
-    if bytes.len() > expected_total {
-        return Err(HtapError::Corruption(format!(
-            "coordinator file has {} trailing leftover bytes",
-            bytes.len() - expected_total
-        )));
-    }
-
-    let payload = &bytes[HEADER_LEN..expected_total];
-    let computed_crc = crc32c::crc32c(payload);
-    if computed_crc != expected_crc {
-        return Err(HtapError::Corruption(format!(
-            "coordinator checksum mismatch: expected {expected_crc:#010x}, got {computed_crc:#010x}"
-        )));
-    }
+    let (_, payload) = decode_envelope(
+        bytes,
+        HEADER_MAGIC,
+        FORMAT_VERSION..=FORMAT_VERSION,
+        MAX_COORDINATOR_PAYLOAD_BYTES,
+        SizeCheckMode::TruncatedThenTrailing,
+    )
+    .map_err(|err| {
+        let message = match err {
+            EnvelopeError::TooSmall { found, min } => {
+                format!("coordinator file too small: {found} bytes, minimum header size is {min}")
+            }
+            EnvelopeError::BadMagic => "invalid coordinator header magic".into(),
+            EnvelopeError::UnsupportedVersion(version) => {
+                format!("unsupported coordinator format version: {version}")
+            }
+            EnvelopeError::PayloadTooLarge { len, max } => {
+                format!("coordinator payload length {len} exceeds maximum limit {max}")
+            }
+            EnvelopeError::Truncated { expected, found } => {
+                format!("truncated coordinator file: expected {expected} bytes, found {found}")
+            }
+            EnvelopeError::TrailingBytes { extra } => {
+                format!("coordinator file has {extra} trailing leftover bytes")
+            }
+            EnvelopeError::SizeMismatch { expected, found } => {
+                format!("truncated coordinator file: expected {expected} bytes, found {found}")
+            }
+            EnvelopeError::ChecksumMismatch { expected, actual } => {
+                format!(
+                    "coordinator checksum mismatch: expected {expected:#010x}, got {actual:#010x}"
+                )
+            }
+        };
+        HtapError::Corruption(message)
+    })?;
 
     let mut state: CoordinatorState = serde_json::from_slice(payload).map_err(|e| {
         HtapError::Corruption(format!("failed to parse coordinator state JSON: {e}"))
@@ -513,43 +487,104 @@ pub fn decode_state(bytes: &[u8]) -> Result<CoordinatorState> {
 
 /// Atomically publish coordinator state: write tmp -> fsync -> rename -> fsync directory.
 fn atomic_publish(dir: &Path, state: &CoordinatorState) -> Result<()> {
-    let tmp_path = dir.join(COORDINATOR_TMP_FILE_NAME);
-    let final_path = dir.join(COORDINATOR_FILE_NAME);
-
     let encoded = encode_state(state)?;
-
-    let write_res = (|| -> Result<()> {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_res {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    if let Err(e) = fs::rename(&tmp_path, &final_path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(HtapError::Io(e));
-    }
-
-    sync_dir(dir)?;
-
-    Ok(())
+    publish_file(
+        dir,
+        COORDINATOR_TMP_FILE_NAME,
+        COORDINATOR_FILE_NAME,
+        &encoded,
+        None,
+        true,
+    )
 }
 
 /// Fsync a directory to ensure metadata operations like rename are durable.
 pub fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let f = File::open(path)?;
-        f.sync_all()?;
+    sync_directory(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_coordinator_state_golden_bytes() {
+        let state = CoordinatorState::default();
+        let bytes = encode_state(&state).unwrap();
+        assert_eq!(
+            bytes,
+            &[
+                72, 84, 65, 80, 67, 82, 68, 49, 1, 0, 60, 0, 0, 0, 92, 233, 97, 148, 123, 34, 109,
+                101, 109, 98, 101, 114, 115, 34, 58, 91, 93, 44, 34, 108, 101, 97, 100, 101, 114,
+                115, 34, 58, 123, 125, 44, 34, 115, 99, 111, 112, 101, 95, 116, 111, 107, 101, 110,
+                115, 34, 58, 123, 125, 44, 34, 110, 101, 120, 116, 95, 116, 111, 107, 101, 110, 34,
+                58, 49, 125
+            ]
+        );
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
+
+    #[test]
+    fn test_coordinator_state_bad_magic_and_oversized() {
+        let mut bad_magic = encode_state(&CoordinatorState::default()).unwrap();
+        bad_magic[0] = b'X';
+        let bad_magic_err = decode_state(&bad_magic).unwrap_err();
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(HEADER_MAGIC);
+        oversized.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        oversized.extend_from_slice(&(MAX_COORDINATOR_PAYLOAD_BYTES + 1).to_le_bytes());
+        oversized.extend_from_slice(&0_u32.to_le_bytes());
+        let oversized_err = decode_state(&oversized).unwrap_err();
+
+        assert_eq!(
+            (bad_magic_err.to_string(), oversized_err.to_string()),
+            (
+                "Corruption error: invalid coordinator header magic".to_string(),
+                "Corruption error: coordinator payload length 67108865 exceeds maximum limit 67108864"
+                    .to_string(),
+            )
+        );
     }
-    Ok(())
+
+    #[test]
+    fn test_coordinator_state_bad_version_and_crc() {
+        let mut bad_version = encode_state(&CoordinatorState::default()).unwrap();
+        bad_version[8..10].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+        let bad_version_err = decode_state(&bad_version).unwrap_err();
+
+        let mut bad_crc = encode_state(&CoordinatorState::default()).unwrap();
+        bad_crc[14..18].copy_from_slice(&0_u32.to_le_bytes());
+        let bad_crc_err = decode_state(&bad_crc).unwrap_err();
+
+        assert_eq!(
+            (bad_version_err.to_string(), bad_crc_err.to_string()),
+            (
+                "Corruption error: unsupported coordinator format version: 2".to_string(),
+                "Corruption error: coordinator checksum mismatch: expected 0x00000000, got 0x9461e95c"
+                    .to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn test_coordinator_state_size_check_truncated() {
+        let mut bytes = encode_state(&CoordinatorState::default()).unwrap();
+        bytes.pop();
+        let err = decode_state(&bytes).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: truncated coordinator file: expected 78 bytes, found 77"
+        );
+    }
+
+    #[test]
+    fn test_coordinator_state_size_check_trailing() {
+        let mut bytes = encode_state(&CoordinatorState::default()).unwrap();
+        bytes.push(0);
+        let err = decode_state(&bytes).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: coordinator file has 1 trailing leftover bytes"
+        );
+    }
 }

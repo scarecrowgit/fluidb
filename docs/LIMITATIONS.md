@@ -863,7 +863,7 @@ The Phase 4 implementation delivers an incrementally verified local single-table
 
 The Phase 5 implementation delivers single-node tablet clone, verify, repair, CSV/JSONL import/export, durable job tracking, and `LocalServer` integration. Hardening unit H5/M2 (`b7ff200`) added strict persistence boundaries:
 
-- **H5/M2 fixed (`b7ff200`):** Shared bounded exact-file reader (`read_exact_bounded`) enforces size limits on all owned state files (`CATALOG`, `COORDINATOR`, `movement/jobs/<job-id>/JOB`, tablet manifests, `MANIFEST`, `VISIBLE`, `txn.journal`). Internal movement job IDs, tablet paths, and conversion segment paths are strictly validated against traversal and injection attacks.
+- **H5/M2 fixed (`b7ff200`):** Shared bounded exact-file reader (`read_file_exact_bounded`) enforces size limits on all owned state files (`CATALOG`, `COORDINATOR`, `movement/jobs/<job-id>/JOB`, tablet manifests, `MANIFEST`, `VISIBLE`, `txn.journal`). Internal movement job IDs, tablet paths, and conversion segment paths are strictly validated against traversal and injection attacks.
 - **External CopyOptions paths remain caller-controlled by design:** While internal persistence files and paths are bounded and validated, external filesystem paths supplied via `CopyOptions` (e.g. CSV/JSONL import sources and export destinations) are caller-controlled by design.
 - **Whole-dataset materialization in export and clone:** CSV/JSONL export (where exports materialize the full logical partition before writing) and tablet snapshot cloning materialize whole datasets in intermediate buffers/files rather than streaming records.
 - **Deferred features:** Distributed multi-node coordinated migrations, background replication streams, and cross-partition movement remain deferred.
