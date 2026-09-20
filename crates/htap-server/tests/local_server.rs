@@ -319,6 +319,35 @@ fn test_delete_then_absent() {
 }
 
 #[test]
+fn test_truncate_empties_table_and_reports_affected_rows() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30), (4, 40);")
+        .unwrap();
+
+    let truncate = server.execute("TRUNCATE TABLE t").unwrap();
+    assert!(matches!(
+        truncate,
+        StatementResult::Command(CommandResult::Dml { affected: 4, .. })
+    ));
+
+    match server.execute("SELECT * FROM t").unwrap() {
+        StatementResult::Query(query) => assert!(query.is_empty()),
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    let empty_truncate = server.execute("TRUNCATE TABLE t").unwrap();
+    assert!(matches!(
+        empty_truncate,
+        StatementResult::Command(CommandResult::Dml { affected: 0, .. })
+    ));
+}
+
+#[test]
 fn test_affected_counts_and_commit_versions() {
     let dir = TempDir::new().unwrap();
     let server = LocalServer::open(dir.path()).unwrap();
@@ -1490,15 +1519,15 @@ fn test_analytic_unsupported_clauses() {
         ]
     );
 
-    // Still unsupported: window functions, FULL OUTER JOIN, correlated subqueries.
-    for sql in [
-        "SELECT id, SUM(age) OVER () FROM users;",
-        "SELECT * FROM users a FULL OUTER JOIN users b ON a.id = b.id;",
-        "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM users v WHERE v.id = u.id);",
-    ] {
-        let err = server.execute(sql).unwrap_err();
-        assert!(matches!(err, HtapError::Unsupported(_)), "{sql}: {err}");
-    }
+    // Window functions execute across the full result set and ignore NULL inputs.
+    assert_eq!(
+        rows("SELECT id, SUM(age) OVER () FROM users;"),
+        vec![
+            Row::new(vec![Value::Int64(1), Value::Int64(40)]),
+            Row::new(vec![Value::Int64(2), Value::Int64(40)]),
+            Row::new(vec![Value::Int64(3), Value::Int64(40)]),
+        ]
+    );
 }
 
 #[test]

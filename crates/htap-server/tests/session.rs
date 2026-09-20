@@ -353,6 +353,61 @@ fn test_read_your_own_writes_general_query_join() {
 }
 
 #[test]
+fn test_read_your_own_writes_nested_join_group() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    for table in [
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INT);",
+        "CREATE TABLE b (id BIGINT PRIMARY KEY, v INT);",
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, v INT);",
+    ] {
+        server.execute(table).unwrap();
+    }
+    server
+        .execute("INSERT INTO a (id, v) VALUES (1, 10), (2, 20);")
+        .unwrap();
+    server
+        .execute("INSERT INTO b (id, v) VALUES (1, 100);")
+        .unwrap();
+    server
+        .execute("INSERT INTO c (id, v) VALUES (1, 1000);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.begin().unwrap();
+    session
+        .execute("INSERT INTO b (id, v) VALUES (2, 200);")
+        .unwrap();
+    session
+        .execute("INSERT INTO c (id, v) VALUES (2, 2000);")
+        .unwrap();
+
+    assert_eq!(
+        session_rows(
+            &mut session,
+            "SELECT a.id, b.v, c.v FROM a JOIN (b JOIN c ON b.id = c.id) \
+             ON a.id = b.id ORDER BY a.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int64(1), Value::Int32(100), Value::Int32(1000)]),
+            Row::new(vec![Value::Int64(2), Value::Int32(200), Value::Int32(2000)]),
+        ]
+    );
+    assert_eq!(
+        exec_rows(
+            &server,
+            "SELECT a.id, b.v, c.v FROM a JOIN (b JOIN c ON b.id = c.id) \
+             ON a.id = b.id ORDER BY a.id;",
+        ),
+        vec![Row::new(vec![
+            Value::Int64(1),
+            Value::Int32(100),
+            Value::Int32(1000)
+        ])]
+    );
+}
+
+#[test]
 fn test_double_update_in_one_transaction_composes() {
     let dir = TempDir::new().unwrap();
     let server = Arc::new(LocalServer::open(dir.path()).unwrap());
@@ -1491,6 +1546,239 @@ fn test_set_transaction_read_only_rejects_write() {
 }
 
 #[test]
+fn test_truncate_in_transaction_rollback_restores_rows() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN").unwrap();
+    session.execute("TRUNCATE TABLE t").unwrap();
+    assert!(session_rows(&mut session, "SELECT id FROM t").is_empty());
+
+    session.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        exec_rows(&server, "SELECT id FROM t ORDER BY id"),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+            Row::new(vec![Value::Int64(3)]),
+        ]
+    );
+}
+
+#[test]
+fn test_truncate_in_read_only_transaction_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN READ ONLY").unwrap();
+    let before = server.txn_manager().next_version();
+    let error = session.execute("TRUNCATE TABLE t").unwrap_err();
+    assert!(matches!(error, HtapError::InvalidArgument(_)));
+    assert_eq!(server.txn_manager().next_version(), before);
+    assert_eq!(
+        session_rows(&mut session, "SELECT id FROM t ORDER BY id"),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+        ]
+    );
+}
+
+#[test]
+fn test_delete_by_filter_in_transaction_rollback() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session.execute("DELETE FROM t WHERE v >= 20;").unwrap();
+
+    assert_eq!(
+        session_rows(&mut session, "SELECT id FROM t ORDER BY id;"),
+        vec![Row::new(vec![Value::Int64(1)])]
+    );
+
+    session.execute("ROLLBACK;").unwrap();
+    assert_eq!(
+        exec_rows(&server, "SELECT id FROM t ORDER BY id;"),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+            Row::new(vec![Value::Int64(3)]),
+        ]
+    );
+}
+
+#[test]
+fn test_delete_by_filter_reads_own_writes() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 10);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (2, 20);")
+        .unwrap();
+    session.execute("DELETE FROM t WHERE v >= 20;").unwrap();
+
+    assert!(session_rows(&mut session, "SELECT id FROM t WHERE id = 2;").is_empty());
+    assert!(exec_rows(&server, "SELECT id FROM t WHERE id = 2;").is_empty());
+
+    session.execute("COMMIT;").unwrap();
+    assert!(exec_rows(&server, "SELECT id FROM t WHERE id = 2;").is_empty());
+    assert_eq!(
+        exec_rows(&server, "SELECT id FROM t ORDER BY id;"),
+        vec![Row::new(vec![Value::Int64(1)])]
+    );
+}
+
+#[test]
+fn test_delete_by_filter_payload_cap_rejects_atomically() {
+    const ROW_COUNT: usize = 5_000;
+    const INSERT_BATCH_SIZE: usize = 500;
+
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE big (id VARCHAR(1024) PRIMARY KEY, data VARCHAR);")
+        .unwrap();
+
+    // DELETE mutations retain only a partition ID and encoded primary key, not the row payload.
+    // Long primary keys reach the payload cap with only a few thousand rows.
+    for start in (0..ROW_COUNT).step_by(INSERT_BATCH_SIZE) {
+        let end = (start + INSERT_BATCH_SIZE).min(ROW_COUNT);
+        let values = (start..end)
+            .map(|id| format!("('{id:0>1024}', 'x')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        server
+            .execute(&format!("INSERT INTO big (id, data) VALUES {values};"))
+            .unwrap();
+    }
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+
+    let err = session
+        .execute("DELETE FROM big WHERE id >= '';")
+        .unwrap_err();
+    assert!(
+        matches!(err, HtapError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+
+    // The rejected delete was atomic: none of its mutations entered the write set.
+    assert_eq!(
+        session_rows(&mut session, "SELECT COUNT(*) FROM big;"),
+        vec![Row::new(vec![Value::Int64(ROW_COUNT as i64)])]
+    );
+
+    // A small delete still fits, proving the transaction remains usable.
+    let small_key = format!("{0:0>1024}", 0);
+    session
+        .execute(&format!("DELETE FROM big WHERE id = '{small_key}';"))
+        .unwrap();
+    assert!(session_rows(
+        &mut session,
+        &format!("SELECT id FROM big WHERE id = '{small_key}';")
+    )
+    .is_empty());
+
+    // Rollback discards the successful small delete too.
+    session.execute("ROLLBACK;").unwrap();
+    assert_eq!(
+        exec_rows(&server, "SELECT COUNT(*) FROM big;"),
+        vec![Row::new(vec![Value::Int64(ROW_COUNT as i64)])]
+    );
+}
+
+#[test]
+fn test_delete_by_filter_rejected_in_read_only_transaction() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN READ ONLY;").unwrap();
+
+    let err = session.execute("DELETE FROM t WHERE v >= 10;").unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert_eq!(
+        session_rows(&mut session, "SELECT id FROM t ORDER BY id;"),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+        ]
+    );
+
+    let before = server.txn_manager().next_version();
+    session.execute("COMMIT;").unwrap();
+    assert_eq!(server.txn_manager().next_version(), before);
+}
+
+#[test]
+fn test_delete_by_filter_commit_is_one_version() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30), (4, 40);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session.execute("DELETE FROM t WHERE v >= 20;").unwrap();
+
+    let before = server.txn_manager().next_version();
+    session.execute("COMMIT;").unwrap();
+    let after = server.txn_manager().next_version();
+    assert_eq!(
+        after.get(),
+        before.get() + 1,
+        "multiple filtered deletes must commit as exactly one version"
+    );
+
+    assert_eq!(
+        exec_rows(&server, "SELECT id, v FROM t ORDER BY id;"),
+        vec![Row::new(vec![Value::Int64(1), Value::Int32(10)])]
+    );
+    assert!(exec_rows(&server, "SELECT id FROM t WHERE v >= 20;").is_empty());
+}
+
+#[test]
 fn test_connector_startup_set_statements_accepted() {
     let dir = TempDir::new().unwrap();
     let server = Arc::new(LocalServer::open(dir.path()).unwrap());
@@ -2016,4 +2304,188 @@ fn test_account_ddl_rejected_inside_open_transaction() {
     session
         .execute("CREATE USER 'u'@'%' IDENTIFIED BY 'p'")
         .expect("account DDL is executable outside an explicit transaction");
+}
+
+#[test]
+fn test_insert_select_uncommitted_within_transaction() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE src (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE dst (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session
+        .execute("INSERT INTO src (id, v) VALUES (1, 10), (2, 20);")
+        .unwrap();
+    session
+        .execute("INSERT INTO dst (id, v) SELECT id, v FROM src;")
+        .unwrap();
+
+    assert_eq!(
+        session_rows(&mut session, "SELECT id, v FROM dst ORDER BY id;"),
+        vec![
+            Row::new(vec![Value::Int64(1), Value::Int32(10)]),
+            Row::new(vec![Value::Int64(2), Value::Int32(20)]),
+        ]
+    );
+
+    session.execute("ROLLBACK;").unwrap();
+    assert!(exec_rows(&server, "SELECT id FROM src;").is_empty());
+    assert!(exec_rows(&server, "SELECT id FROM dst;").is_empty());
+}
+
+#[test]
+fn test_insert_select_payload_cap_exceeded() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE src (id BIGINT PRIMARY KEY, data VARCHAR);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE dst (id BIGINT PRIMARY KEY, data VARCHAR);")
+        .unwrap();
+
+    let chunk = "x".repeat(2_000_000);
+    for id in 0..9 {
+        server
+            .execute(&format!(
+                "INSERT INTO src (id, data) VALUES ({id}, '{chunk}');"
+            ))
+            .unwrap();
+    }
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    let err = session
+        .execute("INSERT INTO dst (id, data) SELECT id, data FROM src;")
+        .unwrap_err();
+    assert!(
+        matches!(err, HtapError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+    assert!(
+        session_rows(&mut session, "SELECT id FROM dst;").is_empty(),
+        "the rejected INSERT SELECT must not partially enter the write set"
+    );
+
+    // The failed statement leaves the transaction usable for subsequent buffered writes.
+    session
+        .execute("INSERT INTO dst (id, data) VALUES (999, 'small');")
+        .unwrap();
+    assert_eq!(
+        session_rows(&mut session, "SELECT id FROM dst;"),
+        vec![Row::new(vec![Value::Int64(999)])]
+    );
+    session.rollback().unwrap();
+}
+
+#[test]
+fn test_insert_select_in_read_only_transaction() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE src (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE dst (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO src (id, v) VALUES (1, 10);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("START TRANSACTION READ ONLY;").unwrap();
+    let err = session
+        .execute("INSERT INTO dst (id, v) SELECT id, v FROM src;")
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(session_rows(&mut session, "SELECT id FROM dst;").is_empty());
+    session.execute("ROLLBACK;").unwrap();
+}
+
+#[test]
+fn test_correlated_subquery_sees_uncommitted_session_writes() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE parent (id BIGINT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE child (id BIGINT PRIMARY KEY, parent_id BIGINT, v INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO parent (id) VALUES (1), (2), (3);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session
+        .execute(
+            "INSERT INTO child (id, parent_id, v) \
+             VALUES (10, 1, 100), (11, 1, 101), (12, 3, 300);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        session_rows(
+            &mut session,
+            "SELECT p.id FROM parent p \
+             WHERE EXISTS (SELECT 1 FROM child c WHERE c.parent_id = p.id) \
+             ORDER BY p.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(3)]),
+        ]
+    );
+
+    session.execute("ROLLBACK;").unwrap();
+    assert!(exec_rows(&server, "SELECT id FROM child;").is_empty());
+}
+
+#[test]
+fn test_recursive_cte_reads_uncommitted_rows_and_rollback_hides_them() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE edges (src BIGINT, dst BIGINT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute("INSERT INTO edges (src, dst) VALUES (1, 2);")
+        .unwrap();
+
+    let recursive_query = "\
+        WITH RECURSIVE reachable(node) AS ( \
+            SELECT dst FROM edges WHERE src = 1 \
+            UNION ALL \
+            SELECT e.dst FROM edges e JOIN reachable r ON e.src = r.node \
+        ) \
+        SELECT node FROM reachable ORDER BY node;";
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session
+        .execute("INSERT INTO edges (src, dst) VALUES (2, 3), (3, 4);")
+        .unwrap();
+
+    assert_eq!(
+        session_rows(&mut session, recursive_query),
+        vec![
+            Row::new(vec![Value::Int64(2)]),
+            Row::new(vec![Value::Int64(3)]),
+            Row::new(vec![Value::Int64(4)]),
+        ]
+    );
+
+    session.execute("ROLLBACK;").unwrap();
+
+    assert_eq!(
+        exec_rows(&server, recursive_query),
+        vec![Row::new(vec![Value::Int64(2)])]
+    );
 }

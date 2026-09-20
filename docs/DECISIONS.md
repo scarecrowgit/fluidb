@@ -48,10 +48,16 @@ and group evaluation. Columnar `ScanStats` and block pruning are available inter
 execution evidence, but SQL evaluation still operates on materialized logical rows;
 vectorized aggregation is not implemented. Complete-PK point queries strictly take the
 hand-written transactional fast path (`Route::RowstorePointRead`), structurally bypassing
-the analytical evaluator and converter, remaining separate and unchanged. Compound `AND`
-pushdown beyond one leaf, `!=` pushdown, joins, CTEs, windows, ORDER BY, LIMIT, HAVING, OR,
-expressions, AVG, DISTINCT, multi-tablet/distributed scans, quotas, spill, cancellation,
-and DataFusion/Arrow analytical integration remain deferred future work.
+the analytical evaluator and converter, remaining separate and unchanged. Within this
+narrow `AnalyticSelect`/`Route::OlapScan` path itself, compound `AND` pushdown beyond one
+leaf, `!=` pushdown, joins, CTEs, and windows remain deferred — those are instead handled,
+system-wide, by the separate general query executor `htap-sql::{query, expr, binder_query}`/
+`htap-server::query_exec` (`Route::Query`, ADR-017, extended by ADR-022), which added joins/
+CTEs/expressions/`ORDER BY`/`LIMIT`/`HAVING`/`OR`/`AVG`/`DISTINCT` (Phase 9) and window
+functions/correlated subqueries/`FULL OUTER`/`NATURAL`/`USING` joins/recursive CTEs (Phase
+13) without touching this ADR's narrow-path/DataFusion proposal. Multi-tablet/distributed
+scans, quotas, spill, cancellation, cost-based optimization, and DataFusion/Arrow analytical
+integration remain deferred future work on every path.
 
 ### Consequences
 
@@ -332,7 +338,8 @@ Option **(c)**.
   4. `Column`: executes the final catalog CAS cutover to `StorageDescriptor::Column`, clearing
      conversion descriptors and binding the tablet's `ColumnManifestRef`.
 - **Authoritative rowstore base-plus-delta overlay:** The rowstore remains the authoritative
-  truth for point operations (`Route::RowstoreWrite` and `Route::RowstorePointRead`), executing
+  truth for point operations (`Route::RowstoreWrite` for `INSERT`, `Route::RowstoreDelete` for
+  `DELETE` since Phase 13, and `Route::RowstorePointRead` for point reads), executing
   without interruption across `Row`, `Converting`, and `Column` states. Materialized scans
   via converter APIs (`read_column_partition` and projection-aware compact reads
   `read_column_partition_compact_core`, verified in `crates/htap-convert/tests/materialization.rs`)
@@ -344,9 +351,11 @@ Option **(c)**.
 - **Scope boundaries:** Direct SegmentReader pushdown optimization is now implemented for the compact
   base path. Compound `AND` pushdown remains limited to one leaf, and `!=` remains residual.
   Metadata-only `Column -> Row` demotion is implemented via catalog CAS (see ADR-015), while physical
-  reverse transcoding is not implemented. Columnar bitmap delete vectors, physical rowstore reclamation,
+  reverse transcoding is not implemented. This narrow `Route::OlapScan` analytical-scan path itself does
+  not support joins/CTEs/windows (those are handled system-wide by the separate general query executor,
+  `Route::Query` — see ADR-017/ADR-022). Columnar bitmap delete vectors, physical rowstore reclamation,
   delta-to-base background compaction, autonomous background conversion scheduling, vectorized aggregation,
-  vectorized operator pipelines, joins/CTEs/windows, and distributed multi-tablet conversion are explicitly deferred.
+  vectorized operator pipelines, and distributed multi-tablet conversion are explicitly deferred on every path.
 
 ### Consequences
 
@@ -2151,3 +2160,257 @@ Cross-references: ADR-017 (the `id_high_water`/format-version-bump precedent thi
 ADR-018 (`Session::execute_statement` as the single enforcement point, reused unchanged as the privilege-check
 call site), ADR-020 (TLS/compression activate strictly after the authentication this ADR replaces
 `verify_credentials` with).
+
+---
+
+## ADR-022: Depth-1 correlated subqueries with a bounded execution callback; a purely structural `JoinTree` with bind-time offset rebasing, flat-lowering, and a mandatory flat/tree differential test
+
+`Status: Accepted`
+`Date: 2026-09-20`
+
+### Context
+
+Phase 9 (ADR-017) deliberately deferred window functions, correlated subqueries, `FULL OUTER`/`NATURAL`/
+`USING` joins, parenthesized nested join trees, recursive CTEs, `EXCEPT`/`INTERSECT`, `GROUP BY`/`ORDER BY`
+ordinals, filtered `DELETE`, `TRUNCATE`, `INSERT ... SELECT`, and integer `DIV`. The user explicitly lifted
+all of these for Phase 13, on top of the same general query executor ADR-017 built
+(`htap-sql::{query, expr, binder_query}`, `htap-server::query_exec`, `Route::Query`), without weakening R5
+(point lookups structurally bypass the analytical engine), without a new on-disk format or WAL record, and
+without a cost-based join optimizer (explicitly out of scope — see CLAUDE.md's scope rule). Of the items
+lifted, two required genuinely new execution machinery and are the subject of this ADR: correlated subqueries
+(a new htap-sql -> htap-server callback boundary) and arbitrary parenthesized/outer join trees (a second join
+executor alongside the existing flat one). The remaining Phase 13 items (`GROUP BY`/`ORDER BY` ordinals,
+integer `DIV`, `EXCEPT`/`INTERSECT`, `DELETE` by filter, `TRUNCATE`, `INSERT ... SELECT`, `NATURAL`/`USING`
+coalescing, `WITH RECURSIVE`, window functions) are additive extensions of ADR-017's existing binder/executor
+stages and did not require a separate design decision beyond what is recorded in `docs/PROGRESS.md`.
+
+Two consultation rounds (`reasoner`, `cx/gpt-5.6-sol`) plus one `architect` ADR-level check were run
+specifically because the main session overrode the researcher's initial, more conservative recommendation to
+narrow `NATURAL`/`USING` coalescing and general nested join trees; both are recorded below as the panel's
+corrections to the first draft, not as the first draft itself.
+
+### Options considered — correlated subqueries
+
+1. **Unbounded-depth correlation, resolving a name against any ancestor scope.** Rejected: matching MySQL's
+   own de facto behavior here means a reference that *should* be a bind error (skipping past an intermediate
+   scope) can instead silently resolve against a grandparent, which is exactly the "silent mis-resolution"
+   class of bug CLAUDE.md's evidence rule exists to prevent. It also means every subquery-binding function has
+   to thread an ever-growing, flattened list of ancestor slots, compounding the risk.
+2. **Depth-1 correlation: a child subquery's binder sees only its immediate parent's own slots, never a
+   concatenated ancestor chain; a name that would need to skip a level is a specific bind error
+   ("correlated subqueries may only reference the immediately enclosing query"), not a generic unknown-column
+   error.** **Chosen.** This is sound by construction — each binding level only ever threads "my immediate
+   parent's own slots," so a subquery nested inside an otherwise-uncorrelated subquery of a grandparent still
+   binds correctly against *its own* immediate parent, without ever being able to reach past it. Confirmed by
+   both panel rounds to cover every cited TPC-H correlated shape (Q2, Q4, Q17, Q20-Q22) used to motivate lifting
+   this deferral.
+3. **A new `Expr::CorrelatedColumnRef` variant, distinct from `Expr::ColumnRef`, carrying an offset into the
+   immediate parent's own row layout.** **Chosen** over reusing `ColumnRef` with a sentinel: keeping the two
+   variants distinct in traversal/type-inference/column-reference-collection means a correlated reference can
+   never be silently treated as an ordinary local column (e.g., during predicate pushdown or hash-key
+   extraction), and the compiler's exhaustive-match requirement forces every such site to make an explicit
+   choice about how to handle it.
+4. **Execution: a `SubqueryRunner` callback trait in `htap-sql::expr` (subquery index + outer-row slice only,
+   no storage type in the signature), implemented in `htap-server::query_exec` by recursively calling the same
+   query executor against the referenced subquery, reusing the statement's single pinned `Snapshot`/write-set
+   overlay.** **Chosen** over threading a storage handle into `htap-sql` (would create a `htap-sql -> htap-
+   server` dependency the crate boundaries in `docs/ARCHITECTURE.md` forbid) or precomputing every subquery
+   once up front the way an *uncorrelated* subquery already is (impossible for a correlated one, since its
+   result depends on the current outer row). The existing precomputed-once path for uncorrelated subqueries is
+   left byte-for-byte unchanged; only a subquery flagged `correlated` at bind time takes the callback path.
+5. **A per-statement `SubqueryBudget` (total invocation cap and re-entrant nesting-depth cap), independent of
+   the recursive-CTE cap, erroring the same way (`HtapError::InvalidArgument`) once exceeded.** **Chosen**:
+   without an independent bound, a pathological query (a correlated subquery whose own body re-triggers
+   another correlated evaluation) has no structural reason to terminate the way the recursive-CTE loop's own
+   iteration counter does; `crates/htap-server/src/query_exec.rs` constructs the runtime budget as
+   `SubqueryBudget::new(10_000, 20)` (10,000 total invocations, 20 re-entrant nesting levels), and
+   `crates/htap-sql/src/expr.rs` unit-tests the budget type in isolation with a fake `SubqueryRunner` that
+   always recurses, proving it hits a bounded error rather than a stack overflow or hang.
+6. **In an aggregate query, a correlated subquery in `HAVING`/the projection may only correlate on the outer
+   query's own `GROUP BY` keys.** **Chosen**, closing a trap both panel rounds flagged: without this check, a
+   correlated subquery inside an aggregate context could silently read an arbitrary representative row of a
+   group instead of a value that is actually constant across the group. The existing grouped-expression
+   validator (which already treats a subquery reference as an opaque leaf) now looks up the referenced
+   subquery's recorded outer-correlation list and requires every one of those outer-side references to itself
+   be a `GROUP BY` key, rejecting with a message naming the offending column and clause otherwise.
+
+### Options considered — general join trees (`JoinTree`)
+
+1. **Extend the existing flat `Vec<JoinSpec>` representation to carry an explicit nesting marker instead of
+   adding a new type.** Rejected: `FULL OUTER`/`NATURAL`/`USING` coalescing needs each join node to carry a
+   *visible schema* that is itself a merge of its two children's visible schemas (not "accumulated flat slots
+   so far vs. one new physical slot," which is all the flat representation can express), and an arbitrarily
+   parenthesized tree (e.g. `a LEFT JOIN (b JOIN c ON ...) ON ...`) has no faithful flat encoding at all.
+2. **A cost-based join-tree IR shared with a future join-reordering optimizer.** Rejected for this phase, per
+   both panel rounds and `architect`: cost-based optimization is explicitly out of scope (CLAUDE.md), and nothing
+   about *this* tree's contract (built once, directly and always, 1:1 with the SQL's own parenthesization, never
+   rewritten/reordered/commuted/cost-estimated) is compatible with what a reordering optimizer would need to do
+   to it later. `architect`'s explicit condition for accepting this design was that it stay out of that
+   territory permanently — Phase 14, if it ever adds join reordering, needs its own IR, not a repurposing of
+   this one.
+3. **A small, purely structural `JoinTree` (`Slot(usize)` | `Join{kind, left, right, on}`), built directly and
+   always from the parsed `FROM` clause (comma-separated items fold in as unconditional-cross nodes in
+   encounter order), used as the single binding source of truth for every query — with a total, pure
+   `lower_to_flat` function computing, at bind time, whether the tree is purely left-deep (every join node's
+   right child a bare slot leaf; the join **kind** at each step unrestricted) and, when it is, populating
+   today's existing flat fields exactly as before.** **Chosen.** Both panel rounds explicitly warned against
+   maintaining two divergent binding code paths for "flat" and "nested" shapes — building the tree unconditionally
+   and *deriving* the flat form from it (rather than binding flat-or-tree depending on shape) means there is only
+   ever one source of truth for what the query's join structure actually is.
+4. **Offset scheme for a tree node's own `ON` condition: (a) a runtime offset-bias parameter threaded through
+   `Expr::eval`, (b) a stable-identity/layout-descriptor scheme decoupling logical columns from physical
+   offsets entirely, or (c) a bind-time-only, regenerate-every-time rebased copy of the `ON` expression (offsets
+   shifted down by the subtree's own base offset, computable from already-known slot widths), with
+   `Expr::ColumnRef.offset` itself and `Expr::eval`/`EvalContext` completely unchanged.** **(c) chosen.** Option
+   (a) would touch the expression evaluator itself for a bind-time-derivable fact; option (b) was independently
+   flagged by both panel rounds as "architecturally cleaner but bigger" and deliberately deferred to a future
+   phase rather than taken on here. `architect`'s binding condition on accepting (c): the rebased copy must
+   never be persisted or cached as a second source of truth — it is documented as regenerable fresh, every time
+   it is needed, purely from the node's own slot range, so it structurally cannot drift from the canonical
+   globally-offset tree. Top-level `WHERE`/`GROUP BY`/projection/`HAVING` keep using the original globally-offset
+   expressions unchanged throughout, since by the time the whole tree has joined up to the full select body,
+   every surviving row is already the full global-width concatenation exactly as before this ADR.
+5. **`NATURAL`/`USING` column coalescing: (a) a single flat `COALESCE` over all physical positions sharing a
+   name, or (b) a per-join-node recursive merge rule where the visible/merged expression at the node
+   introducing a shared column is `INNER`/`LEFT` -> the left operand's own (possibly already-merged) expression,
+   `RIGHT` -> the right operand's, `FULL` -> `COALESCE` of both.** **(b) chosen**, correcting the researcher's
+   original draft ((a)) after the panel showed it does not compose correctly through a chained
+   `a FULL JOIN b USING(id) FULL JOIN c USING(id)`: the second predicate must compare against the already-merged
+   `COALESCE(a.id, b.id)`, not a raw physical column, and the final visible value is
+   `COALESCE(a.id, b.id, c.id)`. No new `Expr` variant was needed; the existing `ScalarFn::Coalesce` is reused
+   unchanged. Unqualified name resolution searches the *whole* visible schema (physical + merged) and requires
+   a *unique* match rather than preferring a coalesced column — the panel showed a "coalesced-preferred, else
+   fall back" rule would hide a real ambiguity. Merged-column nullability is derived per-operand, from each
+   side's own nullability *as of just before this join's own null-extension* (not generically re-derived from
+   post-padding physical nullability, which the panel showed can be needlessly conservative — e.g. a `FULL`
+   join of two `NOT NULL` keys has a non-NULL merged key even though both physical positions individually
+   become nullable after that join's own padding). `NATURAL`'s empty-intersection case degrades to `CROSS` only
+   for `INNER`; `LEFT`/`RIGHT`/`FULL` keep their own kind with an always-true condition, because literal `CROSS`
+   would silently change empty-right-side null-preservation behavior.
+6. **A mandatory, permanent differential test proving the flat executor and the new recursive `JoinTree`
+   evaluator produce byte-identical output (rows and ordering) for every documented lowerable shape, shipped as
+   ordinary `cargo test` coverage, not a one-time manual migration check.** **Chosen** per `architect`'s
+   explicit, non-optional condition — both panel rounds independently flagged silent divergence between the two
+   executors as the single biggest risk this design introduces, since a future edit to one path has no
+   structural reason to also update the other.
+7. **Generalizing `join_rows` (the existing two-input hash-join-with-nested-loop-residual primitive) to take
+   explicit left/right widths as parameters, derived from the actual input row sets, rather than assuming the
+   right side is exactly one physical slot.** **Chosen**, required for the same primitive to serve both the
+   existing flat one-physical-slot-at-a-time case and the new recursive evaluator's arbitrary-width intermediate
+   relations; done in the same pass as fixing the pre-existing `Int32`/`Int64`/`Timestamp` -> `Float64` hash-key
+   widening, which could collide two distinct integers above `2^53` — exact-integer values now keep an
+   integer-keyed representation and only widen to `Float64` when one side of the same key position is actually
+   `Float64`.
+
+### Decision
+
+1. **`Expr::CorrelatedColumnRef` + `SubqueryRunner` + `SubqueryBudget`.** A correlated subquery binds one level
+   deep only; a name requiring a grandparent lookup is the specific bind error "correlated subqueries may only
+   reference the immediately enclosing query" (`crates/htap-sql/src/binder_query.rs`). Execution threads a
+   `SubqueryRunner` callback and the current outer row through every per-row evaluation site (`WHERE` filter,
+   projection, `HAVING`) via the shared `EvalContext`, reusing the statement's one pinned `Snapshot`/write-set
+   overlay — never re-pinning or advancing it — so a correlated subquery reads exactly the same committed-plus-
+   buffered view as the rest of the statement (the snapshot/self-write invariant is unchanged from ADR-018). A
+   per-statement `SubqueryBudget` (`crates/htap-server/src/query_exec.rs`: `SubqueryBudget::new(10_000, 20)`)
+   bounds total invocations and re-entrant nesting depth, erroring `HtapError::InvalidArgument` and naming
+   which cap fired, mirroring the recursive-CTE cap's error convention (decision 3 below) without sharing its
+   counter. A correlated subquery inside an aggregate `HAVING`/projection may only correlate on the outer
+   query's `GROUP BY` keys.
+2. **`query::JoinTree` as the single binding source of truth, with a total/pure `lower_to_flat` deriving the
+   existing flat form when eligible.** `bind_table_with_joins`/`bind_table_factor` always build a `JoinTree`
+   mirroring the parsed `FROM` clause 1:1; `TableFactor::NestedJoin` recurses into a tree node; `JoinOperator::
+   FullOuter` maps to a new `JoinKind::Full`. Nullability marking generalizes to "every physical slot covered by
+   the relevant subtree" (sound because every tree node covers a contiguous, declaration-order-preserving slot
+   range). Each node's `ON` condition gets a derived, bind-time-only rebased copy (offsets shifted by the
+   subtree's own base offset) that is regenerated fresh whenever needed and never cached; `Expr::ColumnRef.
+   offset` and `Expr::eval`/`EvalContext` are untouched. `lower_to_flat` returns `Some(Vec<JoinSpec>)` exactly
+   when every join node's right child is a bare slot leaf (any join kind), in which case the executor's existing
+   flat path runs byte-for-byte unchanged for every pre-Phase-13 query and every plain non-nested Phase-13
+   query; a genuinely nested/parenthesized shape uses the new recursive evaluator instead.
+3. **`NATURAL`/`USING` real column coalescing, per-join-node, reusing `ScalarFn::Coalesce`.** Built bottom-up
+   on the same `JoinTree`, each node's visible schema merges its children's per O1's rule (see options above);
+   unqualified resolution requires a unique match over the whole visible schema; `SELECT *` expands merged/
+   common columns first (left-input order), then each side's remaining physical columns; qualified `t.col`/
+   `t.*` are unaffected, always resolving through the existing per-slot physical path.
+4. **Recursive `JoinTree` evaluator plus the mandatory flat/tree differential test.** A leaf materializes
+   exactly as today; an internal node recursively evaluates its children into locally-compact row sets,
+   evaluates its regenerated-fresh rebased `ON` condition via the generalized `join_rows`, and returns its own
+   compact row set — top-level `WHERE`/`GROUP BY`/projection/`HAVING` continue over the final, full-width row
+   set unchanged. `run_select` picks this path only when `SelectBody`'s flat fields are empty.
+   `crates/htap-server/tests/query_exec.rs::test_flat_and_tree_join_evaluators_match_for_lowerable_queries` is
+   the permanent, mandatory regression gate proving the two executors agree, run as ordinary `cargo test -p
+   htap-server` coverage.
+5. **`WITH RECURSIVE` caps, for symmetry with decision 1's subquery budget:** a `QueryBody::RecursiveQueryBody`
+   with a working-table placeholder slot (`TableSlot::WorkingTableSlot`, resolved by the executor to the
+   previous iteration's rows, never a real table lookup) executes a fixed-point loop bounded by three
+   independent, explicitly named caps in `crates/htap-server/src/query_exec.rs`: `MAX_RECURSIVE_ITERATIONS =
+   1_000`, `MAX_RECURSIVE_ROWS = 1_000_000`, `MAX_RECURSIVE_BYTES = 256 * 1024 * 1024` (approximate), each
+   erroring `HtapError::InvalidArgument` naming exactly which cap fired — the same error convention decision 1
+   uses for the independent correlated-subquery budget, deliberately not sharing a counter with it.
+
+### Consequences
+
+- Correlated subqueries and general join trees both cross a boundary that did not exist before Phase 13 (a
+  htap-sql -> htap-server execution callback, and a second join executor), so both were storage-reviewed per
+  CLAUDE.md's trigger list even though neither touches an on-disk format, WAL record, or catalog envelope.
+- The `SubqueryRunner`/`VariableLookup` pattern now has two structurally similar callback traits on
+  `EvalContext`; a third such trait should trigger consolidating them into one seam rather than growing the
+  field list further (documented on the evaluation context itself).
+- `JoinTree` genuinely reopens part of ADR-017's original "no join-tree IR" framing, but is categorically
+  different from a cost-based optimizer's join-tree: it mirrors the SQL's own parenthesization 1:1, never
+  reorders/commutes/estimates cost, and `lower_to_flat`'s eligibility predicate is exhaustively enumerated
+  (purely left-deep in shape, any join kind), not inferred heuristically — Phase 14, if it adds join
+  reordering, must treat this predicate as a per-candidate, re-callable check rather than a one-shot bind-time
+  decision baked into `SelectBody`, per `architect`'s note (not actionable in this phase).
+- Two join executors now exist permanently; the differential test in decision 4 is not a one-time migration
+  check — it must keep passing for every future join-related change, and a future edit to one executor without
+  the other should fail it immediately.
+- Memory growth is unchanged in kind from ADR-017 (everything in-memory, unbounded except where explicitly
+  capped): window partitions, recursive-CTE working tables, join hash tables, and now the recursive `JoinTree`
+  evaluator's per-node materialized row sets are all fully in-memory; only the recursive-CTE and
+  correlated-subquery paths have hard caps (decisions 1 and 5).
+- `INSERT ... SELECT`, `DELETE` by filter, and `TRUNCATE` (implemented as an unfiltered `DELETE`, additive to
+  this ADR's scope, see `docs/PROGRESS.md`) all read the statement's single pinned snapshot and build every
+  mutation before the one `commit_or_buffer` call, preserving the snapshot/self-write (Halloween-problem)
+  invariant unchanged from ADR-017/018 — verified for a self-referencing `INSERT INTO t SELECT ... FROM t` by
+  `crates/htap-server/tests/query_exec.rs::test_insert_select_halloween`.
+
+### How to reverse it
+
+Correlated subqueries can be reverted independently of the join-tree work: removing `SubqueryRunner`/
+`SubqueryBudget`/`Expr::CorrelatedColumnRef` and rejecting a subquery flagged `correlated` at bind time restores
+Phase 9's uncorrelated-only behavior without touching joins, recursion, or windows. The join-tree work is
+additive at the type level (`JoinTree`/`VisibleColumn` are new types alongside the unchanged flat `JoinSpec`
+representation) but `lower_to_flat` and the tree-construction change in `bind_table_with_joins` are the single
+source of truth for every join binding going forward; reverting to flat-only binding would mean re-adding the
+old rejection for `NestedJoin`/`FullOuter`/`NATURAL`/`USING`, which Phase 13 removed. Neither touches the
+rowstore, colstore, or catalog on-disk formats.
+
+### Test Evidence
+
+- Correlated subqueries — binder: `crates/htap-sql/tests/query_bind.rs::test_correlated_subquery_binding_and_depth_limit`,
+  `::test_correlated_subquery_grouped_context`, `::test_correlated_subquery_binding_is_case_insensitive`.
+- Correlated subqueries — callback/caps unit tests: `crates/htap-sql/src/expr.rs::subquery_runner_trait_and_correlation_eval`,
+  `::subquery_invocation_and_nesting_caps`.
+- Correlated subqueries — execution: `crates/htap-server/tests/query_exec.rs::test_correlated_exists_in_where`,
+  `::test_correlated_in_subquery`, `::test_correlated_subquery_nested_two_levels`,
+  `::test_correlated_subquery_caps_fire_during_execution`, `::test_correlated_subquery_column_outer_pruning_and_having`,
+  `::test_correlated_scalar_subquery_in_select`, `::test_correlated_subquery_in_having_grouped`,
+  `::test_correlated_subquery_self_reference`, `::test_correlated_subquery_across_row_column_converting_and_partitions`.
+- Correlated subqueries — sessions/transactions: `crates/htap-server/tests/session.rs::test_correlated_subquery_sees_uncommitted_session_writes`.
+- Join tree — binder: `crates/htap-sql/tests/query_bind.rs::test_join_tree_lowering_and_nested_groups`,
+  `::test_natural_using_coalescing_all_join_kinds`, `::test_natural_using_ambiguity_and_errors`.
+- Join tree — execution: `crates/htap-server/tests/query_exec.rs::test_nested_join_groups_and_full_join_execute`,
+  `::test_nested_join_groups_using_qualified_access_derived_tables_and_subqueries`,
+  `::test_flat_and_tree_join_evaluators_match_for_lowerable_queries` (the mandatory differential harness),
+  `::test_using_and_natural_joins_merge_columns`, `::test_hash_join_preserves_large_integer_keys` (decision on
+  option 7, the hash-key widening fix).
+- Join tree — sessions: `crates/htap-server/tests/session.rs::test_read_your_own_writes_nested_join_group`.
+- Recursive CTE caps: `crates/htap-server/tests/query_exec.rs::test_recursive_cte_iteration_and_row_cap_bounded_time`,
+  `::test_recursive_cte_large_working_set`, `::test_recursive_cte_counting_and_hierarchy_traversal`,
+  `::test_recursive_cte_union_distinct_vs_all_semantics`.
+
+Cross-references: ADR-017 (the general query executor and R5's syntactic shape gate this ADR extends without
+weakening), ADR-018 (the snapshot-pinning/self-write-visibility invariant every new write and re-execution
+path in this ADR preserves), ADR-004/008/009 (durability invariants — unaffected: no on-disk envelope, WAL
+record, or catalog format changed anywhere in this ADR).

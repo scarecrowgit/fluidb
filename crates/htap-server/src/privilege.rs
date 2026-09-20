@@ -3,7 +3,7 @@
 use htap_catalog::{PrivilegeScope, PrivilegeSet};
 use htap_common::error::{HtapError, Result};
 use htap_sql::{
-    ast::{BoundStatement, ShowStatement, UpdateTarget},
+    ast::{BoundStatement, DeleteTarget, InsertSource, ShowStatement, UpdateTarget},
     referenced_table_names, table_not_found,
 };
 use sqlparser::ast::{ObjectType, Statement};
@@ -85,14 +85,23 @@ fn check_query_privileges(
                             PrivilegeSet::SELECT,
                         )?,
                         htap_sql::TableSlot::Derived { query, .. } => {
-                            walk(username, account, query, catalog)?
+                            walk(username, account, query.as_ref(), catalog)?
                         }
+                        htap_sql::TableSlot::WorkingTableSlot { .. } => {}
                     }
                 }
             }
             htap_sql::QueryBody::SetOp { left, right, .. } => {
-                walk(username, account, left, catalog)?;
-                walk(username, account, right, catalog)?;
+                walk(username, account, left.as_ref(), catalog)?;
+                walk(username, account, right.as_ref(), catalog)?;
+            }
+            htap_sql::QueryBody::RecursiveQueryBody {
+                anchor,
+                recursive_term,
+                ..
+            } => {
+                walk(username, account, anchor.as_ref(), catalog)?;
+                walk(username, account, recursive_term.as_ref(), catalog)?;
             }
         }
         Ok(())
@@ -139,16 +148,24 @@ pub(crate) fn check_statement_visible(
     }
 
     let referenced_tables = referenced_table_names(statement);
+    let truncate_if_exists =
+        matches!(statement, Statement::Truncate(truncate) if truncate.if_exists);
 
     for table in referenced_tables {
         let table_by_name = catalog.table_by_name(&table);
 
         let Some(descriptor) = table_by_name else {
+            if truncate_if_exists {
+                continue;
+            }
             return Err(table_not_found(&table));
         };
         let has_any_privilege = catalog.has_any_privilege_on(account.id, descriptor.id);
 
         if !has_any_privilege {
+            if truncate_if_exists {
+                continue;
+            }
             return Err(table_not_found(&table));
         }
     }
@@ -180,20 +197,49 @@ pub(crate) fn check_privileges(
         BoundStatement::CreateTable(_) => {
             check_global_privilege(username, account.id, catalog, PrivilegeSet::CREATE)
         }
-        BoundStatement::Insert(insert) => check_table_privilege(
-            username,
-            account.id,
-            catalog,
-            &insert.table,
-            PrivilegeSet::INSERT,
-        ),
-        BoundStatement::Delete(delete) => check_table_privilege(
-            username,
-            account.id,
-            catalog,
-            &delete.table,
-            PrivilegeSet::DELETE,
-        ),
+        BoundStatement::Insert(insert) => {
+            check_table_privilege(
+                username,
+                account.id,
+                catalog,
+                &insert.table,
+                PrivilegeSet::INSERT,
+            )?;
+            if let InsertSource::Query { query, .. } = &insert.source {
+                check_query_privileges(username, account.id, query, catalog)?;
+            }
+            Ok(())
+        }
+        BoundStatement::Delete(delete) => {
+            let descriptor = catalog.table_by_name(&delete.table);
+            if delete.if_exists && descriptor.is_none() {
+                return Ok(());
+            }
+            if delete.if_exists
+                && descriptor.is_some_and(|descriptor| {
+                    !catalog.has_any_privilege_on(account.id, descriptor.id)
+                })
+            {
+                return Ok(());
+            }
+            check_table_privilege(
+                username,
+                account.id,
+                catalog,
+                &delete.table,
+                PrivilegeSet::DELETE,
+            )?;
+            if matches!(delete.target, DeleteTarget::Filter(Some(_))) {
+                check_table_privilege(
+                    username,
+                    account.id,
+                    catalog,
+                    &delete.table,
+                    PrivilegeSet::SELECT,
+                )?;
+            }
+            Ok(())
+        }
         BoundStatement::Select(select) => check_table_privilege(
             username,
             account.id,

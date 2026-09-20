@@ -35,11 +35,11 @@ components are **deliberately not implemented** and are out of scope for this lo
   `NEWDECIMAL` parameters are kept as text and bound as a numeric literal (no arbitrary-precision decimal
   type); `TIME`-typed parameters are rejected. See "Prepared statements" below.
 - **No TPC-C or TPC-H compliance:** The system does not implement the TPC-C or TPC-H benchmark specifications, relational transaction models, or analytical query profiles. Microbenchmarks evaluate isolated internal subsystem performance only.
-- **No window functions, correlated subqueries, or cost-based optimization:** The general query executor
-  (see "Supported SQL Subset" below) handles joins, expressions, subqueries, and set operations over
-  materialized logical rows held in memory, with no spilling, no cost-based planner, and no worker-pool
-  parallelism above the per-partition scan. `OVER`, correlated subqueries, `FULL OUTER`/`NATURAL`/`USING`
-  joins, recursive CTEs, and `EXCEPT`/`INTERSECT` are not implemented.
+- **No cost-based optimization, vectorized execution, or worker-pool parallelism above the per-partition
+  scan:** The general query executor (see "Supported SQL Subset" below) handles joins (including arbitrarily
+  nested join trees, kept purely structural — it never reorders/commutes/estimates cost), window functions,
+  correlated subqueries (one level deep only), recursive CTEs, `EXCEPT`/`INTERSECT`, and other set operations
+  over materialized logical rows held in memory, with no spilling and no cost-based planner.
 - **No physical reclamation on `DROP TABLE`:** Dropping a table removes it from the catalog in one CAS;
   the rowstore data and columnar segments of its tablets stay on disk, unreachable (dropped identifiers are
   never reissued, so they can never be aliased by a new table, but disk space is not freed).
@@ -118,10 +118,12 @@ fn main() -> Result<()> {
 }
 ```
 
-### SQL breadth: joins across storage engines, `UPDATE`, `DROP TABLE`, `SHOW`
+### SQL breadth: joins across storage engines, windows, `UPDATE`, `DELETE` by filter, `DROP TABLE`, `SHOW`
 
-`execute(sql)` also drives the general query executor (joins, expressions, aggregates, subqueries,
-`UNION`), `UPDATE`, `DROP TABLE`, and `SHOW`/`DESCRIBE` — over `EmbeddedClient`, `RemoteClient`, or
+`execute(sql)` also drives the general query executor (joins including `FULL OUTER`/`NATURAL`/`USING` and
+arbitrarily nested join trees, expressions, aggregates, window functions, correlated and uncorrelated
+subqueries, `WITH RECURSIVE`, `UNION`/`EXCEPT`/`INTERSECT`), `UPDATE`, `DELETE` by filter, `TRUNCATE`,
+`INSERT ... SELECT`, `DROP TABLE`, and `SHOW`/`DESCRIBE` — over `EmbeddedClient`, `RemoteClient`, or
 `LocalServer` directly. Joining a converted (`Column`) table against a plain `Row` table works because
 every base table side is read through the same storage path at one MVCC snapshot per statement. This
 example uses `htap_server::LocalServer` directly to also call `convert_table_to_column`, which
@@ -157,6 +159,16 @@ fn main() -> Result<()> {
     // UPDATE (point form, complete-PK WHERE; a filtered WHERE scans all partitions instead).
     server.execute("UPDATE orders SET amount = amount * 1.1 WHERE order_id = 10;")?;
 
+    // A window function: running total per customer, evaluated after GROUP BY/HAVING.
+    server.execute(
+        "SELECT customer_id, amount, \
+         SUM(amount) OVER (PARTITION BY customer_id ORDER BY order_id) AS running_total \
+         FROM orders;",
+    )?;
+
+    // DELETE by an arbitrary filter (not just a complete-PK predicate), one transaction.
+    server.execute("DELETE FROM orders WHERE amount < 1.0;")?;
+
     // SHOW / DESCRIBE, answered from the catalog only.
     server.execute("SHOW TABLES;")?;
     server.execute("DESCRIBE customers;")?;
@@ -168,9 +180,9 @@ fn main() -> Result<()> {
 }
 ```
 
-Deferred on this path: window functions, correlated subqueries, recursive CTEs, `EXCEPT`/`INTERSECT`,
-`INSERT ... SELECT`, `UPDATE` with joins/subqueries, filtered `DELETE`, and cost-based optimization — see
-"Unsupported & Deferred SQL & Partition Features" below.
+Deferred on this path: `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, `LIMIT BY`, non-partition
+`ALTER TABLE`, and cost-based optimization (the join-tree evaluator above is purely structural and never
+reorders/commutes/estimates cost) — see "Unsupported & Deferred SQL & Partition Features" below.
 
 ---
 
@@ -445,27 +457,42 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
   - Multi-partition scanning: For partitioned tables, analytical queries scan partitions at a single visible snapshot and combine results globally or per group. Conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented as narrow local features; distributed fanout, disk spilling, query cancellation, and resource quotas remain deferred.
   - Base scan pushdown optimization: For materialized `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads unioning primary key and requested columns, safely pushing down at most one eligible predicate leaf (`=`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`) directly into `SegmentReader::scan`. Stale base rows are suppressed via newest post-base rowstore deltas, mutations (`Put`/`Delete`) are overlaid, and rows are ordered by primary key deterministically before complete residual SQL filter, aggregate, and group evaluation. `ScanStats`/pruning is tracked internally as execution evidence, but SQL evaluation operates on materialized logical rows (vectorized aggregation is not implemented).
   - Point read isolation: Complete-PK `Route::RowstorePointRead` queries remain strictly isolated, separate, and unchanged.
-- **General `SELECT` (joins, expressions, subqueries, `UNION`; `Route::Query`):** Any `SELECT` that does not
-  fit the narrow shape above (a join, an alias, a `LIMIT`/`HAVING`/`DISTINCT`, a subquery, an arithmetic
-  projection, etc.) binds through the general query binder and executes via `htap-server::query_exec`:
-  - Joins: `INNER`/`LEFT`/`RIGHT`/`CROSS` (left-deep chains, comma joins), table aliases, qualified names, `*`/`t.*`.
-  - Expressions: arithmetic (`+ - * / %`, `/` always widens to `Float64`, checked overflow), comparisons
-    (incl. column-vs-column), `AND`/`OR`/`NOT`, `IS [NOT] NULL`/`TRUE`/`FALSE`, `LIKE`, `IN (list)`,
-    `BETWEEN`, `CASE`, `CAST`, and scalar functions `UPPER`/`LOWER`/`LENGTH`/`CHAR_LENGTH`/`CONCAT`/`ABS`/
-    `COALESCE`/`IFNULL`/`NULLIF`.
-  - Aggregation: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` with `DISTINCT`, `GROUP BY` with strict grouping validation,
-    `HAVING`, `SELECT DISTINCT`.
+- **General `SELECT` (joins, windows, subqueries, recursion, set ops; `Route::Query`):** Any `SELECT` that
+  does not fit the narrow shape above (a join, an alias, a `LIMIT`/`HAVING`/`DISTINCT`, a subquery, an
+  arithmetic projection, etc.) binds through the general query binder and executes via
+  `htap-server::query_exec`:
+  - Joins: `INNER`/`LEFT`/`RIGHT`/`CROSS`/`FULL OUTER`, `NATURAL`/`USING` with real column coalescing, table
+    aliases, qualified names, `*`/`t.*`, and arbitrarily nested parenthesized join trees (e.g.
+    `a LEFT JOIN (b JOIN c ON ...) ON ...`) — a purely left-deep, any-join-kind shape lowers to the original
+    flat hash-join executor unchanged; a genuinely nested/parenthesized shape uses a separate recursive
+    evaluator, pinned byte-identical to the flat one by a mandatory differential test.
+  - Expressions: arithmetic (`+ - * / % DIV`, `/` always widens to `Float64`, `DIV` truncates and stays
+    `Int64`, checked overflow), comparisons (incl. column-vs-column), `AND`/`OR`/`NOT`, `IS [NOT] NULL`/
+    `TRUE`/`FALSE`, `LIKE`, `IN (list)`, `BETWEEN`, `CASE`, `CAST`, and scalar functions `UPPER`/`LOWER`/
+    `LENGTH`/`CHAR_LENGTH`/`CONCAT`/`ABS`/`COALESCE`/`IFNULL`/`NULLIF`.
+  - Aggregation: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` with `DISTINCT`, `GROUP BY` (expressions or ordinals) with
+    strict grouping validation, `HAVING`, `SELECT DISTINCT`.
+  - Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`,
+    `LAST_VALUE`, and ordinary aggregates as window functions, with `PARTITION BY`/`ORDER BY` and `ROWS`/
+    peer-`RANGE`/value-offset-`RANGE` frames (the last requires exactly one numeric/`Timestamp` `ORDER BY`
+    key). Windows are evaluated after `GROUP BY`/`HAVING`, so they can combine with aggregates; `HAVING`
+    cannot reference a window's result.
+  - Correlated subqueries, one level deep only (a reference needing a grandparent is a specific bind error),
+    in `WHERE`/`SELECT`/`HAVING`, bounded by a per-statement invocation/nesting budget.
   - Ordering/paging: `ORDER BY` expressions/aliases/ordinals with `ASC`/`DESC`/`NULLS FIRST`/`LAST`,
     `LIMIT`/`OFFSET` (incl. MySQL `LIMIT off, cnt`).
-  - Composition: `UNION`/`UNION ALL` with numeric widening, derived tables, non-recursive `WITH` CTEs, and
-    uncorrelated scalar/`IN`/`EXISTS` subqueries.
+  - Composition: `UNION`/`UNION ALL`/`EXCEPT`/`INTERSECT` (`ALL`/`DISTINCT`) with numeric widening and
+    correct multiset semantics, derived tables, non-recursive and recursive (`WITH RECURSIVE`, one
+    self-referencing CTE, capped iterations/rows/bytes) CTEs, and uncorrelated/correlated scalar/`IN`/
+    `EXISTS` subqueries.
   - Cross-engine consistency: every base table side of a join is read through the same storage path as
     `Route::OlapScan` above, all at **one** MVCC snapshot per statement, so a join between a `Row` table and
     a converted `Column`/`Converting` table is consistent. Per-slot partition pruning and single-leaf
     predicate pushdown apply as above, except a conjunct on the null-supplying side of an outer join is kept
     as a residual filter rather than pushed down.
-  - Limits: intermediate results (scanned rows, hash tables, groups) are held in memory without bounds — no
-    spilling, no cost-based planning, and no worker-pool parallelism above the per-slot scan.
+  - Limits: intermediate results (scanned rows, hash tables, groups, window partitions, recursive working
+    tables) are held in memory without bounds — no spilling, no cost-based planning (the join tree above is
+    purely structural), and no worker-pool parallelism above the per-slot scan.
   - R5 is preserved structurally: a purely syntactic shape test (`is_narrow_select_shape`) runs before any
     deep binding, so a complete-PK lookup or narrow scan keeps its existing route unchanged, and a clause
     that would otherwise be silently dropped (`LIMIT`, alias, join, `OR` on a PK lookup) instead falls
@@ -481,6 +508,27 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
   makes the actual bound smaller; see `docs/LIMITATIONS.md` — no chunking). Assignments evaluate left to right
   against the progressively updated row. Rejected: assigning a primary-key or partition-key column, subqueries
   in `SET`, and `UPDATE ... FROM`/`JOIN`/`ORDER BY`/`LIMIT`.
+- **`DELETE` by filter, and `TRUNCATE`** (`Route::RowstoreDelete`):
+  ```sql
+  DELETE FROM orders WHERE amount < 1.0;
+  TRUNCATE TABLE orders;
+  ```
+  `DELETE` accepts any `WHERE` filter, not just a complete-PK predicate; a non-PK filter scans every
+  partition at one snapshot and commits all matching deletes in **one** transaction (same payload cap and
+  no-chunking rule as filtered `UPDATE`; requires `DELETE` privilege always, plus `SELECT` when filtered).
+  `TRUNCATE TABLE t` / `TRUNCATE t` bind to the exact same unfiltered-`DELETE` representation — transactional
+  and rollback-able, a disclosed deviation from real MySQL `TRUNCATE`. Unsupported `TRUNCATE` options
+  (multiple targets, `PARTITION`, `IDENTITY`, `CASCADE`) are bind errors.
+- **`INSERT ... SELECT`** (`Route::RowstoreWrite`):
+  ```sql
+  INSERT INTO archived_orders (order_id, customer_id, amount)
+    SELECT order_id, customer_id, amount FROM orders WHERE amount > 100;
+  ```
+  Requires the same explicit target column list every `INSERT` requires, and an exact per-column static type
+  match between the source query's output and the target columns (no widening; a NULL literal/variable is
+  permissive). The source executes fully at the statement's one snapshot before any target row is inserted,
+  so a self-referencing `INSERT INTO t SELECT ... FROM t` reads only the pre-insert snapshot and inserts each
+  source row exactly once.
 - **`DROP TABLE`** (`Route::CatalogDdl`):
   ```sql
   DROP TABLE IF EXISTS orders;
@@ -526,15 +574,15 @@ Partitioned tables can be defined via SQL DDL or via the native `LocalServer` ad
   - Fail-closed storage validation: `LocalServer::open` verifies that catalog partition metadata matches `<root>/colstore` manifests and segments on disk, failing closed (with `HtapError::Corruption` or `HtapError::Io` depending on the cause) if inconsistencies are detected.
 
 ### Unsupported & Deferred SQL & Partition Features
-Direct `SegmentReader` pushdown optimization is implemented for the compact base path (single leaf pushdown), used by `Route::OlapScan` and, per slot, `Route::Query`. Simple unqualified source/projected column `ORDER BY` is implemented for `AnalyticSelect`; the general query path additionally supports joins, CTEs, expressions, aliases, full `ORDER BY`, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, and `UPDATE`/`DROP TABLE`/`SHOW` (see "General `SELECT`" and the `UPDATE`/`DROP TABLE`/`SHOW` bullets above). The following features are still explicitly deferred:
+Direct `SegmentReader` pushdown optimization is implemented for the compact base path (single leaf pushdown), used by `Route::OlapScan` and, per slot, `Route::Query`. Simple unqualified source/projected column `ORDER BY` is implemented for `AnalyticSelect`; the general query path additionally supports joins (including `FULL OUTER`/`NATURAL`/`USING` and arbitrarily nested join trees), CTEs (including `WITH RECURSIVE`), expressions (including integer `DIV`), aliases, full `ORDER BY`/`GROUP BY` (including ordinals), `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, window functions, correlated subqueries, `EXCEPT`/`INTERSECT`, and `UPDATE`/`DELETE` by filter/`TRUNCATE`/`INSERT ... SELECT`/`DROP TABLE`/`SHOW` (see "General `SELECT`" and the bullets above). The following features are still explicitly deferred:
 - Compound `AND` pushdown beyond one leaf, and `!=` pushdown (evaluated as residual SQL filters).
-- Vectorized aggregation, vectorized/pipelined operator execution, and worker-pool parallelism for the general query path (each slot's own partition scan still uses the narrow path's scan workers; joins/grouping/ordering run single-threaded in memory).
-- Window functions (`OVER`), correlated subqueries, `FULL OUTER`/`NATURAL`/`USING` joins, parenthesized nested join trees, recursive CTEs, `EXCEPT`/`INTERSECT`, `GROUP BY` ordinals, `LIMIT BY`.
-- `INSERT ... SELECT`, `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, `DELETE` by non-PK filter (still complete-PK only), `TRUNCATE`, non-partition `ALTER TABLE`.
-- Cost-based query optimization, memory bounds/spilling for the general query path, physical reclamation of data on `DROP TABLE`.
+- Vectorized aggregation, vectorized/pipelined operator execution, and worker-pool parallelism for the general query path (each slot's own partition scan still uses the narrow path's scan workers; joins/grouping/ordering/windows run single-threaded in memory).
+- Cost-based query optimization (the join tree is purely structural — it never reorders/commutes/estimates cost), `LIMIT BY`.
+- `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, non-partition `ALTER TABLE`.
+- Memory bounds/spilling for the general query path, physical reclamation of data on `DROP TABLE`.
 - Multi-tablet or distributed scans, distributed fanout, resource quotas, disk spilling, query cancellation (conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented locally).
 - DataFusion and Apache Arrow integration.
-- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, integer `DIV`, and broader string/date functions. (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
+- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, and broader string/date/`DATE`/`DECIMAL`/`EXTRACT`/`SUBSTRING`/`INTERVAL`/view functions. (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
 - **MySQL Partition DDL & Partition Lifecycle Boundary:**
   - Supported SQL partitioning: MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via vendored `sqlparser` and bound to validated catalog partition models.
   - Supported SQL lifecycle DDL: `ALTER TABLE <table> ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` for strict finite range and list forms and final `MAXVALUE` where supported, gated by empty-source rowstore checks before catalog mutation.

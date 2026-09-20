@@ -312,6 +312,11 @@ When a statement specifies a complete primary key:
    ```
 2. **Composite Primary Keys:** The partition key is not required to be the first column in a composite primary key. As long as it is part of the PK, its position within `pk_key` is correctly located (verified in `test_partitioned_composite_pk_partition_key_not_first`).
 3. **Point `DELETE`:** Routes to `partition_id` and commits a single `Mutation::Delete` via `txn_manager`.
+   Since Phase 13, a complete-PK equality `WHERE` still takes exactly this point path
+   (`Route::RowstoreDelete { key: Some(key) }`); a `DELETE` with any other filter (or none) instead resolves
+   every partition of the table and scans each at one snapshot, the same multi-partition pattern filtered
+   `UPDATE` already uses, committing all matching-row deletes across every partition in **one** transaction
+   (verified by `test_delete_by_filter_prunes_range_partition_and_preserves_other_partitions`).
 4. **Point `SELECT` (`Route::RowstorePointRead`):**
    - Obtains snapshot at `visible_version`.
    - Calls `self.engine.get(partition_id.as_u64(), &key, snapshot)` directly on the LSM rowstore.

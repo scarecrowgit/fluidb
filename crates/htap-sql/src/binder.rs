@@ -10,12 +10,12 @@ use htap_common::types::{
 };
 use sqlparser::ast::{
     Action, AlterTable as SqlAlterTable, AlterTableOperation, BinaryOperator, ColumnOption,
-    CreateTable as SqlCreateTable, CreateTableOptions, Delete as SqlDelete, DuplicateTreatment,
-    Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GrantObjects, Grantee,
-    GranteeName, GranteesType, GroupByExpr, Ident, IndexColumn, Insert as SqlInsert,
-    MysqlLessThanBound, MysqlPartitionBy, MysqlPartitionDef, MysqlPartitionValues, ObjectName,
-    ObjectNamePart, OrderByExpr, PrimaryKeyConstraint, Privileges, Query, SelectItem, SetExpr,
-    Statement, TableConstraint, TableFactor, TableObject, UnaryOperator,
+    CreateTable as SqlCreateTable, CreateTableOptions, DuplicateTreatment, Expr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GrantObjects, Grantee, GranteeName, GranteesType,
+    GroupByExpr, Ident, IndexColumn, Insert as SqlInsert, MysqlLessThanBound, MysqlPartitionBy,
+    MysqlPartitionDef, MysqlPartitionValues, ObjectName, ObjectNamePart, OrderByExpr,
+    PrimaryKeyConstraint, Privileges, Query, SelectItem, SetExpr, Statement, TableConstraint,
+    TableFactor, TableObject, UnaryOperator,
 };
 
 use crate::{
@@ -23,8 +23,8 @@ use crate::{
         AggregateFunction, AlterPartitions, AlterUserStatement, AnalyticExpr, AnalyticFilter,
         AnalyticOrderBy, AnalyticSelect, BoundListPartition, BoundPartitioning,
         BoundRangePartition, BoundStatement, ComparisonOp, CreateTable, CreateUserStatement,
-        DeleteByPrimaryKey, DropUserStatement, GrantScope, GrantStatement, Insert, PointSelect,
-        RevokeStatement, ShowGrantsStatement,
+        DropUserStatement, GrantScope, GrantStatement, Insert, PointSelect, RevokeStatement,
+        ShowGrantsStatement,
     },
     table_not_found,
 };
@@ -45,7 +45,8 @@ pub fn bind(statement: &Statement, catalog: &CatalogSnapshot) -> Result<BoundSta
     match statement {
         Statement::CreateTable(create_table) => bind_create_table(create_table, catalog),
         Statement::Insert(insert) => bind_insert(insert, catalog),
-        Statement::Delete(delete) => bind_delete(delete, catalog),
+        Statement::Delete(delete) => crate::binder_query::bind_delete(delete, catalog),
+        Statement::Truncate(truncate) => crate::binder_query::bind_truncate(truncate, catalog),
         Statement::Query(query) => bind_select(query, catalog),
         Statement::AlterTable(alter_table) => bind_alter_table(alter_table, catalog),
         Statement::Update(update) => crate::binder_query::bind_update(update, catalog),
@@ -1832,36 +1833,34 @@ fn bind_insert(insert: &SqlInsert, catalog: &CatalogSnapshot) -> Result<BoundSta
         HtapError::InvalidArgument("INSERT statement missing source query".into())
     })?;
 
-    if query.with.is_some() {
-        return Err(HtapError::Unsupported(
-            "CTEs not supported in INSERT".into(),
-        ));
-    }
-    if query.order_by.is_some() || query.limit_clause.is_some() {
-        return Err(HtapError::Unsupported(
-            "ORDER BY / LIMIT not supported in INSERT".into(),
-        ));
-    }
-
     let values = match &*query.body {
-        SetExpr::Values(v) => v,
-        SetExpr::Select(_) | SetExpr::Query(_) | SetExpr::SetOperation { .. } => {
-            return Err(HtapError::Unsupported(
-                "INSERT ... SELECT not supported".into(),
-            ));
-        }
+        SetExpr::Values(values) => Some(values),
+        SetExpr::Select(_) | SetExpr::Query(_) | SetExpr::SetOperation { .. } => None,
         _ => {
             return Err(HtapError::Unsupported("unsupported INSERT source".into()));
         }
     };
 
-    if values.rows.is_empty() {
-        return Err(HtapError::InvalidArgument(
-            "INSERT VALUES cannot be empty".into(),
-        ));
+    if let Some(values) = values {
+        if query.with.is_some() {
+            return Err(HtapError::Unsupported(
+                "CTEs not supported in INSERT VALUES".into(),
+            ));
+        }
+        if query.order_by.is_some() || query.limit_clause.is_some() {
+            return Err(HtapError::Unsupported(
+                "ORDER BY / LIMIT not supported in INSERT VALUES".into(),
+            ));
+        }
+        if values.rows.is_empty() {
+            return Err(HtapError::InvalidArgument(
+                "INSERT VALUES cannot be empty".into(),
+            ));
+        }
     }
 
-    // Check missing columns: every schema column must be present in insert.columns
+    // Check missing columns: every schema column must be present in insert.columns.
+    // This is validated before binding an INSERT ... SELECT source.
     if insert.columns.len() != table_desc.schema.len() {
         return Err(HtapError::InvalidArgument(format!(
             "INSERT column count mismatch: expected all {} schema columns, got {}",
@@ -1904,6 +1903,28 @@ fn bind_insert(insert: &SqlInsert, catalog: &CatalogSnapshot) -> Result<BoundSta
         col_index_in_schema.push(schema_idx);
     }
 
+    if values.is_none() {
+        let bound_query = crate::binder_query::bind_query(query, catalog)?;
+        let targets = col_index_in_schema
+            .iter()
+            .map(|&index| {
+                table_desc
+                    .schema
+                    .column(index)
+                    .expect("INSERT column index validated")
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        crate::binder_query::validate_insert_query_types(&bound_query, &targets)?;
+
+        return Ok(BoundStatement::Insert(Insert::from_query(
+            table_name,
+            bound_query,
+            col_index_in_schema,
+        )));
+    }
+
+    let values = values.expect("literal INSERT source validated");
     let schema_len = table_desc.schema.len();
     let mut rows = Vec::with_capacity(values.rows.len());
 
@@ -2087,94 +2108,6 @@ pub(crate) fn bind_pk_where_predicate(
     Ok(key)
 }
 
-fn bind_delete(delete: &SqlDelete, catalog: &CatalogSnapshot) -> Result<BoundStatement> {
-    if !delete.tables.is_empty() {
-        return Err(HtapError::Unsupported(
-            "multi-table DELETE not supported".into(),
-        ));
-    }
-    if delete.using.is_some() {
-        return Err(HtapError::Unsupported(
-            "USING clause not supported in DELETE".into(),
-        ));
-    }
-    if delete.returning.is_some() {
-        return Err(HtapError::Unsupported(
-            "RETURNING clause not supported in DELETE".into(),
-        ));
-    }
-    if !delete.order_by.is_empty() {
-        return Err(HtapError::Unsupported(
-            "ORDER BY not supported in DELETE".into(),
-        ));
-    }
-    if delete.limit.is_some() {
-        return Err(HtapError::Unsupported(
-            "LIMIT not supported in DELETE".into(),
-        ));
-    }
-
-    let tables = match &delete.from {
-        FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
-    };
-    if tables.len() != 1 {
-        return Err(HtapError::Unsupported(
-            "joins or multiple tables in DELETE not supported".into(),
-        ));
-    }
-    let table_with_joins = &tables[0];
-    if !table_with_joins.joins.is_empty() {
-        return Err(HtapError::Unsupported(
-            "JOIN not supported in DELETE".into(),
-        ));
-    }
-
-    let table_name = match &table_with_joins.relation {
-        TableFactor::Table {
-            name,
-            alias,
-            partitions,
-            args,
-            with_hints,
-            version,
-            ..
-        } => {
-            if alias.is_some() {
-                return Err(HtapError::Unsupported(
-                    "table aliases not supported in DELETE".into(),
-                ));
-            }
-            if !partitions.is_empty()
-                || args.is_some()
-                || !with_hints.is_empty()
-                || version.is_some()
-            {
-                return Err(HtapError::Unsupported(
-                    "unsupported table factor options in DELETE".into(),
-                ));
-            }
-            extract_unqualified_name(name)?
-        }
-        _ => {
-            return Err(HtapError::Unsupported(
-                "unsupported table relation in DELETE".into(),
-            ));
-        }
-    };
-
-    let table_desc = catalog
-        .table_by_name(&table_name)
-        .ok_or_else(|| table_not_found(&table_name))?;
-
-    validate_table_descriptor_primary_key(table_desc)?;
-
-    let key = bind_pk_where_predicate(table_desc, delete.selection.as_ref())?;
-
-    Ok(BoundStatement::Delete(DeleteByPrimaryKey::new(
-        table_name, key,
-    )))
-}
-
 /// Binds a `SELECT`.
 ///
 /// Statements whose shape fits the narrow single-table slice (see
@@ -2188,7 +2121,8 @@ fn bind_select(query: &Query, catalog: &CatalogSnapshot) -> Result<BoundStatemen
     if is_narrow_select_shape(query) {
         return bind_narrow_select(query, catalog);
     }
-    crate::binder_query::bind_query(query, catalog).map(BoundStatement::Query)
+    crate::binder_query::bind_query(query, catalog)
+        .map(|query| BoundStatement::Query(Box::new(query)))
 }
 
 /// Whether a query has the shape handled by the narrow point/analytic binders:

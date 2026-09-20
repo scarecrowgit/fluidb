@@ -41,8 +41,8 @@ use htap_movement::{
 };
 use htap_rowstore::{Engine, EngineOptions, Snapshot};
 use htap_sql::ast::{
-    AnalyticSelect, BoundPartitioning, BoundStatement, CreateTable, DeleteByPrimaryKey, Insert,
-    PointSelect, UpdateStatement, UpdateTarget,
+    AnalyticSelect, BoundPartitioning, BoundStatement, CreateTable, DeleteStatement, DeleteTarget,
+    Insert, InsertSource, PointSelect, UpdateStatement, UpdateTarget,
 };
 use htap_sql::ast::{DropTableStatement, ShowStatement};
 use htap_sql::expr::VariableLookup;
@@ -439,6 +439,8 @@ impl LocalServer {
         variables: &dyn VariableLookup,
         principal: &Principal,
     ) -> Result<StatementResult> {
+        privilege::check_privileges(principal, &bound, catalog)?;
+
         match bound {
             BoundStatement::CreateTable(create) => {
                 let _route = classify_route(
@@ -448,16 +450,77 @@ impl LocalServer {
                 self.execute_create_table(create, catalog)
             }
             BoundStatement::Insert(insert) => {
+                if let InsertSource::Query { query, .. } = &insert.source {
+                    for slot in Self::general_base_tables(query.as_ref())? {
+                        let (_, partitions) =
+                            self.resolve_table_and_all_partitions(&slot, catalog)?;
+                        for partition in partitions {
+                            let _route = classify_route(
+                                &BoundStatement::Query(query.clone()),
+                                &partition.storage,
+                            )?;
+                        }
+                    }
+                }
                 let table_desc = self.resolve_table(&insert.table, catalog)?;
-                self.execute_insert(insert, table_desc, catalog, &mut mode)
+                self.execute_insert(insert, table_desc, catalog, &mut mode, variables)
             }
             BoundStatement::Delete(delete) => {
+                let descriptor = catalog.table_by_name(&delete.table);
+                if delete.if_exists && descriptor.is_none() {
+                    return Ok(StatementResult::dml(0, None));
+                }
+                if let Principal::Account { id, .. } = principal {
+                    if delete.if_exists
+                        && descriptor.is_some_and(|descriptor| {
+                            !catalog.has_any_privilege_on(*id, descriptor.id)
+                        })
+                    {
+                        return Ok(StatementResult::dml(0, None));
+                    }
+                }
                 let table_desc = self.resolve_table(&delete.table, catalog)?;
-                let partition_id = self.route_pk_to_partition(table_desc, &delete.key, catalog)?;
-                let partition = self.validate_partition(table_desc, partition_id, catalog)?;
-                let _route =
-                    classify_route(&BoundStatement::Delete(delete.clone()), &partition.storage)?;
-                self.execute_delete(delete, table_desc.id, partition.id, &mut mode)
+                match &delete.target {
+                    DeleteTarget::PrimaryKey(key_values) => {
+                        let partition_id =
+                            self.route_pk_to_partition(table_desc, key_values, catalog)?;
+                        let partition =
+                            self.validate_partition(table_desc, partition_id, catalog)?;
+                        let route = classify_route(
+                            &BoundStatement::Delete(delete.clone()),
+                            &partition.storage,
+                        )?;
+                        let key = match route {
+                            Route::RowstoreDelete { key: Some(key) } => key,
+                            _ => unreachable!(),
+                        };
+                        self.execute_delete_by_key(
+                            delete,
+                            table_desc.id,
+                            partition.id,
+                            key,
+                            &mut mode,
+                        )
+                    }
+                    DeleteTarget::Filter(filter) => {
+                        let (_, partitions) =
+                            self.resolve_table_and_all_partitions(&delete.table, catalog)?;
+                        for partition in &partitions {
+                            let _route = classify_route(
+                                &BoundStatement::Delete(delete.clone()),
+                                &partition.storage,
+                            )?;
+                        }
+                        self.execute_delete_by_filter(
+                            &delete,
+                            table_desc,
+                            filter.as_ref(),
+                            catalog,
+                            &mut mode,
+                            variables,
+                        )
+                    }
+                }
             }
             BoundStatement::Select(select) => {
                 let table_desc = self.resolve_table(&select.table, catalog)?;
@@ -492,7 +555,7 @@ impl LocalServer {
             BoundStatement::Query(query) => {
                 // Every base slot must be a known table; storage descriptors of all
                 // partitions are accepted (rowstore, columnar, converting).
-                for slot in Self::general_base_tables(&query) {
+                for slot in Self::general_base_tables(query.as_ref())? {
                     let (_, partitions) = self.resolve_table_and_all_partitions(&slot, catalog)?;
                     for partition in partitions {
                         let _route = classify_route(
@@ -504,7 +567,7 @@ impl LocalServer {
                 let (snapshot, write_set) = mode.read_view(self);
                 query_exec::execute_query(
                     self,
-                    &query,
+                    query.as_ref(),
                     catalog,
                     snapshot,
                     write_set,
@@ -581,10 +644,10 @@ impl LocalServer {
 
     /// Names of every base table referenced anywhere in a bound query (including derived
     /// tables, CTEs, subqueries, and set-operation branches).
-    fn general_base_tables(query: &htap_sql::BoundQuery) -> Vec<String> {
-        fn walk(query: &htap_sql::BoundQuery, out: &mut Vec<String>) {
+    fn general_base_tables(query: &htap_sql::BoundQuery) -> Result<Vec<String>> {
+        fn walk(query: &htap_sql::BoundQuery, out: &mut Vec<String>) -> Result<()> {
             for sub in &query.subqueries {
-                walk(sub, out);
+                walk(sub, out)?;
             }
             match &query.body {
                 htap_sql::QueryBody::Select(sel) => {
@@ -595,19 +658,29 @@ impl LocalServer {
                                     out.push(table.clone());
                                 }
                             }
-                            htap_sql::TableSlot::Derived { query, .. } => walk(query, out),
+                            htap_sql::TableSlot::Derived { query, .. } => walk(query, out)?,
+                            htap_sql::TableSlot::WorkingTableSlot { .. } => {}
                         }
                     }
                 }
                 htap_sql::QueryBody::SetOp { left, right, .. } => {
-                    walk(left, out);
-                    walk(right, out);
+                    walk(left, out)?;
+                    walk(right, out)?;
+                }
+                htap_sql::QueryBody::RecursiveQueryBody {
+                    anchor,
+                    recursive_term,
+                    ..
+                } => {
+                    walk(anchor, out)?;
+                    walk(recursive_term, out)?;
                 }
             }
+            Ok(())
         }
         let mut out = Vec::new();
-        walk(query, &mut out);
-        out
+        walk(query, &mut out)?;
+        Ok(out)
     }
 
     /// Creates a catalog account.
@@ -1352,9 +1425,88 @@ impl LocalServer {
         table_desc: &TableDescriptor,
         catalog: &CatalogSnapshot,
         mode: &mut ExecMode,
+        variables: &dyn VariableLookup,
     ) -> Result<StatementResult> {
-        let mut mutations = Vec::with_capacity(insert.rows.len());
-        for row in &insert.rows {
+        let (statement_snapshot, write_set) = mode.read_view(self);
+        let rows = match insert.source {
+            InsertSource::Values(rows) => rows,
+            InsertSource::Query {
+                query,
+                column_mapping,
+            } => {
+                let result = query_exec::execute_query(
+                    self,
+                    query.as_ref(),
+                    catalog,
+                    statement_snapshot,
+                    write_set,
+                    Some(variables),
+                )?;
+                let StatementResult::Query(result) = result else {
+                    return Err(HtapError::Internal(
+                        "INSERT SELECT source did not produce a query result".into(),
+                    ));
+                };
+
+                result
+                    .rows
+                    .into_iter()
+                    .map(|source_row| {
+                        if source_row.values().len() != column_mapping.len() {
+                            return Err(HtapError::Internal(format!(
+                                "INSERT SELECT source row has {} values for {} target columns",
+                                source_row.values().len(),
+                                column_mapping.len()
+                            )));
+                        }
+
+                        let mut target_values = vec![None; table_desc.schema.len()];
+                        for (source_index, &target_index) in column_mapping.iter().enumerate() {
+                            let value = source_row.values()[source_index].clone();
+                            let column =
+                                table_desc.schema.column(target_index).ok_or_else(|| {
+                                    HtapError::Internal(format!(
+                                        "INSERT target column index {target_index} out of bounds"
+                                    ))
+                                })?;
+                            if value.is_null() && !column.nullable {
+                                return Err(HtapError::InvalidArgument(format!(
+                                    "column '{}' is NOT NULL",
+                                    column.name
+                                )));
+                            }
+                            if let Some(data_type) = value.data_type() {
+                                if data_type != column.data_type {
+                                    return Err(HtapError::InvalidArgument(format!(
+                                        "type mismatch for column '{}': expected {}, found {}",
+                                        column.name,
+                                        column.data_type.name(),
+                                        data_type.name()
+                                    )));
+                                }
+                            }
+                            target_values[target_index] = Some(value);
+                        }
+
+                        let values = target_values
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, value)| {
+                                value.ok_or_else(|| {
+                                    HtapError::Internal(format!(
+                                        "INSERT column list did not provide a value for target column index {index}"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(Row::new(values))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+
+        let mut mutations = Vec::with_capacity(rows.len());
+        for row in &rows {
             let partition_id = match &table_desc.partitioning {
                 Some(partitioning) => {
                     let val = row.get(partitioning.key_column).ok_or_else(|| {
@@ -1393,21 +1545,17 @@ impl LocalServer {
             });
         }
 
-        // A blind `INSERT` never reads, but autocommit's own 2PC commit still needs the snapshot
-        // it would have read at (F4): taken here, before the commit below, exactly like a
-        // statement that does read.
-        let (statement_snapshot, _) = mode.read_view(self);
         self.commit_or_buffer(table_desc.id, mutations, mode, statement_snapshot)
     }
 
-    fn execute_delete(
+    fn execute_delete_by_key(
         &self,
-        delete: DeleteByPrimaryKey,
+        _delete: DeleteStatement,
         table_id: TableId,
         partition_id: PartitionId,
+        key: Vec<u8>,
         mode: &mut ExecMode,
     ) -> Result<StatementResult> {
-        let key = encode_key(&delete.key)?;
         let mutation = Mutation::Delete {
             partition_id: partition_id.as_u64(),
             key,
@@ -1417,6 +1565,67 @@ impl LocalServer {
         // snapshot for autocommit's own commit (F4).
         let (statement_snapshot, _) = mode.read_view(self);
         self.commit_or_buffer(table_id, vec![mutation], mode, statement_snapshot)
+    }
+
+    /// Scans a table, deletes rows matching `filter`, and commits or buffers all tombstones as
+    /// one mutation batch.
+    fn execute_delete_by_filter(
+        &self,
+        delete: &DeleteStatement,
+        table_desc: &TableDescriptor,
+        filter: Option<&htap_sql::Expr>,
+        catalog: &CatalogSnapshot,
+        mode: &mut ExecMode,
+        variables: &dyn VariableLookup,
+    ) -> Result<StatementResult> {
+        let (snapshot, write_set) = mode.read_view(self);
+        let ctx = query_exec::ExecContext {
+            server: self,
+            catalog,
+            snapshot,
+            write_set,
+            variables: Some(variables),
+            working_rows: None,
+            working_width: 0,
+        };
+        let all_columns: std::collections::BTreeSet<usize> = (0..table_desc.schema.len()).collect();
+        let rows = query_exec::scan_base_table(&ctx, &delete.table, &all_columns, 0, &[])?;
+        let mut mutations = Vec::new();
+
+        for values in rows {
+            if let Some(filter) = filter {
+                let filter_ctx = htap_sql::EvalContext {
+                    row: &values,
+                    current_outer_row: None,
+                    aggregates: &[],
+                    output: None,
+                    subqueries: &[],
+                    variables: Some(variables),
+                    subquery_runner: None,
+                    subquery_budget: None,
+                };
+                if !filter.eval_predicate(&filter_ctx)? {
+                    continue;
+                }
+            }
+
+            let pk_values: Vec<Value> = table_desc
+                .primary_key
+                .iter()
+                .map(|&idx| {
+                    values.get(idx).cloned().ok_or_else(|| {
+                        HtapError::Internal(format!("row missing primary key column index {idx}"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let partition_id = self.route_pk_to_partition(table_desc, &pk_values, catalog)?;
+            mutations.push(Mutation::Delete {
+                partition_id: partition_id.as_u64(),
+                key: encode_key(&pk_values)?,
+            });
+        }
+
+        self.commit_or_buffer(table_desc.id, mutations, mode, snapshot)
     }
 
     /// `DROP TABLE`: removes the table and its partitions, tablets, and replicas from the
@@ -1591,10 +1800,13 @@ impl LocalServer {
         for (col_idx, expr) in &update.assignments {
             let ctx = htap_sql::EvalContext {
                 row: &values,
+                current_outer_row: None,
                 aggregates: &[],
                 output: None,
                 subqueries: &[],
                 variables: Some(variables),
+                subquery_runner: None,
+                subquery_budget: None,
             };
             let value = expr.eval(&ctx)?;
             let col = table_desc.schema.column(*col_idx).ok_or_else(|| {
@@ -1756,6 +1968,8 @@ impl LocalServer {
             snapshot,
             write_set,
             variables: Some(variables),
+            working_rows: None,
+            working_width: 0,
         };
         let all_columns: std::collections::BTreeSet<usize> = (0..table_desc.schema.len()).collect();
         let rows = query_exec::scan_base_table(&ctx, &update.table, &all_columns, 0, &[])?;
@@ -1764,10 +1978,13 @@ impl LocalServer {
             if let Some(f) = filter {
                 let filter_ctx = htap_sql::EvalContext {
                     row: &values,
+                    current_outer_row: None,
                     aggregates: &[],
                     output: None,
                     subqueries: &[],
                     variables: Some(variables),
+                    subquery_runner: None,
+                    subquery_budget: None,
                 };
                 if !f.eval_predicate(&filter_ctx)? {
                     continue;

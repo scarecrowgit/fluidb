@@ -73,16 +73,46 @@ Phase 12 has a completed local MVP for transport security and per-user accounts:
 compressed-packet framing (zlib via `flate2`, zstd via `zstd`), and a catalog-backed per-user account/privilege
 model replacing the single shared `--password`. See "TLS and compression (Phase 12)" and "Accounts and
 privileges (Phase 12)" below, ADR-020, ADR-021, and `docs/PROGRESS.md`.
+Phase 13 has a completed local MVP for SQL query breadth on top of the Phase 9 general query executor
+(`htap-sql::{query, expr, binder_query}`, `htap-server::query_exec`), no on-disk format change: `GROUP BY`/
+`ORDER BY` ordinals, integer `DIV` (truncating, `Int64`-only, division-by-zero -> `NULL`), `EXCEPT`/
+`INTERSECT` (`ALL` and `DISTINCT`, correct multiset semantics), `FULL OUTER`/`NATURAL`/`USING` joins with real
+per-node column coalescing (`INNER`/`LEFT` -> left operand's own expression, `RIGHT` -> right operand's,
+`FULL` -> `COALESCE` of both, recursing through an already-merged operand rather than re-flattening to
+physical columns), and arbitrarily nested parenthesized join trees (`query::JoinTree`) bound directly from the
+parsed `FROM` clause with bind-time offset-rebased `ON` conditions (regenerated fresh, never cached) for the
+recursive tree evaluator, alongside a purely left-deep flat-lowering fast path (`lower_to_flat`) that keeps
+every pre-Phase-13 query on the unchanged flat executor — the two executors are pinned equivalent by a
+mandatory differential test
+(`crates/htap-server/tests/query_exec.rs::test_flat_and_tree_join_evaluators_match_for_lowerable_queries`).
+`DELETE` now accepts an arbitrary `WHERE` filter (`Route::RowstoreDelete`, one transaction, same payload cap
+and privilege rule as filtered `UPDATE`); `TRUNCATE` binds to the same unfiltered-`DELETE` representation
+(transactional, rollback-able, payload-capped — a disclosed deviation from real MySQL `TRUNCATE`);
+`INSERT ... SELECT` binds a query source with an exact per-column static type match (no widening). Correlated
+subqueries are supported one level deep only (`Expr::CorrelatedColumnRef`, the `SubqueryRunner` execution
+callback trait, a per-statement `SubqueryBudget` capping total invocations and re-entrant nesting depth) in
+`WHERE`/`SELECT`/`HAVING`, with an aggregate-query correlation restricted to the outer query's `GROUP BY`
+keys; a reference that would need to skip a level is a specific bind error, never a silent mis-resolution.
+`WITH RECURSIVE` supports one self-referencing two-branch `UNION`/`UNION ALL` CTE with a working-table
+placeholder slot (never a real table lookup) and three independent caps (1000 iterations, 1,000,000
+accumulated rows, ~256 MiB accumulated bytes), each naming which cap fired. Window functions (`ROW_NUMBER`,
+`RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and ordinary aggregates as window
+functions) support `ROWS`, peer-based `RANGE`, and a project-specific value-offset `RANGE` (exactly one
+numeric/`Timestamp` `ORDER BY` key, NULL order-key rows forming their own peer group, checked-arithmetic
+boundary overflow) frame kinds, and are evaluated in a dedicated post-`HAVING`, pre-projection stage so a
+window can combine with `GROUP BY`/aggregates (aggregate discovery scans window specs too), while `HAVING`
+itself cannot reference a window's result (the window stage hasn't run yet when `HAVING` runs). See ADR-022
+and [`PROGRESS.md`](./PROGRESS.md) for the full evidence map.
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
 remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
 physical data migration for populated partition reorganization, physical rowstore reclamation, delete vectors, compaction,
 autonomous background conversion scheduling, compound AND pushdown beyond one leaf, != pushdown, vectorized aggregation / operator pipelines,
-window functions, correlated subqueries, FULL OUTER/NATURAL/USING joins, parenthesized nested join trees, recursive CTEs, EXCEPT/INTERSECT,
-GROUP BY ordinals, LIMIT BY, INSERT ... SELECT, UPDATE with joins/subqueries, DELETE by filter (still complete-PK only), TRUNCATE, non-partition ALTER,
-cost-based optimization, vectorized/pipelined execution, worker-pool parallelism for the general query path, memory bounds/spilling for the general path,
-physical reclamation on DROP TABLE, semi-join rewrites of IN/EXISTS, integer DIV, broader string/date function coverage,
+LIMIT BY, UPDATE with joins/subqueries/ORDER BY/LIMIT, non-partition ALTER,
+cost-based optimization (including for the new Phase 13 join trees, which are purely structural and never reorder/commute/estimate cost),
+vectorized/pipelined execution, worker-pool parallelism for the general query path, memory bounds/spilling for the general path,
+physical reclamation on DROP TABLE, semi-join rewrites of IN/EXISTS, broader string/date function coverage,
 multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection, IPC/multiprocess access,
@@ -109,7 +139,9 @@ flowchart TD
         catalog_bind --> route_class["Route classifier"]
 
         route_class -->|"Route::CatalogDdl"| ddl_cas["LocalCatalogStore.compare_and_set"]
-        route_class -->|"Route::RowstoreWrite"| txn_mgr["TransactionManager"]
+        route_class -->|"Route::RowstoreWrite (INSERT)"| txn_mgr["TransactionManager"]
+        route_class -->|"Route::RowstoreDelete (DELETE/TRUNCATE)"| rs_delete["point Get + tombstone, or query_exec scan +<br/>tombstones, then one Delete transaction"]
+        rs_delete --> txn_mgr
         txn_mgr --> rowstore_part["RowstoreParticipant (ID 1)"]
         rowstore_part --> rowstore_engine["htap-rowstore Engine/WAL/Memtable/SST"]
         route_class -->|"Route::RowstorePointRead"| snap_read["visible snapshot"]
@@ -124,7 +156,7 @@ flowchart TD
         route_class -->|"Route::Query"| query_exec["htap-server query_exec (general executor)"]
         query_exec -->|"per slot, one snapshot per statement"| compact_read
         query_exec -->|"per slot"| row_scan
-        query_exec --> joins_ops["hash join, filter, group/aggregate,<br/>order/limit, union in memory"]
+        query_exec --> joins_ops["flat hash-join/nested-loop chain OR<br/>recursive JoinTree evaluator (nested groups),<br/>filter, group/aggregate/having, window,<br/>distinct, order/limit, union/except/intersect in memory"]
         route_class -->|"Route::RowstoreUpdate"| rs_update["point Get + rewrite, or query_exec scan +<br/>rewrite, then one Put transaction"]
         rs_update --> txn_mgr
         route_class -->|"Route::CatalogRead"| catalog_read["SHOW / DESCRIBE from CatalogSnapshot"]
@@ -162,10 +194,11 @@ flowchart TD
         SQL --> Route["htap_sql::classify_route(bound, storage)"]
 
         Route -->|"Route::CatalogDdl<br/>(CREATE TABLE)"| DDL["DDL Catalog CAS<br/>LocalCatalogStore.compare_and_set"]
-        Route -->|"Route::RowstoreWrite<br/>(INSERT / DELETE)"| DML["commit_or_buffer -> TransactionManager.commit<br/>(statement's own read snapshot)<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
+        Route -->|"Route::RowstoreWrite<br/>(INSERT, literal or ... SELECT)"| DML["commit_or_buffer -> TransactionManager.commit<br/>(statement's own read snapshot)<br/>RowstoreParticipant (ID 1)<br/>htap_rowstore::Engine (WAL + Memtable)"]
+        Route -->|"Route::RowstoreDelete<br/>(DELETE by key, filter, or TRUNCATE)"| Delete["execute_delete_by_key /<br/>execute_delete_by_filter"]
         Route -->|"Route::RowstorePointRead<br/>(complete-PK SELECT)"| PointRead["Snapshot(visible_version)<br/>htap_rowstore::Engine.get(key)"]
         Route -->|"Route::OlapScan<br/>(AnalyticSelect)"| OlapScan["execute_analytic_select"]
-        Route -->|"Route::Query<br/>(joins/expressions/subqueries/UNION)"| GenQuery["query_exec::execute_query<br/>one Snapshot per statement"]
+        Route -->|"Route::Query<br/>(joins/expressions/subqueries/<br/>UNION/EXCEPT/INTERSECT/windows/<br/>recursive CTEs)"| GenQuery["query_exec::execute_query<br/>one Snapshot per statement"]
         Route -->|"Route::RowstoreUpdate<br/>(UPDATE)"| Update["execute_update_by_key /<br/>execute_update_by_filter"]
         Route -->|"Route::CatalogRead<br/>(SHOW / DESCRIBE)"| CatalogRead["execute_show (CatalogSnapshot only)"]
 
@@ -176,10 +209,13 @@ flowchart TD
         ConvertOverlay --> ResidualEval["Evaluate residual SQL filters,<br/>aggregates &amp; groups (Vec&lt;Row&gt;/BTreeMap)"]
         GenQuery -->|"per base table slot<br/>(same storage path as OlapScan)"| ColCompact
         GenQuery -->|"per base table slot"| RowScan
-        GenQuery --> HashJoin["hash join / nested loop,<br/>WHERE, GROUP BY/HAVING,<br/>DISTINCT, ORDER BY, LIMIT, UNION"]
+        GenQuery --> JoinExec["flat left-deep join chain (unchanged fast path)<br/>OR recursive JoinTree evaluator (nested/outer groups)<br/>-- pinned equivalent by a differential test"]
+        JoinExec --> HashJoin["WHERE, GROUP BY/HAVING,<br/>WINDOW (post-HAVING, pre-projection),<br/>DISTINCT, ORDER BY, LIMIT,<br/>UNION/EXCEPT/INTERSECT"]
         Update -->|"point form"| PointRead
         Update -->|"scan form, same snapshot"| GenQuery
         Update --> DML
+        Delete -->|"filter form, same snapshot"| GenQuery
+        Delete --> DML
     end
 
     subgraph PlannedDeferred ["Planned / Deferred Integration (Not in Direct SQL Path)"]
@@ -207,7 +243,7 @@ sequenceDiagram
     participant RowstorePart as RowstoreParticipant (ID 1)
     participant Engine as Rowstore Engine
 
-    Caller->>Client: execute(sql) [INSERT or DELETE]
+    Caller->>Client: execute(sql) [INSERT, or DELETE by key/filter/TRUNCATE]
     Client->>Server: execute(sql)
     Note over Server: Acquire execution_lock (Mutex)
     Server->>Parser: parse_one(sql)
@@ -217,7 +253,7 @@ sequenceDiagram
     Server->>Parser: bind(AST, CatalogSnapshot)
     Parser-->>Server: BoundStatement (Insert / Delete)
     Server->>Parser: classify_route(BoundStatement, partition.storage)
-    Parser-->>Server: Route::RowstoreWrite
+    Parser-->>Server: Route::RowstoreWrite (INSERT) or<br/>Route::RowstoreDelete (DELETE/TRUNCATE, since Phase 13)
 
     Server->>TxnMgr: commit(Transaction{statement's own read snapshot, TransactionRequest})
     Note over TxnMgr: Acquire manager lock (serializes commit decision);<br/>reject up front if recovery_required is latched (Phase 10)
@@ -921,7 +957,7 @@ those writes land directly in the authoritative **row store**, which acts as the
 
 - Historical reads prior to the conversion base version read directly from the rowstore.
 - Materialized partition scans via the converter API (`LocalConverter::read_column_partition` / `htap_convert::read_column_partition`, verified in `crates/htap-convert/tests/materialization.rs`) scan the columnar base segments up to the conversion snapshot version and overlay rowstore mutations (`Put` and `Delete`) committed after that base version up to the target snapshot. Note that `read_column_partition` is a standalone converter query API, not SQL execution.
-- Online transactional writes (`INSERT`, `DELETE`) and point reads (`SELECT` by primary key) execute directly against the row store (`Route::RowstoreWrite` and `Route::RowstorePointRead`), ensuring zero read or write interruption during and after conversion (verified in `crates/htap-server/tests/local_server.rs`).
+- Online transactional writes (`INSERT` via `Route::RowstoreWrite`; `DELETE` — point-key, filtered, or `TRUNCATE` since Phase 13 — via `Route::RowstoreDelete`) and point reads (`SELECT` by primary key, `Route::RowstorePointRead`) execute directly against the row store, ensuring zero read or write interruption during and after conversion (verified in `crates/htap-server/tests/local_server.rs`).
 - Bitmap delete vectors directly on columnar segments, physical rowstore reclamation, and background compaction folding deltas into new columnar segments are explicitly deferred.
 
 ---
@@ -933,7 +969,7 @@ those writes land directly in the authoritative **row store**, which acts as the
 A router inspects the **bound** statement and the partition's **storage descriptor**:
 
 - **Point lookups and short transactions that resolve fully against a primary key** take a dedicated fast path: index probe → row fetch. There is no plan-fragment construction and no vectorized operator pipeline. In `htap-sql`, complete-PK `SELECT` queries strictly bind to `PointSelect` and route to `Route::RowstorePointRead { key }` across all three storage formats (`Row`, `Column`, `Converting`), serving point reads directly from the authoritative rowstore without invoking OLAP execution or the converter (verified in `crates/htap-sql/tests/route.rs`, `crates/htap-sql/tests/parse_bind.rs`, `crates/htap-server/tests/local_server.rs`, and `crates/htap-client/tests/embedded_client.rs`). Complete-PK point read execution remains separate and unchanged. This guarantee is preserved structurally even with the general query path present: `bind_select` (`crates/htap-sql/src/binder.rs`) applies a purely syntactic shape test, `is_narrow_select_shape`, *before* any deep binding — one unaliased table, no joins/CTEs/subqueries/set operations, no `LIMIT`/`HAVING`/`DISTINCT`, a plain-column or single-aggregate projection, an AND-only filter of `column op literal` / `IS [NOT] NULL` leaves, and plain unqualified `GROUP BY`/`ORDER BY`. A statement matching that shape keeps binding through the strict `PointSelect`/`AnalyticSelect` binders (so a complete-PK lookup still routes to `Route::RowstorePointRead` and a narrow scan still routes to `Route::OlapScan`, pruning/pushdown/scan-worker behavior unchanged); a narrow-shaped statement that fails deep binding reports that binder's error rather than silently falling through to the general path. Anything with a join, alias, `LIMIT`, subquery, or an unsupported clause on what looks like a PK lookup fails the shape test up front and binds through the general query binder instead — clauses are never silently dropped. Pinned by `crates/htap-sql/tests/route.rs::test_point_read_fast_path_pinned_against_general_query_path`.
-- **The general query path (`Route::Query`, Phase 9):** Every statement that does not match `is_narrow_select_shape` binds to `BoundStatement::Query(BoundQuery)` (joins, aliases, qualified names, expressions, aggregates with `GROUP BY`/`HAVING`, `DISTINCT`, `ORDER BY`/`LIMIT`/`OFFSET`, `UNION`/`UNION ALL`, derived tables, non-recursive CTEs, uncorrelated scalar/`IN`/`EXISTS` subqueries) and routes to `Route::Query` for every storage descriptor. `htap-server::query_exec` executes it; see "General query executor" under "OLAP execution paths" below for the execution model, snapshot rule, determinism contract, and limits.
+- **The general query path (`Route::Query`, Phase 9, extended Phase 13):** Every statement that does not match `is_narrow_select_shape` binds to `BoundStatement::Query(BoundQuery)` (joins including `FULL OUTER`/`NATURAL`/`USING` and arbitrarily nested join trees, aliases, qualified names, expressions including integer `DIV`, aggregates with `GROUP BY`/`ORDER BY` ordinals/`HAVING`, `DISTINCT`, `ORDER BY`/`LIMIT`/`OFFSET`, `UNION`/`UNION ALL`/`EXCEPT`/`INTERSECT`, derived tables, non-recursive and recursive (`WITH RECURSIVE`) CTEs, uncorrelated and depth-1 correlated scalar/`IN`/`EXISTS` subqueries, and window functions) and routes to `Route::Query` for every storage descriptor. `htap-server::query_exec` executes it; see "General query executor" under "OLAP execution paths" below for the execution model, snapshot rule, determinism contract, and limits.
 - **`UPDATE` (`Route::RowstoreUpdate`, Phase 9):** `UPDATE t [alias] SET col = expr, ... [WHERE ...]` binds to `BoundStatement::Update` and routes to `Route::RowstoreUpdate { key }` for every storage descriptor (rowstore authoritative for mutations); `key` carries the encoded primary key for a complete-PK `WHERE`, `None` for the scan form. See "Transactional write execution path" below.
 - **`DROP TABLE` / `SHOW` (Phase 9):** `DROP TABLE [IF EXISTS] t` routes to `Route::CatalogDdl`; `SHOW TABLES`/`SHOW DATABASES`/`SHOW COLUMNS FROM t`/`DESCRIBE t`/`DESC t` route to `Route::CatalogRead` and are answered purely from the loaded `CatalogSnapshot`, with no rowstore or colstore access.
 - **Narrow OLAP Scans (`Route::OlapScan`):** `htap-sql` binds non-PK queries on a single unaliased table into typed `AnalyticSelect` structures routing to `Route::OlapScan`. `LocalServer` executes these narrow analytical scans over logical rowstore rows or the converter's rowstore-authoritative base-plus-delta view using server-root `<root>/colstore` for materialized `Column` and `Converting` partitions (validating catalog vs disk manifest generations).
@@ -942,7 +978,7 @@ A router inspects the **bound** statement and the partition's **storage descript
   - **Internal execution evidence:** Columnar scan statistics and block pruning (`ScanStats`) are captured as internal execution evidence during compact reads, but the SQL layer continues to evaluate materialized logical rows; vectorized aggregation is not implemented.
 - **Route Acceptance across Storage Formats:** `classify_route` accepts `StorageDescriptor::Row`, `StorageDescriptor::Column`, and `StorageDescriptor::Converting`:
   - `CREATE TABLE` and partition lifecycle `ALTER TABLE` route to `Route::CatalogDdl`.
-  - Literal `INSERT` and PK `DELETE` route to `Route::RowstoreWrite` regardless of whether the partition is `Row`, `Column`, or `Converting`, preserving rowstore write-authority and zero mutation downtime.
+  - Literal `INSERT` routes to `Route::RowstoreWrite`; `DELETE` (point-key, or, since Phase 13, an arbitrary filter/`TRUNCATE`) routes separately to `Route::RowstoreDelete { key: Option<Vec<u8>> }`, mirroring `Route::RowstoreUpdate`. Both are accepted regardless of whether the partition is `Row`, `Column`, or `Converting`, preserving rowstore write-authority and zero mutation downtime.
   - Complete-PK `SELECT` routes to `Route::RowstorePointRead { key }` across all three storage formats, strictly bypassing analytical execution and the converter.
   - `AnalyticSelect` routes to `Route::OlapScan` across `Row`, `Column`, and `Converting` formats.
   - The general `Query` (joins, expressions, subqueries, set operations) routes to `Route::Query`; `Update` routes to `Route::RowstoreUpdate { key }`; `DropTable` routes to `Route::CatalogDdl`; `Show` routes to `Route::CatalogRead` — all across `Row`, `Column`, and `Converting` formats (verified in `crates/htap-sql/tests/route.rs::test_route_classification`).
@@ -958,7 +994,7 @@ A router inspects the **bound** statement and the partition's **storage descript
   - **Storage conversion & demotion:** `LocalServer::convert_table` performs conversion on single-partition tables. Table-wide conversion is available via `LocalServer::convert_table_to_column(table_name)` returning a `TableConversionReport`. Metadata demotion from Column back to Row storage is supported via `LocalServer::convert_table_to_row(table_name)`, which clears catalog `column_manifest` references via CAS while retaining rowstore data (authoritative throughout) and existing column segment files on disk. Explicit policy ticks (`conversion_tick`, `tick`) execute synchronously, resuming persisted jobs only without autonomous background scheduling. Startup validation on `LocalServer::open` fails closed (returning `HtapError::Corruption` or `HtapError::Io` depending on the cause) if catalog metadata and `<root>/colstore` manifests conflict.
   - **Deferred capabilities:** Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), delete vectors, background compaction, autonomous background conversion scheduler, hash tablets, distributed/remote partition serving across network nodes, replica failover, and an inter-node distributed-serving network protocol remain deferred (the client-facing MySQL wire protocol is implemented; see the "Network layer" section above).
   - **Test evidence:** Verified by server partition tests in `crates/htap-server/tests/local_server.rs` (`test_sql_range_partitioning_ddl_and_maxvalue_routing`, `test_sql_list_partitioning_ddl_and_routing`, `test_server_sql_alter_partition_lifecycle`, `test_server_alter_partitions_drop_empty_and_populated_guard`, `test_server_alter_partitions_reorganize_empty_and_populated_guard`, `test_server_convert_table_multi_partition_reports_and_demotion_equivalence`, `test_server_conversion_tick_idempotent_and_resume_snapshot_pinned`, `test_server_open_fail_closed_missing_or_corrupt_manifest`, `test_partitioned_native_range_topology_catalog_reopen_continuation`, `test_partitioned_native_list_topology_catalog_reopen_continuation`, `test_partitioned_boundary_unmatched_null_type_errors`, `test_partitioned_multi_row_insert_spanning_partitions_one_version_point_delete`, `test_partitioned_composite_pk_partition_key_not_first`, `test_partitioned_olap_across_partitions_and_empty_aggregate`, `test_convert_table_multi_partition_guard`, `test_partitioned_empty_topology_rejection_no_catalog_mutation`), catalog recovery tests in `crates/htap-catalog/tests/catalog_recovery.rs` (`test_partitioning_legacy_decode_and_reopen`, `test_range_partitioning_routing_and_boundaries`, `test_list_partitioning_routing`, `test_partitioning_duplicate_violations`, `test_range_overlap_and_order_violations`, `test_partitioning_type_and_null_violations`, `test_partitioning_ownership_and_method_consistency`, `test_partitioning_cas_and_reopen_lifecycle`, `test_partition_alteration_add_range_and_list`, `test_partition_alteration_drop_range_and_list`, `test_partition_alteration_reorganize_contiguous`, `test_partition_alteration_cas_and_reopen`), parser tests in `crates/htap-sql/tests/parse_bind.rs` (`test_mysql_partition_ddl_parsed_and_bound`, `test_mysql_partition_ddl_negative_parser_and_binder`, `test_mysql_alter_partition_parsed_and_bound`, `test_mysql_alter_partition_negative`, `test_negative_create_table`), and conversion tests in `crates/htap-convert/tests/materialization.rs` (`test_demote_partition_to_row_clearing_manifest_and_retained_data`, `test_conversion_tick_resumes_snapshot_pinned`).
-- **Explicitly Deferred OLAP & SQL Capabilities:** Direct SegmentReader pushdown optimization is implemented for the compact base path (single leaf pushdown), used by both `Route::OlapScan` and, per slot, by `Route::Query`. Simple unqualified source/projected column `ORDER BY` is implemented for the narrow `AnalyticSelect` path with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break; the general query path (`Route::Query`, Phase 9) additionally supports joins, CTEs (`WITH`), expressions, aliases, `ORDER BY` of expressions/aliases/ordinals, aggregate ordering, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates — see "General query executor" below. Still deferred on every path: window functions (`OVER`), correlated subqueries, `FULL OUTER`/`NATURAL`/`USING` joins, parenthesized nested join trees, recursive CTEs, `EXCEPT`/`INTERSECT`, `GROUP BY` ordinals, `LIMIT BY`, compound `AND` pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, worker-pool parallelism and memory bounds/spilling for the general query path, multi-tablet or distributed partition scans, resource quotas/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth.
+- **Explicitly Deferred OLAP & SQL Capabilities:** Direct SegmentReader pushdown optimization is implemented for the compact base path (single leaf pushdown), used by both `Route::OlapScan` and, per slot, by `Route::Query`. Simple unqualified source/projected column `ORDER BY` is implemented for the narrow `AnalyticSelect` path with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break; the general query path (`Route::Query`, Phase 9, extended Phase 13) additionally supports joins (including `FULL OUTER`/`NATURAL`/`USING` and arbitrarily nested join trees), CTEs (`WITH`, including `WITH RECURSIVE`), expressions (including integer `DIV`), aliases, `ORDER BY`/`GROUP BY` of expressions/aliases/ordinals, aggregate ordering, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates, window functions, correlated subqueries (one level deep), and `EXCEPT`/`INTERSECT` — see "General query executor" below and `docs/PROGRESS.md`'s Phase 13 row. Still deferred on every path: `LIMIT BY`, compound `AND` pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, worker-pool parallelism and memory bounds/spilling for the general query path, cost-based optimization (the Phase 13 join tree is purely structural), multi-tablet or distributed partition scans, resource quotas/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth.
 
 This separation is enforced **by construction, not by a runtime heuristic**:
 the route code path for point lookups (`Route::RowstorePointRead`) directly
@@ -1002,7 +1038,7 @@ The transactional rowstore path provides ACID point operations, durable MVCC ver
 
 ### Transactional write execution path (`INSERT` / `DELETE` -> 2PC -> `RowstoreParticipant`)
 
-1. **Binding and routing:** Literal `INSERT` and PK `DELETE` bind to `BoundStatement::Insert` or `BoundStatement::Delete` and classify as `Route::RowstoreWrite` across all partition storage descriptors (`Row`, `Column`, `Converting`).
+1. **Binding and routing:** Literal `INSERT` (or, since Phase 13, `INSERT ... SELECT`) binds to `BoundStatement::Insert` and classifies as `Route::RowstoreWrite`; `DELETE` (point-key, or, since Phase 13, an arbitrary filter/`TRUNCATE`) binds to `BoundStatement::Delete` and classifies separately as `Route::RowstoreDelete` — across all partition storage descriptors (`Row`, `Column`, `Converting`).
 2. **Transaction manager coordination:** `LocalServer::execute_insert` and `execute_delete` construct a `TransactionRequest` containing mutations (`Mutation::Put` or `Mutation::Delete`) and route it through `commit_or_buffer` (shared with `UPDATE`, `Session`'s buffering branch, and `Session::commit`'s own final 2PC step), which in autocommit mode builds `Transaction::new(next_txn_id, statement_snapshot.version)` and calls `TransactionManager::commit` directly against the statement's own read snapshot — never `TransactionManager::commit_request` (Phase 10 fix, ADR-018: `commit_request`'s own `begin()` would instead pin a fresh snapshot at commit time, which could let a concurrent writer's commit go undetected as a conflict).
 3. **Two-phase commit sequence:** Under the transaction manager's internal lock, mutations coordinate across registered participants. `LocalServer` registers a single participant: `RowstoreParticipant` with ID 1 (`ROWSTORE_PARTICIPANT_ID = 1`):
    - **Prepare:** `RowstoreParticipant::prepare` delegates to `Engine::prepare`, which validates the mutation
@@ -1431,7 +1467,7 @@ A critical architectural distinction exists between storage scanning and SQL exe
 - **Pre-base historical query fallback:** In `read_column_partition_compact_core` (and `read_column_partition`), if `target_snapshot.version < base_version`, the converter core directly falls back to scanning the rowstore and collapsing rows, because columnar segments only represent state at and after `base_version`.
 - **Manifest-bearing Converting defensive branch:** In normal operation, the conversion process publishes the tablet manifest to the catalog only upon final cutover to `StorageDescriptor::Column`. However, if a converting partition in the catalog already references a valid manifest, `LocalServer` contains a defensive branch executing the compact columnar path.
 
-### General query executor (Phase 9)
+### General query executor (Phase 9, extended Phase 13)
 
 **Status: `implemented (local MVP)`** (`htap-sql::{query, expr, binder_query}`, `htap-server::query_exec`).
 
@@ -1444,12 +1480,25 @@ whose module doc is the source of truth for this contract. Summary:
   rowstore, `Column` and manifest-bearing `Converting` partitions from columnar segments with the rowstore
   delta overlaid, `SnapshotPinned` manifest-less `Converting` partitions falling back to the rowstore path
   (the same fallback rules as `Route::OlapScan`). Execution then runs as separate, sequential stages over
-  those materialized rows: (1) uncorrelated subqueries, executed once; (2) per-slot column projection,
-  partition pruning, and single-leaf predicate pushdown derived from that slot's own `WHERE` conjuncts; (3)
-  left-deep joins (hash join on equi-conjuncts — NULL keys never match — nested loop for residual `ON`
-  predicates, with per-row match tracking for `LEFT`/`RIGHT` null padding); (4) `WHERE`; (5) `GROUP BY` /
-  aggregation; (6) projection; (7) `HAVING`; (8) `DISTINCT`; (9) `ORDER BY`; (10) `LIMIT`/`OFFSET`; (11)
-  `UNION`.
+  those materialized rows: (1) uncorrelated subqueries, executed once, and correlated subqueries (Phase 13,
+  depth-1 only), executed per outer row via the `SubqueryRunner` callback against the statement's single
+  pinned snapshot; (2) per-slot column projection, partition pruning, and single-leaf predicate pushdown
+  derived from that slot's own `WHERE` conjuncts; (3) joins — a purely left-deep, any-join-kind
+  (`INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`) shape runs the original flat executor unchanged (hash join on
+  equi-conjuncts — NULL keys never match — nested loop for residual `ON` predicates, with per-row match
+  tracking for `LEFT`/`RIGHT`/`FULL` null padding); a genuinely nested/parenthesized join tree (Phase 13,
+  `query::JoinTree`) instead runs a separate recursive evaluator, pinned byte-identical to the flat one by a
+  mandatory differential test (see "Query breadth (Phase 13)" below); `NATURAL`/`USING` joins resolve to real
+  per-node column coalescing rather than picking one physical column; (4) `WHERE`; (5) `GROUP BY` /
+  aggregation (aggregate discovery also scans window specs, Phase 13); (6) a pre-window projection (so
+  `HAVING` can resolve projection aliases); (7) `HAVING` (Phase 13: rejects a reference to a window's result,
+  since the window stage hasn't run yet); (8) windows (Phase 13: `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`/
+  `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/aggregates-as-window, `ROWS`/peer/value-offset `RANGE` frames) —
+  evaluated only over rows that survived `HAVING`; (9) the final projection, now able to read window results;
+  (10) `DISTINCT`; (11) `ORDER BY`; (12) `LIMIT`/`OFFSET`; (13) `UNION`/`UNION ALL`/`EXCEPT`/`INTERSECT`
+  (Phase 13 added the last two, with correct occurrence-count multiset semantics). `WITH RECURSIVE` (Phase
+  13) is a distinct query-body shape (`QueryBody::RecursiveQueryBody`) executed as its own bounded
+  fixed-point loop before this pipeline runs on the result, not an extra pipeline stage.
 - **Snapshot:** One MVCC `Snapshot` (`Snapshot::new(txn_manager.visible_version())`) is taken per statement
   and reused for every slot, every partition, and every subquery, so all sides of a cross-engine join observe
   the same committed version — this is what makes the join correct across a `Row` table and a converted
@@ -1463,14 +1512,18 @@ whose module doc is the source of truth for this contract. Summary:
   primary-key order within a partition), each joined with its matching right rows in the right input's scan
   order, with unmatched preserved rows of an outer join emitted after the matched output; groups are emitted
   in ascending order of their `GROUP BY` key tuple.
-- **Limits:** Intermediate results (scanned rows, hash tables, groups) are held in memory without bounds;
-  there is no spilling, no cost-based planning, and — unlike `Route::OlapScan`, which uses bounded in-process
-  partition scan workers — no worker-pool parallelism on this path (each slot's own partition scan still uses
-  the narrow path's scan workers internally, but joins/grouping/ordering run single-threaded in memory).
+- **Limits:** Intermediate results (scanned rows, hash tables, groups, window partitions, recursive-CTE
+  working tables) are held in memory without bounds (except the explicit iteration/row/byte caps on
+  `WITH RECURSIVE` and the invocation/nesting caps on correlated subqueries, Phase 13); there is no spilling,
+  no cost-based planning (the Phase 13 `JoinTree` is purely structural), and — unlike `Route::OlapScan`, which
+  uses bounded in-process partition scan workers — no worker-pool parallelism on this path (each slot's own
+  partition scan still uses the narrow path's scan workers internally, but joins/grouping/ordering/windows
+  run single-threaded in memory).
 
-`UPDATE`'s scan form (`execute_update_by_filter`) reuses this executor's `scan_base_table` helper at the
-statement's snapshot to find matching rows before rewriting them; see "Transactional write execution path"
-below.
+`UPDATE`'s scan form (`execute_update_by_filter`) and, since Phase 13, filtered `DELETE`'s scan form
+(`execute_delete_by_filter`) and `INSERT ... SELECT`'s source materialization both reuse this executor's
+`scan_base_table` helper at the statement's snapshot to find matching rows before mutating; see
+"Transactional write execution path" below.
 
 Verified in `crates/htap-sql/src/expr.rs` unit tests (`three_valued_logic_tables`,
 `numeric_promotion_and_overflow`, `like_in_between_case_cast`, `scalar_functions`,
@@ -1487,7 +1540,10 @@ Verified in `crates/htap-sql/src/expr.rs` unit tests (`three_valued_logic_tables
 `test_union_derived_tables_ctes_and_subqueries`, `test_partition_pruning_and_pushdown_through_general_path`,
 `test_single_snapshot_across_engines_and_freshness`, `test_general_query_over_reopened_server`); and
 `crates/htap-server/tests/local_server.rs::test_analytic_unsupported_clauses` (rewritten to show which
-clauses now bind and execute, and which remain rejected).
+clauses now bind and execute, and which remain rejected). Phase 13's join-tree, window, correlated-subquery,
+recursive-CTE, `DELETE`-by-filter/`TRUNCATE`, `INSERT ... SELECT`, `EXCEPT`/`INTERSECT`, and ordinal/`DIV`
+evidence is listed in full in `docs/PROGRESS.md`'s Phase 13 row and `docs/LIMITATIONS.md`'s "Verification and
+test coverage — Phase 13 additions" (not duplicated here to avoid two lists drifting apart).
 
 ### Verification and test coverage
 
@@ -1570,10 +1626,11 @@ StorageDescriptor::Column
   up to the conversion base version `V`, and overlay rowstore mutations (`Put` and `Delete`) committed after
   version `V` up to the target snapshot. Historical reads for versions earlier than `V` are served directly
   from the rowstore.
-- **Online point writes and reads:** Primary-key point lookups (`SELECT` by PK) and mutations (`INSERT`,
-  `DELETE`) continue to execute online without interruption through `LocalServer` and `htap-sql` query routing
-  (`Route::RowstoreWrite` and `Route::RowstorePointRead`), which operate directly on the rowstore regardless
-  of whether the partition is `Row`, `Converting`, or `Column`.
+- **Online point writes and reads:** Primary-key point lookups (`SELECT` by PK) and mutations (`INSERT` via
+  `Route::RowstoreWrite`, `DELETE` via `Route::RowstoreDelete`) continue to execute online without
+  interruption through `LocalServer` and `htap-sql` query routing (plus `Route::RowstorePointRead` for point
+  reads), which operate directly on the rowstore regardless of whether the partition is `Row`, `Converting`,
+  or `Column`.
 - **Reverse conversion & metadata demotion:** Column->Row metadata demotion is implemented (`LocalServer::convert_table_to_row` / `demote_partition_to_row`), switching catalog metadata to `Row` and clearing `column_manifest` via atomic CAS, while keeping the rowstore authoritative and retaining existing columnar files on disk. Physical reverse transcoding and physical file reclamation remain deferred. (Note that `convert_table` remains single-partition and only converts Row to Column; table-wide conversion and demotion are driven via `convert_table_to_column` and `convert_table_to_row`.)
 
 ### Explicitly deferred features
@@ -1586,7 +1643,7 @@ StorageDescriptor::Column
   reclamation / truncation of converted rowstore history is deferred.
 - **Compaction:** Background merge-on-read compaction folding accumulated rowstore deltas into new columnar
   segments is deferred.
-- **Vectorized aggregation, compound pushdown, and distributed OLAP scans:** Direct `SegmentReader` pushdown optimization is now implemented for the compact base path (projection-aware compact reads and single safe predicate leaf pushdown). Vectorized aggregation, vectorized operator pipelines, compound `AND` pushdown beyond one leaf, `!=` pushdown, joins, CTEs, windows, and multi-tablet/distributed scans remain deferred.
+- **Vectorized aggregation, compound pushdown, and distributed OLAP scans:** Direct `SegmentReader` pushdown optimization is now implemented for the compact base path (projection-aware compact reads and single safe predicate leaf pushdown). This narrow `AnalyticSelect`/`Route::OlapScan` path itself still only supports a single unaliased table with no joins/CTEs/windows (those route through the general `Route::Query` path instead — see "General query executor scope and deferred features" in `docs/LIMITATIONS.md` for the full contract); vectorized aggregation, vectorized operator pipelines, compound `AND` pushdown beyond one leaf, `!=` pushdown, and multi-tablet/distributed scans remain deferred on every path.
 - **Full partition and table conversion semantics:** Conversions across multi-tablet sharded partitions,
   range/list partition boundaries, and distributed multi-node coordinated cutovers are deferred to Phase 5
   and Phase 6.

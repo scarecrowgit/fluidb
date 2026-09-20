@@ -63,6 +63,41 @@ fn test_uncommitted_writes_never_visible_after_reopen() {
 }
 
 #[test]
+fn test_uncommitted_delete_by_filter_vanishes_after_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+        server
+            .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+            .unwrap();
+        server
+            .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let mut session = server.open_session();
+        session.begin().unwrap();
+        session.execute("DELETE FROM t WHERE v >= 20;").unwrap();
+        assert_eq!(
+            as_rows(session.execute("SELECT id FROM t ORDER BY id;").unwrap()),
+            vec![Row::new(vec![Value::Int64(1)])]
+        );
+
+        // `session` and `server` drop without committing the buffered deletes.
+    }
+
+    let reopened = LocalServer::open(dir.path()).unwrap();
+    assert_eq!(
+        as_rows(reopened.execute("SELECT id FROM t ORDER BY id;").unwrap()),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+            Row::new(vec![Value::Int64(3)]),
+        ],
+        "an uncommitted filtered DELETE must never survive a reopen"
+    );
+}
+
+#[test]
 fn test_committed_transaction_visible_after_reopen() {
     let dir = TempDir::new().unwrap();
     {
@@ -213,4 +248,86 @@ fn test_reopen_after_session_commit_durable_pending_resolves_outcome() {
         StatementResult::Command(cmd) => assert_eq!(cmd.affected(), 1),
         other => panic!("expected a Command result, got {other:?}"),
     }
+}
+
+#[test]
+fn test_uncommitted_insert_select_vanishes_after_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+        server
+            .execute("CREATE TABLE src (id BIGINT PRIMARY KEY, v INT);")
+            .unwrap();
+        server
+            .execute("CREATE TABLE dst (id BIGINT PRIMARY KEY, v INT);")
+            .unwrap();
+        server
+            .execute("INSERT INTO src (id, v) VALUES (1, 10), (2, 20);")
+            .unwrap();
+
+        let mut session = server.open_session();
+        session.begin().unwrap();
+        session
+            .execute("INSERT INTO dst (id, v) SELECT id, v FROM src;")
+            .unwrap();
+        assert_eq!(
+            as_rows(
+                session
+                    .execute("SELECT id, v FROM dst ORDER BY id;")
+                    .unwrap()
+            ),
+            vec![
+                Row::new(vec![Value::Int64(1), Value::Int32(10)]),
+                Row::new(vec![Value::Int64(2), Value::Int32(20)]),
+            ]
+        );
+
+        // The buffered INSERT SELECT is abandoned when `session` and `server` drop here.
+    }
+
+    let reopened = LocalServer::open(dir.path()).unwrap();
+    assert!(as_rows(reopened.execute("SELECT id FROM dst;").unwrap()).is_empty());
+    assert_eq!(
+        as_rows(
+            reopened
+                .execute("SELECT id, v FROM src ORDER BY id;")
+                .unwrap()
+        ),
+        vec![
+            Row::new(vec![Value::Int64(1), Value::Int32(10)]),
+            Row::new(vec![Value::Int64(2), Value::Int32(20)]),
+        ]
+    );
+}
+
+#[test]
+fn test_uncommitted_truncate_vanishes_after_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+        server
+            .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+            .unwrap();
+        server
+            .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let mut session = server.open_session();
+        session.begin().unwrap();
+        session.execute("TRUNCATE TABLE t;").unwrap();
+        assert!(as_rows(session.execute("SELECT id FROM t;").unwrap()).is_empty());
+
+        // `session` and `server` drop without committing the buffered truncate.
+    }
+
+    let reopened = LocalServer::open(dir.path()).unwrap();
+    assert_eq!(
+        as_rows(reopened.execute("SELECT id FROM t ORDER BY id;").unwrap()),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+            Row::new(vec![Value::Int64(3)]),
+        ],
+        "an uncommitted TRUNCATE must never survive a reopen"
+    );
 }

@@ -583,6 +583,48 @@ fn test_missing_table_maps_to_1146() {
 }
 
 #[test]
+fn test_prepared_insert_select_with_bound_parameter() {
+    let (_dir, wire) = start(None, 4);
+    let mut setup = WireClient::connect(addr(&wire), None).unwrap();
+    ok(setup
+        .query("CREATE TABLE src (id INT PRIMARY KEY, v INT)")
+        .unwrap());
+    ok(setup
+        .query("INSERT INTO src (id, v) VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap());
+    ok(setup
+        .query("CREATE TABLE dst (id INT PRIMARY KEY, v INT)")
+        .unwrap());
+
+    let mut stream = TcpStream::connect(addr(&wire)).unwrap();
+    raw_handshake(&mut stream);
+    let (prepare_ok, _) = raw_prepare(
+        &mut stream,
+        "INSERT INTO dst (id, v) SELECT id, v FROM src WHERE id > ?",
+    );
+    assert_eq!(prepare_ok.num_params, 1);
+
+    let payload = build_execute_payload(
+        prepare_ok.stmt_id,
+        &[(MYSQL_TYPE_LONG, false, Some(1i32.to_le_bytes().to_vec()))],
+        true,
+    );
+    let response = raw_execute(&mut stream, &payload);
+    assert_eq!(response[0], OK_HEADER, "{response:?}");
+    assert_eq!(parse_ok_payload(&response).unwrap().affected_rows, 2);
+
+    assert_eq!(
+        rows(setup.query("SELECT id, v FROM dst ORDER BY id").unwrap()),
+        vec![
+            Row::new(vec![Value::Int32(2), Value::Int32(20)]),
+            Row::new(vec![Value::Int32(3), Value::Int32(30)]),
+        ]
+    );
+
+    wire.shutdown();
+}
+
+#[test]
 fn test_too_many_connections_returns_1040() {
     let (_dir, wire) = start(None, 1);
     let mut first = WireClient::connect(addr(&wire), None).unwrap();
@@ -1170,6 +1212,38 @@ fn test_prepared_statement_param_type_cache_new_params_bound_zero() {
     let resp3 = raw_execute(&mut stream, &p3);
     assert_eq!(resp3[0], ERR_HEADER);
     assert!(setup.query("SELECT 1").is_ok());
+
+    wire.shutdown();
+}
+
+#[test]
+fn test_prepared_delete_with_filter_reports_affected_rows() {
+    let (_dir, wire) = start(None, 4);
+    let mut setup = WireClient::connect(addr(&wire), None).unwrap();
+    ok(setup
+        .query("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap());
+    ok(setup
+        .query("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap());
+
+    let mut stream = TcpStream::connect(addr(&wire)).unwrap();
+    raw_handshake(&mut stream);
+    let (prepare_ok, _) = raw_prepare(&mut stream, "DELETE FROM t WHERE v > ?");
+    assert_eq!(prepare_ok.num_params, 1);
+
+    let payload = build_execute_payload(
+        prepare_ok.stmt_id,
+        &[(MYSQL_TYPE_LONG, false, Some(15i32.to_le_bytes().to_vec()))],
+        true,
+    );
+    let response = raw_execute(&mut stream, &payload);
+    assert_eq!(response[0], OK_HEADER, "{response:?}");
+    assert_eq!(parse_ok_payload(&response).unwrap().affected_rows, 2);
+    assert_eq!(
+        rows(setup.query("SELECT id FROM t ORDER BY id").unwrap()),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
 
     wire.shutdown();
 }

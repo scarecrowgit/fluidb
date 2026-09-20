@@ -1099,6 +1099,9 @@ impl Session {
                 ))
             }
         };
+        // SET scalar expressions are evaluated directly from the outer table-less SELECT.
+        // Any scalar subquery, including one containing WITH RECURSIVE, is rejected here before
+        // the query executor is invoked.
         if !query.subqueries.is_empty() {
             return Err(HtapError::Unsupported(
                 "SET does not support subquery expressions".into(),
@@ -1110,6 +1113,11 @@ impl Session {
                 return Err(HtapError::Internal(
                     "expected a single SELECT for a scalar SET expression".into(),
                 ))
+            }
+            QueryBody::RecursiveQueryBody { .. } => {
+                return Err(HtapError::Unsupported(
+                    "recursive CTE execution not yet implemented".into(),
+                ));
             }
         };
         if sel.projection.len() != 1 {
@@ -1126,10 +1134,13 @@ impl Session {
         };
         let eval_ctx = EvalContext {
             row: &[],
+            current_outer_row: None,
             aggregates: &[],
             output: None,
             subqueries: &[],
             variables: Some(&vars),
+            subquery_runner: None,
+            subquery_budget: None,
         };
         sel.projection[0].expr.eval(&eval_ctx)
     }

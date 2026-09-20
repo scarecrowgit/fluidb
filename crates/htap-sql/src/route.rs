@@ -40,8 +40,13 @@ use crate::ast::BoundStatement;
 pub enum Route {
     /// Catalog DDL operation (e.g., table creation).
     CatalogDdl,
-    /// Transactional rowstore mutation (insert or delete).
+    /// Transactional rowstore insert.
     RowstoreWrite,
+    /// Transactional rowstore delete; `key` is the encoded primary key for the point form.
+    RowstoreDelete {
+        /// Encoded primary key bytes for a complete-PK delete, `None` for the scan form.
+        key: Option<Vec<u8>>,
+    },
     /// Transactional rowstore point lookup by encoded primary key bytes.
     RowstorePointRead {
         /// Encoded primary key bytes.
@@ -89,10 +94,21 @@ pub fn classify_route(statement: &BoundStatement, storage: &StorageDescriptor) -
         BoundStatement::CreateTable(_) | BoundStatement::AlterPartitions(_) => {
             Ok(Route::CatalogDdl)
         }
-        BoundStatement::Insert(_) | BoundStatement::Delete(_) => match storage {
+        BoundStatement::Insert(_) => match storage {
             StorageDescriptor::Row
             | StorageDescriptor::Column
             | StorageDescriptor::Converting { .. } => Ok(Route::RowstoreWrite),
+        },
+        BoundStatement::Delete(delete) => match storage {
+            StorageDescriptor::Row
+            | StorageDescriptor::Column
+            | StorageDescriptor::Converting { .. } => {
+                let key = match &delete.target {
+                    crate::ast::DeleteTarget::PrimaryKey(values) => Some(encode_key(values)?),
+                    crate::ast::DeleteTarget::Filter(_) => None,
+                };
+                Ok(Route::RowstoreDelete { key })
+            }
         },
         BoundStatement::Select(select) => match storage {
             StorageDescriptor::Row
@@ -137,7 +153,7 @@ pub fn classify_route(statement: &BoundStatement, storage: &StorageDescriptor) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{CreateTable, DeleteByPrimaryKey, Insert, PointSelect};
+    use crate::ast::{CreateTable, DeleteStatement, DeleteTarget, Insert, PointSelect};
     use htap_catalog::StorageFormat;
     use htap_common::types::{ColumnDef, DataType, Row, Schema, Value};
 
@@ -173,8 +189,10 @@ mod tests {
     fn test_rowstore_write_routes() {
         let insert_stmt =
             BoundStatement::Insert(Insert::new("t", vec![Row::new(vec![Value::Int64(1)])]));
-        let delete_stmt =
-            BoundStatement::Delete(DeleteByPrimaryKey::new("t", vec![Value::Int64(1)]));
+        let delete_stmt = BoundStatement::Delete(DeleteStatement::new(
+            "t",
+            DeleteTarget::PrimaryKey(vec![Value::Int64(1)]),
+        ));
 
         let row = StorageDescriptor::Row;
         let col = StorageDescriptor::Column;
@@ -184,7 +202,7 @@ mod tests {
             generation: 1,
         };
 
-        // All storage descriptors route DML to RowstoreWrite (rowstore authoritative)
+        // All storage descriptors route inserts to RowstoreWrite (rowstore authoritative)
         assert_eq!(
             classify_route(&insert_stmt, &row).unwrap(),
             Route::RowstoreWrite
@@ -198,17 +216,24 @@ mod tests {
             Route::RowstoreWrite
         );
 
+        let delete_key = encode_key(&[Value::Int64(1)]).unwrap();
         assert_eq!(
             classify_route(&delete_stmt, &row).unwrap(),
-            Route::RowstoreWrite
+            Route::RowstoreDelete {
+                key: Some(delete_key.clone())
+            }
         );
         assert_eq!(
             classify_route(&delete_stmt, &col).unwrap(),
-            Route::RowstoreWrite
+            Route::RowstoreDelete {
+                key: Some(delete_key.clone())
+            }
         );
         assert_eq!(
             classify_route(&delete_stmt, &conv).unwrap(),
-            Route::RowstoreWrite
+            Route::RowstoreDelete {
+                key: Some(delete_key)
+            }
         );
     }
 

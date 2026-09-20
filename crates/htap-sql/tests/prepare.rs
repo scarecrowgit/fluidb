@@ -304,6 +304,13 @@ fn test_supported_shapes_count_agrees_and_substitution_matches_literal_sql() {
             vec![Value::Int64(1), Value::Int64(2)],
         ),
         (
+            "WITH RECURSIVE seq(n) AS ( \
+                 SELECT ? UNION ALL SELECT n + ? FROM seq WHERE n < 3 \
+             ) SELECT n FROM seq"
+                .to_string(),
+            vec![Value::Int64(1), Value::Int64(1)],
+        ),
+        (
             "SELECT id FROM t WHERE id IN (?, ?, ?)".to_string(),
             vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)],
         ),
@@ -401,6 +408,17 @@ fn test_hint_count_matches_placeholder_count_for_every_supported_shape() {
         "SELECT sub.id FROM (SELECT id FROM t WHERE id = ?) AS sub",
         "WITH c AS (SELECT id FROM t WHERE id = ?) SELECT id FROM c WHERE id = ?",
         "SELECT id FROM t WHERE id = ? UNION SELECT id FROM t WHERE id = ?",
+        "WITH RECURSIVE seq(n) AS ( \
+             SELECT ? UNION ALL SELECT n + ? FROM seq WHERE n < 3 \
+         ) SELECT n FROM seq",
+        "SELECT t.id FROM t \
+         JOIN (orders b JOIN orders c ON b.order_id = c.order_id AND c.amount > ?) \
+         ON t.id = b.user_id",
+        "DELETE FROM t WHERE n > ?",
+        "INSERT INTO orders (order_id, user_id, amount) \
+         SELECT id, id, amt FROM t WHERE n > ?",
+        "SELECT a.id FROM t a JOIN t b USING(id) WHERE b.n > ?",
+        "SELECT a.id FROM t a NATURAL JOIN t b WHERE b.n > ?",
     ];
     for template in templates {
         let stmt = parse_one(template).unwrap();
@@ -416,6 +434,10 @@ fn test_hint_count_matches_placeholder_count_for_every_supported_shape() {
             panic!("resolve_prepare_output_schema must never error for {template:?}: {e:?}")
         });
     }
+
+    let truncate = "TRUNCATE TABLE t";
+    let stmt = parse_one(truncate).unwrap();
+    assert_eq!(checked_placeholder_count(truncate, &stmt).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -773,4 +795,49 @@ fn test_numeric_text_validates_strictly() {
                 .expect_err(&format!("{text:?} should be rejected as numeric text"));
         assert!(matches!(err, HtapError::InvalidArgument(_)), "got {err:?}");
     }
+}
+
+#[test]
+fn test_window_over_placeholder_counts_agree() {
+    for sql in [
+        "SELECT SUM(n) OVER (PARTITION BY ?) FROM t",
+        "SELECT SUM(n) OVER (ORDER BY ?) FROM t",
+        "SELECT SUM(n) OVER (ORDER BY id ROWS BETWEEN ? PRECEDING AND CURRENT ROW) FROM t",
+    ] {
+        let stmt = parse_one(sql).unwrap();
+        assert_eq!(count_placeholders(&stmt), 1, "count mismatch for {sql}");
+        assert_eq!(
+            checked_placeholder_count(sql, &stmt).unwrap(),
+            1,
+            "checked count mismatch for {sql}"
+        );
+        assert_eq!(
+            infer_placeholder_type_hints(&stmt, &catalog())
+                .unwrap()
+                .len(),
+            1,
+            "hint count mismatch for {sql}"
+        );
+    }
+}
+
+#[test]
+fn test_window_partition_placeholder_substitution_matches_literal_sql() {
+    assert_substitution_matches_literal(
+        "SELECT SUM(n) OVER (PARTITION BY ?) FROM t",
+        &[Value::Int64(7)],
+    );
+}
+
+#[test]
+fn test_truncate_partition_placeholder_counts_agree() {
+    let sql = "TRUNCATE TABLE t PARTITION (?)";
+    let stmt = parse_one(sql).unwrap();
+
+    assert_eq!(count_placeholders(&stmt), 1);
+    assert_eq!(checked_placeholder_count(sql, &stmt).unwrap(), 1);
+    assert_eq!(
+        infer_placeholder_type_hints(&stmt, &catalog()).unwrap(),
+        vec![None]
+    );
 }

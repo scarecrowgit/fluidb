@@ -42,10 +42,13 @@ use htap_common::types::{ColumnDef, DataType, Row, Value};
 use htap_rowstore::Snapshot;
 use htap_sql::ast::{AnalyticFilter, ComparisonOp};
 use htap_sql::expr::{
-    cast_value, compare, AggFn, AggregateSpec, BinOp, EvalContext, Expr, VariableLookup,
+    cast_value, compare, AggFn, AggregateSpec, BinOp, EvalContext, Expr, SubqueryBudget,
+    SubqueryRunner, VariableLookup,
 };
 use htap_sql::query::{
-    BoundQuery, JoinKind, JoinSpec, OrderItem, QueryBody, SelectBody, SetOpKind, TableSlot,
+    BoundQuery, JoinKind, JoinSpec, JoinTree, OrderItem, PeerFrameBound, QueryBody, RowFrameBound,
+    SelectBody, SetOpKind, TableSlot, ValueFrameBound, WindowFrame, WindowFrameDirection,
+    WindowFunctionKind,
 };
 use htap_sql::result::StatementResult;
 
@@ -64,6 +67,11 @@ pub(crate) struct ExecContext<'a> {
     /// variables and live state, or [`crate::session::DefaultVariables`] when there is no
     /// session (`LocalServer::execute`).
     pub variables: Option<&'a dyn VariableLookup>,
+    /// Rows produced by the current recursive CTE iteration. Present only while evaluating a
+    /// recursive term containing a [`TableSlot::WorkingTableSlot`].
+    pub working_rows: Option<&'a [Row]>,
+    /// Expected column count of each row in `working_rows`.
+    pub working_width: usize,
 }
 
 /// Executes a bound query and returns its result set.
@@ -81,6 +89,8 @@ pub(crate) fn execute_query(
         snapshot,
         write_set,
         variables,
+        working_rows: None,
+        working_width: 0,
     };
     let rows = run_query(&ctx, query)?;
     let dynamic = dynamic_output_flags(&query.body);
@@ -102,6 +112,9 @@ fn dynamic_output_flags(body: &QueryBody) -> Vec<bool> {
             let l = dynamic_output_flags(&left.body);
             let r = dynamic_output_flags(&right.body);
             l.iter().zip(r.iter()).map(|(a, b)| *a || *b).collect()
+        }
+        QueryBody::RecursiveQueryBody { output_columns, .. } => {
+            vec![false; output_columns.len()]
         }
     }
 }
@@ -158,22 +171,94 @@ struct Keyed {
     keys: Vec<Value>,
 }
 
+/// Inputs to one binary join operation.
+struct JoinRowsInput<'a> {
+    left: Vec<Vec<Value>>,
+    left_width: usize,
+    right: Vec<Vec<Value>>,
+    right_width: usize,
+    right_slot_start: usize,
+    right_slot_end: usize,
+    join: &'a JoinSpec,
+    subqueries: &'a [Vec<Row>],
+    current_outer_row: Option<&'a [Value]>,
+    variables: Option<&'a dyn VariableLookup>,
+    subquery_runner: Option<&'a dyn SubqueryRunner>,
+    subquery_budget: Option<&'a SubqueryBudget>,
+}
+
 /// Runs a query to completion, applying ordering and limits.
 pub(crate) fn run_query(ctx: &ExecContext<'_>, query: &BoundQuery) -> Result<Vec<Row>> {
+    let budget = SubqueryBudget::new(10_000, 20);
+    run_query_with_budget(ctx, query, &budget)
+}
+
+fn run_query_with_budget(
+    ctx: &ExecContext<'_>,
+    query: &BoundQuery,
+    budget: &SubqueryBudget,
+) -> Result<Vec<Row>> {
+    run_query_with_outer(ctx, query, None, budget)
+}
+
+struct CorrelatedRunner<'a> {
+    ctx: &'a ExecContext<'a>,
+    subqueries: &'a [BoundQuery],
+    budget: &'a SubqueryBudget,
+}
+
+impl SubqueryRunner for CorrelatedRunner<'_> {
+    fn run(&self, index: usize, outer_row: &[Value]) -> Result<Vec<Row>> {
+        let query = self
+            .subqueries
+            .get(index)
+            .ok_or_else(|| HtapError::Internal(format!("subquery {index} not available")))?;
+        if query.correlated {
+            run_query_with_outer(self.ctx, query, Some(outer_row), self.budget)
+        } else {
+            run_query_with_budget(self.ctx, query, self.budget)
+        }
+    }
+}
+
+fn run_query_with_outer(
+    ctx: &ExecContext<'_>,
+    query: &BoundQuery,
+    current_outer_row: Option<&[Value]>,
+    budget: &SubqueryBudget,
+) -> Result<Vec<Row>> {
     let subqueries: Vec<Vec<Row>> = query
         .subqueries
         .iter()
-        .map(|q| run_query(ctx, q))
+        .map(|q| {
+            if q.correlated {
+                Ok(Vec::new())
+            } else {
+                run_query_with_budget(ctx, q, budget)
+            }
+        })
         .collect::<Result<_>>()?;
+    let runner = CorrelatedRunner {
+        ctx,
+        subqueries: &query.subqueries,
+        budget,
+    };
 
     let mut keyed = match &query.body {
-        QueryBody::Select(sel) => run_select(ctx, sel, &query.order_by, &subqueries)?,
+        QueryBody::Select(sel) => run_select(
+            ctx,
+            sel,
+            &query.subqueries,
+            &query.order_by,
+            &subqueries,
+            current_outer_row,
+            Some(&runner),
+            Some(budget),
+        )?,
         QueryBody::SetOp { kind, left, right } => {
-            let mut rows = Vec::new();
-            for (side, is_left) in [(left, true), (right, false)] {
-                let side_rows = run_query(ctx, side)?;
-                let _ = is_left;
-                for row in side_rows {
+            let cast_side = |side: &BoundQuery| -> Result<Vec<Vec<Value>>> {
+                let mut rows = Vec::new();
+                for row in run_query_with_outer(ctx, side, current_outer_row, budget)? {
                     let mut values = row.into_values();
                     for (i, target) in query.output_columns.iter().enumerate() {
                         if values[i].data_type().is_some_and(|d| d != target.data_type) {
@@ -182,12 +267,191 @@ pub(crate) fn run_query(ctx: &ExecContext<'_>, query: &BoundQuery) -> Result<Vec
                     }
                     rows.push(values);
                 }
-            }
-            if *kind == SetOpKind::UnionDistinct {
-                rows = dedup_rows(rows);
-            }
+                Ok(rows)
+            };
+            let left_rows = cast_side(left)?;
+            let right_rows = cast_side(right)?;
+            let rows = match *kind {
+                SetOpKind::UnionAll => {
+                    let mut rows = left_rows;
+                    rows.extend(right_rows);
+                    rows
+                }
+                SetOpKind::UnionDistinct => {
+                    let mut rows = left_rows;
+                    rows.extend(right_rows);
+                    dedup_rows(rows)
+                }
+                SetOpKind::ExceptAll
+                | SetOpKind::ExceptDistinct
+                | SetOpKind::IntersectAll
+                | SetOpKind::IntersectDistinct => {
+                    let mut left_counts: BTreeMap<Vec<Value>, usize> = BTreeMap::new();
+                    let mut left_order = Vec::new();
+                    for row in left_rows {
+                        let count = left_counts.entry(row.clone()).or_insert(0);
+                        if *count == 0 {
+                            left_order.push(row.clone());
+                        }
+                        *count += 1;
+                    }
+                    let mut right_counts: BTreeMap<Vec<Value>, usize> = BTreeMap::new();
+                    for row in right_rows {
+                        *right_counts.entry(row).or_insert(0) += 1;
+                    }
+
+                    let mut rows = Vec::new();
+                    for row in left_order {
+                        let left_count = left_counts[&row];
+                        let right_count = right_counts.get(&row).copied().unwrap_or(0);
+                        let copies = match *kind {
+                            SetOpKind::ExceptDistinct => usize::from(right_count == 0),
+                            SetOpKind::ExceptAll => left_count.saturating_sub(right_count),
+                            SetOpKind::IntersectDistinct => usize::from(right_count > 0),
+                            SetOpKind::IntersectAll => left_count.min(right_count),
+                            SetOpKind::UnionAll | SetOpKind::UnionDistinct => unreachable!(),
+                        };
+                        for _ in 0..copies {
+                            rows.push(row.clone());
+                        }
+                    }
+                    rows
+                }
+            };
             let mut out = Vec::with_capacity(rows.len());
             for output in rows {
+                let keys =
+                    order_keys_from_output(&query.order_by, &output, &subqueries, ctx.variables)?;
+                out.push(Keyed { output, keys });
+            }
+            out
+        }
+        QueryBody::RecursiveQueryBody {
+            anchor,
+            recursive_term,
+            distinct,
+            output_columns,
+        } => {
+            const MAX_RECURSIVE_ITERATIONS: usize = 1_000;
+            const MAX_RECURSIVE_ROWS: usize = 1_000_000;
+            const MAX_RECURSIVE_BYTES: usize = 256 * 1024 * 1024;
+
+            fn cast_recursive_rows(rows: Vec<Row>, columns: &[ColumnDef]) -> Result<Vec<Row>> {
+                rows.into_iter()
+                    .map(|row| {
+                        let mut values = row.into_values();
+                        for (i, column) in columns.iter().enumerate() {
+                            if values[i]
+                                .data_type()
+                                .is_some_and(|data_type| data_type != column.data_type)
+                            {
+                                values[i] = cast_value(values[i].clone(), column.data_type)?;
+                            }
+                        }
+                        Ok(Row::new(values))
+                    })
+                    .collect()
+            }
+
+            fn estimated_rows_bytes(rows: &[Row], width: usize) -> usize {
+                rows.iter()
+                    .map(|row| {
+                        let values = (0..width)
+                            .filter_map(|i| row.get(i))
+                            .map(|value| std::mem::size_of::<Value>() + value.to_string().len())
+                            .sum::<usize>();
+                        std::mem::size_of::<Row>() + values
+                    })
+                    .sum()
+            }
+
+            fn check_recursive_caps(row_count: usize, byte_count: usize) -> Result<()> {
+                if row_count > MAX_RECURSIVE_ROWS {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "recursive CTE accumulated-row-count cap of \
+                         {MAX_RECURSIVE_ROWS} rows exceeded"
+                    )));
+                }
+                if byte_count > MAX_RECURSIVE_BYTES {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "recursive CTE approximate accumulated-byte cap of \
+                         {MAX_RECURSIVE_BYTES} bytes exceeded"
+                    )));
+                }
+                Ok(())
+            }
+
+            let anchor_rows = cast_recursive_rows(
+                run_query_with_outer(ctx, anchor, current_outer_row, budget)?,
+                output_columns,
+            )?;
+            let mut seen = BTreeSet::new();
+            let mut accumulated = Vec::new();
+            let mut working = Vec::new();
+
+            for row in anchor_rows {
+                let values = row.into_values();
+                if !*distinct || seen.insert(values.clone()) {
+                    working.push(Row::new(values.clone()));
+                    accumulated.push(Row::new(values));
+                }
+            }
+
+            let mut accumulated_bytes = estimated_rows_bytes(&accumulated, output_columns.len());
+            check_recursive_caps(accumulated.len(), accumulated_bytes)?;
+
+            let mut iterations = 0;
+            while !working.is_empty() {
+                if iterations == MAX_RECURSIVE_ITERATIONS {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "recursive CTE iteration cap of \
+                         {MAX_RECURSIVE_ITERATIONS} iterations exceeded"
+                    )));
+                }
+                iterations += 1;
+
+                let iteration_ctx = ExecContext {
+                    server: ctx.server,
+                    catalog: ctx.catalog,
+                    snapshot: ctx.snapshot,
+                    write_set: ctx.write_set,
+                    variables: ctx.variables,
+                    working_rows: Some(&working),
+                    working_width: output_columns.len(),
+                };
+                let candidates = cast_recursive_rows(
+                    run_query_with_outer(
+                        &iteration_ctx,
+                        recursive_term,
+                        current_outer_row,
+                        budget,
+                    )?,
+                    output_columns,
+                )?;
+
+                let mut next = Vec::new();
+                for row in candidates {
+                    let values = row.into_values();
+                    if !*distinct || seen.insert(values.clone()) {
+                        next.push(Row::new(values));
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+
+                accumulated_bytes = accumulated_bytes
+                    .saturating_add(estimated_rows_bytes(&next, output_columns.len()));
+                let next_row_count = accumulated.len().saturating_add(next.len());
+                check_recursive_caps(next_row_count, accumulated_bytes)?;
+
+                accumulated.extend(next.iter().cloned());
+                working = next;
+            }
+
+            let mut out = Vec::with_capacity(accumulated.len());
+            for row in accumulated {
+                let output = row.into_values();
                 let keys =
                     order_keys_from_output(&query.order_by, &output, &subqueries, ctx.variables)?;
                 out.push(Keyed { output, keys });
@@ -217,10 +481,13 @@ fn order_keys_from_output(
 ) -> Result<Vec<Value>> {
     let ctx = EvalContext {
         row: &[],
+        current_outer_row: None,
         aggregates: &[],
         output: Some(output),
         subqueries,
         variables,
+        subquery_runner: None,
+        subquery_budget: None,
     };
     order_by.iter().map(|o| o.expr.eval(&ctx)).collect()
 }
@@ -270,11 +537,16 @@ fn sort_keyed(rows: &mut [Keyed], order_by: &[OrderItem]) {
 }
 
 /// Executes one select block, returning projected rows with their sort keys.
+#[allow(clippy::too_many_arguments)]
 fn run_select(
     ctx: &ExecContext<'_>,
     sel: &SelectBody,
+    bound_subqueries: &[BoundQuery],
     order_by: &[OrderItem],
     subqueries: &[Vec<Row>],
+    current_outer_row: Option<&[Value]>,
+    subquery_runner: Option<&dyn SubqueryRunner>,
+    subquery_budget: Option<&SubqueryBudget>,
 ) -> Result<Vec<Keyed>> {
     // 1. Which columns each slot must provide.
     let mut needed: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); sel.slots.len()];
@@ -283,10 +555,28 @@ fn run_select(
             needed[slot].insert(col);
         }
     };
+    fn note_join_tree_on(tree: &JoinTree, note: &mut impl FnMut(&Expr)) {
+        match tree {
+            JoinTree::Leaf(_) => {}
+            JoinTree::Join {
+                left, right, on, ..
+            } => {
+                note_join_tree_on(left, note);
+                note_join_tree_on(right, note);
+                if let Some(on) = on {
+                    note(on);
+                }
+            }
+        }
+    }
+
     for j in &sel.joins {
         if let Some(on) = &j.on {
             note(on);
         }
+    }
+    if let Some(tree) = &sel.join_tree {
+        note_join_tree_on(tree, &mut note);
     }
     if let Some(f) = &sel.filter {
         note(f);
@@ -308,19 +598,75 @@ fn run_select(
     for o in order_by {
         note(&o.expr);
     }
+    for window in &sel.windows {
+        for expr in &window.partition_by {
+            note(expr);
+        }
+        for item in &window.order_by {
+            note(&item.expr);
+        }
+        for arg in &window.args {
+            note(arg);
+        }
+        if let WindowFrame::ValueRange { start, end } = &window.frame {
+            for bound in [start, end] {
+                if let ValueFrameBound::Offset { value, .. } = bound {
+                    note(value);
+                }
+            }
+        }
+    }
+
+    // Correlated references are stored as offsets into this select's flattened input row.
+    // Include their physical source columns even when no expression in this select uses them.
+    for subquery in bound_subqueries.iter().filter(|query| query.correlated) {
+        for outer_ref in &subquery.correlated_outer_refs {
+            let Expr::CorrelatedColumnRef { offset, .. } = outer_ref else {
+                continue;
+            };
+            let mut base = 0;
+            let mut found = false;
+            for (slot_index, slot) in sel.slots.iter().enumerate() {
+                let width = slot.width();
+                if *offset >= base && *offset < base + width {
+                    needed[slot_index].insert(*offset - base);
+                    found = true;
+                    break;
+                }
+                base += width;
+            }
+            if !found {
+                return Err(HtapError::Internal(format!(
+                    "correlated column offset {offset} is outside outer row width {base}"
+                )));
+            }
+        }
+    }
 
     // 2. Materialize slots. WHERE conjuncts that touch exactly one slot are offered to
     //    that slot's scan for pruning/pushdown, except for slots on the null-supplying side
     //    of an outer join: their WHERE predicates apply after null padding (for example
     //    `LEFT JOIN c ... WHERE c.id IS NULL`), so they must stay residual.
     let mut null_supplying = vec![false; sel.slots.len()];
-    for j in &sel.joins {
-        match j.kind {
-            JoinKind::Left => null_supplying[j.right_slot] = true,
-            JoinKind::Right => null_supplying[..j.right_slot]
-                .iter_mut()
-                .for_each(|n| *n = true),
-            JoinKind::Inner | JoinKind::Cross => {}
+    if sel.tree_only {
+        if let Some(tree) = &sel.join_tree {
+            mark_tree_null_supplying(tree, false, &mut null_supplying);
+        }
+    } else {
+        for j in &sel.joins {
+            match j.kind {
+                JoinKind::Left => null_supplying[j.right_slot] = true,
+                JoinKind::Right => null_supplying[..j.right_slot]
+                    .iter_mut()
+                    .for_each(|n| *n = true),
+                JoinKind::Full => {
+                    null_supplying[..j.right_slot]
+                        .iter_mut()
+                        .for_each(|n| *n = true);
+                    null_supplying[j.right_slot] = true;
+                }
+                JoinKind::Inner | JoinKind::Cross => {}
+            }
         }
     }
     let where_conjuncts: Vec<&Expr> = sel.filter.as_ref().map(conjuncts).unwrap_or_default();
@@ -339,35 +685,89 @@ fn run_select(
                 };
                 scan_base_table(ctx, table, &needed[i], i, &single_slot_conjuncts)?
             }
-            TableSlot::Derived { query, .. } => run_query(ctx, query)?
-                .into_iter()
-                .map(Row::into_values)
-                .collect(),
+            TableSlot::Derived { query, .. } => {
+                let rows = match subquery_budget {
+                    Some(budget) => run_query_with_outer(ctx, query, current_outer_row, budget)?,
+                    None => run_query(ctx, query)?,
+                };
+                rows.into_iter().map(Row::into_values).collect()
+            }
+            TableSlot::WorkingTableSlot { columns, .. } => {
+                let working_rows = ctx.working_rows.ok_or_else(|| {
+                    HtapError::Internal(
+                        "recursive working table used outside recursive CTE iteration".into(),
+                    )
+                })?;
+                if ctx.working_width != columns.len() {
+                    return Err(HtapError::Internal(format!(
+                        "recursive working table width mismatch: context has {}, slot expects {}",
+                        ctx.working_width,
+                        columns.len()
+                    )));
+                }
+
+                working_rows
+                    .iter()
+                    .map(|row| {
+                        if row.values().len() != ctx.working_width {
+                            return Err(HtapError::Internal(format!(
+                                "recursive working row has {} values, expected {}",
+                                row.values().len(),
+                                ctx.working_width
+                            )));
+                        }
+                        Ok(row.values().to_vec())
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
         };
         slot_rows.push(rows);
     }
 
-    // 3. Joins.
-    let mut current: Vec<Vec<Value>> = match slot_rows.first() {
-        Some(_) => slot_rows.remove(0),
-        None => vec![Vec::new()], // FROM-less select: one empty row.
+    // 3. Joins. Tree-only bodies retain their recursive structure; lowerable bodies keep the
+    // existing left-deep path unchanged.
+    let mut current: Vec<Vec<Value>> = if sel.tree_only {
+        match &sel.join_tree {
+            Some(tree) => evaluate_join_tree(
+                sel,
+                tree,
+                &mut slot_rows,
+                subqueries,
+                current_outer_row,
+                ctx.variables,
+                subquery_runner,
+                subquery_budget,
+            )?,
+            None => vec![Vec::new()],
+        }
+    } else {
+        let mut current = match slot_rows.first() {
+            Some(_) => slot_rows.remove(0),
+            None => vec![Vec::new()], // FROM-less select: one empty row.
+        };
+        for (j, join) in sel.joins.iter().enumerate() {
+            let right = std::mem::take(&mut slot_rows[0]);
+            slot_rows.remove(0);
+            let right_offset = sel.slot_offset(join.right_slot);
+            let right_width = sel.slots[join.right_slot].width();
+            debug_assert_eq!(j + 1, join.right_slot);
+            current = join_rows(JoinRowsInput {
+                left: current,
+                left_width: right_offset,
+                right,
+                right_width,
+                right_slot_start: join.right_slot,
+                right_slot_end: join.right_slot + 1,
+                join,
+                subqueries,
+                current_outer_row,
+                variables: ctx.variables,
+                subquery_runner,
+                subquery_budget,
+            })?;
+        }
+        current
     };
-    for (j, join) in sel.joins.iter().enumerate() {
-        let right = std::mem::take(&mut slot_rows[0]);
-        slot_rows.remove(0);
-        let right_offset = sel.slot_offset(join.right_slot);
-        let right_width = sel.slots[join.right_slot].width();
-        debug_assert_eq!(j + 1, join.right_slot);
-        current = join_rows(
-            current,
-            right,
-            right_offset,
-            right_width,
-            join,
-            subqueries,
-            ctx.variables,
-        )?;
-    }
 
     // 4. WHERE.
     if let Some(filter) = &sel.filter {
@@ -375,10 +775,13 @@ fn run_select(
         for row in current {
             let c = EvalContext {
                 row: &row,
+                current_outer_row,
                 aggregates: &[],
                 output: None,
                 subqueries,
                 variables: ctx.variables,
+                subquery_runner,
+                subquery_budget,
             };
             if filter.eval_predicate(&c)? {
                 kept.push(row);
@@ -387,18 +790,20 @@ fn run_select(
         current = kept;
     }
 
-    // 5-7. Aggregate / project / having.
-    let mut produced: Vec<Keyed> = Vec::new();
-    let no_aggs: Vec<Value> = Vec::new();
+    // 5. Aggregate and retain each input row with its aggregate values.
+    let mut window_inputs: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     if sel.is_aggregate() {
         let mut groups: BTreeMap<Vec<Value>, (Vec<Value>, Vec<AggState>)> = BTreeMap::new();
         for row in current {
             let c = EvalContext {
                 row: &row,
+                current_outer_row,
                 aggregates: &[],
                 output: None,
                 subqueries,
                 variables: ctx.variables,
+                subquery_runner,
+                subquery_budget,
             };
             let key: Vec<Value> = sel
                 .group_by
@@ -412,13 +817,14 @@ fn run_select(
                 )
             });
             for (state, spec) in entry.1.iter_mut().zip(sel.aggregates.iter()) {
-                let v = match &spec.arg {
+                let value = match &spec.arg {
                     Some(arg) => arg.eval(&c)?,
                     None => Value::Int64(1),
                 };
-                state.accumulate(spec, v)?;
+                state.accumulate(spec, value)?;
             }
         }
+
         if groups.is_empty() && sel.group_by.is_empty() {
             let empty_row = vec![Value::Null; sel.row_width()];
             groups.insert(
@@ -429,28 +835,97 @@ fn run_select(
                 ),
             );
         }
+
         for (_, (row, states)) in groups {
-            let aggregates: Vec<Value> = states
+            let aggregates = states
                 .iter()
                 .zip(sel.aggregates.iter())
-                .map(|(s, spec)| s.finish(spec))
-                .collect::<Result<_>>()?;
-            if let Some(k) =
-                project_row(sel, order_by, &row, &aggregates, subqueries, ctx.variables)?
-            {
-                produced.push(k);
-            }
+                .map(|(state, spec)| state.finish(spec))
+                .collect::<Result<Vec<_>>>()?;
+            window_inputs.push((row, aggregates));
         }
     } else {
-        for row in current {
-            if let Some(k) = project_row(sel, order_by, &row, &no_aggs, subqueries, ctx.variables)?
-            {
-                produced.push(k);
-            }
-        }
+        window_inputs.extend(current.into_iter().map(|row| (row, Vec::new())));
     }
 
-    // 8. DISTINCT.
+    // 6-7. Compute only projection aliases needed by HAVING. Window-bearing projection
+    // items cannot be evaluated until after HAVING has filtered the grouped rows.
+    if let Some(having) = &sel.having {
+        let mut needed_outputs = BTreeSet::new();
+        having.walk(&mut |expr| {
+            if let Expr::OutputColumn { index, .. } = expr {
+                needed_outputs.insert(*index);
+            }
+        });
+
+        let mut kept = Vec::with_capacity(window_inputs.len());
+        for (row, aggregates) in window_inputs {
+            let projection_ctx = EvalContext {
+                row: &row,
+                current_outer_row,
+                aggregates: &aggregates,
+                output: None,
+                subqueries,
+                variables: ctx.variables,
+                subquery_runner,
+                subquery_budget,
+            };
+            let mut output = vec![Value::Null; sel.projection.len()];
+            for index in needed_outputs.iter().copied() {
+                let projection = sel.projection.get(index).ok_or_else(|| {
+                    HtapError::Internal(format!("HAVING output column {index} not available"))
+                })?;
+                if !projection.expr.contains_window() {
+                    output[index] = projection.expr.eval(&projection_ctx)?;
+                }
+            }
+
+            let having_ctx = EvalContext {
+                row: &row,
+                current_outer_row,
+                aggregates: &aggregates,
+                output: Some(&output),
+                subqueries,
+                variables: ctx.variables,
+                subquery_runner,
+                subquery_budget,
+            };
+            if having.eval_predicate(&having_ctx)? {
+                kept.push((row, aggregates));
+            }
+        }
+        window_inputs = kept;
+    }
+
+    // 8. Windows are evaluated only over rows that survived HAVING.
+    let window_values = evaluate_windows(
+        sel,
+        &window_inputs,
+        subqueries,
+        current_outer_row,
+        ctx.variables,
+        subquery_runner,
+        subquery_budget,
+    )?;
+
+    // 9. Re-evaluate the final projection and compute top-level ORDER BY keys.
+    let mut produced = Vec::with_capacity(window_inputs.len());
+    for ((row, aggregates), windows) in window_inputs.into_iter().zip(window_values.iter()) {
+        produced.push(project_row(
+            sel,
+            order_by,
+            &row,
+            &aggregates,
+            windows,
+            subqueries,
+            current_outer_row,
+            ctx.variables,
+            subquery_runner,
+            subquery_budget,
+        )?);
+    }
+
+    // 10. DISTINCT.
     if sel.distinct {
         let mut seen: BTreeSet<Vec<Value>> = BTreeSet::new();
         produced.retain(|k| seen.insert(k.output.clone()));
@@ -458,21 +933,614 @@ fn run_select(
     Ok(produced)
 }
 
-/// Projects one input row (or group), applies HAVING, and computes sort keys.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_windows(
+    sel: &SelectBody,
+    inputs: &[(Vec<Value>, Vec<Value>)],
+    subqueries: &[Vec<Row>],
+    current_outer_row: Option<&[Value]>,
+    variables: Option<&dyn VariableLookup>,
+    subquery_runner: Option<&dyn SubqueryRunner>,
+    subquery_budget: Option<&SubqueryBudget>,
+) -> Result<Vec<Vec<Value>>> {
+    let mut results = vec![vec![Value::Null; sel.windows.len()]; inputs.len()];
+    for (window_index, window) in sel.windows.iter().enumerate() {
+        let mut partitions: BTreeMap<Vec<Value>, Vec<usize>> = BTreeMap::new();
+        let mut order_keys = vec![Vec::new(); inputs.len()];
+
+        for (input_index, (row, aggregates)) in inputs.iter().enumerate() {
+            let eval = EvalContext {
+                row,
+                current_outer_row,
+                aggregates,
+                output: None,
+                subqueries,
+                variables,
+                subquery_runner,
+                subquery_budget,
+            };
+            let partition_key = window
+                .partition_by
+                .iter()
+                .map(|expr| expr.eval(&eval))
+                .collect::<Result<Vec<_>>>()?;
+            order_keys[input_index] = window
+                .order_by
+                .iter()
+                .map(|item| item.expr.eval(&eval))
+                .collect::<Result<Vec<_>>>()?;
+            partitions
+                .entry(partition_key)
+                .or_default()
+                .push(input_index);
+        }
+
+        for partition in partitions.values_mut() {
+            if !window.order_by.is_empty() {
+                partition.sort_by(|left, right| {
+                    compare_order_keys(&order_keys[*left], &order_keys[*right], &window.order_by)
+                        .then_with(|| left.cmp(right))
+                });
+            }
+
+            let mut rank = 1usize;
+            let mut dense_rank = 1usize;
+            for position in 0..partition.len() {
+                if position > 0
+                    && !order_keys_equal(
+                        &order_keys[partition[position - 1]],
+                        &order_keys[partition[position]],
+                        &window.order_by,
+                    )
+                {
+                    rank = position + 1;
+                    dense_rank += 1;
+                }
+
+                let input_index = partition[position];
+                let value = match window.func {
+                    WindowFunctionKind::RowNumber => Value::Int64((position + 1) as i64),
+                    WindowFunctionKind::Rank => Value::Int64(rank as i64),
+                    WindowFunctionKind::DenseRank => Value::Int64(dense_rank as i64),
+                    WindowFunctionKind::Ntile => {
+                        let buckets = window_arg_u64(
+                            window,
+                            0,
+                            inputs,
+                            input_index,
+                            subqueries,
+                            current_outer_row,
+                            variables,
+                            subquery_runner,
+                            subquery_budget,
+                        )?;
+                        if buckets == 0 {
+                            return Err(HtapError::InvalidArgument(
+                                "NTILE bucket count must be positive".into(),
+                            ));
+                        }
+                        let row_count = partition.len() as u64;
+                        let position = position as u64;
+                        let larger = row_count % buckets;
+                        let larger_size = row_count / buckets + 1;
+                        let bucket = if position < larger * larger_size {
+                            position / larger_size + 1
+                        } else {
+                            larger + (position - larger * larger_size) / (row_count / buckets) + 1
+                        };
+                        Value::Int64(bucket as i64)
+                    }
+                    WindowFunctionKind::Lag | WindowFunctionKind::Lead => {
+                        let offset = if window.args.len() >= 2 {
+                            window_arg_u64(
+                                window,
+                                1,
+                                inputs,
+                                input_index,
+                                subqueries,
+                                current_outer_row,
+                                variables,
+                                subquery_runner,
+                                subquery_budget,
+                            )?
+                        } else {
+                            1
+                        };
+                        let target = match window.func {
+                            WindowFunctionKind::Lag => position.checked_sub(offset as usize),
+                            WindowFunctionKind::Lead => position.checked_add(offset as usize),
+                            _ => unreachable!(),
+                        }
+                        .filter(|target| *target < partition.len());
+
+                        match target {
+                            Some(target) => {
+                                let target_index = partition[target];
+                                eval_window_arg(
+                                    window,
+                                    0,
+                                    inputs,
+                                    target_index,
+                                    subqueries,
+                                    current_outer_row,
+                                    variables,
+                                    subquery_runner,
+                                    subquery_budget,
+                                )?
+                            }
+                            None if window.args.len() >= 3 => eval_window_arg(
+                                window,
+                                2,
+                                inputs,
+                                input_index,
+                                subqueries,
+                                current_outer_row,
+                                variables,
+                                subquery_runner,
+                                subquery_budget,
+                            )?,
+                            None => Value::Null,
+                        }
+                    }
+                    WindowFunctionKind::FirstValue | WindowFunctionKind::LastValue => {
+                        let frame = window_frame_range(
+                            window,
+                            partition,
+                            position,
+                            &order_keys,
+                            inputs,
+                            input_index,
+                            subqueries,
+                            current_outer_row,
+                            variables,
+                            subquery_runner,
+                            subquery_budget,
+                        )?;
+                        match frame {
+                            Some((start, end)) => {
+                                let frame_position =
+                                    if window.func == WindowFunctionKind::FirstValue {
+                                        start
+                                    } else {
+                                        end
+                                    };
+                                eval_window_arg(
+                                    window,
+                                    0,
+                                    inputs,
+                                    partition[frame_position],
+                                    subqueries,
+                                    current_outer_row,
+                                    variables,
+                                    subquery_runner,
+                                    subquery_budget,
+                                )?
+                            }
+                            None => Value::Null,
+                        }
+                    }
+                    WindowFunctionKind::CountStar
+                    | WindowFunctionKind::Count
+                    | WindowFunctionKind::Sum
+                    | WindowFunctionKind::Avg
+                    | WindowFunctionKind::Min
+                    | WindowFunctionKind::Max => {
+                        let frame = window_frame_range(
+                            window,
+                            partition,
+                            position,
+                            &order_keys,
+                            inputs,
+                            input_index,
+                            subqueries,
+                            current_outer_row,
+                            variables,
+                            subquery_runner,
+                            subquery_budget,
+                        )?;
+                        let aggregate_func = match window.func {
+                            WindowFunctionKind::CountStar => AggFn::CountStar,
+                            WindowFunctionKind::Count => AggFn::Count,
+                            WindowFunctionKind::Sum => AggFn::Sum,
+                            WindowFunctionKind::Avg => AggFn::Avg,
+                            WindowFunctionKind::Min => AggFn::Min,
+                            WindowFunctionKind::Max => AggFn::Max,
+                            _ => unreachable!(),
+                        };
+                        let spec = AggregateSpec {
+                            func: aggregate_func,
+                            distinct: false,
+                            arg: window.args.first().cloned(),
+                            data_type: window.data_type,
+                            nullable: window.nullable,
+                            name: "window aggregate".into(),
+                        };
+                        let mut state = AggState::new(&spec);
+                        if let Some((start, end)) = frame {
+                            for &frame_input_index in partition[start..=end].iter() {
+                                let value = if aggregate_func == AggFn::CountStar {
+                                    Value::Int64(1)
+                                } else {
+                                    eval_window_arg(
+                                        window,
+                                        0,
+                                        inputs,
+                                        frame_input_index,
+                                        subqueries,
+                                        current_outer_row,
+                                        variables,
+                                        subquery_runner,
+                                        subquery_budget,
+                                    )?
+                                };
+                                state.accumulate(&spec, value)?;
+                            }
+                        }
+                        state.finish(&spec)?
+                    }
+                };
+                results[input_index][window_index] = value;
+            }
+        }
+    }
+    Ok(results)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn window_frame_range(
+    window: &htap_sql::query::WindowSpec,
+    partition: &[usize],
+    position: usize,
+    order_keys: &[Vec<Value>],
+    inputs: &[(Vec<Value>, Vec<Value>)],
+    input_index: usize,
+    subqueries: &[Vec<Row>],
+    current_outer_row: Option<&[Value]>,
+    variables: Option<&dyn VariableLookup>,
+    subquery_runner: Option<&dyn SubqueryRunner>,
+    subquery_budget: Option<&SubqueryBudget>,
+) -> Result<Option<(usize, usize)>> {
+    let len = partition.len();
+    if len == 0 {
+        return Ok(None);
+    }
+
+    let peer_range = || {
+        let mut start = position;
+        while start > 0
+            && order_keys_equal(
+                &order_keys[partition[start - 1]],
+                &order_keys[partition[position]],
+                &window.order_by,
+            )
+        {
+            start -= 1;
+        }
+        let mut end = position;
+        while end + 1 < len
+            && order_keys_equal(
+                &order_keys[partition[end + 1]],
+                &order_keys[partition[position]],
+                &window.order_by,
+            )
+        {
+            end += 1;
+        }
+        (start, end)
+    };
+
+    let range = match &window.frame {
+        WindowFrame::None => (0, len - 1),
+        WindowFrame::Rows { start, end } => {
+            let endpoint = |bound: &RowFrameBound| -> i128 {
+                match bound {
+                    RowFrameBound::Unbounded(WindowFrameDirection::Preceding) => i128::MIN,
+                    RowFrameBound::Unbounded(WindowFrameDirection::Following) => i128::MAX,
+                    RowFrameBound::CurrentRow => position as i128,
+                    RowFrameBound::Offset { value, direction } => match direction {
+                        WindowFrameDirection::Preceding => position as i128 - *value as i128,
+                        WindowFrameDirection::Following => position as i128 + *value as i128,
+                    },
+                }
+            };
+            let start = endpoint(start).max(0);
+            let end = endpoint(end).min(len as i128 - 1);
+            if start > end || start >= len as i128 || end < 0 {
+                return Ok(None);
+            }
+            (start as usize, end as usize)
+        }
+        WindowFrame::PeerRange { start, end } => {
+            let (peer_start, peer_end) = peer_range();
+            let endpoint = |bound: &PeerFrameBound, is_start: bool| match bound {
+                PeerFrameBound::Unbounded(WindowFrameDirection::Preceding) => 0,
+                PeerFrameBound::Unbounded(WindowFrameDirection::Following) => len - 1,
+                PeerFrameBound::CurrentRow => {
+                    if is_start {
+                        peer_start
+                    } else {
+                        peer_end
+                    }
+                }
+            };
+            (endpoint(start, true), endpoint(end, false))
+        }
+        WindowFrame::ValueRange { start, end } => {
+            if window.order_by.len() != 1 {
+                return Err(HtapError::Internal(
+                    "value RANGE frame requires exactly one ORDER BY key".into(),
+                ));
+            }
+            let current = &order_keys[input_index][0];
+            let (peer_start, peer_end) = peer_range();
+            let endpoint = |bound: &ValueFrameBound, is_start: bool| -> Result<usize> {
+                match bound {
+                    ValueFrameBound::Unbounded(WindowFrameDirection::Preceding) => Ok(0),
+                    ValueFrameBound::Unbounded(WindowFrameDirection::Following) => Ok(len - 1),
+                    ValueFrameBound::CurrentRow => Ok(if is_start { peer_start } else { peer_end }),
+                    ValueFrameBound::Offset { value, direction } if current.is_null() => {
+                        let _ = value;
+                        let _ = direction;
+                        Ok(if is_start { peer_start } else { peer_end })
+                    }
+                    ValueFrameBound::Offset { value, direction } => {
+                        let (row, aggregates) = &inputs[input_index];
+                        let offset = value.eval(&EvalContext {
+                            row,
+                            current_outer_row,
+                            aggregates,
+                            output: None,
+                            subqueries,
+                            variables,
+                            subquery_runner,
+                            subquery_budget,
+                        })?;
+                        let boundary = value_range_boundary(
+                            current,
+                            &offset,
+                            *direction,
+                            window.order_by[0].asc,
+                        )?;
+                        let boundary_keys = [boundary];
+
+                        if is_start {
+                            Ok(partition
+                                .iter()
+                                .position(|index| {
+                                    !order_keys[*index][0].is_null()
+                                        && compare_order_keys(
+                                            &order_keys[*index],
+                                            &boundary_keys,
+                                            &window.order_by,
+                                        ) != std::cmp::Ordering::Less
+                                })
+                                .unwrap_or(len))
+                        } else {
+                            Ok(partition
+                                .iter()
+                                .rposition(|index| {
+                                    !order_keys[*index][0].is_null()
+                                        && compare_order_keys(
+                                            &order_keys[*index],
+                                            &boundary_keys,
+                                            &window.order_by,
+                                        ) != std::cmp::Ordering::Greater
+                                })
+                                .unwrap_or(len))
+                        }
+                    }
+                }
+            };
+            (endpoint(start, true)?, endpoint(end, false)?)
+        }
+    };
+
+    if range.0 >= len || range.1 >= len || range.0 > range.1 {
+        Ok(None)
+    } else {
+        Ok(Some(range))
+    }
+}
+
+fn value_range_boundary(
+    current: &Value,
+    offset: &Value,
+    direction: WindowFrameDirection,
+    ascending: bool,
+) -> Result<Value> {
+    let subtract = matches!(direction, WindowFrameDirection::Preceding) == ascending;
+    let invalid = || {
+        HtapError::InvalidArgument(format!(
+            "RANGE offset must be a non-negative finite numeric value, got {offset}"
+        ))
+    };
+    let overflow = || HtapError::InvalidArgument("window RANGE boundary overflow".into());
+
+    match current {
+        Value::Int32(value) => {
+            let offset = match offset {
+                Value::Int32(value) if *value >= 0 => *value as i64,
+                Value::Int64(value) if *value >= 0 => *value,
+                _ => return Err(invalid()),
+            };
+            let value = *value as i64;
+            Ok(Value::Int64(if subtract {
+                value.checked_sub(offset).ok_or_else(overflow)?
+            } else {
+                value.checked_add(offset).ok_or_else(overflow)?
+            }))
+        }
+        Value::Int64(value) => {
+            let offset = match offset {
+                Value::Int32(value) if *value >= 0 => *value as i64,
+                Value::Int64(value) if *value >= 0 => *value,
+                _ => return Err(invalid()),
+            };
+            Ok(Value::Int64(if subtract {
+                value.checked_sub(offset).ok_or_else(overflow)?
+            } else {
+                value.checked_add(offset).ok_or_else(overflow)?
+            }))
+        }
+        Value::Timestamp(value) => {
+            let offset = match offset {
+                Value::Int32(value) if *value >= 0 => *value as i64,
+                Value::Int64(value) if *value >= 0 => *value,
+                _ => return Err(invalid()),
+            };
+            Ok(Value::Timestamp(if subtract {
+                value.checked_sub(offset).ok_or_else(overflow)?
+            } else {
+                value.checked_add(offset).ok_or_else(overflow)?
+            }))
+        }
+        Value::Float64(value) if value.is_finite() => {
+            let offset = match offset {
+                Value::Int32(value) if *value >= 0 => *value as f64,
+                Value::Int64(value) if *value >= 0 => *value as f64,
+                Value::Float64(value) if value.is_finite() && *value >= 0.0 => *value,
+                _ => return Err(invalid()),
+            };
+            let boundary = if subtract {
+                *value - offset
+            } else {
+                *value + offset
+            };
+            if !boundary.is_finite() {
+                return Err(overflow());
+            }
+            Ok(Value::Float64(boundary))
+        }
+        _ => Err(HtapError::InvalidArgument(format!(
+            "value RANGE requires a numeric or timestamp ORDER BY key, got {current}"
+        ))),
+    }
+}
+
+fn compare_order_keys(
+    left: &[Value],
+    right: &[Value],
+    order_by: &[OrderItem],
+) -> std::cmp::Ordering {
+    for ((left, right), item) in left.iter().zip(right).zip(order_by) {
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => {
+                if item.nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if item.nulls_first {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (false, false) => {
+                let ordering = compare(left, right)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| left.cmp(right));
+                if item.asc {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }
+            }
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn order_keys_equal(left: &[Value], right: &[Value], order_by: &[OrderItem]) -> bool {
+    compare_order_keys(left, right, order_by) == std::cmp::Ordering::Equal
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_window_arg(
+    window: &htap_sql::query::WindowSpec,
+    argument: usize,
+    inputs: &[(Vec<Value>, Vec<Value>)],
+    input_index: usize,
+    subqueries: &[Vec<Row>],
+    current_outer_row: Option<&[Value]>,
+    variables: Option<&dyn VariableLookup>,
+    subquery_runner: Option<&dyn SubqueryRunner>,
+    subquery_budget: Option<&SubqueryBudget>,
+) -> Result<Value> {
+    let (row, aggregates) = &inputs[input_index];
+    window.args[argument].eval(&EvalContext {
+        row,
+        current_outer_row,
+        aggregates,
+        output: None,
+        subqueries,
+        variables,
+        subquery_runner,
+        subquery_budget,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn window_arg_u64(
+    window: &htap_sql::query::WindowSpec,
+    argument: usize,
+    inputs: &[(Vec<Value>, Vec<Value>)],
+    input_index: usize,
+    subqueries: &[Vec<Row>],
+    current_outer_row: Option<&[Value]>,
+    variables: Option<&dyn VariableLookup>,
+    subquery_runner: Option<&dyn SubqueryRunner>,
+    subquery_budget: Option<&SubqueryBudget>,
+) -> Result<u64> {
+    match eval_window_arg(
+        window,
+        argument,
+        inputs,
+        input_index,
+        subqueries,
+        current_outer_row,
+        variables,
+        subquery_runner,
+        subquery_budget,
+    )? {
+        Value::Int32(value) if value >= 0 => Ok(value as u64),
+        Value::Int64(value) if value >= 0 => Ok(value as u64),
+        value => Err(HtapError::InvalidArgument(format!(
+            "window offset or bucket count must be a non-negative integer, got {value}"
+        ))),
+    }
+}
+
+/// Projects one input row (or group) and computes top-level sort keys.
+#[allow(clippy::too_many_arguments)]
 fn project_row(
     sel: &SelectBody,
     order_by: &[OrderItem],
     row: &[Value],
     aggregates: &[Value],
+    windows: &[Value],
     subqueries: &[Vec<Row>],
+    current_outer_row: Option<&[Value]>,
     variables: Option<&dyn VariableLookup>,
-) -> Result<Option<Keyed>> {
+    subquery_runner: Option<&dyn SubqueryRunner>,
+    subquery_budget: Option<&SubqueryBudget>,
+) -> Result<Keyed> {
     let c = EvalContext {
         row,
+        current_outer_row,
         aggregates,
-        output: None,
+        output: Some(windows),
         subqueries,
         variables,
+        subquery_runner,
+        subquery_budget,
     };
     let output: Vec<Value> = sel
         .projection
@@ -481,21 +1549,19 @@ fn project_row(
         .collect::<Result<_>>()?;
     let c = EvalContext {
         row,
+        current_outer_row,
         aggregates,
         output: Some(&output),
         subqueries,
         variables,
+        subquery_runner,
+        subquery_budget,
     };
-    if let Some(h) = &sel.having {
-        if !h.eval_predicate(&c)? {
-            return Ok(None);
-        }
-    }
     let keys: Vec<Value> = order_by
         .iter()
         .map(|o| o.expr.eval(&c))
         .collect::<Result<_>>()?;
-    Ok(Some(Keyed { output, keys }))
+    Ok(Keyed { output, keys })
 }
 
 /// Splits an expression into its top-level `AND` conjuncts.
@@ -648,16 +1714,192 @@ pub(crate) fn scan_base_table(
     Ok(out)
 }
 
-/// Joins the accumulated left rows with the right slot's rows.
-fn join_rows(
-    left: Vec<Vec<Value>>,
-    right: Vec<Vec<Value>>,
-    right_offset: usize,
-    right_width: usize,
-    join: &JoinSpec,
+/// Marks leaves below an outer join's null-supplying input. A leaf remains ineligible for
+/// single-table WHERE pushdown when any ancestor can NULL-pad it.
+fn mark_tree_null_supplying(tree: &JoinTree, inherited: bool, null_supplying: &mut [bool]) {
+    match tree {
+        JoinTree::Leaf(slot) => null_supplying[*slot] |= inherited,
+        JoinTree::Join {
+            kind, left, right, ..
+        } => {
+            let left_supplied = inherited || matches!(kind, JoinKind::Right | JoinKind::Full);
+            let right_supplied = inherited || matches!(kind, JoinKind::Left | JoinKind::Full);
+            mark_tree_null_supplying(left, left_supplied, null_supplying);
+            mark_tree_null_supplying(right, right_supplied, null_supplying);
+        }
+    }
+}
+
+/// Returns the inclusive slot range covered by a join subtree.
+fn tree_slot_range(tree: &JoinTree) -> (usize, usize) {
+    match tree {
+        JoinTree::Leaf(slot) => (*slot, *slot),
+        JoinTree::Join { left, right, .. } => {
+            let (first, _) = tree_slot_range(left);
+            let (_, last) = tree_slot_range(right);
+            (first, last)
+        }
+    }
+}
+
+/// Evaluates a nested join subtree bottom-up. Each result row is the concatenation of its
+/// leaves' full-width slot rows, which is also the global slot order at the root.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_join_tree(
+    sel: &SelectBody,
+    tree: &JoinTree,
+    slot_rows: &mut [Vec<Vec<Value>>],
     subqueries: &[Vec<Row>],
+    current_outer_row: Option<&[Value]>,
     variables: Option<&dyn VariableLookup>,
+    subquery_runner: Option<&dyn SubqueryRunner>,
+    subquery_budget: Option<&SubqueryBudget>,
 ) -> Result<Vec<Vec<Value>>> {
+    match tree {
+        JoinTree::Leaf(slot) => Ok(std::mem::take(&mut slot_rows[*slot])),
+        JoinTree::Join {
+            kind,
+            left,
+            right,
+            on,
+        } => {
+            let left_rows = evaluate_join_tree(
+                sel,
+                left,
+                slot_rows,
+                subqueries,
+                current_outer_row,
+                variables,
+                subquery_runner,
+                subquery_budget,
+            )?;
+            let right_rows = evaluate_join_tree(
+                sel,
+                right,
+                slot_rows,
+                subqueries,
+                current_outer_row,
+                variables,
+                subquery_runner,
+                subquery_budget,
+            )?;
+            let (left_first, left_last) = tree_slot_range(left);
+            let (right_first, right_last) = tree_slot_range(right);
+            debug_assert_eq!(left_last + 1, right_first);
+
+            let left_width = sel.slots[left_first..=left_last]
+                .iter()
+                .map(TableSlot::width)
+                .sum();
+            let right_width = sel.slots[right_first..=right_last]
+                .iter()
+                .map(TableSlot::width)
+                .sum();
+            let equi_key_types = join_equi_key_types(on.as_ref(), right_first, right_last + 1);
+            let join = JoinSpec {
+                kind: *kind,
+                right_slot: right_first,
+                on: on.clone(),
+                equi_key_types,
+            };
+            join_rows(JoinRowsInput {
+                left: left_rows,
+                left_width,
+                right: right_rows,
+                right_width,
+                right_slot_start: right_first,
+                right_slot_end: right_last + 1,
+                join: &join,
+                subqueries,
+                current_outer_row,
+                variables,
+                subquery_runner,
+                subquery_budget,
+            })
+        }
+    }
+}
+
+fn join_equi_key_types(
+    on: Option<&Expr>,
+    right_slot_start: usize,
+    right_slot_end: usize,
+) -> Vec<Option<DataType>> {
+    let Some(on) = on else {
+        return Vec::new();
+    };
+    let is_left =
+        |slots: &[usize]| !slots.is_empty() && slots.iter().all(|slot| *slot < right_slot_start);
+    let is_right = |slots: &[usize]| {
+        !slots.is_empty()
+            && slots
+                .iter()
+                .all(|slot| *slot >= right_slot_start && *slot < right_slot_end)
+    };
+
+    conjuncts(on)
+        .into_iter()
+        .filter_map(|term| {
+            let Expr::BinaryOp {
+                op: BinOp::Eq,
+                left,
+                right,
+            } = term
+            else {
+                return None;
+            };
+            let left_slots = left.referenced_slots();
+            let right_slots = right.referenced_slots();
+            let (left, right) = if is_left(&left_slots) && is_right(&right_slots) {
+                (left.as_ref(), right.as_ref())
+            } else if is_right(&left_slots) && is_left(&right_slots) {
+                (right.as_ref(), left.as_ref())
+            } else {
+                return None;
+            };
+
+            let left_type = left.expr_type().data_type;
+            let right_type = right.expr_type().data_type;
+            let numeric = |data_type| {
+                matches!(
+                    data_type,
+                    DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Timestamp
+                )
+            };
+            Some(if numeric(left_type) && numeric(right_type) {
+                Some(
+                    if left_type == DataType::Float64 || right_type == DataType::Float64 {
+                        DataType::Float64
+                    } else {
+                        DataType::Int64
+                    },
+                )
+            } else {
+                None
+            })
+        })
+        .collect()
+}
+
+/// Joins the accumulated left rows with the right relation's rows.
+fn join_rows(input: JoinRowsInput<'_>) -> Result<Vec<Vec<Value>>> {
+    let JoinRowsInput {
+        left,
+        left_width,
+        right,
+        right_width,
+        right_slot_start,
+        right_slot_end,
+        join,
+        subqueries,
+        current_outer_row,
+        variables,
+        subquery_runner,
+        subquery_budget,
+    } = input;
+    debug_assert!(left.iter().all(|row| row.len() == left_width));
+    debug_assert!(right.iter().all(|row| row.len() == right_width));
+
     let null_right = vec![Value::Null; right_width];
     let mut out = Vec::new();
     let combine = |l: &[Value], r: &[Value]| {
@@ -690,8 +1932,12 @@ fn join_rows(
         } = c
         {
             let (sa, sb) = (a.referenced_slots(), b.referenced_slots());
-            let is_left = |s: &[usize]| !s.is_empty() && s.iter().all(|&x| x < join.right_slot);
-            let is_right = |s: &[usize]| s == [join.right_slot];
+            let is_left = |s: &[usize]| !s.is_empty() && s.iter().all(|&x| x < right_slot_start);
+            let is_right = |s: &[usize]| {
+                !s.is_empty()
+                    && s.iter()
+                        .all(|&x| x >= right_slot_start && x < right_slot_end)
+            };
             if is_left(&sa) && is_right(&sb) {
                 left_keys.push(a);
                 right_keys.push(b);
@@ -705,17 +1951,29 @@ fn join_rows(
     let eval_on = |row: &[Value]| -> Result<bool> {
         on.eval_predicate(&EvalContext {
             row,
+            current_outer_row,
             aggregates: &[],
             output: None,
             subqueries,
             variables,
+            subquery_runner,
+            subquery_budget,
         })
     };
 
     let mut left_matched = vec![false; left.len()];
     let mut right_matched = vec![false; right.len()];
 
-    if left_keys.is_empty() {
+    let canonical_types = join
+        .equi_key_types
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>();
+    if left_keys.is_empty()
+        || canonical_types
+            .as_ref()
+            .is_none_or(|types| types.len() != left_keys.len())
+    {
         for (li, l) in left.iter().enumerate() {
             for (ri, r) in right.iter().enumerate() {
                 let row = combine(l, r);
@@ -727,21 +1985,21 @@ fn join_rows(
             }
         }
     } else {
-        // Build on the right side; rows whose key contains NULL never match.
+        let canonical_types = canonical_types.expect("canonical key types checked above");
         let mut table: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
-        let pad = vec![Value::Null; right_offset];
+        let pad = vec![Value::Null; left_width];
         for (ri, r) in right.iter().enumerate() {
             let padded = combine(&pad, r);
             let c = EvalContext::row_only(&padded);
             let mut key = Vec::with_capacity(right_keys.len());
             let mut has_null = false;
-            for k in &right_keys {
+            for (k, canonical_type) in right_keys.iter().zip(&canonical_types) {
                 let v = k.eval(&c)?;
                 if v.is_null() {
                     has_null = true;
                     break;
                 }
-                key.push(normalize_key(v));
+                key.push(normalize_key(v, *canonical_type)?);
             }
             if !has_null {
                 table.entry(key).or_default().push(ri);
@@ -751,17 +2009,18 @@ fn join_rows(
             let c = EvalContext::row_only(l);
             let mut key = Vec::with_capacity(left_keys.len());
             let mut has_null = false;
-            for k in &left_keys {
+            for (k, canonical_type) in left_keys.iter().zip(&canonical_types) {
                 let v = k.eval(&c)?;
                 if v.is_null() {
                     has_null = true;
                     break;
                 }
-                key.push(normalize_key(v));
+                key.push(normalize_key(v, *canonical_type)?);
             }
             if has_null {
                 continue;
             }
+
             if let Some(candidates) = table.get(&key) {
                 for &ri in candidates {
                     let row = combine(l, &right[ri]);
@@ -784,7 +2043,20 @@ fn join_rows(
             }
         }
         JoinKind::Right => {
-            let null_left = vec![Value::Null; right_offset];
+            let null_left = vec![Value::Null; left_width];
+            for (ri, r) in right.iter().enumerate() {
+                if !right_matched[ri] {
+                    out.push(combine(&null_left, r));
+                }
+            }
+        }
+        JoinKind::Full => {
+            for (li, l) in left.iter().enumerate() {
+                if !left_matched[li] {
+                    out.push(combine(l, &null_right));
+                }
+            }
+            let null_left = vec![Value::Null; left_width];
             for (ri, r) in right.iter().enumerate() {
                 if !right_matched[ri] {
                     out.push(combine(&null_left, r));
@@ -796,12 +2068,24 @@ fn join_rows(
     Ok(out)
 }
 
-/// Normalizes numeric join keys so `Int32(1)`, `Int64(1)` and `Float64(1.0)` hash equal.
-fn normalize_key(v: Value) -> Value {
-    match v {
-        Value::Int32(i) => Value::Float64(i as f64),
-        Value::Int64(i) | Value::Timestamp(i) => Value::Float64(i as f64),
-        other => other,
+/// Normalizes both sides of an equi-join key to the binder-selected numeric type.
+fn normalize_key(value: Value, canonical_type: DataType) -> Result<Value> {
+    match canonical_type {
+        DataType::Int64 => match value {
+            Value::Int32(value) => Ok(Value::Int64(value as i64)),
+            Value::Int64(value) | Value::Timestamp(value) => Ok(Value::Int64(value)),
+            other => cast_value(other, DataType::Int64),
+        },
+        DataType::Float64 => match value {
+            Value::Int32(value) => Ok(Value::Float64(value as f64)),
+            Value::Int64(value) | Value::Timestamp(value) => Ok(Value::Float64(value as f64)),
+            Value::Float64(value) => Ok(Value::Float64(value)),
+            other => cast_value(other, DataType::Float64),
+        },
+        other => Err(HtapError::Internal(format!(
+            "unsupported canonical join key type {}",
+            other.name()
+        ))),
     }
 }
 

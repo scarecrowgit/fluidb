@@ -834,7 +834,7 @@ use htap_catalog::{CatalogSnapshot, TableDescriptor, TableId};
 use htap_common::types::{
     ColumnDef as CommonColumnDef, DataType as CommonDataType, Row, Schema, Value as CommonValue,
 };
-use htap_sql::{bind, BoundStatement};
+use htap_sql::{bind, BoundStatement, InsertSource};
 
 #[test]
 fn test_grant_table_vs_global_grantee_binding() {
@@ -1065,6 +1065,37 @@ fn parse_and_bind(sql: &str, catalog: &CatalogSnapshot) -> htap_common::Result<B
 }
 
 #[test]
+fn test_bind_truncate() {
+    let catalog = make_test_catalog();
+
+    for sql in ["TRUNCATE t", "TRUNCATE TABLE t"] {
+        match parse_and_bind(sql, &catalog).unwrap() {
+            BoundStatement::Delete(delete) => {
+                assert_eq!(delete.table, "t");
+                assert_eq!(delete.target, htap_sql::DeleteTarget::Filter(None));
+                assert!(!delete.if_exists);
+            }
+            other => panic!("expected Delete for {sql}, got {other:?}"),
+        }
+    }
+
+    let statement = parse_one("TRUNCATE t, u").expect("multi-table TRUNCATE should parse");
+    let error = bind(&statement, &catalog).unwrap_err();
+    assert!(
+        matches!(error, HtapError::Unsupported(ref message) if message.contains("multiple")),
+        "expected multi-table TRUNCATE rejection, got {error:?}"
+    );
+
+    if let Ok(statement) = parse_one("TRUNCATE TABLE t PARTITION (p0)") {
+        let error = bind(&statement, &catalog).unwrap_err();
+        assert!(
+            matches!(error, HtapError::Unsupported(ref message) if message.contains("partitions")),
+            "expected partition TRUNCATE rejection, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn test_bind_create_table_valid() {
     let catalog = CatalogSnapshot::empty();
 
@@ -1192,9 +1223,13 @@ fn test_bind_insert_valid() {
     match bound {
         BoundStatement::Insert(insert) => {
             assert_eq!(insert.table, "users");
-            assert_eq!(insert.rows.len(), 2);
+            let rows = match &insert.source {
+                InsertSource::Values(rows) => rows,
+                other => panic!("expected InsertSource::Values, got {other:?}"),
+            };
+            assert_eq!(rows.len(), 2);
             assert_eq!(
-                insert.rows[0],
+                rows[0],
                 Row::new(vec![
                     CommonValue::Int32(1),
                     CommonValue::String("alice".into()),
@@ -1203,7 +1238,7 @@ fn test_bind_insert_valid() {
                 ])
             );
             assert_eq!(
-                insert.rows[1],
+                rows[1],
                 Row::new(vec![
                     CommonValue::Int32(2),
                     CommonValue::String("bob".into()),
@@ -1225,9 +1260,13 @@ fn test_bind_insert_valid() {
     match bound {
         BoundStatement::Insert(insert) => {
             assert_eq!(insert.table, "all_types");
-            assert_eq!(insert.rows.len(), 1);
+            let rows = match &insert.source {
+                InsertSource::Values(rows) => rows,
+                other => panic!("expected InsertSource::Values, got {other:?}"),
+            };
+            assert_eq!(rows.len(), 1);
             assert_eq!(
-                insert.rows[0],
+                rows[0],
                 Row::new(vec![
                     CommonValue::Bool(true),
                     CommonValue::Int32(-42),
@@ -1241,6 +1280,111 @@ fn test_bind_insert_valid() {
                 ])
             );
         }
+        other => panic!("expected Insert, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_bind_insert_select() {
+    let catalog = make_test_catalog();
+
+    // 1. Explicit column list with SELECT succeeds and maps the SELECT output to table columns.
+    let bound = parse_and_bind(
+        "INSERT INTO users (id, name, age, bio) SELECT id, name, age, bio FROM users",
+        &catalog,
+    )
+    .expect("INSERT ... SELECT with explicit columns should bind");
+    match bound {
+        BoundStatement::Insert(insert) => {
+            assert_eq!(insert.table, "users");
+            match insert.source {
+                InsertSource::Query {
+                    query,
+                    column_mapping,
+                } => {
+                    assert_eq!(column_mapping, vec![0, 1, 2, 3]);
+                    assert!(
+                        !query.output_columns.is_empty(),
+                        "INSERT ... SELECT query should have bound output columns"
+                    );
+                }
+                other => panic!("expected InsertSource::Query, got {other:?}"),
+            }
+        }
+        other => panic!("expected Insert, got {other:?}"),
+    }
+
+    // 2. The SELECT output must match the four target users columns.
+    let res = parse_and_bind(
+        "INSERT INTO users (id, name, age, bio) SELECT id, name, age FROM users",
+        &catalog,
+    );
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(_))),
+        "expected InvalidArgument for SELECT/INSERT arity mismatch, got {res:?}"
+    );
+
+    // 4. users.id is INT32, so a BIGINT SELECT expression cannot be inserted into it.
+    let res = parse_and_bind(
+        "INSERT INTO users (id, name, age, bio) \
+         SELECT order_id, name, age, bio FROM orders, users",
+        &catalog,
+    );
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(_))),
+        "expected InvalidArgument for BIGINT-to-INT INSERT ... SELECT mismatch, got {res:?}"
+    );
+
+    // 5. Nullable source columns still require an exact type match.
+    let res = parse_and_bind(
+        "INSERT INTO orders (tenant_id, order_id, amount, created_at) \
+         SELECT id, age, amount, created_at FROM users, orders",
+        &catalog,
+    );
+    assert!(
+        matches!(
+            res,
+            Err(HtapError::InvalidArgument(ref message))
+                if message.contains("expected bigint") && message.contains("found int")
+        ),
+        "expected nullable INT-to-BIGINT mismatch, got {res:?}"
+    );
+
+    let res = parse_and_bind(
+        "INSERT INTO orders (tenant_id, order_id, amount, created_at) \
+         SELECT id, order_id, amount, bio FROM users, orders",
+        &catalog,
+    );
+    assert!(
+        matches!(
+            res,
+            Err(HtapError::InvalidArgument(ref message))
+                if message.contains("expected timestamp") && message.contains("found varchar")
+        ),
+        "expected nullable VARCHAR-to-TIMESTAMP mismatch, got {res:?}"
+    );
+
+    // 6. NULL is valid for a nullable target column.
+    let bound = parse_and_bind(
+        "INSERT INTO users (id, name, age, bio) \
+         SELECT id, name, NULL, bio FROM users",
+        &catalog,
+    )
+    .expect("INSERT ... SELECT NULL into nullable age should bind");
+    match bound {
+        BoundStatement::Insert(insert) => match insert.source {
+            InsertSource::Query {
+                query,
+                column_mapping,
+            } => {
+                assert_eq!(column_mapping, vec![0, 1, 2, 3]);
+                assert!(
+                    !query.output_columns.is_empty(),
+                    "INSERT ... SELECT query should have bound output columns"
+                );
+            }
+            other => panic!("expected InsertSource::Query, got {other:?}"),
+        },
         other => panic!("expected Insert, got {other:?}"),
     }
 }
@@ -1291,6 +1435,8 @@ fn test_bind_select_valid() {
 
 #[test]
 fn test_bind_delete_valid() {
+    use htap_sql::DeleteTarget;
+
     let catalog = make_test_catalog();
 
     // 1. Single-column PK DELETE
@@ -1299,24 +1445,98 @@ fn test_bind_delete_valid() {
     match bound {
         BoundStatement::Delete(delete) => {
             assert_eq!(delete.table, "users");
-            assert_eq!(delete.key, vec![CommonValue::Int32(99)]);
+            match delete.target {
+                DeleteTarget::PrimaryKey(key_values) => {
+                    assert_eq!(key_values, vec![CommonValue::Int32(99)]);
+                }
+                other => panic!("expected DeleteTarget::PrimaryKey, got {other:?}"),
+            }
         }
         other => panic!("expected DeleteByPrimaryKey, got {other:?}"),
     }
 
     // 2. Composite PK DELETE with reverse predicate order: emits in catalog primary_key order
     let sql = "DELETE FROM orders WHERE order_id = 500 AND tenant_id = 12";
-    let bound = parse_and_bind(sql, &catalog).expect("valid composite PK DELETE");
+    let bound = parse_and_bind(sql, &catalog).expect("valid composite PK reverse order DELETE");
     match bound {
         BoundStatement::Delete(delete) => {
             assert_eq!(delete.table, "orders");
-            assert_eq!(
-                delete.key,
-                vec![CommonValue::Int32(12), CommonValue::Int64(500)]
-            );
+            match delete.target {
+                DeleteTarget::PrimaryKey(key_values) => {
+                    assert_eq!(
+                        key_values,
+                        vec![CommonValue::Int32(12), CommonValue::Int64(500)]
+                    );
+                }
+                other => panic!("expected DeleteTarget::PrimaryKey, got {other:?}"),
+            }
         }
         other => panic!("expected DeleteByPrimaryKey, got {other:?}"),
     }
+}
+
+#[test]
+fn test_bind_delete_general_filters() {
+    use htap_sql::DeleteTarget;
+
+    let catalog = make_test_catalog();
+
+    let bound = parse_and_bind("DELETE FROM users WHERE id = 1", &catalog)
+        .expect("DELETE with complete primary key should bind");
+    match bound {
+        BoundStatement::Delete(delete) => {
+            assert_eq!(delete.table, "users");
+            assert_eq!(
+                delete.target,
+                DeleteTarget::PrimaryKey(vec![CommonValue::Int32(1)])
+            );
+        }
+        other => panic!("expected Delete, got {other:?}"),
+    }
+
+    let bound = parse_and_bind("DELETE FROM users WHERE 1 = id", &catalog)
+        .expect("DELETE with reversed equality should bind");
+    match bound {
+        BoundStatement::Delete(delete) => {
+            assert!(matches!(delete.target, DeleteTarget::Filter(Some(_))));
+        }
+        other => panic!("expected Delete, got {other:?}"),
+    }
+
+    let bound = parse_and_bind("DELETE FROM users WHERE age > 30", &catalog)
+        .expect("DELETE with non-primary-key filter should bind");
+    match bound {
+        BoundStatement::Delete(delete) => {
+            assert!(matches!(delete.target, DeleteTarget::Filter(Some(_))));
+        }
+        other => panic!("expected Delete, got {other:?}"),
+    }
+
+    let bound =
+        parse_and_bind("DELETE FROM users", &catalog).expect("DELETE without WHERE should bind");
+    match bound {
+        BoundStatement::Delete(delete) => {
+            assert_eq!(delete.target, DeleteTarget::Filter(None));
+        }
+        other => panic!("expected Delete, got {other:?}"),
+    }
+
+    let bound = parse_and_bind("DELETE FROM users u WHERE id = 1", &catalog)
+        .expect("DELETE with table alias should bind");
+    match bound {
+        BoundStatement::Delete(delete) => {
+            assert_eq!(
+                delete.target,
+                DeleteTarget::PrimaryKey(vec![CommonValue::Int32(1)])
+            );
+        }
+        other => panic!("expected Delete, got {other:?}"),
+    }
+
+    assert!(matches!(
+        parse_and_bind("DELETE FROM users WHERE COUNT(*) > 5", &catalog),
+        Err(HtapError::InvalidArgument(_))
+    ));
 }
 
 #[test]
@@ -1550,8 +1770,6 @@ fn test_negative_insert() {
     }
 
     let unsupported_cases = [
-        // INSERT SELECT
-        "INSERT INTO users (id, name, age, bio) SELECT 1, 'a', 20, 'b'",
         // INSERT SET
         "INSERT INTO users SET id = 1, name = 'a', age = 20, bio = 'b'",
         // INSERT IGNORE
@@ -1612,19 +1830,6 @@ fn test_negative_select_and_delete() {
         "SELECT * FROM users WHERE id = 1 AND id = 2",
         // NULL literal in WHERE
         "SELECT * FROM users WHERE id = NULL",
-        "DELETE FROM users WHERE 1 = id",
-        // Missing WHERE clause in DELETE
-        "DELETE FROM users",
-        // Predicate on non-PK column in DELETE
-        "DELETE FROM users WHERE name = 'alice'",
-        // Non-PK column combined with PK in WHERE in DELETE
-        "DELETE FROM users WHERE id = 1 AND name = 'alice'",
-        // Partial PK predicate on composite PK table in DELETE
-        "DELETE FROM orders WHERE tenant_id = 1",
-        // Non-equality operators in DELETE
-        "DELETE FROM users WHERE id > 1",
-        "DELETE FROM users WHERE id != 1",
-        "DELETE FROM users WHERE id IS NULL",
         // Placeholder in WHERE value
         "SELECT * FROM users WHERE id = ?",
         // Type mismatch in WHERE value
@@ -1644,9 +1849,7 @@ fn test_negative_select_and_delete() {
     }
 
     let unsupported_cases = [
-        // DELETE aliases / qualified names / ORDER BY / LIMIT
-        "DELETE FROM users u WHERE id = 1",
-        "DELETE FROM users AS u WHERE id = 1",
+        // DELETE qualified names / ORDER BY / LIMIT
         "DELETE FROM db.users WHERE id = 1",
         "DELETE FROM users WHERE id = 1 ORDER BY id",
         "DELETE FROM users WHERE id = 1 LIMIT 1",

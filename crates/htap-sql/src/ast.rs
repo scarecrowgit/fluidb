@@ -65,8 +65,8 @@ pub enum BoundStatement {
     CreateTable(CreateTable),
     /// INSERT statement.
     Insert(Insert),
-    /// Single-row DELETE by primary key.
-    Delete(DeleteByPrimaryKey),
+    /// DELETE statement.
+    Delete(DeleteStatement),
     /// Single-row SELECT by primary key with column projection.
     Select(PointSelect),
     /// Analytical SELECT statement with column/aggregate projections, filters, and optional grouping.
@@ -74,7 +74,7 @@ pub enum BoundStatement {
     /// ALTER TABLE partition statement (ADD, DROP, REORGANIZE).
     AlterPartitions(AlterPartitions),
     /// General query (joins, expressions, subqueries, set operations, LIMIT, ...).
-    Query(BoundQuery),
+    Query(Box<BoundQuery>),
     /// UPDATE statement.
     Update(UpdateStatement),
     /// DROP TABLE statement.
@@ -308,40 +308,84 @@ impl CreateTable {
     }
 }
 
+/// Source rows for a bound INSERT statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    /// Literal rows supplied by `INSERT ... VALUES`.
+    Values(Vec<Row>),
+    /// Rows produced by `INSERT ... SELECT`.
+    ///
+    /// `column_mapping[source_index]` is the target schema column index receiving that source
+    /// output column.
+    Query {
+        /// Fully bound source query.
+        query: Box<BoundQuery>,
+        /// Source-output to target-schema column mapping.
+        column_mapping: Vec<usize>,
+    },
+}
+
 /// Bound representation of an INSERT statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Insert {
     /// Target table name.
     pub table: String,
-    /// Rows to insert.
-    pub rows: Vec<Row>,
+    /// Source rows.
+    pub source: InsertSource,
 }
 
 impl Insert {
-    /// Create a new [`Insert`] bound statement.
+    /// Create a new literal-row [`Insert`] bound statement.
     pub fn new(table: impl Into<String>, rows: Vec<Row>) -> Self {
         Self {
             table: table.into(),
-            rows,
+            source: InsertSource::Values(rows),
+        }
+    }
+
+    /// Create a new query-source [`Insert`] bound statement.
+    pub fn from_query(
+        table: impl Into<String>,
+        query: BoundQuery,
+        column_mapping: Vec<usize>,
+    ) -> Self {
+        Self {
+            table: table.into(),
+            source: InsertSource::Query {
+                query: Box::new(query),
+                column_mapping,
+            },
         }
     }
 }
 
-/// Bound representation of a single-row DELETE by primary key.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteByPrimaryKey {
+/// Bound representation of a DELETE statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStatement {
     /// Target table name.
     pub table: String,
-    /// Primary key value tuple.
-    pub key: Vec<Value>,
+    /// Which rows to delete.
+    pub target: DeleteTarget,
+    /// Whether a missing target is accepted as a no-op.
+    pub if_exists: bool,
 }
 
-impl DeleteByPrimaryKey {
-    /// Create a new [`DeleteByPrimaryKey`] bound statement.
-    pub fn new(table: impl Into<String>, key: Vec<Value>) -> Self {
+/// Row selection of a DELETE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteTarget {
+    /// The WHERE clause names the complete primary key: a single point delete.
+    PrimaryKey(Vec<Value>),
+    /// Scan-based delete; `None` deletes every row.
+    Filter(Option<Expr>),
+}
+
+impl DeleteStatement {
+    /// Create a new [`DeleteStatement`] bound statement.
+    pub fn new(table: impl Into<String>, target: DeleteTarget) -> Self {
         Self {
             table: table.into(),
-            key,
+            target,
+            if_exists: false,
         }
     }
 }
@@ -611,8 +655,8 @@ impl From<Insert> for BoundStatement {
     }
 }
 
-impl From<DeleteByPrimaryKey> for BoundStatement {
-    fn from(stmt: DeleteByPrimaryKey) -> Self {
+impl From<DeleteStatement> for BoundStatement {
+    fn from(stmt: DeleteStatement) -> Self {
         Self::Delete(stmt)
     }
 }
@@ -652,7 +696,7 @@ mod tests {
         let bound_insert: BoundStatement = insert.clone().into();
         assert_eq!(bound_insert, BoundStatement::Insert(insert));
 
-        let delete = DeleteByPrimaryKey::new("users", vec![Value::Int64(1)]);
+        let delete = DeleteStatement::new("users", DeleteTarget::PrimaryKey(vec![Value::Int64(1)]));
         let bound_delete: BoundStatement = delete.clone().into();
         assert_eq!(bound_delete, BoundStatement::Delete(delete));
 

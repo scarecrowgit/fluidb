@@ -32,6 +32,8 @@ pub enum BinOp {
     Mul,
     /// `/` (always floating point)
     Div,
+    /// `DIV` (integer division)
+    IntDiv,
     /// `%`
     Mod,
     /// `=`
@@ -65,7 +67,7 @@ impl BinOp {
     pub fn is_arithmetic(self) -> bool {
         matches!(
             self,
-            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::IntDiv | Self::Mod
         )
     }
 }
@@ -77,6 +79,7 @@ impl std::fmt::Display for BinOp {
             Self::Sub => "-",
             Self::Mul => "*",
             Self::Div => "/",
+            Self::IntDiv => "DIV",
             Self::Mod => "%",
             Self::Eq => "=",
             Self::NotEq => "<>",
@@ -209,6 +212,20 @@ pub enum Expr {
         /// Nullability (already accounts for null-supplying outer joins).
         nullable: bool,
     },
+    /// Reference to a column in the immediately enclosing query's input row.
+    ///
+    /// Correlated references are bound successfully but cannot execute until the query executor
+    /// supplies an outer-row evaluation context.
+    CorrelatedColumnRef {
+        /// Offset within the immediately enclosing query's flat joined row.
+        offset: usize,
+        /// Column name (for display).
+        name: String,
+        /// Data type.
+        data_type: DataType,
+        /// Nullability in the enclosing query.
+        nullable: bool,
+    },
     /// Reference to an output (projected) column, used by `ORDER BY`/`HAVING` alias resolution.
     OutputColumn {
         /// Index in the projection.
@@ -306,14 +323,25 @@ pub enum Expr {
         /// Result nullability.
         nullable: bool,
     },
-    /// Uncorrelated scalar subquery, precomputed by the executor.
+    /// Reference to a precomputed window function.
+    WindowRef {
+        /// Index into the query's window list.
+        index: usize,
+        /// Result type.
+        data_type: DataType,
+        /// Result nullability.
+        nullable: bool,
+    },
+    /// Scalar subquery, precomputed by the executor unless correlated.
     ScalarSubquery {
         /// Index into the query's subquery list.
         index: usize,
         /// Result type.
         data_type: DataType,
+        /// Whether the subquery must be executed against the current row.
+        correlated: bool,
     },
-    /// `expr [NOT] IN (subquery)`, subquery precomputed by the executor.
+    /// `expr [NOT] IN (subquery)`, precomputed by the executor unless correlated.
     InSubquery {
         /// Value expression.
         expr: Box<Expr>,
@@ -321,13 +349,17 @@ pub enum Expr {
         index: usize,
         /// `NOT IN`.
         negated: bool,
+        /// Whether the subquery must be executed against the current row.
+        correlated: bool,
     },
-    /// `[NOT] EXISTS (subquery)`, subquery precomputed by the executor.
+    /// `[NOT] EXISTS (subquery)`, precomputed by the executor unless correlated.
     Exists {
         /// Index into the query's subquery list.
         index: usize,
         /// `NOT EXISTS`.
         negated: bool,
+        /// Whether the subquery must be executed against the current row.
+        correlated: bool,
     },
     /// `@name` (user variable) or `@@[session.]name` (system variable), resolved at
     /// evaluation time via [`EvalContext::variables`]. `name` has any leading `@`/`@@` sigil
@@ -338,6 +370,65 @@ pub enum Expr {
         /// `true` for `@@name` (system variable), `false` for `@name` (user variable).
         is_system: bool,
     },
+}
+
+/// Runs a correlated subquery against one calling-query row.
+///
+/// This intentionally only exposes bound SQL values: implementations belong to the execution
+/// layer, while this expression crate remains independent of storage and server types.
+pub trait SubqueryRunner {
+    /// Executes correlated subquery `index` using `outer_row` from its immediately enclosing
+    /// query and returns its result rows.
+    fn run(&self, index: usize, outer_row: &[Value]) -> Result<Vec<Row>>;
+}
+
+/// Shared limits for correlated-subquery execution within one statement.
+///
+/// Evaluation contexts deliberately carry separate callback fields for variables and subqueries.
+/// If a third callback is needed, consolidate these into a single execution-services interface
+/// rather than continuing to grow [`EvalContext`].
+#[derive(Debug)]
+pub struct SubqueryBudget {
+    invocations: std::cell::Cell<usize>,
+    depth: std::cell::Cell<usize>,
+    invocation_cap: usize,
+    depth_cap: usize,
+}
+
+impl SubqueryBudget {
+    /// Creates a budget with explicit total-invocation and nesting-depth caps.
+    pub fn new(invocation_cap: usize, depth_cap: usize) -> Self {
+        Self {
+            invocations: std::cell::Cell::new(0),
+            depth: std::cell::Cell::new(0),
+            invocation_cap,
+            depth_cap,
+        }
+    }
+
+    fn enter(&self) -> Result<()> {
+        let invocations = self.invocations.get();
+        if invocations >= self.invocation_cap {
+            return Err(HtapError::InvalidArgument(format!(
+                "correlated subquery invocation cap ({}) exceeded",
+                self.invocation_cap
+            )));
+        }
+        let depth = self.depth.get();
+        if depth >= self.depth_cap {
+            return Err(HtapError::InvalidArgument(format!(
+                "correlated subquery nesting-depth cap ({}) exceeded",
+                self.depth_cap
+            )));
+        }
+        self.invocations.set(invocations + 1);
+        self.depth.set(depth + 1);
+        Ok(())
+    }
+
+    fn exit(&self) {
+        self.depth.set(self.depth.get() - 1);
+    }
 }
 
 /// Provides live values for [`Expr::Variable`] during evaluation.
@@ -360,6 +451,8 @@ pub trait VariableLookup {
 pub struct EvalContext<'a> {
     /// Flat joined input row (all slots concatenated in slot order).
     pub row: &'a [Value],
+    /// Row of the immediately enclosing query when evaluating a correlated subquery.
+    pub current_outer_row: Option<&'a [Value]>,
     /// Aggregate results of the current group, indexed like the query's aggregate list.
     pub aggregates: &'a [Value],
     /// Projected output row of the current input row / group, if already computed.
@@ -370,6 +463,10 @@ pub struct EvalContext<'a> {
     /// available (for example constant folding or the narrow point/analytic paths, which never
     /// bind a `Variable`).
     pub variables: Option<&'a dyn VariableLookup>,
+    /// Correlated-subquery executor supplied by the query execution layer.
+    pub subquery_runner: Option<&'a dyn SubqueryRunner>,
+    /// Shared per-statement budget for correlated subquery invocations.
+    pub subquery_budget: Option<&'a SubqueryBudget>,
 }
 
 impl std::fmt::Debug for EvalContext<'_> {
@@ -389,10 +486,13 @@ impl<'a> EvalContext<'a> {
     pub fn row_only(row: &'a [Value]) -> Self {
         Self {
             row,
+            current_outer_row: None,
             aggregates: &[],
             output: None,
             subqueries: &[],
             variables: None,
+            subquery_runner: None,
+            subquery_budget: None,
         }
     }
 }
@@ -413,12 +513,22 @@ impl Expr {
                 nullable,
                 ..
             }
+            | Expr::CorrelatedColumnRef {
+                data_type,
+                nullable,
+                ..
+            }
             | Expr::OutputColumn {
                 data_type,
                 nullable,
                 ..
             }
             | Expr::AggregateRef {
+                data_type,
+                nullable,
+                ..
+            }
+            | Expr::WindowRef {
                 data_type,
                 nullable,
                 ..
@@ -502,15 +612,37 @@ impl Expr {
         found
     }
 
-    /// Whether the expression references any input column.
-    pub fn references_columns(&self) -> bool {
+    /// Whether the expression contains a window reference.
+    pub fn contains_window(&self) -> bool {
         let mut found = false;
         self.walk(&mut |e| {
-            if matches!(e, Expr::ColumnRef { .. }) {
+            if matches!(e, Expr::WindowRef { .. }) {
                 found = true;
             }
         });
         found
+    }
+
+    /// Whether the expression references any input column.
+    pub fn references_columns(&self) -> bool {
+        let mut found = false;
+        self.walk(&mut |e| {
+            if matches!(e, Expr::ColumnRef { .. } | Expr::CorrelatedColumnRef { .. }) {
+                found = true;
+            }
+        });
+        found
+    }
+
+    /// Collects correlated references to the immediately enclosing query.
+    pub fn correlated_outer_refs(&self) -> Vec<Expr> {
+        let mut refs = Vec::new();
+        self.walk(&mut |e| {
+            if matches!(e, Expr::CorrelatedColumnRef { .. }) && !refs.contains(e) {
+                refs.push(e.clone());
+            }
+        });
+        refs
     }
 
     /// Collects the set of slots referenced by the expression.
@@ -545,9 +677,11 @@ impl Expr {
         f(self);
         match self {
             Expr::ColumnRef { .. }
+            | Expr::CorrelatedColumnRef { .. }
             | Expr::OutputColumn { .. }
             | Expr::Literal(_)
             | Expr::AggregateRef { .. }
+            | Expr::WindowRef { .. }
             | Expr::ScalarSubquery { .. }
             | Expr::Exists { .. }
             | Expr::Variable { .. } => {}
@@ -611,6 +745,20 @@ impl Expr {
                     ))
                 })
             }
+            Expr::CorrelatedColumnRef { offset, name, .. } => ctx
+                .current_outer_row
+                .ok_or_else(|| {
+                    HtapError::Internal(format!(
+                        "correlated column '{name}' evaluated without an outer row"
+                    ))
+                })?
+                .get(*offset)
+                .cloned()
+                .ok_or_else(|| {
+                    HtapError::Internal(format!(
+                        "correlated column '{name}' offset {offset} out of bounds for outer row"
+                    ))
+                }),
             Expr::OutputColumn { index, .. } => ctx
                 .output
                 .and_then(|o| o.get(*index))
@@ -728,8 +876,15 @@ impl Expr {
                 .get(*index)
                 .cloned()
                 .ok_or_else(|| HtapError::Internal(format!("aggregate {index} not available"))),
-            Expr::ScalarSubquery { index, .. } => {
-                let rows = subquery_rows(ctx, *index)?;
+            Expr::WindowRef { index, .. } => ctx
+                .output
+                .and_then(|output| output.get(*index))
+                .cloned()
+                .ok_or_else(|| HtapError::Internal(format!("window result {index} not available"))),
+            Expr::ScalarSubquery {
+                index, correlated, ..
+            } => {
+                let rows = subquery_result_rows(ctx, *index, *correlated)?;
                 match rows.len() {
                     0 => Ok(Value::Null),
                     1 => rows[0]
@@ -745,12 +900,13 @@ impl Expr {
                 expr,
                 index,
                 negated,
+                correlated,
             } => {
                 let v = expr.eval(ctx)?;
                 if v.is_null() {
                     return Ok(Value::Null);
                 }
-                let rows = subquery_rows(ctx, *index)?;
+                let rows = subquery_result_rows(ctx, *index, *correlated)?;
                 let mut saw_null = false;
                 for row in rows {
                     let candidate = row.get(0).cloned().unwrap_or(Value::Null);
@@ -766,8 +922,12 @@ impl Expr {
                     Value::Bool(*negated)
                 })
             }
-            Expr::Exists { index, negated } => {
-                let rows = subquery_rows(ctx, *index)?;
+            Expr::Exists {
+                index,
+                negated,
+                correlated,
+            } => {
+                let rows = subquery_result_rows(ctx, *index, *correlated)?;
                 Ok(Value::Bool(rows.is_empty() == *negated))
             }
             Expr::Variable { name, is_system } => {
@@ -811,6 +971,28 @@ fn subquery_rows<'a>(ctx: &EvalContext<'a>, index: usize) -> Result<&'a Vec<Row>
     ctx.subqueries
         .get(index)
         .ok_or_else(|| HtapError::Internal(format!("subquery {index} not available")))
+}
+
+fn subquery_result_rows(ctx: &EvalContext<'_>, index: usize, correlated: bool) -> Result<Vec<Row>> {
+    if !correlated {
+        return Ok(subquery_rows(ctx, index)?.clone());
+    }
+
+    let runner = ctx.subquery_runner.ok_or_else(|| {
+        HtapError::Internal(format!(
+            "correlated subquery {index} evaluated without a subquery runner"
+        ))
+    })?;
+    let budget = ctx.subquery_budget.ok_or_else(|| {
+        HtapError::Internal(format!(
+            "correlated subquery {index} evaluated without a subquery budget"
+        ))
+    })?;
+
+    budget.enter()?;
+    let result = runner.run(index, ctx.row);
+    budget.exit();
+    result
 }
 
 fn type_error(what: &str, v: &Value) -> HtapError {
@@ -896,6 +1078,29 @@ fn eval_binary(op: BinOp, left: &Expr, right: &Expr, ctx: &EvalContext<'_>) -> R
 }
 
 fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
+    if op == BinOp::IntDiv {
+        let (x, y) = match (l, r) {
+            (Value::Int32(x), Value::Int32(y)) => (*x as i64, *y as i64),
+            (Value::Int32(x), Value::Int64(y)) => (*x as i64, *y),
+            (Value::Int64(x), Value::Int32(y)) => (*x, *y as i64),
+            (Value::Int64(x), Value::Int64(y)) => (*x, *y),
+            _ => {
+                let bad = if matches!(l, Value::Int32(_) | Value::Int64(_)) {
+                    r
+                } else {
+                    l
+                };
+                return Err(type_error("DIV", bad));
+            }
+        };
+        if y == 0 {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Int64(
+            x.checked_div(y).ok_or_else(|| overflow("DIV"))?,
+        ));
+    }
+
     let (a, b) = match (as_num(l), as_num(r)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -1222,6 +1427,29 @@ mod tests {
             Value::Null
         );
         assert_eq!(
+            ev(bin(
+                BinOp::IntDiv,
+                lit(Value::Int64(-7)),
+                lit(Value::Int64(2))
+            )),
+            Value::Int64(-3)
+        );
+        assert_eq!(
+            ev(bin(
+                BinOp::IntDiv,
+                lit(Value::Int64(7)),
+                lit(Value::Int64(0))
+            )),
+            Value::Null
+        );
+        assert!(bin(
+            BinOp::IntDiv,
+            lit(Value::Int64(i64::MIN)),
+            lit(Value::Int64(-1))
+        )
+        .eval_constant()
+        .is_err());
+        assert_eq!(
             ev(bin(BinOp::Mod, lit(Value::Int64(7)), lit(Value::Int64(3)))),
             Value::Int64(1)
         );
@@ -1446,14 +1674,18 @@ mod tests {
         let aggregates = vec![Value::Int64(9)];
         let ctx = EvalContext {
             row: &[],
+            current_outer_row: None,
             aggregates: &aggregates,
             output: None,
             subqueries: &subqueries,
             variables: None,
+            subquery_runner: None,
+            subquery_budget: None,
         };
         let scalar = |index| Expr::ScalarSubquery {
             index,
             data_type: DataType::Int64,
+            correlated: false,
         };
         assert_eq!(scalar(0).eval(&ctx).unwrap(), Value::Int64(5));
         assert_eq!(scalar(1).eval(&ctx).unwrap(), Value::Null);
@@ -1461,7 +1693,8 @@ mod tests {
         assert_eq!(
             Expr::Exists {
                 index: 1,
-                negated: false
+                negated: false,
+                correlated: false,
             }
             .eval(&ctx)
             .unwrap(),
@@ -1471,7 +1704,8 @@ mod tests {
             Expr::InSubquery {
                 expr: Box::new(lit(Value::Int64(2))),
                 index: 2,
-                negated: false
+                negated: false,
+                correlated: false,
             }
             .eval(&ctx)
             .unwrap(),
@@ -1487,6 +1721,108 @@ mod tests {
             .unwrap(),
             Value::Int64(9)
         );
+    }
+
+    struct EchoOuterRow;
+
+    impl SubqueryRunner for EchoOuterRow {
+        fn run(&self, _index: usize, outer_row: &[Value]) -> Result<Vec<Row>> {
+            Ok(vec![Row::new(vec![outer_row[0].clone()])])
+        }
+    }
+
+    #[test]
+    fn subquery_runner_trait_and_correlation_eval() {
+        let budget = SubqueryBudget::new(10, 5);
+        let runner = EchoOuterRow;
+        let outer_row = [Value::Int64(42)];
+        let expr = Expr::ScalarSubquery {
+            index: 0,
+            data_type: DataType::Int64,
+            correlated: true,
+        };
+        let ctx = EvalContext {
+            row: &[Value::Int64(999)],
+            current_outer_row: Some(&outer_row),
+            aggregates: &[],
+            output: None,
+            subqueries: &[],
+            variables: None,
+            subquery_runner: Some(&runner),
+            subquery_budget: Some(&budget),
+        };
+
+        // Correlated subqueries receive the immediate parent's current row (`ctx.row`),
+        // not the enclosing grandparent row (`current_outer_row`).
+        assert_eq!(expr.eval(&ctx).unwrap(), Value::Int64(999));
+
+        let unwired = EvalContext::row_only(&[]);
+        let err = expr.eval(&unwired).unwrap_err().to_string();
+        assert!(err.contains("without a subquery runner"), "{err}");
+    }
+
+    struct RecursiveRunner<'a> {
+        budget: &'a SubqueryBudget,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl SubqueryRunner for RecursiveRunner<'_> {
+        fn run(&self, index: usize, outer_row: &[Value]) -> Result<Vec<Row>> {
+            self.calls.set(self.calls.get() + 1);
+            let expr = Expr::ScalarSubquery {
+                index,
+                data_type: DataType::Int64,
+                correlated: true,
+            };
+            let ctx = EvalContext {
+                row: &[],
+                current_outer_row: Some(outer_row),
+                aggregates: &[],
+                output: None,
+                subqueries: &[],
+                variables: None,
+                subquery_runner: Some(self),
+                subquery_budget: Some(self.budget),
+            };
+            expr.eval(&ctx)?;
+            unreachable!("the nesting-depth cap must stop recursion")
+        }
+    }
+
+    #[test]
+    fn subquery_invocation_and_nesting_caps() {
+        let depth_budget = SubqueryBudget::new(100, 5);
+        let runner = RecursiveRunner {
+            budget: &depth_budget,
+            calls: std::cell::Cell::new(0),
+        };
+        let outer_row = [Value::Int64(1)];
+        let expr = Expr::ScalarSubquery {
+            index: 0,
+            data_type: DataType::Int64,
+            correlated: true,
+        };
+        let ctx = EvalContext {
+            row: &[],
+            current_outer_row: Some(&outer_row),
+            aggregates: &[],
+            output: None,
+            subqueries: &[],
+            variables: None,
+            subquery_runner: Some(&runner),
+            subquery_budget: Some(&depth_budget),
+        };
+        let err = expr.eval(&ctx).unwrap_err().to_string();
+        assert!(err.contains("nesting-depth cap (5) exceeded"), "{err}");
+        assert_eq!(runner.calls.get(), 5);
+
+        let invocation_budget = SubqueryBudget::new(10_000, 1);
+        for _ in 0..10_000 {
+            invocation_budget.enter().unwrap();
+            invocation_budget.exit();
+        }
+        let err = invocation_budget.enter().unwrap_err().to_string();
+        assert!(err.contains("invocation cap (10000) exceeded"), "{err}");
     }
 
     #[test]
@@ -1523,6 +1859,15 @@ mod tests {
             .data_type,
             DataType::String
         );
+        let window = Expr::WindowRef {
+            index: 0,
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        assert_eq!(window.expr_type(), ExprType::new(DataType::Int64, false));
+        assert!(window.contains_window());
+        assert!(!window.contains_aggregate());
+
         let var = Expr::Variable {
             name: "x".into(),
             is_system: false,
@@ -1572,10 +1917,13 @@ mod tests {
         let fake = FakeVars(vars);
         let ctx = EvalContext {
             row: &[],
+            current_outer_row: None,
             aggregates: &[],
             output: None,
             subqueries: &[],
             variables: Some(&fake),
+            subquery_runner: None,
+            subquery_budget: None,
         };
         assert_eq!(user_var.eval(&ctx).unwrap(), Value::Int64(7));
         assert_eq!(sys_var.eval(&ctx).unwrap(), Value::Int64(1));

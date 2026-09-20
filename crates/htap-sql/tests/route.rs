@@ -1,6 +1,5 @@
 use htap_catalog::{CatalogSnapshot, StorageDescriptor, StorageFormat, TableDescriptor, TableId};
 use htap_common::encode_key;
-use htap_common::error::HtapError;
 use htap_common::types::Value;
 use htap_sql::{bind, classify_route, parse_one, BoundStatement, Route};
 
@@ -64,7 +63,7 @@ fn test_route_classification() {
         );
     }
 
-    // 3. Assert INSERT / DELETE RowstoreWrite under Row, Column, Converting
+    // 3. Assert INSERT routes to RowstoreWrite under Row, Column, Converting
     let insert_sql = "INSERT INTO orders (tenant_id, order_id, amount) VALUES (42, 1000, 99.5)";
     let parsed_insert = parse_one(insert_sql).expect("parse INSERT");
     let bound_insert = bind(&parsed_insert, &catalog).expect("bind INSERT");
@@ -75,13 +74,18 @@ fn test_route_classification() {
         );
     }
 
+    // A DELETE with a complete primary key uses the rowstore point-delete route.
     let delete_sql = "DELETE FROM orders WHERE tenant_id = 42 AND order_id = 1000";
     let parsed_delete = parse_one(delete_sql).expect("parse DELETE");
     let bound_delete = bind(&parsed_delete, &catalog).expect("bind DELETE");
+    let expected_delete_key =
+        encode_key(&[Value::Int32(42), Value::Int64(1000)]).expect("encode DELETE key");
     for storage in [&row_storage, &col_storage, &conv_storage] {
         assert_eq!(
             classify_route(&bound_delete, storage).expect("DELETE classification"),
-            Route::RowstoreWrite
+            Route::RowstoreDelete {
+                key: Some(expected_delete_key.clone())
+            }
         );
     }
 
@@ -138,23 +142,27 @@ fn test_route_classification() {
         );
     }
 
-    // 6. Non-point DELETE remains rejected
+    // 6. Non-point DELETEs bind successfully and use the general rowstore delete route.
     let full_delete_sql = "DELETE FROM orders";
-    let parsed_full_delete = parse_one(full_delete_sql).expect("parse full delete");
-    let full_delete_err =
-        bind(&parsed_full_delete, &catalog).expect_err("full delete should fail binding");
-    assert!(
-        matches!(full_delete_err, HtapError::InvalidArgument(_)),
-        "expected InvalidArgument for full delete without WHERE, got {full_delete_err:?}"
+    let bound_full_delete = bind(
+        &parse_one(full_delete_sql).expect("parse full delete"),
+        &catalog,
+    )
+    .expect("bind full delete");
+    assert_eq!(
+        classify_route(&bound_full_delete, &row_storage).expect("full delete route"),
+        Route::RowstoreDelete { key: None }
     );
 
     let partial_delete_sql = "DELETE FROM orders WHERE tenant_id = 42";
-    let parsed_partial_delete = parse_one(partial_delete_sql).expect("parse partial delete");
-    let partial_delete_err =
-        bind(&parsed_partial_delete, &catalog).expect_err("partial PK delete should fail");
-    assert!(
-        matches!(partial_delete_err, HtapError::InvalidArgument(_)),
-        "expected InvalidArgument for partial PK delete, got {partial_delete_err:?}"
+    let bound_partial_delete = bind(
+        &parse_one(partial_delete_sql).expect("parse partial delete"),
+        &catalog,
+    )
+    .expect("bind partial delete");
+    assert_eq!(
+        classify_route(&bound_partial_delete, &row_storage).expect("partial delete route"),
+        Route::RowstoreDelete { key: None }
     );
 
     let order_by_sql =

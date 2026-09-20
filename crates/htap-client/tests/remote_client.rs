@@ -55,7 +55,7 @@ fn test_remote_client_matches_embedded_client_ddl_dml_select() {
         "SELEC 1 FROM t",
         "SELECT id FROM missing WHERE id = 1",
         "CREATE TABLE t (id BIGINT PRIMARY KEY)",
-        "SELECT name, COUNT(*) OVER () FROM t",
+        "SELECT name FROM t FOR UPDATE",
     ];
     for sql in cases {
         let a = embedded.execute(sql).unwrap_err();

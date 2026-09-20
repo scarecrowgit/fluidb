@@ -323,12 +323,12 @@ fn test_embedded_client_unsupported_sql_preserves_error_categories() {
         .unwrap();
     assert!(matches!(having_res, StatementResult::Query(_)));
 
-    // 7. Still unsupported: window functions.
-    let err_window = client
-        .execute("SELECT name, COUNT(*) OVER () FROM products;")
+    // 7. Still unsupported: locking clauses.
+    let err_locking = client
+        .execute("SELECT name FROM products FOR UPDATE;")
         .unwrap_err();
     assert!(
-        matches!(err_window, HtapError::Unsupported(_)),
-        "expected Unsupported for window function, got {err_window:?}"
+        matches!(err_locking, HtapError::Unsupported(_)),
+        "expected Unsupported for locking clause, got {err_locking:?}"
     );
 }

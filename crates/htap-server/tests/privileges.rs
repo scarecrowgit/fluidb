@@ -146,6 +146,125 @@ fn test_join_with_ungranted_table_is_masked() {
 }
 
 #[test]
+fn test_join_using_ungranted_table_is_masked() {
+    let (_dir, server) = setup();
+    server.execute("GRANT SELECT ON a TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "b",
+        session
+            .execute("SELECT * FROM a JOIN b USING(id)")
+            .unwrap_err(),
+        session
+            .execute("SELECT * FROM a JOIN zzz USING(id)")
+            .unwrap_err(),
+    );
+}
+
+#[test]
+fn test_natural_join_with_ungranted_table_is_masked() {
+    let (_dir, server) = setup();
+    server.execute("GRANT SELECT ON a TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "b",
+        session
+            .execute("SELECT * FROM a NATURAL JOIN b")
+            .unwrap_err(),
+        session
+            .execute("SELECT * FROM a NATURAL JOIN zzz")
+            .unwrap_err(),
+    );
+}
+
+#[test]
+fn test_nested_join_tree_with_ungranted_table_is_masked() {
+    let (_dir, server) = setup();
+    server
+        .execute("CREATE TABLE hidden (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server.execute("GRANT SELECT ON a TO u").unwrap();
+    server.execute("GRANT SELECT ON b TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "hidden",
+        session
+            .execute(
+                "SELECT a.id FROM a \
+                 JOIN (b JOIN hidden ON b.id = hidden.id) ON a.id = b.id",
+            )
+            .unwrap_err(),
+        session
+            .execute(
+                "SELECT a.id FROM a \
+                 JOIN (b JOIN zzz ON b.id = zzz.id) ON a.id = b.id",
+            )
+            .unwrap_err(),
+    );
+}
+
+#[test]
+fn test_full_outer_join_with_ungranted_table_is_masked() {
+    let (_dir, server) = setup();
+    server.execute("GRANT SELECT ON a TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "b",
+        session
+            .execute("SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id")
+            .unwrap_err(),
+        session
+            .execute("SELECT * FROM a FULL OUTER JOIN zzz ON a.id = zzz.id")
+            .unwrap_err(),
+    );
+}
+
+#[test]
+fn test_visible_but_unselectable_join_tables_are_denied_post_bind() {
+    let (_dir, server) = setup();
+    server
+        .execute("CREATE TABLE hidden (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server.execute("GRANT SELECT ON a TO u").unwrap();
+    server.execute("GRANT UPDATE ON b TO u").unwrap();
+    server.execute("GRANT UPDATE ON hidden TO u").unwrap();
+    let mut session = user_session(&server);
+
+    for sql in [
+        "SELECT * FROM a NATURAL JOIN b",
+        "SELECT a.id FROM a \
+         JOIN (b JOIN hidden ON b.id = hidden.id) ON a.id = b.id",
+        "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
+    ] {
+        assert!(matches!(
+            session.execute(sql).unwrap_err(),
+            HtapError::PermissionDenied(_)
+        ));
+    }
+}
+
+#[test]
+fn test_filtered_delete_subquery_with_ungranted_table_is_masked() {
+    let (_dir, server) = setup();
+    server.execute("GRANT DELETE ON a TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "b",
+        session
+            .execute("DELETE FROM a WHERE id IN (SELECT id FROM b)")
+            .unwrap_err(),
+        session
+            .execute("DELETE FROM a WHERE id IN (SELECT id FROM zzz)")
+            .unwrap_err(),
+    );
+}
+
+#[test]
 fn test_subquery_and_cte_referencing_ungranted_table_masked() {
     let (_dir, server) = setup();
     let mut session = user_session(&server);
@@ -328,6 +447,18 @@ fn test_update_requires_update_and_select_when_where_present() {
 }
 
 #[test]
+fn test_delete_without_grants_masks_filtered_target_table() {
+    let (_dir, server) = setup();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "a",
+        session.execute("DELETE FROM a WHERE v > 1").unwrap_err(),
+        session.execute("DELETE FROM zzz WHERE v > 1").unwrap_err(),
+    );
+}
+
+#[test]
 fn test_delete_requires_delete() {
     let (_dir, server) = setup();
     let mut session = user_session(&server);
@@ -338,6 +469,64 @@ fn test_delete_requires_delete() {
     ));
     server.execute("GRANT DELETE ON a TO u").unwrap();
     session.execute("DELETE FROM a WHERE id = 1").unwrap();
+}
+
+#[test]
+fn test_delete_requires_only_delete_for_point_targets_but_select_for_filters() {
+    let (_dir, server) = setup();
+    server.execute("GRANT UPDATE ON a TO u").unwrap();
+    server.execute("GRANT DELETE ON a TO u").unwrap();
+    let mut session = user_session(&server);
+
+    session.execute("DELETE FROM a WHERE id = 1").unwrap();
+    assert!(matches!(
+        session.execute("DELETE FROM a WHERE v > 1").unwrap_err(),
+        HtapError::PermissionDenied(_)
+    ));
+    server.execute("GRANT SELECT ON a TO u").unwrap();
+    session.execute("DELETE FROM a WHERE v > 1").unwrap();
+    session.execute("DELETE FROM a").unwrap();
+}
+
+#[test]
+fn test_truncate_requires_delete_only_and_masks_hidden_tables() {
+    let (_dir, server) = setup();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "a",
+        session.execute("TRUNCATE TABLE a").unwrap_err(),
+        session.execute("TRUNCATE TABLE zzz").unwrap_err(),
+    );
+
+    server.execute("GRANT DELETE ON a TO u").unwrap();
+    session.execute("TRUNCATE TABLE a").unwrap();
+}
+
+#[test]
+fn test_truncate_if_exists_missing_table_is_a_noop() {
+    let (_dir, server) = setup();
+    let mut session = user_session(&server);
+
+    session.execute("TRUNCATE TABLE IF EXISTS zzz").unwrap();
+}
+
+#[test]
+fn test_truncate_if_exists_invisible_table_masks_as_missing() {
+    let (_dir, server) = setup();
+    let mut session = user_session(&server);
+
+    let hidden = session.execute("TRUNCATE TABLE IF EXISTS a").unwrap();
+    let missing = session.execute("TRUNCATE TABLE IF EXISTS zzz").unwrap();
+    assert_eq!(hidden, missing);
+
+    assert_eq!(
+        rows(server.execute("SELECT id FROM a ORDER BY id").unwrap()),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+        ]
+    );
 }
 
 #[test]
@@ -463,4 +652,231 @@ fn test_show_grants_without_for_uses_calling_account() {
             "GRANT SELECT ON htap.a TO 'u'@'%'".into()
         )])]
     );
+}
+
+#[test]
+fn test_insert_select_requires_select_on_source_and_leaves_target_unchanged_when_denied() {
+    let (_dir, server) = setup();
+    server
+        .execute("CREATE TABLE src (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server
+        .execute("INSERT INTO src (id, v) VALUES (1, 10), (2, 20)")
+        .unwrap();
+    server
+        .execute("CREATE TABLE dst (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server.execute("GRANT INSERT ON dst TO u").unwrap();
+    server.execute("GRANT UPDATE ON src TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert!(matches!(
+        session
+            .execute("INSERT INTO dst (id, v) SELECT id, v FROM src")
+            .unwrap_err(),
+        HtapError::PermissionDenied(_)
+    ));
+    assert!(rows(server.execute("SELECT * FROM dst").unwrap()).is_empty());
+
+    server.execute("GRANT SELECT ON src TO u").unwrap();
+    session
+        .execute("INSERT INTO dst (id, v) SELECT id, v FROM src")
+        .unwrap();
+    assert_eq!(
+        rows(server.execute("SELECT id, v FROM dst ORDER BY id").unwrap()),
+        vec![
+            Row::new(vec![Value::Int64(1), Value::Int32(10)]),
+            Row::new(vec![Value::Int64(2), Value::Int32(20)]),
+        ]
+    );
+}
+
+#[test]
+fn test_insert_select_masks_invisible_source_as_missing_table() {
+    let (_dir, server) = setup();
+    server
+        .execute("CREATE TABLE src (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server
+        .execute("CREATE TABLE dst (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server.execute("GRANT INSERT ON dst TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "src",
+        session
+            .execute("INSERT INTO dst (id, v) SELECT id, v FROM src")
+            .unwrap_err(),
+        session
+            .execute("INSERT INTO dst (id, v) SELECT id, v FROM zzz")
+            .unwrap_err(),
+    );
+}
+
+#[test]
+fn test_insert_select_masks_hidden_sources_in_subquery_and_cte() {
+    let (_dir, server) = setup();
+    for table in ["src", "hidden", "visible"] {
+        server
+            .execute(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v INT)"
+            ))
+            .unwrap();
+    }
+    server
+        .execute("INSERT INTO src (id, v) VALUES (1, 10)")
+        .unwrap();
+    server
+        .execute("INSERT INTO hidden (id, v) VALUES (1, 10)")
+        .unwrap();
+    server.execute("GRANT INSERT ON visible TO u").unwrap();
+    server.execute("GRANT SELECT ON src TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert_masked(
+        "hidden",
+        session
+            .execute(
+                "INSERT INTO visible (id, v) SELECT id, v FROM src \
+                 WHERE id IN (SELECT id FROM hidden)",
+            )
+            .unwrap_err(),
+        session
+            .execute(
+                "INSERT INTO visible (id, v) SELECT id, v FROM src \
+                 WHERE id IN (SELECT id FROM zzz)",
+            )
+            .unwrap_err(),
+    );
+    assert_masked(
+        "hidden",
+        session
+            .execute(
+                "WITH c AS (SELECT id, v FROM hidden) \
+                 INSERT INTO visible (id, v) SELECT * FROM c",
+            )
+            .unwrap_err(),
+        session
+            .execute(
+                "WITH c AS (SELECT id, v FROM zzz) \
+                 INSERT INTO visible (id, v) SELECT * FROM c",
+            )
+            .unwrap_err(),
+    );
+}
+
+#[test]
+fn test_insert_select_requires_insert_on_target() {
+    let (_dir, server) = setup();
+    server
+        .execute("CREATE TABLE src (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server
+        .execute("INSERT INTO src (id, v) VALUES (1, 10)")
+        .unwrap();
+    server
+        .execute("CREATE TABLE dst (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server.execute("GRANT SELECT ON src TO u").unwrap();
+    server.execute("GRANT UPDATE ON dst TO u").unwrap();
+    let mut session = user_session(&server);
+
+    assert!(matches!(
+        session
+            .execute("INSERT INTO dst (id, v) SELECT id, v FROM src")
+            .unwrap_err(),
+        HtapError::PermissionDenied(_)
+    ));
+}
+
+#[test]
+fn test_recursive_cte_privilege_checks_masking_and_self_reference() {
+    let (_dir, server) = setup();
+    server
+        .execute("CREATE TABLE hidden (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server
+        .execute("CREATE TABLE visible (id BIGINT PRIMARY KEY, v INT)")
+        .unwrap();
+    server.execute("GRANT UPDATE ON visible TO u").unwrap();
+    server.execute("GRANT SELECT ON a TO u").unwrap();
+    let mut session = user_session(&server);
+
+    // A recursive CTE can read a visible base table and reference itself.
+    assert_eq!(
+        rows(
+            session
+                .execute(
+                    "WITH RECURSIVE x AS (\
+                         SELECT id FROM a WHERE id = 1 \
+                         UNION ALL \
+                         SELECT id + 1 FROM x WHERE id < 2\
+                     ) \
+                     SELECT id FROM x ORDER BY id",
+                )
+                .unwrap()
+        ),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+        ]
+    );
+
+    let hidden_error = session
+        .execute(
+            "WITH RECURSIVE x AS (\
+             SELECT id FROM hidden \
+             UNION ALL \
+             SELECT id FROM x) \
+             SELECT * FROM x",
+        )
+        .unwrap_err();
+    let missing_error = session
+        .execute(
+            "WITH RECURSIVE x AS (\
+             SELECT id FROM zzz \
+             UNION ALL \
+             SELECT id FROM x) \
+             SELECT * FROM x",
+        )
+        .unwrap_err();
+    assert!(hidden_error.to_string().contains("'hidden'"));
+    assert!(missing_error.to_string().contains("'zzz'"));
+    assert_masked("hidden", hidden_error, missing_error);
+
+    let hidden_error = session
+        .execute(
+            "WITH RECURSIVE x AS (\
+             SELECT id FROM a \
+             UNION ALL \
+             SELECT hidden.id FROM x JOIN hidden ON x.id = hidden.id) \
+             SELECT * FROM x",
+        )
+        .unwrap_err();
+    let missing_error = session
+        .execute(
+            "WITH RECURSIVE x AS (\
+             SELECT id FROM a \
+             UNION ALL \
+             SELECT zzz.id FROM x JOIN zzz ON x.id = zzz.id) \
+             SELECT * FROM x",
+        )
+        .unwrap_err();
+    assert!(hidden_error.to_string().contains("'hidden'"));
+    assert!(missing_error.to_string().contains("'zzz'"));
+    assert_masked("hidden", hidden_error, missing_error);
+
+    assert!(matches!(
+        session
+            .execute(
+                "WITH RECURSIVE x AS (\
+                     SELECT id FROM visible \
+                     UNION ALL \
+                     SELECT id FROM x) \
+                     SELECT * FROM x",
+            )
+            .unwrap_err(),
+        HtapError::PermissionDenied(_)
+    ));
 }

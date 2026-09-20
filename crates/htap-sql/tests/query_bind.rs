@@ -6,7 +6,7 @@ use htap_common::error::{HtapError, Result};
 use htap_common::types::{DataType, Row, Value};
 use htap_sql::{
     bind, parse_one, BinOp, BoundQuery, BoundStatement, EvalContext, Expr, JoinKind, QueryBody,
-    ShowStatement, TableSlot, UpdateTarget, VariableLookup,
+    ShowStatement, TableSlot, UpdateTarget, VariableLookup, WindowFunctionKind,
 };
 
 fn catalog() -> CatalogSnapshot {
@@ -16,6 +16,11 @@ fn catalog() -> CatalogSnapshot {
         "CREATE TABLE orders (order_id BIGINT PRIMARY KEY, user_id INT NOT NULL, \
          amount DOUBLE, note VARCHAR(64))",
         "CREATE TABLE docs (id INT PRIMARY KEY, data BLOB)",
+        "CREATE TABLE a (id INT PRIMARY KEY, v INT)",
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT)",
+        "CREATE TABLE c (id INT PRIMARY KEY, b_id INT)",
+        "CREATE TABLE p (id INT PRIMARY KEY, x BIGINT)",
+        "CREATE TABLE ch (id INT PRIMARY KEY)",
     ];
     let mut tables = Vec::new();
     for (i, ddl) in ddls.iter().enumerate() {
@@ -38,7 +43,7 @@ fn catalog() -> CatalogSnapshot {
 
 fn bind_query(sql: &str) -> BoundQuery {
     match bind(&parse_one(sql).unwrap(), &catalog()) {
-        Ok(BoundStatement::Query(q)) => q,
+        Ok(BoundStatement::Query(q)) => *q,
         other => panic!("expected Query for {sql}: {other:?}"),
     }
 }
@@ -108,6 +113,145 @@ fn test_join_binding_kinds_aliases_and_wildcards() {
 }
 
 #[test]
+fn test_join_tree_lowering_and_nested_groups() {
+    let chain = bind_query(
+        "SELECT a.id, b.id, c.id FROM a JOIN b ON a.id = b.a_id \
+         LEFT JOIN c ON b.id = c.b_id",
+    );
+    let body = select_body(&chain);
+    assert!(!body.tree_only);
+    assert_eq!(body.joins.len(), 2);
+    assert_eq!(body.joins[0].kind, JoinKind::Inner);
+    assert_eq!(body.joins[1].kind, JoinKind::Left);
+    assert!(!chain.output_columns[0].nullable);
+    assert!(!chain.output_columns[1].nullable);
+    assert!(chain.output_columns[2].nullable);
+
+    let nested = bind_query(
+        "SELECT a.id, b.id, c.id FROM a LEFT JOIN (b JOIN c ON b.id = c.b_id) \
+         ON a.id = b.a_id",
+    );
+    let body = select_body(&nested);
+    assert!(body.tree_only);
+    assert!(body.joins.is_empty());
+    assert!(nested.output_columns[1].nullable);
+    assert!(nested.output_columns[2].nullable);
+    match body.join_tree.as_ref().unwrap() {
+        htap_sql::JoinTree::Join { right, .. } => match right.as_ref() {
+            htap_sql::JoinTree::Join { on: Some(on), .. } => match on {
+                Expr::BinaryOp { left, right, .. } => {
+                    assert!(matches!(left.as_ref(), Expr::ColumnRef { offset: 0, .. }));
+                    assert!(matches!(right.as_ref(), Expr::ColumnRef { offset: 3, .. }));
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+
+    let full = bind_query(
+        "SELECT a.id, b.id, c.id FROM (a LEFT JOIN b ON a.id = b.a_id) \
+         FULL JOIN c ON b.id = c.b_id",
+    );
+    let body = select_body(&full);
+    assert!(!body.tree_only);
+    assert_eq!(body.joins.len(), 2);
+    assert_eq!(body.joins[0].kind, JoinKind::Left);
+    assert_eq!(body.joins[1].kind, JoinKind::Full);
+    assert!(full.output_columns.iter().all(|c| c.nullable));
+
+    let comma = bind_query("SELECT a.id, b.id, c.id FROM a, b, c");
+    let body = select_body(&comma);
+    assert!(!body.tree_only);
+    assert_eq!(body.joins.len(), 2);
+    assert!(body.joins.iter().all(|j| j.kind == JoinKind::Cross));
+}
+
+#[test]
+fn test_nested_join_on_cannot_reference_outer_comma_item() {
+    let err = bind_err("SELECT a.id FROM a, (b JOIN c ON a.id = c.id)");
+    assert!(
+        matches!(
+            err,
+            HtapError::InvalidArgument(ref message)
+                if message.contains("unknown table or alias 'a'")
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_nested_join_on_with_valid_outer_join() {
+    let q = bind_query(
+        "SELECT a.id, b.id, c.id \
+         FROM a JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id",
+    );
+    let body = select_body(&q);
+    assert!(body.tree_only);
+
+    match body.join_tree.as_ref().unwrap() {
+        htap_sql::JoinTree::Join {
+            left,
+            right,
+            on: Some(outer_on),
+            ..
+        } => {
+            assert!(matches!(left.as_ref(), htap_sql::JoinTree::Leaf(0)));
+            match outer_on {
+                Expr::BinaryOp { left, right, .. } => {
+                    assert!(matches!(
+                        left.as_ref(),
+                        Expr::ColumnRef {
+                            slot: 0,
+                            offset: 0,
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        right.as_ref(),
+                        Expr::ColumnRef {
+                            slot: 1,
+                            offset: 2,
+                            ..
+                        }
+                    ));
+                }
+                other => panic!("{other:?}"),
+            }
+
+            match right.as_ref() {
+                htap_sql::JoinTree::Join {
+                    on: Some(inner_on), ..
+                } => match inner_on {
+                    Expr::BinaryOp { left, right, .. } => {
+                        assert!(matches!(
+                            left.as_ref(),
+                            Expr::ColumnRef {
+                                slot: 1,
+                                offset: 0,
+                                ..
+                            }
+                        ));
+                        assert!(matches!(
+                            right.as_ref(),
+                            Expr::ColumnRef {
+                                slot: 2,
+                                offset: 2,
+                                ..
+                            }
+                        ));
+                    }
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn test_join_binding_errors() {
     // 'id' exists only in users, so it is unambiguous across the join.
     bind_query(
@@ -128,22 +272,15 @@ fn test_join_binding_errors() {
         matches!(e, HtapError::InvalidArgument(ref m) if m.contains("not unique")),
         "{e}"
     );
-    assert!(matches!(
-        bind_err("SELECT * FROM users FULL OUTER JOIN orders ON users.id = orders.user_id"),
-        HtapError::Unsupported(_)
-    ));
-    assert!(matches!(
-        bind_err("SELECT * FROM users NATURAL JOIN orders"),
-        HtapError::Unsupported(_)
-    ));
-    assert!(matches!(
-        bind_err("SELECT * FROM users JOIN orders USING (id)"),
-        HtapError::Unsupported(_)
-    ));
-    assert!(matches!(
-        bind_err("SELECT * FROM users LEFT JOIN (orders o JOIN users v ON o.user_id = v.id) ON users.id = v.id"),
-        HtapError::Unsupported(_)
-    ));
+
+    let natural = bind_query("SELECT * FROM a NATURAL JOIN b");
+    assert_eq!(names(&natural), ["id", "v", "a_id"]);
+    assert_eq!(select_body(&natural).joins[0].kind, JoinKind::Inner);
+
+    let using = bind_query("SELECT * FROM a JOIN b USING (id)");
+    assert_eq!(names(&using), ["id", "v", "a_id"]);
+    assert_eq!(select_body(&using).joins[0].kind, JoinKind::Inner);
+
     assert!(matches!(
         bind_err("SELECT * FROM users LEFT JOIN orders"),
         HtapError::InvalidArgument(_)
@@ -165,7 +302,7 @@ fn test_join_binding_errors() {
 #[test]
 fn test_expressions_functions_and_type_checks() {
     let q = bind_query(
-        "SELECT id * 2 + 1 AS twice, age / 2, -age, CAST(age AS DOUBLE), UPPER(name), \
+        "SELECT id * 2 + 1 AS twice, age / 2, age DIV 2, -age, CAST(age AS DOUBLE), UPPER(name), \
          CONCAT(name, '!'), CASE WHEN age > 30 THEN 'old' ELSE 'young' END AS bucket, \
          COALESCE(age, 0), name LIKE 'a%', age BETWEEN 1 AND 5, id IN (1, 2), \
          age IS NULL, NOT (age > 1) FROM users",
@@ -177,21 +314,22 @@ fn test_expressions_functions_and_type_checks() {
     assert_eq!(cols[1].data_type, DataType::Float64);
     assert!(cols[1].nullable);
     assert_eq!(cols[2].data_type, DataType::Int64);
-    assert_eq!(cols[3].data_type, DataType::Float64);
-    assert_eq!(cols[4].data_type, DataType::String);
+    assert_eq!(cols[3].data_type, DataType::Int64);
+    assert_eq!(cols[4].data_type, DataType::Float64);
     assert_eq!(cols[5].data_type, DataType::String);
-    assert_eq!(cols[6].name, "bucket");
     assert_eq!(cols[6].data_type, DataType::String);
+    assert_eq!(cols[7].name, "bucket");
+    assert_eq!(cols[7].data_type, DataType::String);
     assert_eq!(
-        cols[7].data_type,
+        cols[8].data_type,
         DataType::Int64,
         "COALESCE widens Int32 with an Int64 literal"
     );
-    assert!(!cols[7].nullable);
-    for c in &cols[8..] {
+    assert!(!cols[8].nullable);
+    for c in &cols[9..] {
         assert_eq!(c.data_type, DataType::Bool, "{}", c.name);
     }
-    assert_eq!(cols[11].name, "age IS NULL");
+    assert_eq!(cols[12].name, "age IS NULL");
 
     // Evaluate the projection against a row (id=3, name='ann', age=40, score=NULL).
     let row = vec![
@@ -212,6 +350,7 @@ fn test_expressions_functions_and_type_checks() {
         vec![
             Value::Int64(7),
             Value::Float64(20.0),
+            Value::Int64(20),
             Value::Int64(-40),
             Value::Float64(40.0),
             Value::String("ANN".into()),
@@ -261,7 +400,6 @@ fn test_expressions_functions_and_type_checks() {
     }
     for sql in [
         "SELECT NOW() FROM users",
-        "SELECT COUNT(*) OVER () FROM users",
         "SELECT id FROM users WHERE id = ROW(1)",
         "SELECT CAST(id AS JSON) FROM users",
     ] {
@@ -340,6 +478,8 @@ fn test_aggregates_group_by_having_and_grouping_rules() {
     // Grouping by an expression; projecting the same expression is allowed.
     let q = bind_query("SELECT age + 1, COUNT(*) FROM users GROUP BY age + 1");
     assert_eq!(select_body(&q).group_by.len(), 1);
+    let q = bind_query("SELECT age, COUNT(*) FROM users GROUP BY 1");
+    assert_eq!(select_body(&q).group_by.len(), 1);
     // Aggregate without GROUP BY (narrow shape stays on the analytic path).
     assert!(matches!(
         bind(
@@ -361,7 +501,8 @@ fn test_aggregates_group_by_having_and_grouping_rules() {
         "SELECT COUNT(COUNT(*)) FROM users",
         "SELECT age, COUNT(*) FROM users GROUP BY age, age",
         "SELECT age FROM users GROUP BY age ORDER BY name",
-        "SELECT age FROM users GROUP BY 1",
+        "SELECT age FROM users GROUP BY 2",
+        "SELECT * FROM users GROUP BY 1",
     ] {
         let e = bind_err(sql);
         assert!(
@@ -369,6 +510,36 @@ fn test_aggregates_group_by_having_and_grouping_rules() {
             "{sql}: {e}"
         );
     }
+}
+
+#[test]
+fn test_order_by_uses_merged_join_columns() {
+    let using = bind_query("SELECT a.v FROM a JOIN b USING (id) ORDER BY id");
+    assert!(matches!(
+        &using.order_by[0].expr,
+        Expr::ScalarFunction {
+            func: htap_sql::ScalarFn::Coalesce,
+            ..
+        }
+    ));
+
+    let natural = bind_query("SELECT a.v FROM a NATURAL JOIN b ORDER BY id");
+    assert!(matches!(
+        &natural.order_by[0].expr,
+        Expr::ScalarFunction {
+            func: htap_sql::ScalarFn::Coalesce,
+            ..
+        }
+    ));
+
+    let err = bind_err("SELECT a.v FROM a JOIN b ON a.id = b.id ORDER BY id");
+    assert!(
+        matches!(
+            err,
+            HtapError::InvalidArgument(ref message) if message.contains("ambiguous")
+        ),
+        "{err}"
+    );
 }
 
 #[test]
@@ -387,7 +558,10 @@ fn test_order_by_limit_distinct() {
     assert!(matches!(q.order_by[1].expr, Expr::BinaryOp { .. }));
     assert!(q.order_by[1].asc);
     assert!(q.order_by[1].nulls_first, "ASC defaults to NULLS FIRST");
-    assert!(matches!(q.order_by[2].expr, Expr::Literal(Value::Int64(1))));
+    assert!(matches!(
+        q.order_by[2].expr,
+        Expr::OutputColumn { index: 0, .. }
+    ));
 
     // Alias shadows a source column of the same name in ORDER BY.
     let q = bind_query("SELECT age AS name FROM users ORDER BY name");
@@ -423,6 +597,169 @@ fn test_order_by_limit_distinct() {
 }
 
 #[test]
+fn test_window_ranking_and_offset_function_binding() {
+    let q = bind_query(
+        "SELECT \
+             ROW_NUMBER() OVER (PARTITION BY age ORDER BY id DESC), \
+             RANK() OVER (PARTITION BY age ORDER BY id DESC), \
+             DENSE_RANK() OVER (PARTITION BY age ORDER BY id DESC), \
+             NTILE(4) OVER (PARTITION BY age ORDER BY id DESC), \
+             LAG(name, 2, 'missing') OVER (PARTITION BY age ORDER BY id DESC), \
+             LEAD(age) OVER (PARTITION BY age ORDER BY id DESC) \
+         FROM users",
+    );
+    let body = select_body(&q);
+    assert_eq!(body.windows.len(), 6);
+    assert_eq!(
+        body.windows
+            .iter()
+            .map(|window| window.func)
+            .collect::<Vec<_>>(),
+        vec![
+            WindowFunctionKind::RowNumber,
+            WindowFunctionKind::Rank,
+            WindowFunctionKind::DenseRank,
+            WindowFunctionKind::Ntile,
+            WindowFunctionKind::Lag,
+            WindowFunctionKind::Lead,
+        ]
+    );
+
+    for window in &body.windows {
+        assert_eq!(window.partition_by.len(), 1);
+        assert!(matches!(
+            window.partition_by[0],
+            Expr::ColumnRef {
+                ref name,
+                column: 2,
+                ..
+            } if name == "age"
+        ));
+        assert_eq!(window.order_by.len(), 1);
+        assert!(matches!(
+            window.order_by[0].expr,
+            Expr::ColumnRef {
+                ref name,
+                column: 0,
+                ..
+            } if name == "id"
+        ));
+        assert!(!window.order_by[0].asc);
+        assert!(!window.order_by[0].nulls_first);
+    }
+
+    assert_eq!(body.windows[3].args, vec![Expr::Literal(Value::Int64(4))]);
+    assert_eq!(body.windows[4].args.len(), 3);
+    assert!(matches!(
+        body.windows[4].args[0],
+        Expr::ColumnRef {
+            ref name,
+            column: 1,
+            ..
+        } if name == "name"
+    ));
+    assert_eq!(body.windows[4].args[1], Expr::Literal(Value::Int64(2)));
+    assert_eq!(
+        body.windows[4].args[2],
+        Expr::Literal(Value::String("missing".into()))
+    );
+    assert_eq!(body.windows[5].args.len(), 3);
+    assert!(matches!(
+        body.windows[5].args[0],
+        Expr::ColumnRef {
+            ref name,
+            column: 2,
+            ..
+        } if name == "age"
+    ));
+    assert_eq!(body.windows[5].args[1], Expr::Literal(Value::Int64(1)));
+    assert_eq!(body.windows[5].args[2], Expr::Literal(Value::Null));
+
+    for (sql, clause) in [
+        (
+            "SELECT id FROM users WHERE ROW_NUMBER() OVER (ORDER BY id) = 1",
+            "WHERE",
+        ),
+        (
+            "SELECT age, COUNT(*) FROM users \
+             GROUP BY age, ROW_NUMBER() OVER (ORDER BY id)",
+            "GROUP BY",
+        ),
+        (
+            "SELECT age, COUNT(*) FROM users GROUP BY age \
+             HAVING ROW_NUMBER() OVER (ORDER BY age) = 1",
+            "HAVING",
+        ),
+        (
+            "SELECT u.id FROM users u JOIN orders o \
+             ON ROW_NUMBER() OVER (ORDER BY u.id) = 1",
+            "JOIN ON",
+        ),
+        (
+            "SELECT u.id FROM users u JOIN \
+                 (orders o JOIN a ON ROW_NUMBER() OVER (ORDER BY o.order_id) = 1) \
+             ON u.id = o.user_id",
+            "JOIN ON",
+        ),
+    ] {
+        let err = bind_err(sql);
+        assert!(
+            matches!(
+                err,
+                HtapError::InvalidArgument(ref message)
+                    if message.contains(&format!(
+                        "window functions are not allowed in {clause}"
+                    ))
+            ),
+            "{sql}: {err}"
+        );
+    }
+
+    for (sql, message) in [
+        (
+            "SELECT LAG(ROW_NUMBER() OVER (), 1) OVER () FROM users",
+            "cannot be nested",
+        ),
+        (
+            "SELECT SUM(ROW_NUMBER() OVER ()) FROM users",
+            "inside aggregate arguments",
+        ),
+        (
+            "SELECT NTILE(0) OVER (ORDER BY id) FROM users",
+            "positive integer literal",
+        ),
+        (
+            "SELECT NTILE(age) OVER (ORDER BY id) FROM users",
+            "positive integer literal",
+        ),
+        (
+            "SELECT LAG(name, age) OVER (ORDER BY id) FROM users",
+            "non-negative integer literal",
+        ),
+        (
+            "SELECT LEAD(name, 1, age) OVER (ORDER BY id) FROM users",
+            "incompatible type",
+        ),
+        (
+            "SELECT ROW_NUMBER() OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) FROM users",
+            "frame",
+        ),
+        (
+            "SELECT ROW_NUMBER() OVER named_window FROM users",
+            "named windows",
+        ),
+    ] {
+        let err = bind_err(sql);
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains(&message.to_ascii_lowercase()),
+            "{sql}: {err}"
+        );
+    }
+}
+
+#[test]
 fn test_subqueries_ctes_derived_tables_and_union() {
     let q = bind_query(
         "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders) \
@@ -440,19 +777,20 @@ fn test_subqueries_ctes_derived_tables_and_union() {
     });
     assert_eq!(kinds, [("in", 0), ("exists", 1), ("scalar", 2)]);
 
-    // Correlated subquery is rejected clearly.
-    let e =
-        bind_err("SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE user_id = u.id)");
-    assert!(
-        matches!(e, HtapError::Unsupported(ref m) if m.contains("correlated")),
-        "{e}"
+    // Correlated subqueries bind successfully and record their outer references.
+    let q = bind_query(
+        "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE user_id = u.id)",
     );
-    let e =
-        bind_err("SELECT id FROM users WHERE age > (SELECT amount FROM orders WHERE user_id = id)");
-    assert!(
-        matches!(e, HtapError::Unsupported(ref m) if m.contains("correlated")),
-        "{e}"
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(q.subqueries[0].correlated);
+    assert!(!q.subqueries[0].correlated_outer_refs.is_empty());
+
+    let q = bind_query(
+        "SELECT id FROM users WHERE age > (SELECT amount FROM orders WHERE user_id = id)",
     );
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(q.subqueries[0].correlated);
+    assert!(!q.subqueries[0].correlated_outer_refs.is_empty());
     assert!(matches!(
         bind_err("SELECT id FROM users WHERE age > (SELECT order_id, amount FROM orders)"),
         HtapError::InvalidArgument(_)
@@ -477,10 +815,13 @@ fn test_subqueries_ctes_derived_tables_and_union() {
     assert!(
         matches!(&select_body(&q).slots[0], TableSlot::Derived { alias, .. } if alias == "named")
     );
+    // A non-self-referencing recursive CTE behaves like a plain CTE.
+    let q = bind_query("WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r");
     assert!(matches!(
-        bind_err("WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r"),
-        HtapError::Unsupported(_)
+        &select_body(&q).slots[0],
+        TableSlot::Derived { alias, .. } if alias == "r"
     ));
+    assert_eq!(names(&q), ["1"]);
     assert!(matches!(
         bind_err("SELECT * FROM (SELECT id, id FROM users) AS d"),
         HtapError::InvalidArgument(_)
@@ -509,10 +850,11 @@ fn test_subqueries_ctes_derived_tables_and_union() {
         bind_err("SELECT name FROM users UNION SELECT amount FROM orders"),
         HtapError::InvalidArgument(_)
     ));
-    assert!(matches!(
-        bind_err("SELECT id FROM users EXCEPT SELECT user_id FROM orders"),
-        HtapError::Unsupported(_)
-    ));
+    let q = bind_query("SELECT id FROM users EXCEPT SELECT user_id FROM orders");
+    match &q.body {
+        QueryBody::SetOp { kind, .. } => assert_eq!(*kind, htap_sql::SetOpKind::ExceptDistinct),
+        other => panic!("{other:?}"),
+    }
     assert!(matches!(
         bind_err("SELECT id FROM users UNION SELECT user_id FROM orders ORDER BY age"),
         HtapError::InvalidArgument(_)
@@ -745,11 +1087,8 @@ fn test_user_and_system_variable_binding() {
     // No lookup provided: an unset user variable is NULL, so `age = NULL` is never true.
     assert!(!filter.eval_predicate(&EvalContext::row_only(&row)).unwrap());
     let ctx = EvalContext {
-        row: &row,
-        aggregates: &[],
-        output: None,
-        subqueries: &[],
         variables: Some(&vars),
+        ..EvalContext::row_only(&row)
     };
     assert!(!filter.eval_predicate(&ctx).unwrap());
     let vars_match = FakeVars {
@@ -774,14 +1113,115 @@ fn test_user_and_system_variable_binding() {
     // The same variable resolves once a lookup is available.
     assert_eq!(
         sys.eval(&EvalContext {
-            row: &[],
-            aggregates: &[],
-            output: None,
-            subqueries: &[],
             variables: Some(&vars),
+            ..EvalContext::row_only(&[])
         })
         .unwrap(),
         Value::Int64(1)
+    );
+}
+
+#[test]
+fn test_natural_using_coalescing_all_join_kinds() {
+    let assert_coalesced = |sql: &str, row: Vec<Value>, expected: Vec<Value>| {
+        let q = bind_query(sql);
+        assert_eq!(names(&q), ["id", "v", "a_id"], "{sql}");
+        let body = select_body(&q);
+        assert_eq!(body.projection.len(), 3, "{sql}");
+
+        let ctx = EvalContext::row_only(&row);
+        let actual = body
+            .projection
+            .iter()
+            .map(|p| p.expr.eval(&ctx).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{sql}");
+    };
+
+    let matched = vec![
+        Value::Int32(1),
+        Value::Int32(10),
+        Value::Int32(1),
+        Value::Int32(100),
+    ];
+    let left_only = vec![Value::Int32(2), Value::Int32(20), Value::Null, Value::Null];
+    let right_only = vec![Value::Null, Value::Null, Value::Int32(3), Value::Int32(300)];
+
+    for join in ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"] {
+        let using_sql = format!("SELECT * FROM a {join} b USING (id)");
+        let natural_sql = format!("SELECT * FROM a NATURAL {join} b");
+
+        let (row, expected) = match join {
+            "JOIN" => (
+                matched.clone(),
+                vec![Value::Int32(1), Value::Int32(10), Value::Int32(100)],
+            ),
+            "LEFT JOIN" => (
+                left_only.clone(),
+                vec![Value::Int32(2), Value::Int32(20), Value::Null],
+            ),
+            "RIGHT JOIN" => (
+                right_only.clone(),
+                vec![Value::Int32(3), Value::Null, Value::Int32(300)],
+            ),
+            "FULL JOIN" => (
+                right_only.clone(),
+                vec![Value::Int32(3), Value::Null, Value::Int32(300)],
+            ),
+            other => unreachable!("{other}"),
+        };
+
+        assert_coalesced(&using_sql, row.clone(), expected.clone());
+        assert_coalesced(&natural_sql, row, expected);
+    }
+
+    // FULL JOIN must also preserve the left key for an unmatched left row.
+    assert_coalesced(
+        "SELECT * FROM a FULL JOIN b USING (id)",
+        left_only.clone(),
+        vec![Value::Int32(2), Value::Int32(20), Value::Null],
+    );
+    assert_coalesced(
+        "SELECT * FROM a NATURAL FULL JOIN b",
+        left_only,
+        vec![Value::Int32(2), Value::Int32(20), Value::Null],
+    );
+}
+
+#[test]
+fn test_natural_using_merged_column_nullability() {
+    let full_not_null = bind_query("SELECT id FROM a FULL JOIN b USING (id)");
+    assert!(
+        !full_not_null.output_columns[0].nullable,
+        "FULL JOIN of two NOT NULL keys must produce a NOT NULL merged key"
+    );
+
+    let full_nullable = bind_query(
+        "SELECT id FROM a FULL JOIN \
+         (SELECT age AS id FROM users) AS nullable_ids USING (id)",
+    );
+    assert!(
+        full_nullable.output_columns[0].nullable,
+        "FULL JOIN with a nullable input key must produce a nullable merged key"
+    );
+
+    let left = bind_query(
+        "SELECT id FROM a LEFT JOIN \
+         (SELECT age AS id FROM users) AS nullable_ids USING (id)",
+    );
+    assert!(
+        !left.output_columns[0].nullable,
+        "LEFT JOIN merged-key nullability must follow the left input"
+    );
+
+    let right = bind_query(
+        "SELECT id FROM \
+         (SELECT age AS id FROM users) AS nullable_ids \
+         RIGHT JOIN a USING (id)",
+    );
+    assert!(
+        !right.output_columns[0].nullable,
+        "RIGHT JOIN merged-key nullability must follow the right input"
     );
 }
 
@@ -795,4 +1235,621 @@ fn test_global_scope_rejected() {
         bind_err("SELECT @@GLOBAL.autocommit FROM users"),
         HtapError::Unsupported(_)
     ));
+}
+
+#[test]
+fn test_natural_using_ambiguity_and_errors() {
+    // USING removes the duplicate join key from the unqualified namespace.
+    let q = bind_query("SELECT id, a.id, b.id FROM a JOIN b USING (id)");
+    assert_eq!(names(&q), ["id", "id", "id"]);
+    assert_eq!(select_body(&q).projection.len(), 3);
+
+    // The merged key remains unambiguous across another USING/NATURAL join.
+    let q = bind_query("SELECT id FROM a JOIN b USING (id) JOIN c USING (id)");
+    assert_eq!(names(&q), ["id"]);
+    let q = bind_query("SELECT id FROM a NATURAL JOIN b NATURAL JOIN c");
+    assert_eq!(names(&q), ["id"]);
+
+    // An ordinary ON join retains both keys, so an unqualified reference is ambiguous.
+    let e = bind_err("SELECT id FROM a JOIN b ON a.id = b.id");
+    assert!(
+        matches!(e, HtapError::InvalidArgument(ref m) if m.contains("ambiguous")),
+        "{e}"
+    );
+
+    // USING cannot choose between duplicate columns already present on one side.
+    let e = bind_err("SELECT * FROM (a JOIN b ON a.id = b.id) JOIN c USING (id)");
+    assert!(
+        matches!(e, HtapError::InvalidArgument(ref m) if m.contains("ambiguous")),
+        "{e}"
+    );
+    let e = bind_err("SELECT * FROM (a JOIN b ON a.id = b.id) NATURAL JOIN c");
+    assert!(
+        matches!(e, HtapError::InvalidArgument(ref m) if m.contains("ambiguous")),
+        "{e}"
+    );
+
+    for sql in [
+        "SELECT * FROM a JOIN b USING (nope)",
+        "SELECT * FROM a JOIN b USING (id, id)",
+    ] {
+        assert!(
+            matches!(bind_err(sql), HtapError::InvalidArgument(_)),
+            "{sql}"
+        );
+    }
+
+    // Same-named USING columns still need compatible types.
+    let e = bind_err(
+        "SELECT * FROM (SELECT id AS k FROM a) x \
+         JOIN (SELECT name AS k FROM users) y USING (k)",
+    );
+    assert!(matches!(e, HtapError::InvalidArgument(_)), "{e}");
+}
+
+#[test]
+fn test_correlated_subquery_binding_and_depth_limit() {
+    // EXISTS can reference columns from its immediately enclosing query.
+    let q = bind_query(
+        "SELECT id FROM users u \
+         WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)",
+    );
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(q.subqueries[0].correlated);
+    assert!(!q.subqueries[0].correlated_outer_refs.is_empty());
+
+    // Scalar subqueries in the projection can also be correlated.
+    let q = bind_query(
+        "SELECT (SELECT amount FROM orders o WHERE o.user_id = u.id) \
+         FROM users u",
+    );
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(q.subqueries[0].correlated);
+    assert!(!q.subqueries[0].correlated_outer_refs.is_empty());
+
+    // IN subqueries retain correlation information as well.
+    let q = bind_query(
+        "SELECT id FROM users u \
+         WHERE id IN (SELECT user_id FROM orders o WHERE o.amount > u.score)",
+    );
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(q.subqueries[0].correlated);
+    assert!(!q.subqueries[0].correlated_outer_refs.is_empty());
+
+    // A nested subquery cannot skip its immediate parent and reference an outer query.
+    let e = bind_err(
+        "SELECT id FROM users u WHERE EXISTS (\
+             SELECT 1 FROM orders o WHERE EXISTS (\
+                 SELECT 1 FROM docs d WHERE d.id = u.id\
+             )\
+         )",
+    );
+    assert!(
+        matches!(
+            e,
+            HtapError::InvalidArgument(ref m)
+                if m.contains("correlated subqueries may only reference the immediately enclosing query")
+        ),
+        "{e}"
+    );
+
+    // The same depth restriction applies to unqualified references.
+    let e = bind_err(
+        "SELECT id FROM users u WHERE EXISTS (\
+             SELECT 1 FROM orders o WHERE EXISTS (\
+                 SELECT 1 FROM docs d WHERE d.id = score\
+             )\
+         )",
+    );
+    assert!(
+        matches!(
+            e,
+            HtapError::InvalidArgument(ref m)
+                if m.contains("correlated subqueries may only reference the immediately enclosing query")
+        ),
+        "{e}"
+    );
+
+    // A name missing from every scope retains the ordinary unknown-column diagnostic.
+    let e = bind_err(
+        "SELECT id FROM users u WHERE EXISTS (\
+             SELECT 1 FROM orders o WHERE EXISTS (\
+                 SELECT 1 FROM docs d WHERE d.id = nowhere\
+             )\
+         )",
+    );
+    assert!(
+        matches!(e, HtapError::InvalidArgument(ref m) if m.contains("unknown column 'nowhere'")),
+        "{e}"
+    );
+
+    // The inner query may reference its immediate parent even if that parent is uncorrelated.
+    bind_query(
+        "SELECT id FROM users u WHERE EXISTS (\
+             SELECT 1 FROM orders o WHERE EXISTS (\
+                 SELECT 1 FROM docs d WHERE d.id = o.user_id\
+             )\
+         )",
+    );
+
+    // Ordinary subqueries do not report correlation or outer references.
+    let q = bind_query(
+        "SELECT id FROM users \
+         WHERE EXISTS (SELECT 1 FROM orders WHERE amount > 1)",
+    );
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(!q.subqueries[0].correlated);
+    assert!(q.subqueries[0].correlated_outer_refs.is_empty());
+}
+
+#[test]
+fn test_correlated_subquery_grouped_context() {
+    // A correlated reference to a grouping key is valid in HAVING.
+    let q = bind_query(
+        "SELECT u.age, COUNT(*) FROM users u GROUP BY u.age \
+         HAVING EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.age)",
+    );
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(q.subqueries[0].correlated);
+
+    // HAVING cannot correlate through a non-grouped parent column.
+    let e = bind_err(
+        "SELECT u.age, COUNT(*) FROM users u GROUP BY u.age \
+         HAVING EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)",
+    );
+    assert!(
+        matches!(e, HtapError::InvalidArgument(ref m) if m.contains("id")),
+        "{e}"
+    );
+
+    // The same grouping rule applies when a correlated scalar subquery is an aggregate argument.
+    let e = bind_err(
+        "SELECT SUM((SELECT amount FROM orders o WHERE o.user_id = u.id)) \
+         FROM users u GROUP BY u.age",
+    );
+    assert!(
+        matches!(e, HtapError::InvalidArgument(ref m) if m.contains("id")),
+        "{e}"
+    );
+}
+
+#[test]
+fn test_correlated_subquery_binding_is_case_insensitive() {
+    let q = bind_query(
+        "SELECT u.Id FROM users AS u \
+         WHERE EXISTS ( \
+             SELECT 1 FROM orders AS o \
+             WHERE o.USER_ID = u.Id \
+         )",
+    );
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(q.subqueries[0].correlated);
+    assert!(!q.subqueries[0].correlated_outer_refs.is_empty());
+
+    let q = bind_query(
+        "SELECT u.AGE, COUNT(*) FROM users AS u GROUP BY u.AgE \
+         HAVING EXISTS ( \
+             SELECT 1 FROM orders AS o \
+             WHERE o.USER_ID = u.aGe \
+         )",
+    );
+    assert_eq!(q.subqueries.len(), 1);
+    assert!(q.subqueries[0].correlated);
+    assert!(!q.subqueries[0].correlated_outer_refs.is_empty());
+}
+
+#[test]
+fn test_recursive_cte_binding_and_output_schema() {
+    let q = bind_query(
+        "WITH RECURSIVE seq(n) AS ( \
+             SELECT 1 \
+             UNION ALL \
+             SELECT n + 1 FROM seq WHERE n < 5 \
+         ) \
+         SELECT n FROM seq",
+    );
+
+    assert_eq!(names(&q), ["n"]);
+    assert_eq!(q.output_columns[0].data_type, DataType::Int64);
+
+    let q = bind_query(
+        "WITH RECURSIVE descendants(id) AS ( \
+             SELECT id FROM a WHERE id = 1 \
+             UNION ALL \
+             SELECT b.id FROM b JOIN descendants d ON b.a_id = d.id \
+         ) \
+         SELECT id FROM descendants",
+    );
+    assert_eq!(names(&q), ["id"]);
+}
+
+#[test]
+fn test_recursive_cte_binding_rejects_invalid_shapes() {
+    for sql in [
+        "WITH RECURSIVE r(n) AS (SELECT n + 1 FROM r) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS ( \
+             SELECT 1 UNION ALL \
+             SELECT x.n + y.n FROM r x JOIN r y ON x.n = y.n \
+         ) SELECT n FROM r",
+        "WITH RECURSIVE r(a, b) AS ( \
+             SELECT 1 UNION ALL SELECT a + 1 FROM r \
+         ) SELECT * FROM r",
+    ] {
+        let err = bind_err(sql);
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("recursive"),
+            "{sql}: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_recursive_cte_binding_restrictions_and_non_recursive_forms() {
+    for (sql, message) in [
+        (
+            "WITH RECURSIVE a AS (SELECT 1 FROM b), \
+                 b AS (SELECT 1 FROM a) \
+             SELECT * FROM a",
+            "nested or mutually recursive CTEs not supported",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL \
+                 SELECT x.n + y.n FROM r AS x JOIN r AS y ON x.n = y.n \
+             ) SELECT n FROM r",
+            "exactly once",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL \
+                 SELECT (SELECT n FROM r) FROM r \
+             ) SELECT n FROM r",
+            "subquery",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL \
+                 SELECT r.n FROM (SELECT 1 AS n) AS x LEFT JOIN r ON x.n = r.n \
+             ) SELECT n FROM r",
+            "outer join",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL \
+                 SELECT r.n FROM (a LEFT JOIN r ON a.id = r.n) \
+             ) SELECT n FROM r",
+            "null-supplying side of an outer join",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL SELECT SUM(n) FROM r \
+             ) SELECT n FROM r",
+            "aggregate",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL SELECT n FROM r GROUP BY n \
+             ) SELECT n FROM r",
+            "GROUP BY",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL SELECT DISTINCT n FROM r \
+             ) SELECT n FROM r",
+            "DISTINCT",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL (SELECT n FROM r ORDER BY n) \
+             ) SELECT n FROM r",
+            "ORDER BY",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS ( \
+                 SELECT 1 UNION ALL (SELECT n FROM r LIMIT 1) \
+             ) SELECT n FROM r",
+            "LIMIT",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT n FROM r) \
+             SELECT n FROM r",
+            "body",
+        ),
+    ] {
+        let err = bind_err(sql);
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains(&message.to_ascii_lowercase()),
+            "{sql}: {err}"
+        );
+    }
+
+    bind_query("WITH r AS (SELECT id FROM users) SELECT id FROM r");
+    bind_query("WITH RECURSIVE r AS (SELECT id FROM users) SELECT id FROM r");
+    bind_query("WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r");
+}
+
+#[test]
+fn test_window_aggregate_and_value_functions_with_frames() {
+    use htap_sql::{
+        PeerFrameBound, RowFrameBound, ValueFrameBound, WindowFrame, WindowFrameDirection,
+    };
+
+    let q = bind_query(
+        "SELECT \
+             COUNT(*) OVER (), \
+             COUNT(age) OVER (), \
+             SUM(id) OVER (), \
+             AVG(age) OVER (), \
+             MIN(name) OVER (), \
+             MAX(score) OVER (), \
+             FIRST_VALUE(name) OVER (), \
+             LAST_VALUE(age) OVER () \
+         FROM users",
+    );
+    let body = select_body(&q);
+    assert_eq!(body.windows.len(), 8);
+
+    let expected = [
+        (DataType::Int64, false),
+        (DataType::Int64, false),
+        (DataType::Int64, true),
+        (DataType::Float64, true),
+        (DataType::String, true),
+        (DataType::Float64, true),
+        (DataType::String, true),
+        (DataType::Int32, true),
+    ];
+    for (column, (data_type, nullable)) in q.output_columns.iter().zip(expected) {
+        assert_eq!(column.data_type, data_type);
+        assert_eq!(column.nullable, nullable);
+    }
+    assert!(body
+        .windows
+        .iter()
+        .all(|window| window.frame == WindowFrame::None));
+
+    let q = bind_query("SELECT SUM(id) OVER (ORDER BY age) FROM users");
+    assert_eq!(
+        select_body(&q).windows[0].frame,
+        WindowFrame::PeerRange {
+            start: PeerFrameBound::Unbounded(WindowFrameDirection::Preceding),
+            end: PeerFrameBound::CurrentRow,
+        }
+    );
+
+    let q = bind_query(
+        "SELECT \
+             SUM(id) OVER (ORDER BY age ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), \
+             AVG(age) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 3 FOLLOWING), \
+             COUNT(*) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
+         FROM users",
+    );
+    let windows = &select_body(&q).windows;
+    assert_eq!(
+        windows[0].frame,
+        WindowFrame::Rows {
+            start: RowFrameBound::Offset {
+                value: 2,
+                direction: WindowFrameDirection::Preceding,
+            },
+            end: RowFrameBound::CurrentRow,
+        }
+    );
+    assert_eq!(
+        windows[1].frame,
+        WindowFrame::Rows {
+            start: RowFrameBound::CurrentRow,
+            end: RowFrameBound::Offset {
+                value: 3,
+                direction: WindowFrameDirection::Following,
+            },
+        }
+    );
+    assert_eq!(
+        windows[2].frame,
+        WindowFrame::Rows {
+            start: RowFrameBound::Unbounded(WindowFrameDirection::Preceding),
+            end: RowFrameBound::Unbounded(WindowFrameDirection::Following),
+        }
+    );
+
+    let q = bind_query(
+        "SELECT SUM(id) OVER (ORDER BY age \
+         RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM users",
+    );
+    assert_eq!(
+        select_body(&q).windows[0].frame,
+        WindowFrame::PeerRange {
+            start: PeerFrameBound::Unbounded(WindowFrameDirection::Preceding),
+            end: PeerFrameBound::CurrentRow,
+        }
+    );
+
+    for (sql, message) in [
+        (
+            "SELECT SUM(id) OVER (ORDER BY age ROWS BETWEEN \
+             UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM users",
+            "UNBOUNDED FOLLOWING",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY age ROWS BETWEEN \
+             UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING) FROM users",
+            "UNBOUNDED PRECEDING",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY age ROWS BETWEEN \
+             1 FOLLOWING AND 1 PRECEDING) FROM users",
+            "frame start",
+        ),
+    ] {
+        let err = bind_err(sql);
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains(&message.to_ascii_lowercase()),
+            "{sql}: {err}"
+        );
+    }
+
+    // Keep ValueFrameBound imported alongside the other concrete frame-bound types.
+    let _: Option<ValueFrameBound> = None;
+}
+
+#[test]
+fn test_value_offset_range_frame_binding_and_key_restrictions() {
+    use htap_sql::{
+        PeerFrameBound, RowFrameBound, ValueFrameBound, WindowFrame, WindowFrameDirection,
+    };
+
+    let q = bind_query(
+        "SELECT SUM(id) OVER (ORDER BY age \
+         RANGE BETWEEN 2 PRECEDING AND 3 FOLLOWING) FROM users",
+    );
+    assert_eq!(
+        select_body(&q).windows[0].frame,
+        WindowFrame::ValueRange {
+            start: ValueFrameBound::Offset {
+                value: Expr::Literal(Value::Int64(2)),
+                direction: WindowFrameDirection::Preceding,
+            },
+            end: ValueFrameBound::Offset {
+                value: Expr::Literal(Value::Int64(3)),
+                direction: WindowFrameDirection::Following,
+            },
+        }
+    );
+
+    for (sql, message) in [
+        (
+            "SELECT SUM(id) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+            "exactly one ORDER BY",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY age, id \
+             RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+            "exactly one ORDER BY",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY name \
+             RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+            "numeric or timestamp",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY age \
+             RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM users",
+            "non-negative",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY age \
+             RANGE BETWEEN age PRECEDING AND CURRENT ROW) FROM users",
+            "literal",
+        ),
+    ] {
+        let err = bind_err(sql);
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains(&message.to_ascii_lowercase()),
+            "{sql}: {err}"
+        );
+    }
+
+    // Keep the other concrete bound types imported with the frame API.
+    let _: Option<PeerFrameBound> = None;
+    let _: Option<RowFrameBound> = None;
+}
+
+#[test]
+fn test_window_functions_over_group_by_and_aggregate_discovery() {
+    // A window can order by a GROUP BY key.
+    let q = bind_query(
+        "SELECT age, ROW_NUMBER() OVER (ORDER BY age) \
+         FROM users GROUP BY age",
+    );
+    assert_eq!(select_body(&q).group_by.len(), 1);
+    assert_eq!(select_body(&q).windows.len(), 1);
+
+    // Aggregates used only by a window specification must still be discovered.
+    let q = bind_query(
+        "SELECT age, ROW_NUMBER() OVER (ORDER BY SUM(id)) \
+         FROM users GROUP BY age",
+    );
+    let body = select_body(&q);
+    assert_eq!(body.aggregates.len(), 1);
+    assert_eq!(body.aggregates[0].name, "SUM(id)");
+    assert_eq!(body.windows.len(), 1);
+
+    // Window arguments are subject to the parent query's grouping rules.
+    let err = bind_err(
+        "SELECT age, FIRST_VALUE(name) OVER (ORDER BY age) \
+         FROM users GROUP BY age",
+    );
+    assert!(
+        matches!(err, HtapError::InvalidArgument(ref message) if message.contains("name")),
+        "{err}"
+    );
+
+    // An aggregate referenced only by a window creates an implicit single group.
+    let q = bind_query("SELECT ROW_NUMBER() OVER (ORDER BY SUM(id)) FROM users");
+    let body = select_body(&q);
+    assert!(body.is_aggregate());
+    assert_eq!(body.aggregates.len(), 1);
+    assert_eq!(body.aggregates[0].name, "SUM(id)");
+
+    // A window may reuse an ordinary aggregate from the same query.
+    let q = bind_query(
+        "SELECT SUM(id), ROW_NUMBER() OVER (ORDER BY SUM(id)) \
+         FROM users",
+    );
+    let body = select_body(&q);
+    assert_eq!(body.aggregates.len(), 1);
+    assert_eq!(body.aggregates[0].name, "SUM(id)");
+    assert_eq!(body.windows.len(), 1);
+}
+
+#[test]
+fn test_having_cannot_reference_window_result() {
+    // HAVING cannot reference an alias whose expression is a window function.
+    let err = bind_err(
+        "SELECT age, ROW_NUMBER() OVER (ORDER BY age) AS rn \
+         FROM users GROUP BY age HAVING rn = 1",
+    );
+    assert!(
+        matches!(
+            err,
+            HtapError::InvalidArgument(ref message)
+                if message.contains("window function results cannot be referenced in HAVING clause")
+        ),
+        "{err}"
+    );
+
+    // An ordinary aggregate alias remains valid in HAVING.
+    let q = bind_query(
+        "SELECT age, COUNT(*) AS n \
+         FROM users GROUP BY age HAVING n > 1",
+    );
+    assert!(select_body(&q).having.is_some());
+}
+
+#[test]
+fn test_correlated_subquery_window_order_by() {
+    let q = bind_query("SELECT p.id, (SELECT ROW_NUMBER() OVER (ORDER BY p.id) FROM ch) FROM p");
+
+    assert!(q.subqueries[0].correlated);
+    assert!(!q.subqueries[0].correlated_outer_refs.is_empty());
+
+    let body = select_body(&q.subqueries[0]);
+    assert_eq!(body.windows.len(), 1);
+    assert!(matches!(
+        body.windows[0].order_by[0].expr,
+        Expr::CorrelatedColumnRef { ref name, .. } if name == "id"
+    ));
+    assert!(q.subqueries[0].correlated_outer_refs.iter().any(|expr| {
+        matches!(
+            expr,
+            Expr::CorrelatedColumnRef { name, .. } if name == "id"
+        )
+    }));
 }

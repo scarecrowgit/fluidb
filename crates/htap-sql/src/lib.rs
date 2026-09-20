@@ -23,9 +23,9 @@ pub fn table_not_found(name: &str) -> htap_common::error::HtapError {
 pub use ast::{
     parse_many, parse_one, AggregateFunction, AlterPartitions, AlterUserStatement, AnalyticExpr,
     AnalyticFilter, AnalyticOrderBy, AnalyticSelect, BoundStatement, ComparisonOp, CreateTable,
-    CreateUserStatement, DeleteByPrimaryKey, DropTableStatement, DropUserStatement, GrantScope,
-    GrantStatement, Insert, PointSelect, RevokeStatement, ShowGrantsStatement, ShowStatement,
-    UpdateStatement, UpdateTarget,
+    CreateUserStatement, DeleteStatement, DeleteTarget, DropTableStatement, DropUserStatement,
+    GrantScope, GrantStatement, Insert, InsertSource, PointSelect, RevokeStatement,
+    ShowGrantsStatement, ShowStatement, UpdateStatement, UpdateTarget,
 };
 pub use binder::bind;
 pub use expr::{
@@ -37,8 +37,9 @@ pub use prepare::{
     substitute_placeholders_ext, tokenizer_placeholder_count, ParamLiteral,
 };
 pub use query::{
-    BoundQuery, JoinKind, JoinSpec, OrderItem, ProjectionItem, QueryBody, SelectBody, SetOpKind,
-    TableSlot,
+    BoundQuery, JoinKind, JoinSpec, JoinTree, OrderItem, PeerFrameBound, ProjectionItem, QueryBody,
+    RowFrameBound, SelectBody, SetOpKind, TableSlot, ValueFrameBound, WindowFrame,
+    WindowFrameDirection, WindowFunctionKind, WindowSpec,
 };
 pub use result::{CommandResult, QueryResult, StatementResult};
 pub use route::{classify_route, Route};
