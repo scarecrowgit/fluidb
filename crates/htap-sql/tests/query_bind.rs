@@ -76,11 +76,29 @@ fn test_join_binding_kinds_aliases_and_wildcards() {
     assert_eq!(body.slots.len(), 3);
     assert_eq!(body.slots[0].alias(), "u");
     assert!(matches!(&body.slots[1], TableSlot::Base { table, .. } if table == "orders"));
-    assert_eq!(body.joins.len(), 2);
-    assert_eq!(body.joins[0].kind, JoinKind::Inner);
-    assert_eq!(body.joins[0].right_slot, 1);
-    assert_eq!(body.joins[1].kind, JoinKind::Left);
-    assert!(body.joins[1].on.is_some());
+    match &body.join_tree {
+        htap_sql::JoinTree::Join {
+            left,
+            right,
+            kind: JoinKind::Left,
+            on: Some(_),
+        } => {
+            assert!(matches!(right.as_ref(), htap_sql::JoinTree::Leaf(2)));
+            match left.as_ref() {
+                htap_sql::JoinTree::Join {
+                    left,
+                    right,
+                    kind: JoinKind::Inner,
+                    on: Some(_),
+                } => {
+                    assert!(matches!(left.as_ref(), htap_sql::JoinTree::Leaf(0)));
+                    assert!(matches!(right.as_ref(), htap_sql::JoinTree::Leaf(1)));
+                }
+                other => panic!("expected inner join on left, got {other:?}"),
+            }
+        }
+        other => panic!("expected left join at root, got {other:?}"),
+    }
     assert_eq!(body.row_width(), 4 + 4 + 4);
     assert_eq!(body.slot_offset(2), 8);
     assert_eq!(names(&q), ["id", "amount", "name"]);
@@ -97,7 +115,13 @@ fn test_join_binding_kinds_aliases_and_wildcards() {
 
     let star = bind_query("SELECT * FROM users, orders");
     assert_eq!(star.output_columns.len(), 8);
-    assert_eq!(select_body(&star).joins[0].kind, JoinKind::Cross);
+    assert!(matches!(
+        &select_body(&star).join_tree,
+        htap_sql::JoinTree::Join {
+            kind: JoinKind::Cross,
+            ..
+        }
+    ));
     let qualified_star = bind_query("SELECT o.*, u.name FROM users u CROSS JOIN orders o");
     assert_eq!(
         names(&qualified_star),
@@ -105,7 +129,13 @@ fn test_join_binding_kinds_aliases_and_wildcards() {
     );
     // `JOIN` without ON is a cross join.
     let bare = bind_query("SELECT COUNT(*) FROM users JOIN orders");
-    assert_eq!(select_body(&bare).joins[0].kind, JoinKind::Cross);
+    assert!(matches!(
+        &select_body(&bare).join_tree,
+        htap_sql::JoinTree::Join {
+            kind: JoinKind::Cross,
+            ..
+        }
+    ));
     // Same output name twice is allowed at the top level.
     let dup =
         bind_query("SELECT u.id, o.user_id AS id FROM users u JOIN orders o ON u.id = o.user_id");
@@ -119,10 +149,24 @@ fn test_join_tree_lowering_and_nested_groups() {
          LEFT JOIN c ON b.id = c.b_id",
     );
     let body = select_body(&chain);
-    assert!(!body.tree_only);
-    assert_eq!(body.joins.len(), 2);
-    assert_eq!(body.joins[0].kind, JoinKind::Inner);
-    assert_eq!(body.joins[1].kind, JoinKind::Left);
+    match &body.join_tree {
+        htap_sql::JoinTree::Join {
+            left,
+            right,
+            kind: JoinKind::Left,
+            ..
+        } => {
+            assert!(matches!(right.as_ref(), htap_sql::JoinTree::Leaf(2)));
+            assert!(matches!(
+                left.as_ref(),
+                htap_sql::JoinTree::Join {
+                    kind: JoinKind::Inner,
+                    ..
+                }
+            ));
+        }
+        other => panic!("expected left join over an inner join, got {other:?}"),
+    }
     assert!(!chain.output_columns[0].nullable);
     assert!(!chain.output_columns[1].nullable);
     assert!(chain.output_columns[2].nullable);
@@ -132,11 +176,9 @@ fn test_join_tree_lowering_and_nested_groups() {
          ON a.id = b.a_id",
     );
     let body = select_body(&nested);
-    assert!(body.tree_only);
-    assert!(body.joins.is_empty());
     assert!(nested.output_columns[1].nullable);
     assert!(nested.output_columns[2].nullable);
-    match body.join_tree.as_ref().unwrap() {
+    match &body.join_tree {
         htap_sql::JoinTree::Join { right, .. } => match right.as_ref() {
             htap_sql::JoinTree::Join { on: Some(on), .. } => match on {
                 Expr::BinaryOp { left, right, .. } => {
@@ -155,17 +197,46 @@ fn test_join_tree_lowering_and_nested_groups() {
          FULL JOIN c ON b.id = c.b_id",
     );
     let body = select_body(&full);
-    assert!(!body.tree_only);
-    assert_eq!(body.joins.len(), 2);
-    assert_eq!(body.joins[0].kind, JoinKind::Left);
-    assert_eq!(body.joins[1].kind, JoinKind::Full);
+    match &body.join_tree {
+        htap_sql::JoinTree::Join {
+            left,
+            right,
+            kind: JoinKind::Full,
+            ..
+        } => {
+            assert!(matches!(right.as_ref(), htap_sql::JoinTree::Leaf(2)));
+            assert!(matches!(
+                left.as_ref(),
+                htap_sql::JoinTree::Join {
+                    kind: JoinKind::Left,
+                    ..
+                }
+            ));
+        }
+        other => panic!("expected full join over a left join, got {other:?}"),
+    }
     assert!(full.output_columns.iter().all(|c| c.nullable));
 
     let comma = bind_query("SELECT a.id, b.id, c.id FROM a, b, c");
     let body = select_body(&comma);
-    assert!(!body.tree_only);
-    assert_eq!(body.joins.len(), 2);
-    assert!(body.joins.iter().all(|j| j.kind == JoinKind::Cross));
+    match &body.join_tree {
+        htap_sql::JoinTree::Join {
+            left,
+            right,
+            kind: JoinKind::Cross,
+            ..
+        } => {
+            assert!(matches!(right.as_ref(), htap_sql::JoinTree::Leaf(2)));
+            assert!(matches!(
+                left.as_ref(),
+                htap_sql::JoinTree::Join {
+                    kind: JoinKind::Cross,
+                    ..
+                }
+            ));
+        }
+        other => panic!("expected a chain of cross joins, got {other:?}"),
+    }
 }
 
 #[test]
@@ -188,9 +259,7 @@ fn test_nested_join_on_with_valid_outer_join() {
          FROM a JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id",
     );
     let body = select_body(&q);
-    assert!(body.tree_only);
-
-    match body.join_tree.as_ref().unwrap() {
+    match &body.join_tree {
         htap_sql::JoinTree::Join {
             left,
             right,
@@ -275,11 +344,23 @@ fn test_join_binding_errors() {
 
     let natural = bind_query("SELECT * FROM a NATURAL JOIN b");
     assert_eq!(names(&natural), ["id", "v", "a_id"]);
-    assert_eq!(select_body(&natural).joins[0].kind, JoinKind::Inner);
+    assert!(matches!(
+        &select_body(&natural).join_tree,
+        htap_sql::JoinTree::Join {
+            kind: JoinKind::Inner,
+            ..
+        }
+    ));
 
     let using = bind_query("SELECT * FROM a JOIN b USING (id)");
     assert_eq!(names(&using), ["id", "v", "a_id"]);
-    assert_eq!(select_body(&using).joins[0].kind, JoinKind::Inner);
+    assert!(matches!(
+        &select_body(&using).join_tree,
+        htap_sql::JoinTree::Join {
+            kind: JoinKind::Inner,
+            ..
+        }
+    ));
 
     assert!(matches!(
         bind_err("SELECT * FROM users LEFT JOIN orders"),

@@ -64,6 +64,11 @@ pub enum Route {
     },
     /// Catalog metadata read (`SHOW`, `DESCRIBE`).
     CatalogRead,
+    /// Plan rendering, optionally with execution-time measurements.
+    Explain {
+        /// Whether the wrapped statement is executed.
+        analyze: bool,
+    },
 }
 
 /// Classifies a catalog-bound statement into an execution route given the target storage descriptor.
@@ -140,6 +145,7 @@ pub fn classify_route(statement: &BoundStatement, storage: &StorageDescriptor) -
             }
         },
         BoundStatement::DropTable(_)
+        | BoundStatement::AnalyzeTable(_)
         | BoundStatement::CreateUser(_)
         | BoundStatement::AlterUser(_)
         | BoundStatement::DropUser(_)
@@ -147,6 +153,7 @@ pub fn classify_route(statement: &BoundStatement, storage: &StorageDescriptor) -
         | BoundStatement::RevokePrivileges(_)
         | BoundStatement::ShowGrants(_) => Ok(Route::CatalogDdl),
         BoundStatement::Show(_) => Ok(Route::CatalogRead),
+        BoundStatement::Explain { analyze, .. } => Ok(Route::Explain { analyze: *analyze }),
     }
 }
 

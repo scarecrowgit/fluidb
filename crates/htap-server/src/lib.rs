@@ -7,16 +7,21 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod analyze;
+mod explain;
+mod memory_budget;
 pub mod olap;
 mod privilege;
 mod query_exec;
 mod session;
+mod spill;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use htap_catalog::local::LocalCatalogStore;
+use htap_catalog::model::TableStats;
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{Account, Grant, PrivilegeScope};
 pub use htap_catalog::{
@@ -39,7 +44,8 @@ pub use htap_convert::{
 use htap_movement::{
     CopyOptions, CopyReport, LocalDataMover, MovementJob, TabletCloneOptions, TabletPackageManifest,
 };
-use htap_rowstore::{Engine, EngineOptions, Snapshot};
+pub use htap_rowstore::Snapshot;
+use htap_rowstore::{Engine, EngineOptions};
 use htap_sql::ast::{
     AnalyticSelect, BoundPartitioning, BoundStatement, CreateTable, DeleteStatement, DeleteTarget,
     Insert, InsertSource, PointSelect, UpdateStatement, UpdateTarget,
@@ -53,7 +59,9 @@ use htap_txn::{
     TransactionRequest,
 };
 use parking_lot::Mutex;
-use session::{DefaultVariables, WriteSet};
+pub use query_exec::OptimizationMode;
+use session::DefaultVariables;
+use session::WriteSet;
 pub use session::{Principal, Session, SessionId};
 
 /// Definition of a partitioned table to be created via [`LocalServer::create_partitioned_table`].
@@ -108,6 +116,19 @@ pub enum PartitionTopology {
 /// Default bounded worker count for concurrent analytical partition scans.
 pub const DEFAULT_SCAN_WORKERS: usize = 4;
 
+/// Returns the default degree of parallelism for general query execution.
+fn default_query_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+}
+
+/// Default per-query memory budget in bytes.
+pub const DEFAULT_QUERY_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default maximum number of exact distinct values retained per column by `ANALYZE TABLE`.
+pub const DEFAULT_ANALYZE_DISTINCT_LIMIT: usize = 200_000;
+
 /// Result of [`LocalServer::bootstrap_root_account`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootstrapReport {
@@ -131,7 +152,11 @@ pub struct LocalServer {
     data_mover: LocalDataMover,
     execution_lock: Mutex<()>,
     colstore_dir: PathBuf,
+    data_root: PathBuf,
     scan_workers: usize,
+    query_parallelism: usize,
+    query_memory_budget: usize,
+    analyze_distinct_limit: usize,
     next_session_id: AtomicU64,
 }
 
@@ -140,6 +165,9 @@ impl std::fmt::Debug for LocalServer {
         f.debug_struct("LocalServer")
             .field("colstore_dir", &self.colstore_dir)
             .field("scan_workers", &self.scan_workers)
+            .field("query_parallelism", &self.query_parallelism)
+            .field("query_memory_budget", &self.query_memory_budget)
+            .field("analyze_distinct_limit", &self.analyze_distinct_limit)
             .finish()
     }
 }
@@ -229,6 +257,16 @@ impl LocalServer {
         let canonical_root = root.canonicalize()?;
         let lock_guard = ProcessLock::acquire(&canonical_root)?;
 
+        let spill_dir = canonical_root.join("spill");
+        if let Err(error) = std::fs::remove_dir_all(&spill_dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "failed to remove abandoned spill directory {}: {error}",
+                    spill_dir.display()
+                );
+            }
+        }
+
         let catalog_dir = canonical_root.join("catalog");
         let catalog = Arc::new(LocalCatalogStore::open(catalog_dir)?);
 
@@ -263,7 +301,11 @@ impl LocalServer {
             data_mover,
             execution_lock: Mutex::new(()),
             colstore_dir,
+            data_root: canonical_root,
             scan_workers: DEFAULT_SCAN_WORKERS,
+            query_parallelism: default_query_parallelism(),
+            query_memory_budget: DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
+            analyze_distinct_limit: DEFAULT_ANALYZE_DISTINCT_LIMIT,
             next_session_id: AtomicU64::new(1),
         })
     }
@@ -359,6 +401,62 @@ impl LocalServer {
         self.scan_workers
     }
 
+    /// Configures the degree of parallelism used by general query execution.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn with_query_parallelism(mut self, parallelism: usize) -> Self {
+        self.query_parallelism = parallelism.max(1);
+        self
+    }
+
+    /// Sets the degree of parallelism used by general query execution.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn set_query_parallelism(&mut self, parallelism: usize) {
+        self.query_parallelism = parallelism.max(1);
+    }
+
+    /// Returns the configured degree of parallelism for general query execution.
+    pub fn query_parallelism(&self) -> usize {
+        self.query_parallelism
+    }
+
+    /// Configures the per-query memory budget in bytes.
+    pub fn with_query_memory_budget(mut self, limit: usize) -> Self {
+        self.query_memory_budget = limit;
+        self
+    }
+
+    /// Sets the per-query memory budget in bytes.
+    pub fn set_query_memory_budget(&mut self, limit: usize) {
+        self.query_memory_budget = limit;
+    }
+
+    /// Returns the configured per-query memory budget in bytes.
+    pub fn query_memory_budget(&self) -> usize {
+        self.query_memory_budget
+    }
+
+    /// Configures the maximum exact distinct values retained per column by `ANALYZE TABLE`.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn with_analyze_distinct_limit(mut self, distinct_limit: usize) -> Self {
+        self.analyze_distinct_limit = distinct_limit.max(1);
+        self
+    }
+
+    /// Sets the maximum exact distinct values retained per column by `ANALYZE TABLE`.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn set_analyze_distinct_limit(&mut self, distinct_limit: usize) {
+        self.analyze_distinct_limit = distinct_limit.max(1);
+    }
+
+    /// Returns the configured exact-distinct limit used by `ANALYZE TABLE`.
+    pub fn analyze_distinct_limit(&self) -> usize {
+        self.analyze_distinct_limit
+    }
+
     /// Returns a borrowing façade for server-integrated data movement operations.
     pub fn data_mover(&self) -> LocalServerDataMover<'_> {
         LocalServerDataMover {
@@ -395,6 +493,46 @@ impl LocalServer {
         )
     }
 
+    /// Executes a query with explicit optimizer, memory-budget, and parallelism settings.
+    ///
+    /// This narrow entry point supports differential execution tests without exposing bound
+    /// queries, transactional write sets, or the internal query executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] on parsing, binding, catalog, storage, or query execution failure.
+    /// Returns [`HtapError::InvalidArgument`] when `sql` does not bind to a general query.
+    pub fn execute_query_with_options(
+        &self,
+        sql: &str,
+        optimization_mode: OptimizationMode,
+        memory_budget: usize,
+        parallelism: usize,
+    ) -> Result<StatementResult> {
+        let _guard = self.execution_lock.lock();
+
+        let statement = htap_sql::parse_one(sql)?;
+        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+        let bound = htap_sql::bind(&statement, &catalog)?;
+        let BoundStatement::Query(query) = bound else {
+            return Err(HtapError::InvalidArgument(
+                "execute_query_with_options requires a general query".into(),
+            ));
+        };
+
+        query_exec::execute_query_with_mode(query_exec::ExecuteQueryInput {
+            server: self,
+            query: query.as_ref(),
+            catalog: &catalog,
+            snapshot: Snapshot::new(self.txn_manager.visible_version()),
+            write_set: None,
+            variables: Some(&DefaultVariables),
+            optimization_mode,
+            memory_budget,
+            parallelism,
+        })
+    }
+
     /// Authenticates a catalog account and opens a session bound to that account principal.
     ///
     /// Authentication failures deliberately use one generic permission-denied response so callers
@@ -419,6 +557,94 @@ impl LocalServer {
     /// handling in [`Session::commit`].
     pub fn txn_manager(&self) -> &TransactionManager {
         &self.txn_manager
+    }
+
+    /// Executes `ANALYZE TABLE` at one statement-local MVCC snapshot and publishes the
+    /// resulting statistics without overwriting concurrent catalog changes.
+    fn execute_analyze_table(
+        &self,
+        table_name: &str,
+        catalog: &CatalogSnapshot,
+    ) -> Result<StatementResult> {
+        let (table, partitions) = self.resolve_table_and_all_partitions(table_name, catalog)?;
+        let table_id = table.id;
+        let snapshot = Snapshot::new(self.txn_manager.visible_version());
+        let source_columns: Vec<usize> = (0..table.schema.len()).collect();
+        let memory_budget = Arc::new(memory_budget::MemoryBudget::new(self.query_memory_budget));
+        let mut accumulator = analyze::AnalyzeAccumulator::new(
+            table.schema.len(),
+            self.analyze_distinct_limit,
+            Arc::clone(&memory_budget),
+        );
+
+        for partition in partitions {
+            let rows = scan_partition_compact(
+                &self.engine,
+                &self.colstore_dir,
+                catalog,
+                partition,
+                snapshot,
+                &source_columns,
+                &table.primary_key,
+                None,
+                None,
+            )?;
+            let scan_bytes = rows
+                .iter()
+                .map(memory_budget::MemoryBudget::estimate_row_bytes)
+                .fold(0usize, usize::saturating_add);
+            let _scan_reservation = memory_budget.try_reserve(scan_bytes)?;
+            for row in rows {
+                accumulator.observe_row(&row)?;
+            }
+        }
+
+        let stats = accumulator.finish(snapshot.version);
+        self.publish_table_stats(table_name, table_id, stats)?;
+        Ok(StatementResult::ddl(1))
+    }
+
+    /// Publishes statistics only when the table still denotes the object that was analyzed.
+    fn publish_table_stats(
+        &self,
+        table_name: &str,
+        table_id: TableId,
+        stats: TableStats,
+    ) -> Result<()> {
+        loop {
+            let current = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+            let Some(table) = current.table_by_name(table_name) else {
+                return Err(HtapError::NotFound(format!(
+                    "table '{table_name}' not found"
+                )));
+            };
+            if table.id != table_id {
+                return Err(HtapError::NotFound(format!(
+                    "table '{table_name}' not found"
+                )));
+            }
+
+            let table_index = current
+                .tables
+                .iter()
+                .position(|candidate| candidate.id == table_id)
+                .ok_or_else(|| HtapError::NotFound(format!("table '{table_name}' not found")))?;
+            let mut next = current.clone();
+            next.generation =
+                current
+                    .generation
+                    .checked_add(1)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "catalog_generation",
+                    })?;
+            next.tables[table_index].stats = Some(stats.clone());
+
+            match self.catalog.compare_and_set(current.generation, next) {
+                Ok(()) => return Ok(()),
+                Err(HtapError::Conflict(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Binds and routes a single statement, either autocommit or inside an open [`Session`]
@@ -626,6 +852,12 @@ impl LocalServer {
                 )?;
                 self.execute_drop_table(&drop, catalog)
             }
+            BoundStatement::AnalyzeTable(table_name) => {
+                self.execute_analyze_table(&table_name, catalog)
+            }
+            BoundStatement::Explain { inner, analyze } => explain::execute_explain(
+                self, *inner, analyze, catalog, &mut mode, variables, principal,
+            ),
             BoundStatement::Show(show) => {
                 let _route =
                     classify_route(&BoundStatement::Show(show.clone()), &StorageDescriptor::Row)?;
@@ -1587,6 +1819,10 @@ impl LocalServer {
             variables: Some(variables),
             working_rows: None,
             working_width: 0,
+            memory_budget: Arc::new(memory_budget::MemoryBudget::new(self.query_memory_budget)),
+            spill_root: self.data_root(),
+            parallelism: self.query_parallelism,
+            optimization_mode: query_exec::OptimizationMode::Enabled,
         };
         let all_columns: std::collections::BTreeSet<usize> = (0..table_desc.schema.len()).collect();
         let rows = query_exec::scan_base_table(&ctx, &delete.table, &all_columns, 0, &[])?;
@@ -1594,7 +1830,7 @@ impl LocalServer {
 
         for values in rows {
             if let Some(filter) = filter {
-                let filter_ctx = htap_sql::EvalContext {
+                let filter_ctx = htap_sql::eval_context! {
                     row: &values,
                     current_outer_row: None,
                     aggregates: &[],
@@ -1798,7 +2034,7 @@ impl LocalServer {
     ) -> Result<Row> {
         let mut values = row.values().to_vec();
         for (col_idx, expr) in &update.assignments {
-            let ctx = htap_sql::EvalContext {
+            let ctx = htap_sql::eval_context! {
                 row: &values,
                 current_outer_row: None,
                 aggregates: &[],
@@ -1970,13 +2206,17 @@ impl LocalServer {
             variables: Some(variables),
             working_rows: None,
             working_width: 0,
+            memory_budget: Arc::new(memory_budget::MemoryBudget::new(self.query_memory_budget)),
+            spill_root: self.data_root(),
+            parallelism: self.query_parallelism,
+            optimization_mode: query_exec::OptimizationMode::Enabled,
         };
         let all_columns: std::collections::BTreeSet<usize> = (0..table_desc.schema.len()).collect();
         let rows = query_exec::scan_base_table(&ctx, &update.table, &all_columns, 0, &[])?;
         let mut mutations = Vec::new();
         for values in rows {
             if let Some(f) = filter {
-                let filter_ctx = htap_sql::EvalContext {
+                let filter_ctx = htap_sql::eval_context! {
                     row: &values,
                     current_outer_row: None,
                     aggregates: &[],
@@ -2351,6 +2591,11 @@ pub(crate) fn scan_partition_compact(
 }
 
 impl LocalServer {
+    /// Returns the canonical data root directory for this local server.
+    pub(crate) fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+
     /// Returns the columnar storage root directory for this local server.
     pub fn colstore_dir(&self) -> &Path {
         &self.colstore_dir

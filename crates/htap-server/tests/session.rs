@@ -1414,6 +1414,87 @@ fn test_ddl_rejected_inside_explicit_transaction_and_txn_survives() {
     assert!(catalog_has_no_table(&server, "x"));
 }
 
+#[test]
+fn test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (1, 1);")
+        .unwrap();
+
+    let err = session.execute("ANALYZE TABLE t;").unwrap_err();
+    assert!(matches!(err, HtapError::Unsupported(_)));
+    assert!(session.in_transaction(), "the transaction must survive");
+
+    session
+        .execute("INSERT INTO t (id, v) VALUES (2, 2);")
+        .unwrap();
+    session.commit().unwrap();
+    assert_eq!(
+        exec_rows(&server, "SELECT id FROM t ORDER BY id;"),
+        vec![
+            Row::new(vec![Value::Int64(1)]),
+            Row::new(vec![Value::Int64(2)]),
+        ]
+    );
+
+    session.execute("ANALYZE TABLE t;").unwrap();
+}
+
+#[test]
+fn test_explain_analyze_wrapping_ddl_rejected_inside_open_transaction() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("BEGIN;").unwrap();
+    session
+        .execute("INSERT INTO t (id, v) VALUES (1, 1);")
+        .unwrap();
+
+    let err = session
+        .execute("EXPLAIN ANALYZE CREATE TABLE x (id BIGINT PRIMARY KEY);")
+        .unwrap_err();
+    assert!(matches!(err, HtapError::Unsupported(_)));
+    assert!(session.in_transaction(), "the transaction must survive");
+    assert!(catalog_has_no_table(&server, "x"));
+
+    session
+        .execute("INSERT INTO t (id, v) VALUES (2, 2);")
+        .unwrap();
+    session.commit().unwrap();
+}
+
+#[test]
+fn test_explain_analyze_wrapping_insert_rejected_inside_read_only_transaction() {
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+        .unwrap();
+
+    let mut session = server.open_session();
+    session.execute("START TRANSACTION READ ONLY;").unwrap();
+
+    let err = session
+        .execute("EXPLAIN ANALYZE INSERT INTO t (id, v) VALUES (1, 1);")
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(session.in_transaction(), "the transaction must survive");
+
+    session.execute("SELECT 1;").unwrap();
+    session.commit().unwrap();
+}
+
 fn catalog_has_no_table(server: &LocalServer, name: &str) -> bool {
     exec_rows(server, "SHOW TABLES;")
         .into_iter()

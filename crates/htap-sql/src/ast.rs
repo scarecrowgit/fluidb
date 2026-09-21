@@ -93,6 +93,15 @@ pub enum BoundStatement {
     RevokePrivileges(RevokeStatement),
     /// SHOW GRANTS statement.
     ShowGrants(ShowGrantsStatement),
+    /// ANALYZE TABLE statement.
+    AnalyzeTable(String),
+    /// EXPLAIN statement wrapping a recursively bound statement.
+    Explain {
+        /// Statement whose execution plan is rendered.
+        inner: Box<BoundStatement>,
+        /// Whether the inner statement is executed to collect runtime metrics.
+        analyze: bool,
+    },
 }
 
 /// Scope to which a GRANT or REVOKE applies.

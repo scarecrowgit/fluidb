@@ -446,6 +446,28 @@ pub trait VariableLookup {
     fn lookup(&self, name: &str, is_system: bool) -> Result<Value>;
 }
 
+/// Shared execution services required by expression evaluation.
+#[derive(Clone, Copy)]
+pub struct EvalServices<'a> {
+    /// Source of values for [`Expr::Variable`].
+    pub variables: Option<&'a dyn VariableLookup>,
+    /// Correlated-subquery executor supplied by the query execution layer.
+    pub subquery_runner: Option<&'a dyn SubqueryRunner>,
+    /// Shared per-statement budget for correlated subquery invocations.
+    pub subquery_budget: Option<&'a SubqueryBudget>,
+}
+
+impl EvalServices<'_> {
+    /// Empty services for evaluation paths that cannot use variables or subqueries.
+    pub const fn none() -> Self {
+        Self {
+            variables: None,
+            subquery_runner: None,
+            subquery_budget: None,
+        }
+    }
+}
+
 /// Values an [`Expr`] may need while being evaluated.
 #[derive(Clone, Copy)]
 pub struct EvalContext<'a> {
@@ -482,18 +504,30 @@ impl std::fmt::Debug for EvalContext<'_> {
 }
 
 impl<'a> EvalContext<'a> {
-    /// Context with only an input row.
-    pub fn row_only(row: &'a [Value]) -> Self {
+    /// Creates an evaluation context from its row state and shared execution services.
+    pub fn new(
+        row: &'a [Value],
+        current_outer_row: Option<&'a [Value]>,
+        aggregates: &'a [Value],
+        output: Option<&'a [Value]>,
+        subqueries: &'a [Vec<Row>],
+        services: EvalServices<'a>,
+    ) -> Self {
         Self {
             row,
-            current_outer_row: None,
-            aggregates: &[],
-            output: None,
-            subqueries: &[],
-            variables: None,
-            subquery_runner: None,
-            subquery_budget: None,
+            current_outer_row,
+            aggregates,
+            output,
+            subqueries,
+            variables: services.variables,
+            subquery_runner: services.subquery_runner,
+            subquery_budget: services.subquery_budget,
         }
+    }
+
+    /// Context with only an input row.
+    pub fn row_only(row: &'a [Value]) -> Self {
+        Self::new(row, None, &[], None, &[], EvalServices::none())
     }
 }
 
@@ -973,6 +1007,57 @@ fn subquery_rows<'a>(ctx: &EvalContext<'a>, index: usize) -> Result<&'a Vec<Row>
         .ok_or_else(|| HtapError::Internal(format!("subquery {index} not available")))
 }
 
+/// Builds an [`EvalContext`] while ensuring all execution callbacks are supplied together.
+#[macro_export]
+macro_rules! eval_context {
+    (
+        row: $row:expr,
+        current_outer_row: $current_outer_row:expr,
+        aggregates: $aggregates:expr,
+        output: $output:expr,
+        subqueries: $subqueries:expr,
+        variables: $variables:expr,
+        subquery_runner: $subquery_runner:expr,
+        subquery_budget: $subquery_budget:expr $(,)?
+    ) => {
+        $crate::expr::EvalContext::new(
+            $row,
+            $current_outer_row,
+            $aggregates,
+            $output,
+            $subqueries,
+            $crate::expr::EvalServices {
+                variables: $variables,
+                subquery_runner: $subquery_runner,
+                subquery_budget: $subquery_budget,
+            },
+        )
+    };
+    (
+        row: $row:expr,
+        current_outer_row: $current_outer_row:expr,
+        aggregates: $aggregates:expr,
+        output: $output:expr,
+        subqueries: $subqueries:ident,
+        variables: $variables:ident,
+        subquery_runner: $subquery_runner:ident,
+        subquery_budget: $subquery_budget:ident $(,)?
+    ) => {
+        $crate::expr::EvalContext::new(
+            $row,
+            $current_outer_row,
+            $aggregates,
+            $output,
+            $subqueries,
+            $crate::expr::EvalServices {
+                variables: $variables,
+                subquery_runner: $subquery_runner,
+                subquery_budget: $subquery_budget,
+            },
+        )
+    };
+}
+
 fn subquery_result_rows(ctx: &EvalContext<'_>, index: usize, correlated: bool) -> Result<Vec<Row>> {
     if !correlated {
         return Ok(subquery_rows(ctx, index)?.clone());
@@ -1113,7 +1198,13 @@ fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
         if y == 0.0 {
             return Ok(Value::Null);
         }
-        return Ok(Value::Float64(x / y));
+        let result = x / y;
+        if !result.is_finite() {
+            return Err(HtapError::InvalidArgument(
+                "DOUBLE value is out of range in '/'".into(),
+            ));
+        }
+        return Ok(Value::Float64(result));
     }
     match (a, b) {
         (Num::Int(x), Num::Int(y)) => {
@@ -1134,7 +1225,7 @@ fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
         }
         (a, b) => {
             let (x, y) = (num_to_f64(&a), num_to_f64(&b));
-            Ok(Value::Float64(match op {
+            let result = match op {
                 BinOp::Add => x + y,
                 BinOp::Sub => x - y,
                 BinOp::Mul => x * y,
@@ -1145,7 +1236,14 @@ fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
                     x % y
                 }
                 _ => unreachable!(),
-            }))
+            };
+            if !result.is_finite() {
+                return Err(HtapError::InvalidArgument(format!(
+                    "DOUBLE value is out of range in '{}'",
+                    op
+                )));
+            }
+            Ok(Value::Float64(result))
         }
     }
 }
@@ -1271,7 +1369,15 @@ pub fn cast_value(v: Value, to: DataType) -> Result<Value> {
             Value::Int32(i) => *i as f64,
             Value::Int64(i) | Value::Timestamp(i) => *i as f64,
             Value::Float64(f) => *f,
-            Value::String(s) => s.trim().parse().map_err(|_| bad(&v))?,
+            Value::String(s) => {
+                let parsed: f64 = s.trim().parse().map_err(|_| bad(&v))?;
+                if !parsed.is_finite() {
+                    return Err(HtapError::InvalidArgument(
+                        "DOUBLE value is out of range in 'CAST'".into(),
+                    ));
+                }
+                parsed
+            }
             _ => return Err(bad(&v)),
         }),
         DataType::String => Value::String(match &v {

@@ -427,6 +427,19 @@ After rows are merged across partitions:
 - `test_multi_partition_order_by_directions_nulls_and_tie_breaking`: Proves cross-partition ORDER BY with NULL handling.
 - `test_partitioned_olap_across_partitions_and_empty_aggregate`: Validates cross-partition empty table aggregates and post-insert results.
 
+### Statistics and the cost-based optimizer (Phase 14) do not change pruning
+
+`ANALYZE TABLE` (see ADR-023 and `docs/ARCHITECTURE.md`'s "Phase 14" section) records statistics
+**table-level**, aggregated across every partition of the table in one scan — there is no per-partition
+statistics breakdown. Partition pruning above remains exactly what it was before Phase 14: conservative,
+bound/range-based inspection of `AnalyticFilter`/`WHERE` leaves against `partitioning`'s own range/list
+metadata, with no dependency on `TableDescriptor.stats`. The `htap_sql::optimize` cost-based optimizer (join
+reordering, cost-based leaf-pushdown selection) operates entirely on the general `Route::Query` path's
+in-memory rows *after* per-slot partition pruning and scanning have already happened; it has no visibility
+into, and does not influence, which partitions a slot's own scan selects. A table's aggregate statistics say
+nothing about how rows are distributed across its individual partitions, so even if the optimizer wanted to
+use them for pruning, they would not be a sound basis for it.
+
 ---
 
 ## 6. Storage Behavior and Conversion Boundary

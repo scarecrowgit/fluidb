@@ -47,25 +47,41 @@ error text, now produced by the shared `read_file_exact_bounded` and pinned by a
 [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md#dual-format-storage), and [`docs/DECISIONS.md`](./DECISIONS.md) for
 the full record.
 
-## P2 — Parallel paths through the query layer (fix in Phase 14)
+## P2 — Parallel paths through the query layer (partially fixed: Phase 14, Option B)
 
-- **Two binders:**
-  - `htap-sql/src/binder.rs` (3,206 lines) binds point reads and narrow scans (`PointSelect`, `AnalyticSelect`);
-  - `htap-sql/src/binder_query.rs` (3,712 lines) binds general queries (`BoundQuery`).
-- **Several executors:**
-  - the analytic fast path;
-  - the general executor in `htap-server/src/query_exec.rs`, with its flat join evaluator;
-  - the recursive join-tree evaluator.
-- **Hand-built evaluation context:** `EvalContext` is built by hand at 15 sites across `query_exec.rs`, `lib.rs`
-  and `session.rs`. A missing field at one site caused a wrong-result bug in Phase 13's correlated subqueries. The
-  context now carries a variable lookup and a subquery runner; a third callback should trigger consolidation into
-  one execution-services struct.
-- **Long parameter lists:** 11 `#[allow(clippy::too_many_arguments)]` in `crates/*/src`.
+**Status: partially fixed.** The coordinator chose Option B (keep two binder entry points; see ADR-023 decision
+10/"P2 binder convergence" for the full reasoning against ADR-017's structural-R5 argument) over unifying the
+binders. What Phase 14 actually converged, and what is still open:
 
-**Fix.** The Phase 14 cost-based optimizer needs one logical/physical planner anyway. Converge the binders into
-one bound representation. Route every query shape through one planner, keeping R5: complete-PK point reads still
-route to `RowstorePointRead`. Build `EvalContext` through one constructor. Replace argument lists with context
-structs.
+- **Two binders — still open, by deliberate choice, not an oversight:**
+  - `htap-sql/src/binder.rs` binds point reads and narrow scans (`PointSelect`, `AnalyticSelect`);
+  - `htap-sql/src/binder_query.rs` binds general queries (`BoundQuery`).
+  - Each still maintains its own copy of the leaf-level sub-problems both solve (literal binding, cast-target
+    mapping, type-compatibility/comparability checks, scalar-function signature checking, schema column
+    lookup). The planned shared `bind_helpers`-shaped module for these was **not delivered** in this phase's
+    diff — this is the one part of the original Phase 14 plan for P2 that did not land; it remains open for a
+    future phase. Kept apart deliberately: `is_narrow_select_shape` still runs before any general-binder code
+    at all, so R5 stays a compile-time/structural property (this route variant never calls that function)
+    rather than a runtime one — unifying the two entry points would have restored R5 only via the kind of
+    runtime check ADR-017 already rejected.
+- **Several executors — fixed:** the flat join loop inside `run_select` and the recursive tree evaluator have
+  been merged into one. `SelectBody.join_tree` is now always populated at bind time (`left_deep_join_tree`
+  synthesizes a tree from a flat `Vec<JoinSpec>` when needed); the old `SelectBody.joins`/`tree_only` fields and
+  the separate flat-loop branch are gone. `evaluate_join_tree` is the only join execution path.
+- **Hand-built evaluation context — fixed:** every hand-built `EvalContext { .. }` literal (the counted 15 sites
+  across `query_exec.rs`, `lib.rs`, and `session.rs`) now goes through one constructor
+  (`EvalServices`/`EvalContext::new`, exposed as `htap_sql::eval_context!`). `rg "EvalContext \{" crates/htap-server/src`
+  returns no hand-built literals outside `htap-sql/src/expr.rs` itself.
+- **Long parameter lists — fixed in the files this phase touched:** the
+  `#[allow(clippy::too_many_arguments)]` count in `crates/htap-server/src/query_exec.rs` dropped to zero via
+  context structs (following the pre-existing `JoinRowsInput` precedent). `binder_query.rs` (3 allows) and
+  `htap-server/src/lib.rs` (1, on the pre-existing `scan_partition_compact`) were left alone — Phase 14 scoped
+  Track 0 to `query_exec.rs` and to binder *leaf helpers*, not the binder's top-level clause-driving functions;
+  `htap-coord`/`htap-convert`'s allows (2 each) remain P4 ("fix when touched"), unrelated to Phase 14.
+
+**Evidence.** `cargo test -p htap-sql -p htap-server` and `cargo clippy --workspace --all-targets -- -D
+warnings` pass with the join-evaluator and `EvalContext` unifications in place; see `docs/PROGRESS.md`'s
+Phase 14 row and ADR-023 for the full record, including exactly what was not delivered.
 
 ## P3 — Two statement pipelines in the server (fix in Phase 16)
 
@@ -105,8 +121,8 @@ dedicated stage.
 |---|---|---|
 | done | Phase 13 — SQL breadth | — |
 | **done** | **Stage R — shared durability primitives** | P1 |
-| **next** | **Phase 14 — CBO, spill, parallelism** | P2, P4 where touched |
-| then | Phase 15 — DROP reclaim, journal compaction | P4 where touched (uses R's helpers) |
+| **done** | **Phase 14 — CBO, spill, parallelism** | P2 (partial — see above; leaf-helper convergence still open), P4 where touched |
+| **next** | Phase 15 — DROP reclaim, journal compaction | P4 where touched (uses R's helpers) |
 | then | Phase 16 — multiprocess owner + IPC | P3, P4 where touched (uses R's helpers) |
 | then | Phases 17–18 — TPC-H, TPC-C | — |
 | then | Power-loss safety | audits R's single implementation |

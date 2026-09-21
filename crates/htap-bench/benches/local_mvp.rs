@@ -17,6 +17,7 @@ use htap_coord::placement::plan_placement;
 use htap_coord::{Coordinator, LocalCoordinator};
 use htap_movement::{CopyOptions, DataFormat, LocalDataMover};
 use htap_rowstore::{Engine, EngineOptions, Snapshot};
+use htap_server::{LocalServer, OptimizationMode};
 use htap_txn::{ParticipantId, RowstoreParticipant, TransactionManager};
 use tempfile::TempDir;
 
@@ -687,6 +688,329 @@ fn bench_coord_leadership_fenced_cas(c: &mut Criterion) {
 }
 
 // -----------------------------------------------------------------------------
+// 6. Phase 14: cost-based join planning with and without table statistics
+// -----------------------------------------------------------------------------
+
+struct JoinStatisticsFixture {
+    _dir: TempDir,
+    server: LocalServer,
+}
+
+fn setup_join_statistics_fixture(analyze: bool) -> JoinStatisticsFixture {
+    let dir = TempDir::new().expect("tempdir");
+    let server = LocalServer::open(dir.path()).expect("open local server");
+
+    server
+        .execute(
+            "CREATE TABLE bench_join_large (\
+                id BIGINT PRIMARY KEY, \
+                join_key BIGINT NOT NULL, \
+                payload VARCHAR(64) NOT NULL\
+            )",
+        )
+        .expect("create large join table");
+    server
+        .execute(
+            "CREATE TABLE bench_join_small (\
+                id BIGINT PRIMARY KEY, \
+                join_key BIGINT NOT NULL\
+            )",
+        )
+        .expect("create small join table");
+
+    let large_values = (1..=2_048_i64)
+        .map(|id| {
+            format!(
+                "({id}, {}, 'large-payload-{id:04}-xxxxxxxxxxxxxxxxxxxxxxxx')",
+                id % 127
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let small_values = (1..=32_i64)
+        .map(|id| format!("({id}, {})", id % 127))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    server
+        .execute(&format!(
+            "INSERT INTO bench_join_large (id, join_key, payload) VALUES {large_values}"
+        ))
+        .expect("insert large join rows");
+    server
+        .execute(&format!(
+            "INSERT INTO bench_join_small (id, join_key) VALUES {small_values}"
+        ))
+        .expect("insert small join rows");
+
+    if analyze {
+        server
+            .execute("ANALYZE TABLE bench_join_large")
+            .expect("analyze large join table");
+        server
+            .execute("ANALYZE TABLE bench_join_small")
+            .expect("analyze small join table");
+    }
+
+    JoinStatisticsFixture { _dir: dir, server }
+}
+
+fn bench_join_with_and_without_statistics(c: &mut Criterion) {
+    const QUERY: &str = "SELECT l.id, s.id, l.payload \
+                         FROM bench_join_large AS l \
+                         JOIN bench_join_small AS s ON l.join_key = s.join_key";
+
+    let without_stats = setup_join_statistics_fixture(false);
+    let with_stats = setup_join_statistics_fixture(true);
+
+    let without_stats_result = without_stats
+        .server
+        .execute_query_with_options(QUERY, OptimizationMode::Enabled, 256 * 1024 * 1024, 1)
+        .expect("join without statistics succeeds");
+    let with_stats_result = with_stats
+        .server
+        .execute_query_with_options(QUERY, OptimizationMode::Enabled, 256 * 1024 * 1024, 1)
+        .expect("join with statistics succeeds");
+    assert_eq!(
+        format!("{without_stats_result:?}"),
+        format!("{with_stats_result:?}"),
+        "statistics must not change join results"
+    );
+
+    let plan_without_stats = without_stats
+        .server
+        .execute(
+            "EXPLAIN SELECT l.id, s.id, l.payload \
+             FROM bench_join_large AS l \
+             JOIN bench_join_small AS s ON l.join_key = s.join_key",
+        )
+        .expect("explain join without statistics");
+    let plan_with_stats = with_stats
+        .server
+        .execute(
+            "EXPLAIN SELECT l.id, s.id, l.payload \
+             FROM bench_join_large AS l \
+             JOIN bench_join_small AS s ON l.join_key = s.join_key",
+        )
+        .expect("explain join with statistics");
+    assert_ne!(
+        format!("{plan_without_stats:?}"),
+        format!("{plan_with_stats:?}"),
+        "ANALYZE must change the costed physical plan"
+    );
+
+    c.bench_function("phase14/join_without_statistics", |b| {
+        b.iter(|| {
+            let result = without_stats
+                .server
+                .execute_query_with_options(
+                    black_box(QUERY),
+                    OptimizationMode::Enabled,
+                    black_box(256 * 1024 * 1024),
+                    black_box(1),
+                )
+                .unwrap();
+            black_box(result);
+        });
+    });
+
+    c.bench_function("phase14/join_with_statistics", |b| {
+        b.iter(|| {
+            let result = with_stats
+                .server
+                .execute_query_with_options(
+                    black_box(QUERY),
+                    OptimizationMode::Enabled,
+                    black_box(256 * 1024 * 1024),
+                    black_box(1),
+                )
+                .unwrap();
+            black_box(result);
+        });
+    });
+}
+
+// -----------------------------------------------------------------------------
+// 7. Phase 14: GROUP BY at serial and available parallelism
+// -----------------------------------------------------------------------------
+
+fn bench_group_by_parallelism_comparison(c: &mut Criterion) {
+    const QUERY: &str = "SELECT bucket, COUNT(*), SUM(amount), AVG(amount), \
+                         COUNT(DISTINCT tag) \
+                         FROM bench_parallel_groups \
+                         GROUP BY bucket \
+                         ORDER BY bucket";
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = LocalServer::open(dir.path()).expect("open local server");
+
+    server
+        .execute(
+            "CREATE TABLE bench_parallel_groups (\
+                id BIGINT PRIMARY KEY, \
+                bucket BIGINT NOT NULL, \
+                amount BIGINT NOT NULL, \
+                tag BIGINT NOT NULL\
+            )",
+        )
+        .expect("create GROUP BY table");
+
+    let values = (1..=8_192_i64)
+        .map(|id| {
+            format!(
+                "({id}, {}, {}, {})",
+                (id * 17) % 257,
+                (id * 13) % 10_003,
+                (id * 29) % 1_021
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    server
+        .execute(&format!(
+            "INSERT INTO bench_parallel_groups (id, bucket, amount, tag) VALUES {values}"
+        ))
+        .expect("insert GROUP BY rows");
+
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+
+    server.set_query_parallelism(1);
+    let serial_result = server.execute(QUERY).expect("serial GROUP BY succeeds");
+    assert_eq!(server.query_parallelism(), 1);
+
+    server.set_query_parallelism(available_parallelism);
+    let parallel_result = server.execute(QUERY).expect("parallel GROUP BY succeeds");
+    assert_eq!(server.query_parallelism(), available_parallelism);
+    assert_eq!(
+        format!("{serial_result:?}"),
+        format!("{parallel_result:?}"),
+        "parallelism must not change GROUP BY results"
+    );
+
+    server.set_query_parallelism(1);
+    c.bench_function("phase14/group_by_parallelism_1", |b| {
+        b.iter(|| {
+            let result = server.execute(black_box(QUERY)).unwrap();
+            black_box(result);
+        });
+    });
+
+    server.set_query_parallelism(available_parallelism);
+    c.bench_function("phase14/group_by_parallelism_available", |b| {
+        b.iter(|| {
+            let result = server.execute(black_box(QUERY)).unwrap();
+            black_box(result);
+        });
+    });
+}
+
+// -----------------------------------------------------------------------------
+// 8. Phase 14: hash join in memory and forced to spill
+// -----------------------------------------------------------------------------
+
+fn bench_hash_join_spill_vs_memory(c: &mut Criterion) {
+    const LARGE_BUDGET: usize = 256 * 1024 * 1024;
+    const SPILL_BUDGET: usize = 32 * 1024;
+    const QUERY: &str = "SELECT l.id, r.id, l.join_key, l.payload, r.payload \
+                         FROM bench_spill_left AS l \
+                         JOIN bench_spill_right AS r ON l.join_key = r.join_key";
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = LocalServer::open(dir.path()).expect("open local server");
+
+    server
+        .execute(
+            "CREATE TABLE bench_spill_left (\
+                id BIGINT PRIMARY KEY, \
+                join_key BIGINT NOT NULL, \
+                payload VARCHAR(96) NOT NULL\
+            )",
+        )
+        .expect("create left spill table");
+    server
+        .execute(
+            "CREATE TABLE bench_spill_right (\
+                id BIGINT PRIMARY KEY, \
+                join_key BIGINT NOT NULL, \
+                payload VARCHAR(96) NOT NULL\
+            )",
+        )
+        .expect("create right spill table");
+
+    let left_values = (1..=1_024_i64)
+        .map(|id| {
+            format!(
+                "({id}, {}, 'left-payload-{id:04}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')",
+                id % 257
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right_values = (1..=1_280_i64)
+        .map(|id| {
+            format!(
+                "({}, {}, 'right-payload-{id:04}-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy')",
+                id + 10_000,
+                id % 257
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    server
+        .execute(&format!(
+            "INSERT INTO bench_spill_left (id, join_key, payload) VALUES {left_values}"
+        ))
+        .expect("insert left spill rows");
+    server
+        .execute(&format!(
+            "INSERT INTO bench_spill_right (id, join_key, payload) VALUES {right_values}"
+        ))
+        .expect("insert right spill rows");
+
+    server.set_query_memory_budget(LARGE_BUDGET);
+    let in_memory_result = server.execute(QUERY).expect("in-memory hash join succeeds");
+    assert_eq!(server.query_memory_budget(), LARGE_BUDGET);
+    let mut in_memory_rows = match in_memory_result {
+        htap_sql::result::StatementResult::Query(result) => result.rows,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    server.set_query_memory_budget(SPILL_BUDGET);
+    let spilled_result = server.execute(QUERY).expect("spilled hash join succeeds");
+    assert_eq!(server.query_memory_budget(), SPILL_BUDGET);
+    let mut spilled_rows = match spilled_result {
+        htap_sql::result::StatementResult::Query(result) => result.rows,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    in_memory_rows.sort_by_key(|row| format!("{row:?}"));
+    spilled_rows.sort_by_key(|row| format!("{row:?}"));
+    assert_eq!(
+        in_memory_rows, spilled_rows,
+        "spilling must not change hash join results"
+    );
+
+    server.set_query_memory_budget(LARGE_BUDGET);
+    c.bench_function("phase14/hash_join_in_memory", |b| {
+        b.iter(|| {
+            let result = server.execute(black_box(QUERY)).unwrap();
+            black_box(result);
+        });
+    });
+
+    server.set_query_memory_budget(SPILL_BUDGET);
+    c.bench_function("phase14/hash_join_forced_spill", |b| {
+        b.iter(|| {
+            let result = server.execute(black_box(QUERY)).unwrap();
+            black_box(result);
+        });
+    });
+}
+
+// -----------------------------------------------------------------------------
 // Criterion Main Group
 // -----------------------------------------------------------------------------
 
@@ -700,5 +1024,8 @@ criterion_group! {
         bench_movement_csv_import,
         bench_coord_placement_planning,
         bench_coord_leadership_fenced_cas,
+        bench_join_with_and_without_statistics,
+        bench_group_by_parallelism_comparison,
+        bench_hash_join_spill_vs_memory,
 }
 criterion_main!(benches);

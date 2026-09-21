@@ -29,9 +29,13 @@ The following architectural limitations remain explicitly open:
   subqueries, `UNION`, `UPDATE`, `DROP TABLE`, `SHOW`/`DESCRIBE`); Phase 13 extended it with window functions,
   depth-1 correlated subqueries, `FULL OUTER`/`NATURAL`/`USING` joins, arbitrarily nested join trees,
   `WITH RECURSIVE`, `EXCEPT`/`INTERSECT`, `GROUP BY`/`ORDER BY` ordinals, filtered `DELETE`, `TRUNCATE`,
-  `INSERT ... SELECT`, and integer `DIV` (see ADR-022), but it is still not full SQL analytics: no
-  cost-based optimization, vectorized execution, or worker-pool
-  parallelism on that path — see "General query executor scope and deferred features" below. Phase 10 added
+  `INSERT ... SELECT`, and integer `DIV` (see ADR-022); Phase 14 added `ANALYZE TABLE` statistics, a
+  statistics-driven cost-based optimizer stage (enabled by default), `EXPLAIN`/`EXPLAIN ANALYZE`, disk
+  spilling under a per-statement memory budget, and bounded parallelism for `GROUP BY`/`INNER`/`CROSS` joins
+  (see ADR-023) — but it is still not full SQL analytics: no vectorized execution, and no worker-pool
+  parallelism for `LEFT`/`RIGHT`/`FULL` joins (memory-bounded spilling itself is not kind-restricted in code,
+  but is exercised by a test only for `INNER` joins — see "General query executor scope
+  and deferred features" below). Phase 10 added
   server-side sessions and explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, `autocommit`, session
   variables), both in-process and over the wire — see "Sessions and explicit transaction control" below for
   the exact contract and remaining gaps (no locking reads, no idle-transaction
@@ -321,13 +325,18 @@ All architectural call flows, DML transaction sequences, and initialization stat
   functions, aggregates as window functions, `ROWS`/peer/value-offset `RANGE` frames), `GROUP BY`/`HAVING`,
   `SELECT DISTINCT`, `ORDER BY` (expressions/aliases/ordinals, `NULLS FIRST`/`LAST`), `LIMIT`/`OFFSET`,
   `UNION`/`UNION ALL`/`EXCEPT`/`INTERSECT`, derived tables, non-recursive and recursive (`WITH RECURSIVE`)
-  CTEs, and uncorrelated and one-level-deep correlated scalar/`IN`/`EXISTS` subqueries — see "General query
-  executor scope and deferred features" below for the full contract, what is still deferred (a cost-based
-  optimizer, vectorized/pipelined execution, worker-pool parallelism, and more), and the narrow-shape gate
-  (`is_narrow_select_shape`) that keeps complete-PK point reads and narrow single-table scans unchanged. The
+  CTEs, and uncorrelated and one-level-deep correlated scalar/`IN`/`EXISTS` subqueries; as of Phase 14, also
+  `ANALYZE TABLE` statistics, a statistics-driven cost-based optimizer stage (enabled by default), `EXPLAIN`/
+  `EXPLAIN ANALYZE`, disk spilling under a per-statement memory budget, and bounded parallelism for
+  `GROUP BY`/`INNER`/`CROSS` joins — see "General query executor scope and deferred features" below for the
+  full contract, what is still deferred (vectorized/pipelined execution, worker-pool parallelism for
+  `LEFT`/`RIGHT`/`FULL` joins — spilling itself is not kind-restricted in code but is covered by a test only
+  for `INNER` joins — statistics histograms, and more), and the
+  narrow-shape gate (`is_narrow_select_shape`) that keeps complete-PK point reads and narrow single-table
+  scans unchanged (and, since Phase 14, never invokes the optimizer at all for those two routes). The
   narrow `AnalyticSelect` / `Route::OlapScan` path itself
   is unchanged from Phase 3-8.
-- **Direct SegmentReader pushdown optimization and vectorized execution:** Direct `SegmentReader` pushdown optimization is now implemented for the compact base path in `LocalServer` (using `read_column_partition_compact_core` with PK+requested column union and single safe predicate-leaf pushdown). Compound `AND` pushdown beyond one leaf and `!=` remain evaluated as residual SQL filters. `ScanStats`/pruning is available as internal execution evidence, but SQL evaluation still operates on materialized logical rows; vectorized aggregation, vectorized operator pipelines, memory quotas, disk spilling, query cancellation, and DataFusion/Arrow integration are deferred.
+- **Direct SegmentReader pushdown optimization and vectorized execution:** Direct `SegmentReader` pushdown optimization is now implemented for the compact base path in `LocalServer` (using `read_column_partition_compact_core` with PK+requested column union and single safe predicate-leaf pushdown). Compound `AND` pushdown beyond one leaf and `!=` remain evaluated as residual SQL filters. `ScanStats`/pruning is available as internal execution evidence, but SQL evaluation still operates on materialized logical rows; vectorized aggregation, vectorized operator pipelines, memory quotas for the narrow `AnalyticSelect`/`Route::OlapScan` path itself (the general `Route::Query` path has a memory budget as of Phase 14, see above), query cancellation, and DataFusion/Arrow integration are deferred.
 - **Partition Execution & Multi-Partition Routing Scope:**
   - `LocalServer` supports multi-partition tables created via SQL DDL (`CREATE TABLE ... PARTITION BY RANGE/LIST`) or via the native non-SQL `LocalServer::create_partitioned_table` API with finite `PartitionTopology::Range` or `PartitionTopology::List`.
   - Catalog validation requires that the partition key column is non-null and contained in the primary key, validates range half-open intervals `[lower, upper)` with strictly increasing bounds and optional final `MAXVALUE`, list exact values, and enforces uniqueness, ordering, and type constraints (`test_range_partitioning_routing_and_boundaries`, `test_list_partitioning_routing`, `test_partitioning_duplicate_violations`, `test_range_overlap_and_order_violations`, `test_partitioning_type_and_null_violations`, `test_partitioning_ownership_and_method_consistency`, `test_partitioning_cas_and_reopen_lifecycle`).
@@ -434,20 +443,25 @@ flat-lowering/differential-test design).
 - **Arbitrarily nested parenthesized join trees (`query::JoinTree`):** built directly and always from the
   parsed `FROM` clause, 1:1 with the SQL's own parenthesization (comma-separated items fold in as
   unconditional-`CROSS` nodes in encounter order) — the single binding source of truth for every join,
-  replacing the old flat-only construction. A total, pure `lower_to_flat` function derives today's flat
-  `Vec<JoinSpec>` form whenever the tree is purely left-deep in shape (every join node's right child a bare
-  slot leaf; the join *kind* at each step is unrestricted), so every pre-Phase-13 query and every plain
-  non-nested Phase-13 query still runs the unchanged flat executor. A genuinely nested/parenthesized shape
-  (e.g. `a LEFT JOIN (b JOIN c ON ...) ON ...`, `(a LEFT JOIN b ON ...) FULL JOIN c ON ...`) instead runs a new
-  recursive tree evaluator; each tree node's `ON` condition is rebased to a locally-compact offset at bind
-  time, regenerated fresh every time it is needed and never cached, while top-level `WHERE`/`GROUP BY`/
-  projection/`HAVING` keep using the original globally-offset expressions unchanged. A mandatory, permanent
-  differential test
+  replacing the old flat-only construction. At the time of Phase 13, a total, pure `lower_to_flat` function
+  derived a flat `Vec<JoinSpec>` form whenever the tree was purely left-deep in shape (every join node's right
+  child a bare slot leaf; the join *kind* at each step unrestricted), and every such query ran a separate,
+  unchanged flat executor, while a genuinely nested/parenthesized shape (e.g.
+  `a LEFT JOIN (b JOIN c ON ...) ON ...`, `(a LEFT JOIN b ON ...) FULL JOIN c ON ...`) ran a second, recursive
+  tree evaluator; each tree node's `ON` condition is rebased to a locally-compact offset at bind time,
+  regenerated fresh every time it is needed and never cached, while top-level `WHERE`/`GROUP BY`/projection/
+  `HAVING` keep using the original globally-offset expressions unchanged. **Superseded by Phase 14:** the
+  separate flat-loop executor and `SelectBody`'s `joins`/`tree_only` fields were removed; a flat `Vec<JoinSpec>`
+  chain is now synthesized into the same tree shape at bind time (`left_deep_join_tree`), so
+  `evaluate_join_tree` is the sole join execution path for every query, flat or nested. The mandatory,
+  permanent differential test
   (`crates/htap-server/tests/query_exec.rs::test_flat_and_tree_join_evaluators_match_for_lowerable_queries`)
-  pins the flat and recursive tree evaluators byte-identical on every documented lowerable shape — this
-  executor split, and its regression gate, are explicit, permanent load-bearing project structure, not a
-  one-time migration artifact (see ADR-022). This is purely structural: it never reorders, commutes, or
-  cost-estimates joins, and is explicitly not a step toward a cost-based optimizer.
+  now pins a flat-written query and its explicitly-parenthesized equivalent to identical results under that
+  one evaluator, rather than comparing two separate evaluators as it did through Phase 13 (see ADR-022 for the
+  original two-executor design and ADR-023 for the Phase 14 unification). The `JoinTree` itself was purely
+  structural through Phase 13 (never reordered, commuted, or cost-estimated joins); as of Phase 14, an
+  `INNER`/`CROSS` join component may be cost-reordered by `htap_sql::optimize` (enabled by default) before
+  `evaluate_join_tree` ever runs — see "Completed local MVP — Phase 14 additions" below and ADR-023.
 - **`join_rows` generalized to explicit left/right widths**, backing both join executors; in the same pass, a
   pre-existing `Int64`/`Timestamp` -> `Float64` hash-key-widening collision above `2^53` was fixed (exact
   integers keep an integer-keyed representation; only widen to `Float64` when one side of the same key
@@ -521,6 +535,139 @@ flat-lowering/differential-test design).
   a window function's result by alias is a bind error, since the window stage has not run yet when `HAVING`
   runs.
 
+### Completed local MVP — Phase 14 additions
+
+- **`ANALYZE TABLE t`:** binds to `BoundStatement::AnalyzeTable`, routes as `Route::CatalogDdl` (`FOR COLUMNS`,
+  `NOSCAN`, and partition-scoped forms are bind errors). Execution scans every partition at one MVCC snapshot
+  via the existing `scan_partition_compact` path and records an exact row count and, per column, null count,
+  min, max, and an exact distinct count capped at a configurable limit (`LocalServer::with_analyze_distinct_limit`,
+  default 200,000 — past the cap, `distinct_count` is `None`, everything else is still collected). Stats
+  publish by CAS of only the `stats` field after re-verifying the table's id, retrying on an unrelated
+  concurrent CAS conflict; `HTAPCAT1` `FORMAT_VERSION` bumped 3 -> 4 (`TableDescriptor.stats: Option<TableStats>`,
+  `#[serde(default)]`; a v3-or-earlier catalog decodes with `stats: None`). Statistics are table-level only
+  (aggregated across every partition of the table), never expire automatically, and are never checked for
+  staleness against subsequent writes. **Stated behavior, proven by test:** like `CREATE TABLE`/
+  `DROP TABLE`/user-management DDL, `ANALYZE TABLE` is included in `Session::is_ddl`'s match list, so it
+  is rejected by the "no DDL inside an open transaction" gate (explicit or implicit autocommit-off), and the
+  rejection does not poison the transaction; `EXPLAIN ANALYZE` follows the transaction rules of the statement
+  it actually executes, while plain `EXPLAIN` (which only plans) remains permitted inside an open transaction.
+  See `crates/htap-server/tests/session.rs::{test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives, test_explain_analyze_wrapping_ddl_rejected_inside_open_transaction, test_explain_analyze_wrapping_insert_rejected_inside_read_only_transaction}` and `crates/htap-server/tests/explain.rs::test_plain_explain_select_permitted_inside_open_transaction`.
+  Each column's min/max bound reserves the replacement's memory before dropping the old reservation
+  (`AnalyzeAccumulator::replace_bound`), so a failed reservation leaves the existing bound and its
+  accounting exact rather than double-counting or under-counting
+  (`crates/htap-server/src/analyze.rs::analyze::tests::replace_bound_preserves_existing_reservation_when_budget_is_exhausted`).
+  **Disclosed, not fixed:** `ANALYZE TABLE` fully materializes each partition before reserving its
+  memory, so usage can overshoot before the check runs, and a partition whose estimate lands above the
+  budget fails `ANALYZE` outright rather than being handled incrementally.
+- **Cost-based optimization:** a storage-agnostic `htap_sql::optimize` stage, enabled by default for every
+  `Route::Query` execution. Cost estimators (`estimate_row_count`/`estimate_equality_selectivity`/
+  `estimate_range_selectivity`/`estimate_join_cardinality`) report whether each estimate came from real
+  statistics or a hard-coded default (`EstimateSource::{Stats,Default}`). A predicate-atom inventory classifies
+  every `WHERE`/`ON` conjunct by provenance and mobility (a conjunct pinned to one join, restricted to
+  post-join-only, or freely movable within a connected `Inner`/`Cross` component — correctly handling both
+  classic outer-join traps: a `WHERE`-clause filter on a null-supplying slot, and an `ON`-clause filter that
+  touches the null-supplying side); join reordering runs subset dynamic programming for up to 8 relations per
+  component and falls back to a greedy cheapest-connected-extension heuristic above that. An always-on
+  predicate-conservation validator asserts no predicate was dropped or duplicated after reordering; on any
+  internal inconsistency, `optimize` falls back to the identity (unoptimized) plan rather than ever risking a
+  wrong result. A recursive CTE's recursive term is a permanent optimization barrier — never reordered into or
+  merged with an enclosing join component, by design.
+- **`EXPLAIN`/`EXPLAIN ANALYZE`:** `BoundStatement::Explain{inner, analyze}` (`verbose`/`query_plan`/
+  `estimate`/non-default `format` are bind errors). For a general query, renders one row per plan node
+  (`node_id, parent_id, operation, table, est_rows, estimate_source, build_side`); for a complete-PK point
+  lookup or a narrow single-table scan, renders a single-node plan and never calls `htap_sql::optimize::optimize`
+  at all — preserving R5 through `EXPLAIN` too. `EXPLAIN ANALYZE` additionally executes the statement and
+  reports root-level `actual_rows`/`actual_time_ms` (child-node attribution is best effort, not exact).
+- **Scope: `Route::Query` only.** The memory budget and every spilling behavior below apply to the general
+  executor only. A single-table `SELECT` with `ORDER BY`, `GROUP BY`, or a plain aggregate and no join routes
+  to the narrow analytic scan path (`Route::OlapScan`) instead, which has no memory budget and never spills —
+  by design, not an oversight. (Several early spill tests were silently exercising this unbudgeted path; they
+  were rewritten to use a join or another shape that reaches the general executor.) The budget also only
+  bounds each operator's own working memory (hash tables, sort runs, aggregate state, partition buffers); it
+  does not bound the rows materialized between operators, because the executor is not pipelined.
+- **Spilling:** a per-statement `MemoryBudget` (default 256 MiB, `LocalServer::with_query_memory_budget`) with
+  one level of disk spilling — non-durable scratch files under `<data-root>/spill/<statement-id>/` (magic
+  `HTAPSPIL`, deliberately no CRC/fsync/version-range contract, since this is disposable scratch, not a
+  durable artifact), swept in full on every `LocalServer::open` after the root lock is acquired — for
+  hash-equi-joins whose build side would exceed budget (partition count sized from the input and the
+  remaining budget, capped at 128 — windows share this cap, to bound open file descriptors and the writer
+  buffers the budget doesn't count), `GROUP BY` (including `AVG`/`DISTINCT` aggregates,
+  merged correctly across partitions rather than averaging-of-averages; its own fixed 16 partitions), `ORDER BY` (external merge,
+  preserving `NULLS FIRST`/`LAST` and tie-breaking), `DISTINCT`/`EXCEPT`/`INTERSECT`/`UNION DISTINCT`
+  (preserving `ALL`-variant multiplicities; also a fixed 16 partitions), and window functions (hash-partitioned
+  by the `PARTITION BY` key — a window with no `PARTITION BY` is a single partition — processed one partition
+  at a time and reassembled in original input row order). A partition still over its budget after one level of
+  spilling — skew, or the partition-count cap reached — fails cleanly (the memory-budget error) rather than
+  recursing into a second spill level. **Disclosed, not fixed:** unlike the hash join and window, whose
+  partition counts scale with input size and the remaining budget (`GROUP_BY_SPILL_PARTITIONS` and
+  `SET_OPERATION_SPILL_PARTITIONS` in `crates/htap-server/src/query_exec.rs` are each a fixed `16`, not
+  budget-scaled), `GROUP BY`'s and the set operators' partition count does not grow with a larger budget: an
+  input much larger than roughly 16x the budget fails with the memory-budget error instead of spilling
+  successfully. Observed directly: a set operation over 4,096 awkward-double rows failed at a 64 KiB budget,
+  and succeeded once the input was reduced to 1,536 rows
+  (`crates/htap-server/tests/spill.rs::test_spilled_set_operations_and_distinct_preserve_awkward_doubles`,
+  which also asserts `last_query_set_operation_spilled()`/`last_query_distinct_spilled()` fired). Budget-sized
+  partitioning for `GROUP BY`/the set operators, like the hash join's, is a deferred improvement.
+  `GROUP BY` spill reserves each partition's rows as they are read back,
+  then releases that reservation before in-memory aggregation runs so the same bytes are not charged twice on
+  the way in; peak memory during one partition's aggregation can therefore approach about twice the budget —
+  a disclosed imprecision, not an exact bound. **Disclosed, not fixed:** the abandoned-spill sweep at
+  `LocalServer::open` only logs a failure to remove the directory (`eprintln!`) rather than returning an
+  error; a stale spill file left behind by a failed sweep can collide once with a statement id reused after
+  a process restart (`SpillWriter::create` opens with `create_new(true)`), and that one statement fails with
+  an `AlreadyExists` I/O error. The collision heals on its own once that statement id has been consumed.
+  Spill telemetry is per operator: `LocalServer` exposes
+  `last_query_hash_join_spilled()`, `last_query_group_by_spilled()`, `last_query_sort_spilled()`,
+  `last_query_distinct_spilled()`, `last_query_set_operation_spilled()`, and `last_query_window_spilled()` as
+  test telemetry (not a monitoring API), and every spill test asserts its own named operator actually spilled,
+  not merely that the statement succeeded.
+- **Float overflow and catalog statistics finiteness:** float `+`/`-`/`*`/`/` and `SUM`/`AVG` overflow now
+  return `"DOUBLE value is out of range"` (MySQL-compatible) instead of producing `NaN`/`Infinity`; division
+  by zero is unaffected and still yields `NULL`. This closes a real risk: `serde_json`, used to encode both row
+  mutation payloads and catalog statistics, cannot represent a non-finite float (it encodes as `null`, which
+  fails to decode back into a non-`Option` float field). On the row path this was already caught — confusingly,
+  but safely — by the 2PC participant's pre-commit payload decode (`RowstoreParticipant::decode_payload`,
+  called from `prepare`); the catalog statistics path had no equivalent protection and is now closed by
+  rejecting non-finite bounds during `ANALYZE TABLE` and by structural statistics validation (column count,
+  null count, distinct count, min/max type agreement, `min <= max`, and finiteness) on every catalog publish —
+  no format change. `CAST(... AS DOUBLE)` from a string (`CAST('nan'/'inf'/'1e999' AS DOUBLE)`) and an
+  out-of-range float literal (e.g. `1e400`) return the same `"DOUBLE value is out of range"` error
+  (`crates/htap-server/tests/query_exec.rs::{test_non_finite_double_casts_and_literals_are_rejected,
+  test_non_finite_cast_update_fails_at_statement_and_leaves_value_unchanged}`). The narrow analytic scan
+  path's own `SUM` accumulator (`crates/htap-server/src/olap.rs`) now carries the same overflow check as the
+  general executor's `SUM`/`AVG`
+  (`crates/htap-server/tests/query_exec.rs::test_analytic_float_sum_overflow_returns_out_of_range_error`),
+  closing what was previously an unverified, code-inspection-only gap.
+- **`serde_json`'s `float_roundtrip` feature is a precaution, not a bug fix.** Enabled workspace-wide because
+  a review claimed the default ("best-effort precision") float parser could decode a stored `DOUBLE` one ULP
+  off from the value that was encoded. Tested with the feature switched off, the default parser round-tripped
+  50,000 random finite bit patterns plus adjacent doubles, subnormals, the extremes, and `-0.0`
+  bit-identically on this `serde_json` version — no drift was demonstrated. The feature is kept anyway
+  because it guarantees exact round-trips regardless of `serde_json` version, at some parse-speed cost; there
+  is no on-disk format change, only a parsing-library behavior. Covered by
+  `crates/htap-common/src/types.rs::types::tests::test_serde_json_float64_roundtrips_bit_identically`,
+  `crates/htap-server/tests/session_recovery.rs::test_double_values_round_trip_bit_identically_after_reopen`,
+  and `crates/htap-server/tests/spill.rs::test_spilled_set_operations_and_distinct_preserve_awkward_doubles`.
+  Spilled set operations and `SELECT DISTINCT` emit rows by source index rather than by looking one up in a
+  map keyed by a decoded row, making them independent of round-trip exactness — hardening, not a fix for a
+  demonstrated bug.
+- **Parallelism:** bounded intra-query parallelism (`std::thread::scope`, no new dependency;
+  `LocalServer::query_parallelism`, default `available_parallelism()`) for `GROUP BY` above a size threshold
+  and for `INNER`/`CROSS` hash joins with the build side on the right, deterministic across worker counts and
+  sharded by `hash(join key) % k`/`hash(group key) % k`, reassembled by originating row ordinal to preserve
+  the documented no-`ORDER BY` determinism contract; one shared worker budget per statement so a join nested
+  inside a parallel `GROUP BY` does not multiply thread counts. `LEFT`/`RIGHT`/`FULL` joins stay
+  single-threaded.
+- **Code health (P2, partially fixed — see ADR-023 and `docs/PROBLEMS.md`):** one `EvalContext` constructor
+  replacing every hand-built literal across `query_exec.rs`/`lib.rs`/`session.rs`; `SelectBody.join_tree` is
+  always populated at bind time now, so `evaluate_join_tree` is the only join execution path (the old
+  flat-loop branch and `SelectBody.joins`/`tree_only` fields are gone); the
+  `#[allow(clippy::too_many_arguments)]` count in `query_exec.rs` dropped to zero. **Not delivered:** the
+  planned shared leaf-helper module between `htap_sql::binder` and `htap_sql::binder_query` (literal binding,
+  cast-target mapping, comparability checks, scalar-function signature checks, schema column lookup) — the two
+  binder entry points are kept deliberately separate (so R5 stays structural, not a runtime check — see
+  ADR-023), but they still each hold their own copy of that leaf-level logic.
+
 ### Explicitly deferred features
 
 - **`UPDATE` transaction payload cap, no chunking:** The scan form of `UPDATE` commits every rewritten row
@@ -557,28 +704,54 @@ flat-lowering/differential-test design).
   tablet is later assigned both that same numeric id and the same job id as a prior clone job, which is a
   narrow coincidence, not a routine hazard. This is a documented gap, not fixed in code. See "Catalog
   identifier high-water mark" in `docs/ARCHITECTURE.md`.
-- **Memory and concurrency limits of the general executor:** Intermediate results (scanned rows, hash
-  tables, groups) are held in memory without bounds; there is no spilling and no cost-based planning. Unlike
-  `Route::OlapScan`'s bounded in-process partition scan workers, the general executor's join/filter/group/
-  order/limit/union stages run single-threaded in memory (each slot's own partition scan still uses the
-  narrow path's scan workers internally, so per-slot scanning is still parallel; the stages above the scan
-  are not).
+- **Memory, concurrency, and optimizer limits of the general executor (Phase 14, see ADR-023):** A
+  per-statement `MemoryBudget` (default 256 MiB, `LocalServer::with_query_memory_budget`), applying to
+  `Route::Query` only (a single-table `SELECT` with `ORDER BY`/`GROUP BY`/a plain aggregate routes to the
+  unbudgeted `Route::OlapScan` path instead — see "Scope: `Route::Query` only" above), now bounds hash
+  joins, `GROUP BY`, `ORDER BY`, `DISTINCT`/`EXCEPT`/`INTERSECT`, and window partitions, spilling to
+  non-durable scratch under `<data-root>/spill/` one level deep; a partition still over budget after that one
+  level fails cleanly (`HtapError::InvalidArgument`) rather than running unbounded — this is real memory
+  *bounding*, not unlimited spill depth, and a query whose data is skewed enough to blow one partition still
+  fails. `LEFT`/`RIGHT`/`FULL` joins are not parallelized (structurally restricted to `INNER` with the build
+  side on the right); the hash-join *spill* path is not itself kind-restricted in code, but only `INNER`-join
+  spilling is covered by a test, so outer-join spilling is not asserted correct — see `docs/PROGRESS.md`'s
+  Phase 14 row. Window evaluation carries every materialized column of the joined input into its spill
+  partitions, not just the columns the query needs (measured: 8 columns / ~424 B per row where 3 are needed),
+  inflating window partition sizes under a budget; a column-trimming improvement is deferred. The optimizer's
+  leaf-cost and outer-join cardinality estimates are cost-quality-only weaknesses, confirmed by an external
+  reviewer to never affect correctness: outer joins are never reordered by the DP/greedy join-reordering step,
+  and null-padding on an outer join's unmatched rows is independent of which side was chosen as the hash build
+  side. Non-equi joins and `CROSS` joins (no usable equality key) are still evaluated by an in-memory
+  nested loop with no memory budget check at all. Bounded intra-query parallelism now covers `GROUP BY` and
+  `INNER`/`CROSS` hash joins (`LocalServer::query_parallelism`, default `available_parallelism()`); every
+  other stage (filter, `ORDER BY`, `DISTINCT`, set operations, window functions, non-`INNER`/`CROSS` joins)
+  still runs single-threaded (each slot's own partition scan still uses the narrow path's scan workers
+  internally, so per-slot scanning is still parallel independent of all of the above). A recursive CTE's
+  recursive term is a permanent optimizer/parallelism barrier by design (never reordered into or merged with
+  an enclosing join component), not a stopgap. Statistics (`ANALYZE TABLE`) are table-level only (no
+  per-partition breakdown), have no histograms (min/max/null-count/capped-exact-distinct-count only), and
+  have no automatic staleness detection — a table that changes shape after `ANALYZE` keeps using the old
+  numbers until the next explicit `ANALYZE TABLE`. `ANALYZE TABLE` is gated by `Session::is_ddl`'s "no DDL
+  inside an open transaction" rule exactly like `CREATE TABLE`/`DROP TABLE` are — it is rejected inside any
+  open transaction (explicit or implicit autocommit-off) and the transaction survives the rejection; see
+  `crates/htap-server/tests/session.rs::test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives`.
 - **Still deferred regardless of route:** `LIMIT BY`, `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`,
-  non-partition `ALTER TABLE`, cost-based optimization (the Phase 13 `JoinTree` is purely structural and
-  never reorders/commutes/estimates cost — see ADR-022), vectorized/pipelined execution, worker-pool
-  parallelism above the per-slot scan, memory bounds/spilling, semi-join rewrites of `IN`/`EXISTS`, broader
-  string/date function coverage (no `DATE`/`DECIMAL`/`EXTRACT`/`SUBSTRING`/`INTERVAL`/views), and MySQL's
-  implicit string<->number coercion (a comparison between incompatible types is a bind error here, not an
-  implicit cast).
-- **Known test gap from Phase 13 (not yet fixed, tracked here rather than silently dropped):**
+  non-partition `ALTER TABLE`, vectorized/pipelined execution, worker-pool parallelism for `LEFT`/`RIGHT`/
+  `FULL` joins, and memory-bounded spilling for non-equi/`CROSS` joins (evaluated by an in-memory nested loop
+  with no memory budget check at all — genuinely deferred, unlike `LEFT`/`RIGHT`/`FULL` equi-hash joins, whose
+  spill code path exists but is only covered by a test for `INNER`), statistics histograms and
+  per-partition statistics, automatic statistics staleness detection, semi-join rewrites of `IN`/`EXISTS`,
+  broader string/date function coverage (no `DATE`/`DECIMAL`/`EXTRACT`/`SUBSTRING`/`INTERVAL`/views), and
+  MySQL's implicit string<->number coercion (a comparison between incompatible types is a bind error here,
+  not an implicit cast).
+- **Fixed test gap from Phase 13:**
   `crates/htap-client/tests/embedded_client.rs::test_embedded_client_unsupported_sql_preserves_error_categories`
   and `crates/htap-client/tests/remote_client.rs::test_remote_client_matches_embedded_client_ddl_dml_select`
-  both still assert `SELECT name, COUNT(*) OVER () FROM t` returns `HtapError::Unsupported`, which was true
-  before Phase 13 and is no longer true now that window functions are implemented — both currently fail
-  (`cargo test -p htap-client`). Neither test can be cited as passing evidence until its "still unsupported"
-  example is replaced with a construct genuinely still unsupported (e.g. `SELECT ... FOR UPDATE`, or a window
-  function nested inside an ordinary aggregate's argument). This is a code/test-file fix, out of scope for a
-  documentation-only change; `./ci.sh` is not green until it lands.
+  used to assert `SELECT name, COUNT(*) OVER () FROM t` returns `HtapError::Unsupported`, which stopped being
+  true once Phase 13 implemented window functions. Both tests now use a construct genuinely still unsupported
+  (`SELECT name FROM products FOR UPDATE`) and pass (`cargo test -p htap-client`, verified with
+  `-- --list`/`--exact`). This section is kept as a record that the gap was tracked and closed, not silently
+  dropped.
 
 ### Verification and test coverage
 
@@ -613,8 +786,7 @@ flat-lowering/differential-test design).
 - `crates/htap-coord/tests/placement_movement.rs::test_plan_placement_allocates_above_id_high_water`.
 - `crates/htap-client/tests/embedded_client.rs::test_embedded_client_unsupported_sql_preserves_error_categories`,
   `crates/htap-client/tests/remote_client.rs::test_remote_client_matches_embedded_client_ddl_dml_select`
-  (currently failing as of Phase 13 — see "Known test gap from Phase 13" above; not usable as passing
-  evidence until fixed).
+  (both pass — see "Fixed test gap from Phase 13" above).
 - `crates/htap-wire/tests/wire_server.rs::test_general_sql_over_wire` (joins, `UPDATE`, `SHOW`/`DESCRIBE`,
   `DROP TABLE` over the MySQL wire protocol, exercising the same `LocalServer::execute` path unchanged).
 
@@ -686,6 +858,45 @@ flat-lowering/differential-test design).
   `test_insert_select_masks_invisible_source_as_missing_table`,
   `test_insert_select_masks_hidden_sources_in_subquery_and_cte`, `test_insert_select_requires_insert_on_target`,
   `test_recursive_cte_privilege_checks_masking_and_self_reference`.
+
+### Verification and test coverage — Phase 14 additions
+
+See `docs/PROGRESS.md`'s Phase 14 row for the exhaustive, cross-checked (`cargo test -p <crate> -- --list`)
+test list; summarized by file:
+
+- `crates/htap-sql/tests/parse_bind.rs::test_analyze_table_accept_and_reject_forms`.
+- `crates/htap-catalog/tests/catalog_recovery.rs::{test_catalog_v3_envelope_defaults_table_stats_to_none, test_catalog_v4_corrupted_crc_is_rejected}`.
+- `crates/htap-server/tests/analyze.rs` (6 tests: row/column stats, distinct-count cap, reopen recovery,
+  concurrent unrelated catalog mutation, missing-table error, a larger `analyze_target` case).
+- `crates/htap-sql/src/optimize.rs` unit tests (32, estimators/predicate-atom classification/join
+  reordering/conservation-validator mutation tests, including the storage review's outer-join-pinning and
+  cross-join-regression tests) and `crates/htap-sql/tests/optimize.rs` (5, named
+  outer-join traps plus a property/fuzz reordering test).
+- `crates/htap-server/tests/explain.rs` (9 tests, including the two R5-bypass tests
+  `test_explain_primary_key_point_lookup_uses_rowstore_fast_path` and
+  `test_explain_analytic_scan_uses_olap_fast_path`, `test_plain_explain_select_permitted_inside_open_transaction`,
+  and the two `EXPLAIN [ANALYZE] CREATE TABLE` tests `test_explain_create_table_renders_plan_without_creating_table`
+  and `test_explain_analyze_create_table_executes_and_creates_table`).
+- `crates/htap-server/src/memory_budget.rs` and `crates/htap-server/src/spill.rs` unit tests (4 + 5, the fifth
+  spill unit test proving the reader now streams through a fixed buffer instead of loading a whole file).
+- `crates/htap-server/tests/spill.rs` (17 tests, each asserting its own operator's per-operator spill-telemetry
+  accessor: server-root-and-reopen sweep
+  (`test_spill_uses_server_root_and_reopen_sweeps_abandoned_files`), hash-join spill/skew/mixed-key-normalization/
+  cross-storage-format/large-join-with-`ORDER BY`, `GROUP BY` spill, an ungrouped-aggregate spill returning exactly one row including on
+  empty input, `ORDER BY` spill, `SELECT DISTINCT` spill, `UNION DISTINCT`/`EXCEPT`/`INTERSECT ALL` spill, five window-function spill
+  tests (`ROW_NUMBER`/`RANK`/running-sum/no-`PARTITION BY`/skewed-partition)).
+- `crates/htap-server/tests/parallel.rs` (7 tests: nested-parallelism budget, `GROUP BY` determinism/`AVG`/
+  `DISTINCT` correctness, a `GROUP BY` with a variable in its aggregate expression correctly not parallelizing,
+  `INNER` join determinism/row-order/key-normalization).
+- `crates/htap-server/tests/differential.rs` (3 tests: `differential_query_execution_paths_agree`,
+  `differential_outer_join_hoisting_predicate_from_inner_on_clause`,
+  `differential_outer_join_sinking_inner_join_predicate_referencing_null_side` — identity-optimized
+  baseline vs. fully optimized vs. fully optimized under a tiny memory budget, same row bag and, where an
+  order contract exists, the same row order).
+- `crates/htap-server/tests/session.rs` (`test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives`,
+  `test_explain_analyze_wrapping_ddl_rejected_inside_open_transaction`,
+  `test_explain_analyze_wrapping_insert_rejected_inside_read_only_transaction`): `ANALYZE TABLE` is DDL and is
+  rejected inside an open transaction like every other catalog DDL statement.
 
 ---
 
@@ -924,7 +1135,8 @@ The Phase 6 implementation delivers local coordination, leadership fencing, dete
 | Phase 10 — Sessions and explicit transactions | `Complete (local MVP)` | Built server-side sessions (`htap-server::session::Session`, `LocalServer::open_session`, `EmbeddedClient::open_session`, one `htap-wire` connection = one session) with `BEGIN`/`START TRANSACTION [READ ONLY \| READ WRITE]`, `COMMIT`, `ROLLBACK`, `autocommit` (0/1/ON/OFF/TRUE/FALSE), `SET @x = expr` (multi-assign), `SET [SESSION] TRANSACTION ISOLATION LEVEL REPEATABLE READ` (only accepted level) and `READ ONLY`/`READ WRITE` (next-transaction-only, even with `SESSION`), and a new `htap-sql::variables` system-variable registry (`@@name`, aliases, dynamic `autocommit`/`transaction_isolation`/`transaction_read_only`) that replaced the old ad hoc wire-shim fakes. Uncommitted writes are buffered in a session's own `WriteSet` (never journaled — a crash is an implicit `ROLLBACK`) and overlaid below relational operators for point reads, narrow scans, the general executor, and `UPDATE`, across `Row`/`Column`/`Converting` partitions; `COMMIT` runs the existing 2PC path once against the transaction's own pinned snapshot. Snapshot isolation with first-writer-wins, write skew permitted, reported as `REPEATABLE READ`; a write-write conflict at `COMMIT` and a stale snapshot vs. a mid-transaction columnar base both poison the transaction as `Conflict`; commit-time catalog revalidation catches a concurrent `DROP TABLE`/`ALTER`; `DurablePending` moves the session to a quarantined state rejecting every further statement, including `ROLLBACK`, with the original non-retryable error. Fixed two correctness gaps found during this work: the first-writer-wins check now runs in `Engine::prepare` before any journal write (previously only after the `Commit` record was fsynced), and an autocommit write now commits against its own read snapshot instead of a fresh one (previously could lose a race against a concurrent `copy_from_*`/import). Added a manager-wide `TransactionManager` recovery latch that rejects every *other* commit once any commit returns `DurablePending`, with a distinct non-retryable `HtapError::RecoveryRequired` (not the blocking transaction's own `DurablePending`), until `recover()` resolves it in-process (only for a `RecoveryCause::ParticipantIo` latch) or the manager reopens (always clears it, any cause). A follow-up fix pass also: made `recover()` fsync the journal before replaying any commit and cross-check each participant's own `committed_version()` against the journal's replayed max version, failing as `HtapError::Corruption` on mismatch; restored `next_txn_id` via `fetch_max` (never regressing it); truncated a failed journal append back to its pre-append offset; moved the applied-external-transactions ledger capacity check into `Engine::prepare` (before any journal write, not just at apply, rejecting with `HtapError::InvalidArgument`); and found the actual effective 2PC transaction payload cap is about 4 MiB, not the nominal 16 MiB (see "Effective 2PC transaction payload cap" above). A third fix pass added a `Journal`-level `poisoned` state (rejecting further appends/syncs until reopened), latched the manager as `JournalIo` for a failed `Intent`/`Abort` write too (previously only `Commit`), made `recover()` refuse outright and apply nothing while already latched `JournalIo` or while the journal is poisoned, and scaled the payload-cap bound by participant count (lowering the effective single-participant cap to 4,194,143 bytes). See "Sessions and explicit transactions (Phase 10)" in `docs/ARCHITECTURE.md`, ADR-018, and `docs/PROGRESS.md` for the full contract and test evidence. Deferred at the time: `SELECT ... FOR UPDATE`/locking reads, prepared statements/binary protocol, savepoints, XA, IPC/multiprocess sessions, per-user ACL, idle-transaction timeout/reaping, MVCC garbage collection, and a grace period before a new columnar base dooms an open transaction (prepared statements/binary protocol delivered in Phase 11, see that row). |
 | Phase 11 — MySQL binary protocol, prepared statements, connection commands | `Complete (local MVP)` | Built the MySQL binary protocol and prepared statements (`htap-wire::{binary_codec, prepared}`, `htap-sql::prepare`): `COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/`SEND_LONG_DATA` (`COM_STMT_FETCH` cleanly rejected), AST-level placeholder substitution covering every literal-bearing position the binder accepts (subqueries, derived tables, CTEs, UNION, `LIMIT`/`OFFSET`), best-effort `PREPARE` metadata probed through the real binder, a per-statement bound-parameter-type cache for `new_params_bound_flag = 0`, and the full binary parameter type matrix except `TIME`. Added `COM_RESET_CONNECTION`/`COM_CHANGE_USER` (both respecting the ADR-018 `CommitOutcomePending` quarantine, via a new `verify_credentials` seam), ≥16 MiB message reassembly/splitting with a real configurable `max_allowed_packet` (default 64 MiB, `htapd --max-allowed-packet`/`HTAPD_MAX_ALLOWED_PACKET`), a CSPRNG handshake scramble (`getrandom`, no fallback, replacing the seeded xorshift generator), negotiated `CLIENT_MULTI_STATEMENTS` (sequential execution, `SERVER_MORE_RESULTS_EXISTS`, stop on first error including `DurablePending`/`RecoveryRequired`), and shutdown force-close of connections blocked mid-packet (`live_connections` registry with RAII unregistration). `RemoteClient`/`WireClient` gained `prepare`/`execute_prepared`/`close_prepared`/`close_stmt`/`query_multi`. Deferred at the time: TLS, compression, and per-user ACL (delivered in Phase 12, see that row). See "Prepared statements and binary protocol scope and deferred features" above, "Prepared statements and binary protocol (Phase 11)" in `docs/ARCHITECTURE.md`, ADR-019, and `docs/PROGRESS.md` for the full contract and test evidence. Deferred/permanent gaps: `COM_STMT_FETCH`/server-side cursors, unsigned 64-bit values above `i64::MAX` (no `UInt64` value type), exact `DECIMAL` (kept as text, not arbitrary precision), `TIME`-typed parameters, best-effort (not exhaustive) `PREPARE` metadata, and shim-only `SET CHARACTER SET`/`SET CHARSET` forms not usable inside a multi-statement batch. |
 | Phase 12 — TLS, compression, and per-user accounts | `Complete (local MVP)` | Built TLS (`htap-wire::tls`, `rustls` 0.23 with the `ring` provider — `aws-lc-rs` needs `cmake`, unavailable here), MySQL compressed-packet framing (`htap-wire::compression`, zlib via `flate2` and zstd via `zstd`), and a catalog-backed per-user account/privilege model (`htap-catalog` format v3: `accounts`, `grants`, `accounts_initialized`; `htap-server::privilege::check_privileges`; new `htap-sql` `CREATE/ALTER/DROP USER`, `GRANT`/`REVOKE`, `SHOW GRANTS`, requiring a disclosed `vendor/sqlparser` patch for `IDENTIFIED BY`/`'user'@'host'` in `DROP USER`/`SHOW GRANTS`). `htapd` gained `--tls-cert`/`--tls-key`/`--require-secure-transport`/`--disable-compression` and matching `HTAPD_*` env vars; `WireServer::reload_tls_certs()` swaps TLS certs live (no `SIGHUP` trigger); `--password`/`HTAPD_PASSWORD` now only seeds the `root` account once via an `accounts_initialized` latch that never re-fires. See "TLS and compression (Phase 12)" and "Accounts and privileges (Phase 12)" in `docs/ARCHITECTURE.md`, ADR-020/ADR-021, "TLS, compression, and account/privilege scope and deferred features" above, and `docs/PROGRESS.md` for the full contract and test evidence. Deferred/permanent gaps: roles and delegated administration (`WITH GRANT OPTION` parses but is rejected at bind time), hosts other than `%`, `ACCOUNT LOCK`/`UNLOCK` SQL syntax, `caching_sha2_password`, `SIGHUP`-triggered TLS cert reload, unsalted password hashes with no KDF work factor (the comparison itself is constant-time — see ADR-021's fix pass), and `CREATE TABLE` auto-granting privileges on the table just created. |
-| Phase 13 — SQL query breadth (windows, correlated subqueries, join trees, recursion, set ops) | `Complete (local MVP)` | Extended the Phase 9 general query executor with `GROUP BY`/`ORDER BY` ordinals, integer `DIV`, `EXCEPT`/`INTERSECT` (`ALL`/`DISTINCT`), `FULL OUTER`/`NATURAL`/`USING` joins with real per-join-node column coalescing, arbitrarily nested parenthesized join trees (a purely structural `query::JoinTree`, a total/pure `lower_to_flat` fast path, a generalized `join_rows`, and a mandatory permanent flat/tree differential test), `DELETE` by arbitrary filter (`Route::RowstoreDelete`), `TRUNCATE` (as a transactional unfiltered `DELETE`), `INSERT ... SELECT` (exact per-column type match), depth-1-only correlated subqueries (a bounded `SubqueryRunner`/`SubqueryBudget` execution boundary), `WITH RECURSIVE` (capped iterations/rows/bytes), and window functions (`ROWS`/peer/value-offset `RANGE` frames, evaluated post-`HAVING`) — no on-disk format change. See ADR-022, `docs/PROGRESS.md`'s Phase 13 row, and "General query executor scope and deferred features" above for the full contract and evidence. Known gap: two pre-existing `htap-client` tests (`test_embedded_client_unsupported_sql_preserves_error_categories`, `test_remote_client_matches_embedded_client_ddl_dml_select`) still assert a window function is `Unsupported` and currently fail — see "Known test gap from Phase 13" above. Deferred: cost-based optimization (the new `JoinTree` is purely structural), vectorized/pipelined execution, worker-pool parallelism, memory bounds/spilling, `LIMIT BY`, `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, and non-partition `ALTER TABLE`. |
+| Phase 13 — SQL query breadth (windows, correlated subqueries, join trees, recursion, set ops) | `Complete (local MVP)` | Extended the Phase 9 general query executor with `GROUP BY`/`ORDER BY` ordinals, integer `DIV`, `EXCEPT`/`INTERSECT` (`ALL`/`DISTINCT`), `FULL OUTER`/`NATURAL`/`USING` joins with real per-join-node column coalescing, arbitrarily nested parenthesized join trees (a purely structural `query::JoinTree`, a total/pure `lower_to_flat` fast path, a generalized `join_rows`, and a mandatory permanent flat/tree differential test), `DELETE` by arbitrary filter (`Route::RowstoreDelete`), `TRUNCATE` (as a transactional unfiltered `DELETE`), `INSERT ... SELECT` (exact per-column type match), depth-1-only correlated subqueries (a bounded `SubqueryRunner`/`SubqueryBudget` execution boundary), `WITH RECURSIVE` (capped iterations/rows/bytes), and window functions (`ROWS`/peer/value-offset `RANGE` frames, evaluated post-`HAVING`) — no on-disk format change. See ADR-022, `docs/PROGRESS.md`'s Phase 13 row, and "General query executor scope and deferred features" above for the full contract and evidence. Fixed test gap: two pre-existing `htap-client` tests (`test_embedded_client_unsupported_sql_preserves_error_categories`, `test_remote_client_matches_embedded_client_ddl_dml_select`) used to assert a window function is `Unsupported`, which stopped being true once this row's window functions landed; both now use `SELECT ... FOR UPDATE` as their still-unsupported example and pass — see "Fixed test gap from Phase 13" above. Deferred at the time (cost-based optimization, spilling, and bounded parallelism were added in Phase 14, see that row): vectorized/pipelined execution, worker-pool parallelism, memory bounds/spilling, `LIMIT BY`, `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, and non-partition `ALTER TABLE`. |
+| Phase 14 — Cost-based optimization, `EXPLAIN`, spilling, and bounded parallelism | `Complete (local MVP)` | Lifted exactly three named gaps for the general executor only (`Route::RowstorePointRead`/`Route::OlapScan` byte-for-byte unchanged): `ANALYZE TABLE` (exact table/column statistics, capped exact-distinct count, `HTAPCAT1` format v3 -> v4, `stats` published by single-field CAS); a storage-agnostic `htap-sql::optimize` cost-based optimizer (statistics-driven estimators with disclosed provenance, predicate-atom reordering with an always-on conservation validator, subset-DP join reordering up to 8 relations then greedy, enabled by default); `EXPLAIN`/`EXPLAIN ANALYZE` (verified to bypass the optimizer entirely for the two narrow routes, including on DDL such as `EXPLAIN CREATE TABLE`); a per-statement memory budget, `Route::Query` only (a single-table `SELECT` with `ORDER BY`/`GROUP BY`/a plain aggregate still routes to the unbudgeted, non-spilling `Route::OlapScan` path — by design), with one level of disk spilling (non-durable scratch under `<data-root>/spill/`, swept on `LocalServer::open`; hash joins and windows capped at 128 partitions, `GROUP BY`/set operators at a fixed 16) for hash joins/`GROUP BY`/`ORDER BY`/set operators/windows, with per-operator spill test telemetry; and bounded intra-query parallelism for `GROUP BY` and `INNER`/`CROSS` hash joins. A second external-review round also closed a catalog-statistics brick risk (structural validation, including finite-float bounds — no format change) and made float overflow (`+`/`-`/`*`/`/`/`SUM`/`AVG`) return an out-of-range error instead of writing a non-finite value. A third, independent storage review then enabled `serde_json`'s `float_roundtrip` feature workspace-wide as a precaution (tested with the feature off, the default parser round-tripped every value tried, so no drift was demonstrated — not a bug fix), made spilled set operations/`DISTINCT` emit rows by source index rather than a decoded-row-keyed map (hardening), tightened the hash-join/window spill partition cap from 256 to 128, closed the previously-unverified analytic-path `SUM` overflow gap (`CAST(... AS DOUBLE)` from a string and non-finite literals are now rejected the same way), and fixed `ANALYZE`'s min/max bound to reserve memory before swapping so a failed reservation leaves accounting exact — see ADR-023's second external-review round. Also partially fixed `docs/PROBLEMS.md` P2: one `EvalContext` constructor, one join evaluator (`SelectBody.join_tree` always populated, the old flat-loop branch removed), and zero `too_many_arguments` allows in `query_exec.rs` — but the planned shared binder leaf-helper module was **not** delivered; the two binder entry points still each hold their own copy of that logic, by the deliberate Option B choice recorded in ADR-023 (keeping R5 structural). See ADR-023, `docs/PROGRESS.md`'s Phase 14 row, and "General query executor scope and deferred features" above for the full contract and evidence. `ANALYZE TABLE` is gated by the "no DDL inside an open transaction" rule exactly like other catalog DDL (`crates/htap-server/tests/session.rs::test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives`, `test_explain_analyze_wrapping_ddl_rejected_inside_open_transaction`, `test_explain_analyze_wrapping_insert_rejected_inside_read_only_transaction`), and `EXPLAIN ANALYZE` follows the transaction rules of the statement it executes while plain `EXPLAIN` remains permitted (`crates/htap-server/tests/explain.rs::test_plain_explain_select_permitted_inside_open_transaction`). One disclosed gap remains: hash-join spilling is not itself kind-restricted in code but is only tested for `INNER` joins. Deferred: vectorized/pipelined execution, worker-pool parallelism for `LEFT`/`RIGHT`/`FULL` joins, memory-bounded spilling for non-equi/`CROSS` joins (a genuine gap — evaluated by an in-memory nested loop with no budget check at all, unlike `LEFT`/`RIGHT`/`FULL` equi-hash spilling, which exists in code but only `INNER` is tested), statistics histograms and per-partition statistics, automatic statistics staleness detection, `LIMIT BY`, `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, and non-partition `ALTER TABLE`. |
 
 ---
 

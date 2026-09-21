@@ -21,9 +21,10 @@ pub const CATALOG_TMP_FILE_NAME: &str = "CATALOG.tmp";
 pub const HEADER_MAGIC: &[u8; 8] = b"HTAPCAT1";
 /// Catalog binary envelope format version written by this build.
 ///
-/// Version 3 adds accounts and grants to the JSON payload. Version 2 added the persisted
-/// identifier high-water mark (`id_high_water`). Versions 1 and 2 remain decodable.
-pub const FORMAT_VERSION: u16 = 3;
+/// Version 4 adds inline table statistics through the optional `stats` field on
+/// `TableDescriptor`. Version 3 added accounts and grants, and version 2 added the persisted
+/// identifier high-water mark (`id_high_water`). Versions 1 through 3 remain decodable.
+pub const FORMAT_VERSION: u16 = 4;
 /// Oldest catalog envelope format version this build still decodes.
 pub const LEGACY_FORMAT_VERSION: u16 = 1;
 /// Fixed header length (8 magic + 2 version + 4 payload_len + 4 crc32c = 18 bytes).
@@ -360,7 +361,7 @@ mod tests {
         let snapshot = test_snapshot();
         let v1 = encode_v1(&snapshot);
         let v2 = encode_v2(&snapshot);
-        let v3 = encode_snapshot(&snapshot).unwrap();
+        let v4 = encode_snapshot(&snapshot).unwrap();
 
         assert_eq!(
             v1,
@@ -430,9 +431,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            v3,
+            v4,
             vec![
-                72, 84, 65, 80, 67, 65, 84, 49, 3, 0, 86, 2, 0, 0, 11, 97, 133, 107, 123, 34, 103,
+                72, 84, 65, 80, 67, 65, 84, 49, 4, 0, 86, 2, 0, 0, 11, 97, 133, 107, 123, 34, 103,
                 101, 110, 101, 114, 97, 116, 105, 111, 110, 34, 58, 49, 44, 34, 97, 99, 99, 111,
                 117, 110, 116, 115, 34, 58, 91, 93, 44, 34, 103, 114, 97, 110, 116, 115, 34, 58,
                 91, 93, 44, 34, 97, 99, 99, 111, 117, 110, 116, 115, 95, 105, 110, 105, 116, 105,
@@ -477,7 +478,7 @@ mod tests {
             decode_snapshot(&v2).unwrap().generation,
             snapshot.generation
         );
-        assert_eq!(decode_snapshot(&v3).unwrap(), snapshot);
+        assert_eq!(decode_snapshot(&v4).unwrap(), snapshot);
     }
 
     #[test]

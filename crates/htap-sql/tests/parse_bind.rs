@@ -2771,3 +2771,57 @@ fn test_mysql_alter_partition_negative() {
         "expected InvalidArgument for non-contiguous sources, got {res:?}"
     );
 }
+
+#[test]
+fn test_analyze_table_accept_and_reject_forms() {
+    let catalog = make_partitioned_test_catalog();
+
+    let stmt = parse_one("ANALYZE TABLE t_unpart").expect("ANALYZE TABLE should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Ok(BoundStatement::AnalyzeTable(_))),
+        "expected AnalyzeTable for a valid single table, got {res:?}"
+    );
+
+    let stmt = parse_one("ANALYZE").expect("bare ANALYZE should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::InvalidArgument(ref msg)) if msg.contains("ANALYZE requires a table name")),
+        "expected InvalidArgument requiring a table name for bare ANALYZE, got {res:?}"
+    );
+
+    let stmt =
+        parse_one("ANALYZE TABLE nonexistent").expect("ANALYZE TABLE nonexistent should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(
+            res,
+            Err(HtapError::NotFound(_)) | Err(HtapError::InvalidArgument(_))
+        ),
+        "expected NotFound or InvalidArgument for nonexistent table, got {res:?}"
+    );
+
+    let stmt = parse_one("ANALYZE TABLE t_unpart FOR COLUMNS col1")
+        .expect("ANALYZE TABLE FOR COLUMNS should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::Unsupported(_))),
+        "expected Unsupported for FOR COLUMNS, got {res:?}"
+    );
+
+    let stmt =
+        parse_one("ANALYZE TABLE t_unpart NOSCAN").expect("ANALYZE TABLE NOSCAN should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::Unsupported(_))),
+        "expected Unsupported for NOSCAN, got {res:?}"
+    );
+
+    let stmt = parse_one("ANALYZE TABLE t_range PARTITION (p_col = 1)")
+        .expect("partition-scoped ANALYZE TABLE should parse");
+    let res = bind(&stmt, &catalog);
+    assert!(
+        matches!(res, Err(HtapError::Unsupported(_))),
+        "expected Unsupported for partition-scoped ANALYZE TABLE, got {res:?}"
+    );
+}

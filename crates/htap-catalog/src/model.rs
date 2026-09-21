@@ -543,6 +543,33 @@ impl From<&PartitionAlteration> for PartitionAlteration {
     }
 }
 
+/// Statistics for a single table column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnStats {
+    /// Number of null values in the column.
+    pub null_count: u64,
+    /// Estimated or exact number of distinct non-null values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct_count: Option<u64>,
+    /// Minimum non-null value in the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<Value>,
+    /// Maximum non-null value in the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<Value>,
+}
+
+/// Statistics collected for a table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableStats {
+    /// Catalog or data version at which these statistics were analyzed.
+    pub analyzed_at_version: u64,
+    /// Number of rows in the table.
+    pub row_count: u64,
+    /// Per-column statistics in schema column order.
+    pub columns: Vec<ColumnStats>,
+}
+
 /// Metadata descriptor for a relational table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableDescriptor {
@@ -561,6 +588,9 @@ pub struct TableDescriptor {
     /// Partitioning strategy descriptor, if table is partitioned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitioning: Option<PartitioningDescriptor>,
+    /// Statistics collected for this table, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<TableStats>,
 }
 
 impl TableDescriptor {
@@ -581,6 +611,7 @@ impl TableDescriptor {
             partitions,
             generation,
             partitioning: None,
+            stats: None,
         }
     }
 
@@ -590,6 +621,12 @@ impl TableDescriptor {
         partitioning: impl Into<Option<PartitioningDescriptor>>,
     ) -> Self {
         self.partitioning = partitioning.into();
+        self
+    }
+
+    /// Set table statistics metadata.
+    pub fn with_stats(mut self, stats: impl Into<Option<TableStats>>) -> Self {
+        self.stats = stats.into();
         self
     }
 
@@ -1990,6 +2027,101 @@ impl CatalogSnapshot {
                 }
             }
 
+            if let Some(stats) = &table.stats {
+                if stats.columns.len() != schema_len {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "table '{}' statistics column count {} does not match schema column count {}",
+                        table.name,
+                        stats.columns.len(),
+                        schema_len
+                    )));
+                }
+
+                for (column_index, (column, column_stats)) in table
+                    .schema
+                    .columns()
+                    .iter()
+                    .zip(&stats.columns)
+                    .enumerate()
+                {
+                    if column_stats.null_count > stats.row_count {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "table '{}' statistics for column '{}' (index {}) has null count {} exceeding row count {}",
+                            table.name,
+                            column.name,
+                            column_index,
+                            column_stats.null_count,
+                            stats.row_count
+                        )));
+                    }
+
+                    let non_null_count = stats.row_count - column_stats.null_count;
+                    if let Some(distinct_count) = column_stats.distinct_count {
+                        if distinct_count > non_null_count {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "table '{}' statistics for column '{}' (index {}) has distinct count {} exceeding non-null row count {}",
+                                table.name,
+                                column.name,
+                                column_index,
+                                distinct_count,
+                                non_null_count
+                            )));
+                        }
+                    }
+
+                    if let Some(min) = &column_stats.min {
+                        if min.data_type() != Some(column.data_type) {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "table '{}' statistics for column '{}' (index {}) has min value with type {:?}, expected {:?}",
+                                table.name,
+                                column.name,
+                                column_index,
+                                min.data_type(),
+                                column.data_type
+                            )));
+                        }
+                        if matches!(min, Value::Float64(value) if !value.is_finite()) {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "table '{}' statistics for column '{}' (index {}) has non-finite min bound",
+                                table.name, column.name, column_index
+                            )));
+                        }
+                    }
+
+                    if let Some(max) = &column_stats.max {
+                        if max.data_type() != Some(column.data_type) {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "table '{}' statistics for column '{}' (index {}) has max value with type {:?}, expected {:?}",
+                                table.name,
+                                column.name,
+                                column_index,
+                                max.data_type(),
+                                column.data_type
+                            )));
+                        }
+                        if matches!(max, Value::Float64(value) if !value.is_finite()) {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "table '{}' statistics for column '{}' (index {}) has non-finite max bound",
+                                table.name, column.name, column_index
+                            )));
+                        }
+                    }
+
+                    if let (Some(min), Some(max)) = (&column_stats.min, &column_stats.max) {
+                        if min > max {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "table '{}' statistics for column '{}' (index {}) has min value {} greater than max value {}",
+                                table.name,
+                                column.name,
+                                column_index,
+                                min,
+                                max
+                            )));
+                        }
+                    }
+                }
+            }
+
             if let Some(partitioning) = &table.partitioning {
                 if partitioning.key_column >= schema_len {
                     return Err(HtapError::InvalidArgument(format!(
@@ -2671,6 +2803,50 @@ mod tests {
         let empty = CatalogSnapshot::empty();
         assert_eq!(empty.generation, 0);
         assert!(empty.validate().is_ok());
+    }
+
+    #[test]
+    fn test_table_descriptor_stats_serde_round_trip() {
+        let schema = Schema::new(vec![ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        }])
+        .unwrap();
+
+        let table = TableDescriptor::new(
+            TableId::new(1),
+            "users",
+            schema,
+            vec![0],
+            vec![PartitionId::new(10)],
+            1,
+        );
+
+        let json_without_stats = serde_json::to_string(&table).unwrap();
+        assert!(!json_without_stats.contains("\"stats\""));
+        let decoded_without_stats: TableDescriptor =
+            serde_json::from_str(&json_without_stats).unwrap();
+        assert_eq!(decoded_without_stats, table);
+        assert_eq!(decoded_without_stats.stats, None);
+
+        let stats = TableStats {
+            analyzed_at_version: 42,
+            row_count: 100,
+            columns: vec![ColumnStats {
+                null_count: 3,
+                distinct_count: Some(97),
+                min: Some(Value::Int64(1)),
+                max: Some(Value::Int64(100)),
+            }],
+        };
+        let table_with_stats = table.with_stats(stats);
+
+        let json_with_stats = serde_json::to_string(&table_with_stats).unwrap();
+        assert!(json_with_stats.contains("\"stats\""));
+        let decoded_with_stats: TableDescriptor = serde_json::from_str(&json_with_stats).unwrap();
+        assert_eq!(decoded_with_stats, table_with_stats);
     }
 
     #[test]

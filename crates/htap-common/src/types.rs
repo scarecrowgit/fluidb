@@ -601,4 +601,32 @@ mod tests {
         let json = serde_json::to_string(&row).unwrap();
         assert_eq!(row, serde_json::from_str::<Row>(&json).unwrap());
     }
+
+    #[test]
+    fn test_serde_json_float64_roundtrips_bit_identically() {
+        let values = [
+            0.1_f64,
+            -0.0_f64,
+            1.000_000_000_000_000_2_f64,
+            1.234_567_890_123_456_7_f64,
+            1e-308_f64,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::MAX,
+        ];
+
+        for value in values {
+            let original = Value::Float64(value);
+            let json = serde_json::to_string(&original).unwrap();
+            let decoded = serde_json::from_str::<Value>(&json).unwrap();
+            let Value::Float64(decoded) = decoded else {
+                panic!("expected Float64 after JSON roundtrip");
+            };
+            assert_eq!(
+                decoded.to_bits(),
+                value.to_bits(),
+                "JSON roundtrip changed DOUBLE bits for {value:?}: {json}"
+            );
+        }
+    }
 }

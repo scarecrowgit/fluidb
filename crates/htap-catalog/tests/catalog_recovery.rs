@@ -464,7 +464,7 @@ fn test_corruption_and_truncation() {
 
     // 4. Unsupported version (neither current nor legacy)
     let mut encoded = encode_snapshot(&snap).unwrap();
-    encoded[8..10].copy_from_slice(&4u16.to_le_bytes());
+    encoded[8..10].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
     fs::write(&catalog_path, &encoded).unwrap();
     let err = LocalCatalogStore::open(temp.path()).unwrap_err();
     assert!(matches!(err, HtapError::Corruption(_)));
@@ -2942,7 +2942,7 @@ fn test_partition_alteration_cas_and_reopen() {
 
 /// A version-1 envelope (payload without `id_high_water`) still decodes, its counters
 /// default to zero, and allocation falls back to the live maximum + 1. After a
-/// CAS the file is rewritten as version 2.
+/// CAS the file is rewritten using the current format version.
 #[test]
 fn test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max() {
     use htap_catalog::local::{decode_snapshot, LEGACY_FORMAT_VERSION};
@@ -3004,7 +3004,7 @@ fn test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max() {
     store.compare_and_set(1, next.clone()).unwrap();
     let bytes = fs::read(temp.path().join("CATALOG")).unwrap();
     assert_eq!(&bytes[8..10], &FORMAT_VERSION.to_le_bytes());
-    assert_eq!(FORMAT_VERSION, 3);
+    assert_eq!(FORMAT_VERSION, 4);
     let reloaded = LocalCatalogStore::open(temp.path())
         .unwrap()
         .load()
@@ -3496,13 +3496,52 @@ fn test_catalog_cas_rejects_regressing_account_high_water() {
 fn test_catalog_future_version_rejected() {
     let snap = make_valid_snapshot(1);
     let mut encoded = encode_snapshot(&snap).unwrap();
-    encoded[8..10].copy_from_slice(&4u16.to_le_bytes());
+    encoded[8..10].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
 
     let err = htap_catalog::local::decode_snapshot(&encoded).unwrap_err();
     assert!(matches!(err, HtapError::Corruption(_)));
     assert!(err
         .to_string()
         .contains("unsupported catalog format version"));
+}
+
+#[test]
+fn test_catalog_v3_envelope_defaults_table_stats_to_none() {
+    let temp = TempDir::new().unwrap();
+    let snapshot = make_valid_snapshot(1);
+    let mut json = serde_json::to_value(&snapshot).unwrap();
+
+    for table in json
+        .get_mut("tables")
+        .and_then(serde_json::Value::as_array_mut)
+        .unwrap()
+    {
+        table.as_object_mut().unwrap().remove("stats");
+    }
+
+    let payload = serde_json::to_vec(&json).unwrap();
+    let mut raw = Vec::new();
+    raw.extend_from_slice(HEADER_MAGIC);
+    raw.extend_from_slice(&3u16.to_le_bytes());
+    raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+    raw.extend_from_slice(&payload);
+    fs::write(temp.path().join("CATALOG"), raw).unwrap();
+
+    let store = LocalCatalogStore::open(temp.path()).unwrap();
+    let decoded = store.load().unwrap().unwrap();
+    assert!(decoded.tables.iter().all(|table| table.stats.is_none()));
+}
+
+#[test]
+fn test_catalog_v4_corrupted_crc_is_rejected() {
+    let mut encoded = encode_snapshot(&make_valid_snapshot(1)).unwrap();
+    assert_eq!(&encoded[8..10], &FORMAT_VERSION.to_le_bytes());
+    encoded[14] ^= 0xff;
+
+    let err = htap_catalog::local::decode_snapshot(&encoded).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("checksum mismatch"));
 }
 
 #[cfg(unix)]
@@ -3544,4 +3583,329 @@ fn test_catalog_v2_payload_without_id_high_water_is_rejected() {
     raw[8..10].copy_from_slice(&1u16.to_le_bytes());
     let decoded = decode_snapshot(&raw).unwrap();
     assert_eq!(decoded.id_high_water, htap_catalog::IdHighWater::default());
+}
+
+#[test]
+fn test_catalog_validate_rejects_column_count_mismatch() {
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 10,
+        columns: vec![ColumnStats {
+            null_count: 0,
+            distinct_count: Some(10),
+            min: Some(Value::Int64(1)),
+            max: Some(Value::Int64(10)),
+        }],
+    });
+
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_catalog_validate_rejects_null_count_exceeds_rows() {
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 10,
+        columns: vec![
+            ColumnStats {
+                null_count: 11,
+                distinct_count: Some(0),
+                min: None,
+                max: None,
+            },
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(0),
+                min: None,
+                max: None,
+            },
+        ],
+    });
+
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_catalog_validate_rejects_distinct_exceeds_non_null() {
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 10,
+        columns: vec![
+            ColumnStats {
+                null_count: 3,
+                distinct_count: Some(8),
+                min: None,
+                max: None,
+            },
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(0),
+                min: None,
+                max: None,
+            },
+        ],
+    });
+
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_catalog_validate_rejects_min_type_mismatch() {
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 1,
+        columns: vec![
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(1),
+                min: Some(Value::String("one".into())),
+                max: None,
+            },
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(0),
+                min: None,
+                max: None,
+            },
+        ],
+    });
+
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_catalog_validate_rejects_max_type_mismatch() {
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 1,
+        columns: vec![
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(1),
+                min: None,
+                max: Some(Value::String("two".into())),
+            },
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(0),
+                min: None,
+                max: None,
+            },
+        ],
+    });
+
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_catalog_validate_rejects_nonfinite_min_float() {
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "value".to_string(),
+            data_type: DataType::Float64,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let table = TableDescriptor::new(
+        TableId::new(1),
+        "measurements",
+        schema,
+        vec![0],
+        vec![PartitionId::new(10)],
+        1,
+    );
+    let partition = PartitionDescriptor::new(
+        PartitionId::new(10),
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![TabletId::new(100)],
+        1,
+    );
+    let tablet = TabletDescriptor::new(
+        TabletId::new(100),
+        PartitionId::new(10),
+        0,
+        vec![ReplicaId::new(1000)],
+        1,
+    );
+    let replica = ReplicaDescriptor::new(
+        ReplicaId::new(1000),
+        TabletId::new(100),
+        NodeId::new(42),
+        true,
+        true,
+        1,
+    );
+
+    let mut snap =
+        CatalogSnapshot::new(1, vec![table], vec![partition], vec![tablet], vec![replica]);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 2,
+        columns: vec![
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(2),
+                min: Some(Value::Int64(1)),
+                max: Some(Value::Int64(2)),
+            },
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(2),
+                min: Some(Value::Float64(f64::INFINITY)),
+                max: Some(Value::Float64(2.0)),
+            },
+        ],
+    });
+
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("non-finite min"));
+}
+
+#[test]
+fn test_catalog_validate_rejects_nonfinite_max_float() {
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+        },
+        ColumnDef {
+            name: "value".to_string(),
+            data_type: DataType::Float64,
+            nullable: false,
+            primary_key: false,
+        },
+    ])
+    .unwrap();
+
+    let table = TableDescriptor::new(
+        TableId::new(1),
+        "measurements",
+        schema,
+        vec![0],
+        vec![PartitionId::new(10)],
+        1,
+    );
+    let partition = PartitionDescriptor::new(
+        PartitionId::new(10),
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![TabletId::new(100)],
+        1,
+    );
+    let tablet = TabletDescriptor::new(
+        TabletId::new(100),
+        PartitionId::new(10),
+        0,
+        vec![ReplicaId::new(1000)],
+        1,
+    );
+    let replica = ReplicaDescriptor::new(
+        ReplicaId::new(1000),
+        TabletId::new(100),
+        NodeId::new(42),
+        true,
+        true,
+        1,
+    );
+
+    let mut snap =
+        CatalogSnapshot::new(1, vec![table], vec![partition], vec![tablet], vec![replica]);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 2,
+        columns: vec![
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(2),
+                min: Some(Value::Int64(1)),
+                max: Some(Value::Int64(2)),
+            },
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(2),
+                min: Some(Value::Float64(1.0)),
+                max: Some(Value::Float64(f64::NAN)),
+            },
+        ],
+    });
+
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+    assert!(err.to_string().contains("non-finite max"));
+}
+
+#[test]
+fn test_catalog_validate_rejects_min_greater_than_max() {
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 2,
+        columns: vec![
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(2),
+                min: Some(Value::Int64(20)),
+                max: Some(Value::Int64(10)),
+            },
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(0),
+                min: None,
+                max: None,
+            },
+        ],
+    });
+
+    let err = snap.validate().unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
+}
+
+#[test]
+fn test_catalog_validate_accepts_correct_statistics() {
+    let mut snap = make_valid_snapshot(1);
+    snap.tables[0].stats = Some(TableStats {
+        analyzed_at_version: 1,
+        row_count: 10,
+        columns: vec![
+            ColumnStats {
+                null_count: 0,
+                distinct_count: Some(10),
+                min: Some(Value::Int64(1)),
+                max: Some(Value::Int64(10)),
+            },
+            ColumnStats {
+                null_count: 2,
+                distinct_count: Some(4),
+                min: Some(Value::String("a".into())),
+                max: Some(Value::String("z".into())),
+            },
+        ],
+    });
+
+    snap.validate().unwrap();
 }

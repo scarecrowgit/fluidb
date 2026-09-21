@@ -34,7 +34,7 @@ The following operational facilities and production features are **explicitly no
 - **No Authentication or Security Boundary for In-Process Use:** `LocalServer`/`EmbeddedClient` calls have no
   user credentials, authentication handshakes, or RBAC — the caller is trusted the way any embedded library
   is trusted.
-- **Narrow OLAP SQL path, plus a separate general query executor:** `LocalServer` executes narrow single-table analytical scans (`Route::OlapScan`: plain projections, AND-only typed filters, `COUNT(*)`, `COUNT(col)`, `SUM(Int32/Int64/Float64)`, `MIN/MAX`, deterministic `GROUP BY` with SQL NULL grouping, and simple unqualified source/projected column `ORDER BY` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break) over logical rowstore and base-plus-delta rows using server-root `<root>/colstore` for materialized `Column`/`Converting` partitions. For `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads (PK + requested column union), safely pushing down one eligible predicate leaf directly into `SegmentReader::scan`, suppressing stale base rows via post-base rowstore deltas, and evaluating residual SQL logic. ScanStats/pruning is available as internal execution evidence, but SQL still uses materialized logical rows and vectorized aggregation is not implemented. Complete-PK `RowstorePointRead` remains separate and unchanged. This narrow path itself has no joins, CTEs, windows, expressions beyond a plain column, or `HAVING`/`OR`/arithmetic — those are handled instead by the separate general query executor (`Route::Query`, `htap-server::query_exec`), which implements joins (including `FULL OUTER`/`NATURAL`/`USING` and nested join trees), CTEs (including `WITH RECURSIVE`), expressions, aliases, full `ORDER BY`/`GROUP BY` (including ordinals), `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, window functions, correlated subqueries (one level deep), `UNION`/`EXCEPT`/`INTERSECT`, `DELETE` by filter, `TRUNCATE`, and `INSERT ... SELECT` — see `docs/ARCHITECTURE.md`'s Phase 9/13 paragraphs and `docs/LIMITATIONS.md`'s "General query executor scope and deferred features" for the full contract. Direct `SegmentReader` pushdown optimization is implemented for the compact base path; compound `AND` pushdown beyond one leaf, `!=` pushdown, vectorized operator pipelines, cost-based optimization, worker-pool parallelism above the per-slot scan, multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow, and full MySQL breadth remain unsupported on every path.
+- **Narrow OLAP SQL path, plus a separate general query executor:** `LocalServer` executes narrow single-table analytical scans (`Route::OlapScan`: plain projections, AND-only typed filters, `COUNT(*)`, `COUNT(col)`, `SUM(Int32/Int64/Float64)`, `MIN/MAX`, deterministic `GROUP BY` with SQL NULL grouping, and simple unqualified source/projected column `ORDER BY` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break) over logical rowstore and base-plus-delta rows using server-root `<root>/colstore` for materialized `Column`/`Converting` partitions. For `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads (PK + requested column union), safely pushing down one eligible predicate leaf directly into `SegmentReader::scan`, suppressing stale base rows via post-base rowstore deltas, and evaluating residual SQL logic. ScanStats/pruning is available as internal execution evidence, but SQL still uses materialized logical rows and vectorized aggregation is not implemented. Complete-PK `RowstorePointRead` remains separate and unchanged. This narrow path itself has no joins, CTEs, windows, expressions beyond a plain column, or `HAVING`/`OR`/arithmetic — those are handled instead by the separate general query executor (`Route::Query`, `htap-server::query_exec`), which implements joins (including `FULL OUTER`/`NATURAL`/`USING` and nested join trees), CTEs (including `WITH RECURSIVE`), expressions, aliases, full `ORDER BY`/`GROUP BY` (including ordinals), `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, window functions, correlated subqueries (one level deep), `UNION`/`EXCEPT`/`INTERSECT`, `DELETE` by filter, `TRUNCATE`, and `INSERT ... SELECT` — see `docs/ARCHITECTURE.md`'s Phase 9/13 paragraphs and `docs/LIMITATIONS.md`'s "General query executor scope and deferred features" for the full contract. Direct `SegmentReader` pushdown optimization is implemented for the compact base path. As of Phase 14, the general `Route::Query` executor also has `ANALYZE TABLE` statistics, a statistics-driven cost-based optimizer (`htap_sql::optimize`, enabled by default), `EXPLAIN`/`EXPLAIN ANALYZE`, a per-statement memory budget with disk spilling, and bounded parallelism for `GROUP BY`/`INNER`/`CROSS` hash joins — see "Cost-based optimization, `EXPLAIN`, spilling, and parallelism (Phase 14)" in `README.md` and ADR-023 in `docs/DECISIONS.md`. Compound `AND` pushdown beyond one leaf, `!=` pushdown, vectorized operator pipelines, worker-pool parallelism above the per-slot scan for `LEFT`/`RIGHT`/`FULL` joins (their equi-hash spilling is not itself kind-restricted in code, but is exercised by a test only for `INNER` joins), memory-bounded spilling for non-equi/`CROSS` joins (a genuine gap — evaluated by an in-memory nested loop with no budget check at all), multi-tablet/distributed scans, resource quotas/cancellation, DataFusion/Arrow, and full MySQL breadth remain unsupported on every path.
 - **No High Availability (HA) or Distributed Consensus:** No Raft (`openraft`), ZooKeeper ensemble backend, network heartbeats, ephemeral sessions, remote RPC replica serving, or active failover exists.
 - **One-Owner Multiprocess-Exclusive Mode (Not Concurrent Shared-Root Writers):** Root locking (`<root>/LOCK`) enforces that only one operating system process may open a server or coordinator root. Concurrent multiprocess shared-root operations and concurrent writers are strictly unsupported. Standalone subsystem opens (`Engine::open`, `LocalCatalogStore::open`, `LocalDataMover::new`) do not acquire this lock and remain unsafe for direct concurrent use.
 - **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks Applies:** Neither `txn.journal` nor the rowstore `MANIFEST` v2 external ledger implements compaction or coordinated retention. The external ledger enforces a hard cap (`MAX_APPLIED_EXTERNAL_TXNS = 1_000_000`). Once full, new external applies fail with `HtapError::InvalidArgument` (there is no `HtapError::CapacityExceeded` variant); a Phase 10 fix pass moved this check into `Engine::prepare` as well, so a real 2PC/direct-commit transaction is rejected before any journal write rather than only at apply time.
@@ -125,6 +125,9 @@ flowchart TD
 │       ├── MANIFEST                          # Durable columnar tablet manifest envelope (HTAPTBM1)
 │       └── *.seg                             # Columnar segment files
 ├── txn.journal                               # 2PC transaction manager write-ahead log (irrevocable 88cc314, bounded b7ff200)
+├── spill/                                    # Phase 14: non-durable query spill scratch, swept in full on every open
+│   └── <statement-id>/
+│       └── *.spill                           # Length-prefixed spill rows (magic HTAPSPIL; no CRC/fsync/version contract)
 └── movement/
     ├── jobs/
     │   └── <job-id>/
@@ -235,6 +238,59 @@ flowchart TD
    - Columnar storage root for materialized partitions.
    - Houses per-tablet directories (`colstore/<tablet_id>/`) containing immutable columnar segments (`*.seg`) and tablet manifests (`MANIFEST` in `HTAPTBM1` envelope format with CRC32C checksums).
    - Used by `LocalServer::convert_table`, `LocalServer::convert_table_to_column`, `convert_table_to_row` (which retains columnar segment files on disk during demotion), and `LocalServer` analytical scans (`Route::OlapScan`) over `Column` and `Converting` partitions, utilizing projection-aware compact reads with safe single-leaf predicate pushdown into `SegmentReader::scan` and rowstore base-plus-delta overlay. Manifest generation on disk is validated against catalog metadata before execution, and startup validation (`validate_storage_state_on_open`) fails closed (returning `HtapError::Corruption` or `HtapError::Io` depending on the cause) if catalog and disk states diverge.
+6. **`spill/` (Phase 14, `crates/htap-server/src/spill.rs`):**
+   - Non-durable scratch space for the general query executor's (`Route::Query`) memory-bounded hash joins,
+     `GROUP BY`, `ORDER BY`, `DISTINCT`/`EXCEPT`/`INTERSECT`, and window functions, used only when a statement's
+     data exceeds its `MemoryBudget` (default 256 MiB). This applies to `Route::Query` only: a single-table
+     `SELECT` with `ORDER BY`, `GROUP BY`, or a plain aggregate and no join routes to the narrow
+     `Route::OlapScan` path instead, which has no memory budget and never spills, by design. One level of
+     spilling only — hash-join partition count is sized from the input and the remaining budget, capped at 128
+     (windows share this cap, to bound open file descriptors and the writer buffers the budget doesn't count);
+     `GROUP BY` and the set operators each spill into their own fixed 16 partitions — unlike the hash join and
+     window, not scaled by input size or the remaining budget, so an input much larger than roughly 16x the
+     budget fails with the memory-budget error instead of spilling successfully (a deferred improvement); a
+     partition that still doesn't fit (skew, or the cap) fails with the memory-budget error rather than
+     recursing.
+   - One subdirectory per statement (`spill/<statement-id>/`), containing length-prefixed row files tagged
+     with a minimal header (magic `HTAPSPIL`, kind/operator tags) — **deliberately not** an
+     `htap_common::envelope` file: no CRC, no fsync guarantee, no accepted-version-range contract, since this
+     is disposable scratch, never a durable artifact.
+   - A statement's own `SpillDir` removes every file it created (best-effort, log-and-continue) when the
+     statement finishes, via `Drop`. `LocalServer::open` additionally removes `<root>/spill/` in full after
+     acquiring the root `<root>/LOCK`, so an abandoned directory left by a killed process never accumulates or
+     confuses a later statement. **Disclosed, not fixed:** this sweep only logs a failure to remove the
+     directory rather than returning an error, and `SpillWriter::create` opens with `create_new(true)`, so a
+     stale file the sweep failed to remove can collide once with a statement id reused after a process
+     restart, failing that one statement with an `AlreadyExists` I/O error. The collision heals on its own
+     once that statement id has been consumed by the next spilling statement.
+   - `SpillWriter` itself has no custom `Drop`: finishing a writer (flushing it so a write failure surfaces to
+     the query) before the file is read back is enforced by convention at each of its call sites, not by the
+     type. A `SpillWriter` dropped without an explicit `.finish()` call still flushes via its inner
+     `BufWriter`'s own drop, but silently discards any I/O error rather than returning it. All current call
+     sites call `.finish()` explicitly; this is a call-site convention, not a compiler-checked guarantee.
+   - Spill scratch carries **no durability guarantee of any kind** and is unrelated to the WAL/rowstore/
+     catalog/manifest durability invariants elsewhere in this document; a crash mid-spill simply loses the
+     in-flight query, which was never reported as committed.
+
+### Query execution settings (Phase 14, `LocalServer` builder methods; no `htapd` CLI flag yet)
+
+These are configured in Rust via `LocalServer` builder methods (`with_*`) or their `set_*`/getter
+counterparts, the same pattern the pre-existing `scan_workers` setting already uses; unlike
+`--max-allowed-packet` and similar `htapd` flags documented in "Running `htapd`" below, none of these three
+has an `htapd` command-line flag or environment variable yet:
+
+| Setting | Default | Method |
+| --- | --- | --- |
+| Per-statement memory budget for spillable stages | 256 MiB | `with_query_memory_budget`/`set_query_memory_budget`/`query_memory_budget()` |
+| Intra-query parallelism worker budget | `std::thread::available_parallelism()` (falls back to 1) | `with_query_parallelism`/`set_query_parallelism`/`query_parallelism()` |
+| Exact-distinct-value cap per column for `ANALYZE TABLE` | 200,000 | `with_analyze_distinct_limit`/`set_analyze_distinct_limit`/`analyze_distinct_limit()` (past the cap, `distinct_count` is reported as unknown rather than approximated) |
+
+`LocalServer` also exposes test-telemetry accessors, not a stable monitoring API: `last_query_parallel_workers()`,
+`last_query_optimizer_invocations()`, and one per-operator spill accessor each for hash join, `GROUP BY`, sort,
+distinct, set-operation, and window (`last_query_hash_join_spilled()`, `last_query_group_by_spilled()`,
+`last_query_sort_spilled()`, `last_query_distinct_spilled()`, `last_query_set_operation_spilled()`,
+`last_query_window_spilled()`), each reporting whether that operator kind spilled in the caller thread's most
+recent statement.
 
 ---
 

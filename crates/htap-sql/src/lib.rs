@@ -9,6 +9,7 @@ pub mod ast;
 pub mod binder;
 mod binder_query;
 pub mod expr;
+pub mod optimize;
 pub mod prepare;
 pub mod query;
 pub mod result;

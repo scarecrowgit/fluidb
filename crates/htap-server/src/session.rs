@@ -62,7 +62,7 @@ use htap_common::types::{Mutation, Row, Value};
 use htap_common::Version;
 use htap_rowstore::Snapshot;
 use htap_sql::ast::BoundStatement;
-use htap_sql::expr::{EvalContext, VariableLookup};
+use htap_sql::expr::VariableLookup;
 use htap_sql::result::StatementResult;
 use htap_sql::{
     classify_set_target, parse_autocommit_value, system_variable_value, validate_isolation_level,
@@ -454,6 +454,7 @@ fn is_ddl(bound: &BoundStatement) -> bool {
         BoundStatement::CreateTable(_)
             | BoundStatement::DropTable(_)
             | BoundStatement::AlterPartitions(_)
+            | BoundStatement::AnalyzeTable(_)
             | BoundStatement::CreateUser(_)
             | BoundStatement::AlterUser(_)
             | BoundStatement::DropUser(_)
@@ -470,6 +471,18 @@ fn is_write(bound: &BoundStatement) -> bool {
         bound,
         BoundStatement::Insert(_) | BoundStatement::Delete(_) | BoundStatement::Update(_)
     )
+}
+
+/// Returns the statement actually executed by an `EXPLAIN ANALYZE`; plain `EXPLAIN` only plans
+/// its inner statement and therefore remains permitted inside an open transaction.
+fn execution_target(bound: &BoundStatement) -> &BoundStatement {
+    match bound {
+        BoundStatement::Explain {
+            inner,
+            analyze: true,
+        } => execution_target(inner),
+        _ => bound,
+    }
 }
 
 fn access_denied(username: &str) -> HtapError {
@@ -826,7 +839,8 @@ impl Session {
 
         // DDL is rejected inside any open transaction, explicit or implicit (autocommit off);
         // the transaction, if any, survives untouched (not poisoned).
-        if is_ddl(&bound) && (self.in_transaction() || !self.autocommit) {
+        let execution_target = execution_target(&bound);
+        if is_ddl(execution_target) && (self.in_transaction() || !self.autocommit) {
             return Err(HtapError::Unsupported(
                 "DDL is not supported inside an explicit transaction; COMMIT or ROLLBACK first"
                     .into(),
@@ -857,7 +871,7 @@ impl Session {
                 if let Some(reason) = &open_txn.poisoned {
                     return Err(HtapError::Conflict(reason.clone()));
                 }
-                if open_txn.read_only && is_write(&bound) {
+                if open_txn.read_only && is_write(execution_target) {
                     return Err(HtapError::InvalidArgument(
                         "cannot execute a data-modifying statement inside a READ ONLY \
                          transaction"
@@ -1132,7 +1146,7 @@ impl Session {
             read_only,
             max_allowed_packet: self.max_allowed_packet,
         };
-        let eval_ctx = EvalContext {
+        let eval_ctx = htap_sql::eval_context! {
             row: &[],
             current_outer_row: None,
             aggregates: &[],

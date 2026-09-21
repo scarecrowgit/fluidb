@@ -235,8 +235,16 @@ fn walk_referenced_statement(statement: &Statement, ctes: &[String], names: &mut
                 names.push(table_name_for_reference(name));
             }
         }
+        Statement::Explain { statement, .. } => {
+            walk_referenced_statement(statement, ctes, names);
+        }
         Statement::ExplainTable { table_name, .. } => {
             names.push(table_name_for_reference(table_name));
+        }
+        Statement::Analyze(analyze) => {
+            if let Some(table_name) = &analyze.table_name {
+                names.push(table_name_for_reference(table_name));
+            }
         }
         _ => {}
     }

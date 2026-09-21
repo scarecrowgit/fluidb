@@ -331,3 +331,172 @@ fn test_uncommitted_truncate_vanishes_after_reopen() {
         "an uncommitted TRUNCATE must never survive a reopen"
     );
 }
+
+#[test]
+fn test_non_finite_float_update_reports_reopen_outcome() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+        server
+            .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v DOUBLE);")
+            .unwrap();
+        server
+            .execute("INSERT INTO t (id, v) VALUES (1, 1e308);")
+            .unwrap();
+
+        let err = server
+            .execute("UPDATE t SET v = v * 10 WHERE id = 1;")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("DOUBLE value is out of range"),
+            "expected DOUBLE range error, got {err}"
+        );
+
+        // `server` drops here before reopen, releasing the root's advisory lock.
+    }
+
+    let reopened = LocalServer::open(dir.path()).unwrap();
+    assert_eq!(
+        as_rows(reopened.execute("SELECT v FROM t WHERE id = 1;").unwrap()),
+        vec![Row::new(vec![Value::Float64(1e308)])],
+        "the rejected non-finite UPDATE must not alter the original value"
+    );
+}
+
+#[test]
+fn test_float_multiply_overflow_rejected() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v DOUBLE);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 1e308);")
+        .unwrap();
+
+    let err = server
+        .execute("UPDATE t SET v = v * 10 WHERE id = 1;")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("DOUBLE value is out of range"),
+        "expected DOUBLE range error, got {err}"
+    );
+}
+
+#[test]
+fn test_float_divide_by_tiny_overflow_rejected() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v DOUBLE);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 1e308);")
+        .unwrap();
+
+    let err = server
+        .execute("UPDATE t SET v = v / 1e-308 WHERE id = 1;")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("DOUBLE value is out of range"),
+        "expected DOUBLE range error, got {err}"
+    );
+}
+
+#[test]
+fn test_float_add_overflow_rejected() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v DOUBLE);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 1e308);")
+        .unwrap();
+
+    let err = server
+        .execute("UPDATE t SET v = v + 1e308 WHERE id = 1;")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("DOUBLE value is out of range"),
+        "expected DOUBLE range error, got {err}"
+    );
+}
+
+#[test]
+fn test_float_subtract_overflow_rejected() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v DOUBLE);")
+        .unwrap();
+    server
+        .execute("INSERT INTO t (id, v) VALUES (1, 1e308);")
+        .unwrap();
+
+    let err = server
+        .execute("UPDATE t SET v = v - (-1e308) WHERE id = 1;")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("DOUBLE value is out of range"),
+        "expected DOUBLE range error, got {err}"
+    );
+}
+
+#[test]
+fn test_double_values_round_trip_bit_identically_after_reopen() {
+    let dir = TempDir::new().unwrap();
+    let expected = [
+        (1_i64, 0.1_f64),
+        (2_i64, -0.0_f64),
+        (3_i64, 1.000_000_000_000_000_2_f64),
+        (4_i64, 1.234_567_890_123_456_7_f64),
+        (5_i64, 1e-308_f64),
+        (6_i64, f64::MIN_POSITIVE),
+        (7_i64, f64::from_bits(1)),
+        (8_i64, f64::MAX),
+    ];
+
+    {
+        let server = LocalServer::open(dir.path()).unwrap();
+        server
+            .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v DOUBLE);")
+            .unwrap();
+
+        let values = expected
+            .iter()
+            .map(|(id, value)| {
+                let value = if *value == 0.0 && value.is_sign_negative() {
+                    "-0.0".to_string()
+                } else {
+                    value.to_string()
+                };
+                format!("({id}, {value})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        server
+            .execute(&format!("INSERT INTO t (id, v) VALUES {values};"))
+            .unwrap();
+    }
+
+    let reopened = LocalServer::open(dir.path()).unwrap();
+    let rows = as_rows(
+        reopened
+            .execute("SELECT id, v FROM t ORDER BY id;")
+            .unwrap(),
+    );
+    assert_eq!(rows.len(), expected.len());
+
+    for (row, (expected_id, expected_value)) in rows.iter().zip(expected) {
+        assert_eq!(row.get(0), Some(&Value::Int64(expected_id)));
+        let Value::Float64(actual_value) = row.get(1).unwrap() else {
+            panic!("expected DOUBLE value, got {row:?}");
+        };
+        assert_eq!(
+            actual_value.to_bits(),
+            expected_value.to_bits(),
+            "DOUBLE value for id={expected_id} must preserve its exact bit pattern"
+        );
+    }
+}

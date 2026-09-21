@@ -2486,3 +2486,318 @@ Stage R row for the full test list.
 **How to reverse it.** Inline each shared function back into its call sites; every call site's own control
 flow (error typing, cleanup policy, dir-sync propagation) was preserved unchanged, so reversal is a pure
 mechanical inlining with no format or behavior consequence.
+
+---
+
+## ADR-023: Inline catalog statistics with a format bump; an `htap-sql`-hosted cost-based optimizer stage; non-durable spill scratch; keeping two binder entry points (Option B) for P2
+
+`Status: Accepted`
+`Date: 2026-09-21`
+
+### Context
+
+`docs/LIMITATIONS.md` and ADR-017's Consequences section listed "no cost-based planning, no spilling, and no
+worker-pool parallelism" as current, intentional gaps on the general query path (`Route::Query`), deferred
+again at Phase 13 (ADR-022). The task explicitly lifted exactly these three items for the general executor
+only — `Route::RowstorePointRead` and `Route::OlapScan` stay byte-for-byte unchanged — plus a partial pass at
+`docs/PROBLEMS.md` P2 (parallel paths through the query layer), without a new on-disk WAL/rowstore format and
+without weakening R5.
+
+### Options considered — where statistics live
+
+1. **A separate sidecar file per table (e.g. `<root>/catalog/stats/<table_id>`).** Rejected: it would add a
+   second durable artifact that has to be kept consistent with the catalog CAS (a table rename/drop racing an
+   in-flight `ANALYZE` publish would need its own two-file consistency protocol), duplicating machinery the
+   catalog's own CAS already provides for free.
+2. **Inline `stats: Option<TableStats>` on `TableDescriptor`, published by the existing single-CAS `HTAPCAT1`
+   envelope, bumping `FORMAT_VERSION` 3 -> 4.** **Chosen.** One CAS already atomically publishes every other
+   piece of table metadata (schema, partitioning, accounts/grants since ADR-021); statistics are just another
+   additive, `#[serde(default)]` field following the same `id_high_water`/`partitioning` precedent — a v3
+   payload decodes with `stats: None` on every table with no new decode-time branching, and a v4 payload with a
+   corrupted CRC is rejected the same way every other envelope fault is (`EnvelopeError::ChecksumMismatch` ->
+   `HtapError::Corruption`).
+3. **Refresh policy: explicit-only (`ANALYZE TABLE`), no automatic trigger, default-heuristic fallback when
+   absent.** **Chosen** over auto-refresh-on-write or a background analyze job: either would need its own
+   scheduling/backoff/staleness-tracking machinery disproportionate to a local MVP, and CLAUDE.md's scope rule
+   already excludes autonomous background scheduling elsewhere (conversion ticks). `estimate_row_count`/
+   `estimate_equality_selectivity`/`estimate_range_selectivity` each report whether the number came from real
+   statistics or a hard-coded default (`EstimateSource::{Stats,Default}`), surfaced through `EXPLAIN`, so an
+   operator can always tell which one fired rather than the optimizer silently pretending a default is a
+   measurement. Statistics never expire automatically and are never checked for staleness against subsequent
+   writes — a documented gap, not fixed here (see `docs/LIMITATIONS.md`).
+4. **Statistics are table-level only (aggregated across every partition in one `ANALYZE TABLE`), not
+   per-partition.** **Chosen**: a per-partition breakdown would roughly multiply the exact-distinct-count
+   memory cost by partition count for no benefit the optimizer currently uses (partition pruning is still
+   purely bound/range-based, unaffected by statistics — see `docs/PARTITIONS.md`), and would require deciding
+   how to merge per-partition distinct sets at the cap boundary, a genuinely harder problem than exact
+   distinct counting itself.
+5. **Distinct count: exact via `HashSet<Value>`/`BTreeSet<Value>`, capped at a configurable limit
+   (`LocalServer::with_analyze_distinct_limit`, default 200,000); past the cap, drop the accumulated set and
+   report `distinct_count: None` rather than an approximation.** **Chosen** over an approximate sketch
+   (HyperLogLog or similar): an approximate structure is a second statistics format to design, encode, and
+   keep correct, and an *exact* count that stops being available past a cap (rather than becoming silently
+   wrong) matches the project's existing "fail loud, not silently approximate" posture (e.g. `EnvelopeError`
+   over guessed recovery). `min`/`max`/`null_count` are always collected unconditionally regardless of the
+   cap, since they cost O(1) additional state per row, not O(distinct values).
+
+### Options considered — the optimizer stage
+
+1. **Host the optimizer in `htap-server` alongside `query_exec`.** Rejected: cost estimation, predicate-atom
+   classification, and join-tree reordering operate purely on `htap-sql::query::{BoundQuery, SelectBody,
+   JoinTree}` types and need no storage access beyond a small `StatsLookup` trait object — putting it in
+   `htap-server` would create a needless `htap-server -> htap-sql -> htap-server` type round-trip and blur the
+   crate boundary ADR-022's `SubqueryRunner` design explicitly kept clean (`htap-sql` must never depend on
+   `htap-server`).
+2. **A storage-agnostic `htap-sql::optimize` stage: a `StatsLookup` trait supplied by the caller (implemented
+   as a thin `CatalogStats` wrapper in `htap-server`), cost estimators reporting `EstimateSource`, a
+   predicate-atom inventory with `origin`/`mobility` (not a "lowest common ancestor slot" heuristic — see
+   below), subset-DP join reordering up to 8 relations per connected `Inner`/`Cross` component with a greedy
+   cheapest-extension fallback above that, and a `PhysicalQuery` entry point (`optimize::optimize`) that is
+   total (never panics) and never changes the result set.** **Chosen.**
+3. **Predicate placement model: "lowest common slot" (attach a predicate to the lowest join node whose subtree
+   covers every slot the predicate references) vs. predicate atoms carrying explicit provenance
+   (`origin: On(join_id) | Where | Using | Natural`, `mobility: FreelyMovableWithinComponent |
+   PinnedToJoin(join_id) | PostJoinOnly`).** **Chosen the provenance model.** "Lowest common slot" alone gets
+   the two classic outer-join traps wrong: a `WHERE`-clause conjunct referencing a null-supplying slot under an
+   outer join, or a conjunct inside a `LEFT JOIN ... ON` that touches the null-supplying side, both change the
+   query's result set if freely relocated, even though a slot-coverage rule alone would place them the same
+   way it places a safe inner-join conjunct. `PredicateAtom.mobility` is computed once per atom from its
+   origin and the join structure it sits under, and every reorder respects it.
+4. **Always-on predicate-conservation validator, not a debug-only assertion.** **Chosen**: a silently dropped
+   or duplicated predicate during reordering is a wrong-result bug, the single most dangerous failure class
+   for this feature (see the researcher's original plan's "Risks" section). `validate_predicate_conservation`
+   runs unconditionally after every optimization attempt and asserts the multiset of original predicate ids
+   equals exactly the attached-plus-retained set; on failure, `optimize_select` falls back to the identity
+   `PhysicalQuery` (`HtapError::Internal` is never raised to the caller as a query failure — a suboptimal but
+   correct plan is always preferred over erroring out or risking a wrong result).
+5. **Enable the optimizer by default for every `Route::Query` execution** (`ExecContext::optimization_mode`
+   defaults to `OptimizationMode::Enabled`, both `dispatch_bound` call sites in `htap-server/src/lib.rs`
+   construct it enabled), keeping an internal `Disabled` mode reachable only for the differential test's
+   identity-baseline comparison. **Chosen** over an opt-in flag: the optimizer only ever produces a
+   conservation-validated, differentially-tested plan or falls back to the untouched original, so there is no
+   "unsafe by default" argument for gating it behind a setting the way, say, `--require-secure-transport` is
+   gated for a genuinely behavior-changing security posture.
+
+### Options considered — spill files
+
+1. **Reuse `htap_common::envelope` (the shared six-envelope magic+version+CRC32C format) for spill files.**
+   Rejected: that contract exists specifically for durable, recoverable files that must be correctly readable
+   after a crash and across format versions — every property spill scratch explicitly does not need. Reusing
+   it would either weaken the envelope's own guarantees by special-casing an exemption, or force spill files to
+   pay for CRC computation and a version-range decision they get no benefit from.
+2. **A minimal, explicitly non-durable spill header** (`crates/htap-server/src/spill.rs`: magic `HTAPSPIL`,
+   kind tag, statement id, operator kind, format tag; no CRC, no fsync, no accepted-version-range contract) **+
+   a `SpillDir` that tracks every file it creates and removes them all, best-effort, on `Drop`.** **Chosen.**
+   Framing still goes through `htap_common::bytecursor::ByteReader` for the length-prefixed row records (so a
+   truncated or adversarially large length field fails cleanly with a structured error rather than an
+   unchecked allocation or panic), but the file as a whole carries no durability contract, matching decision 8
+   below.
+3. **Location and lifecycle: `<data-root>/spill/<statement-id>/`, removed on `SpillDir::drop` at the end of
+   the statement, and swept in full (`remove_dir_all("<data-root>/spill")`) on every `LocalServer::open`, after
+   the root `ProcessLock` is acquired.** **Chosen** over leaving abandoned spill directories from a crashed
+   process for a future statement to stumble over, or requiring an operator to clean them manually; sweeping
+   under the exclusive root lock is safe because no other statement can be mid-spill while the lock is held
+   exclusively at open time.
+4. **Spill scratch is never counted toward any durability guarantee, and is disclosed as such, not silently
+   assumed safe.** **Chosen** (restating decision 2 as an explicit consequence): a process kill mid-spill
+   leaves partial spill files that the next `LocalServer::open`'s sweep simply deletes; no in-flight query's
+   result was ever considered committed or durable while spilling, so this has no bearing on the CLAUDE.md
+   durability invariants (WAL/rowstore/catalog/manifest envelopes), which are entirely unrelated files.
+
+### Options considered — P2 binder convergence
+
+1. **Option A: unify `htap_sql::binder::bind` and `htap_sql::binder_query::bind_select_body` into one binder
+   entry point with a post-bind classifier deciding the route.** Rejected, per the coordinator's explicit
+   instruction and verified against ADR-017's own text before being accepted: ADR-017 deliberately rejected
+   exactly this shape ("it would remove the purely structural separation R5 depends on... a single
+   binder/executor for every `SELECT` shape makes... a runtime property... instead of a compile-time one").
+   Option A would restore R5's guarantee only via the same kind of runtime check ADR-017 already considered
+   and declined.
+2. **Option B: keep both binder entry points, converge only the leaf-level sub-problems they solve
+   independently (literal binding, cast-target mapping, type-compatibility/comparability checks, scalar-
+   function signature checking, schema column lookup), plus executor-side unifications that do not touch
+   binding at all (one `EvalContext` constructor, one join evaluator).** **Chosen**, for the reason above: a
+   complete-PK point read is still decided by `is_narrow_select_shape` before any general-binder code runs at
+   all, exactly as before this ADR — the guarantee stays in the code's shape, not a runtime branch, at the
+   admitted cost of a less complete cleanup than Option A would have given.
+
+**What this diff actually delivered under Option B, stated exactly so `docs/PROBLEMS.md` is not overclaimed.**
+Delivered: an `EvalServices`/`EvalContext::new` (`htap_sql::eval_context!`) constructor replacing every
+hand-built `EvalContext { .. }` literal across `crates/htap-server/src/{query_exec,lib,session}.rs`; one join
+evaluator (`SelectBody.join_tree` is now always populated at bind time — `left_deep_join_tree` synthesizes a
+tree from the flat `Vec<JoinSpec>` form when the binder builds one — and the separate flat-loop branch inside
+`run_select` plus the old `SelectBody.joins`/`tree_only` fields were removed, leaving `evaluate_join_tree` as
+the only join execution path); and the `#[allow(clippy::too_many_arguments)]` count in
+`crates/htap-server/src/query_exec.rs` dropped to zero via context structs. **Not delivered in this diff: the
+shared binder leaf-helper module** (literal binding, cast-target mapping, comparability checks, scalar-
+function signature checks, schema column lookup) that decision 2 above scoped as Option B's actual P2
+deliverable. `htap_sql::binder.rs` and `binder_query.rs` still each maintain their own copy of that
+leaf-level logic; no `bind_helpers`-shaped module exists. This is recorded here as an open item, not folded
+silently into "P2 partially fixed" without saying which part is still open — see `docs/PROBLEMS.md`'s Phase 14
+update for the precise remaining scope.
+
+### Consequences
+
+- `HTAPCAT1` `FORMAT_VERSION` is 4; a version-3-or-earlier catalog still opens (`stats: None` on every table),
+  and a version-4 payload with a bad CRC is rejected the same way every other envelope fault is. The
+  storage-format compatibility table in `docs/ARCHITECTURE.md` reflects the new accepted range.
+- `Route::RowstorePointRead` and `Route::OlapScan` never call `htap_sql::optimize::optimize` — verified
+  directly (not just by matching output) in `crates/htap-server/tests/explain.rs`'s two R5-bypass tests.
+- `ANALYZE TABLE` binds to `BoundStatement::AnalyzeTable`, classified as `Route::CatalogDdl` like every other
+  DDL statement, and **is** included in `Session::is_ddl`'s match list: it is rejected by the "DDL inside an
+  open transaction" gate exactly like `CREATE TABLE`/`DROP TABLE`/user-management DDL, the rejection does not
+  poison the transaction, and `EXPLAIN ANALYZE` follows the transaction rules of the statement it actually
+  executes (plain `EXPLAIN`, which only plans, remains permitted). Proven by
+  `crates/htap-server/tests/session.rs::{test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives, test_explain_analyze_wrapping_ddl_rejected_inside_open_transaction, test_explain_analyze_wrapping_insert_rejected_inside_read_only_transaction}`
+  and `crates/htap-server/tests/explain.rs::test_plain_explain_select_permitted_inside_open_transaction`. This
+  was originally shipped as a disclosed gap (see the superseded wording this bullet replaces, still visible in
+  git history) and was closed by the storage review described below, not by this ADR's original diff.
+- Hash-join spilling is not structurally restricted to `INNER`/`CROSS` the way the *parallel* hash join is
+  (`join_rows_inner`'s `allow_spill` path runs for any join kind whose `ON` clause yields at least one usable
+  equi-key); only `INNER`-join spilling is exercised by a test in `crates/htap-server/tests/spill.rs`. This is
+  recorded as an evidence gap, not a claim that outer-join spilling is proven correct.
+- P2 (`docs/PROBLEMS.md`) moves from "fix in Phase 14" to "partially fixed in Phase 14": the executor-side
+  duplication (hand-built `EvalContext`, two join executors, long parameter lists in `query_exec.rs`) is
+  resolved; the binder-side leaf-helper duplication decision 2 above scoped as the actual P2 deliverable is
+  not, and remains open for a future phase.
+- **A storage review of this ADR's original diff found 13 defects, all fixed and covered by tests before this
+  wording was written.** Most were narrower correctness/evidence gaps (including the `ANALYZE TABLE`
+  transaction-gating gap closed above, and the spill scratch location and reader-buffering issues described in
+  `docs/PROGRESS.md`'s Phase 14 row). Two are worth naming here as lessons for whoever next touches this code,
+  not just a fix log entry: (1) the optimizer's predicate-atom reordering could move a predicate across an
+  outer-join boundary and silently change the result set — exactly the class of bug decision 3 under "the
+  optimizer stage" above was designed to prevent, so the conservation validator alone was not sufficient
+  without also fixing the mobility classification itself; fixed and now covered by
+  `crates/htap-sql/src/optimize.rs`'s pinning/conservation unit tests and
+  `crates/htap-server/tests/differential.rs`'s two outer-join differential tests (see `docs/PROGRESS.md`). (2)
+  The parallel `GROUP BY`/hash-join operators were unreachable dead code — the parallelism gate's precondition
+  could never be satisfied in practice, so every "parallel" test was actually comparing the serial path against
+  itself under a different worker-count setting; fixed by reworking the gate to inspect the expressions workers
+  evaluate instead of requiring services to be absent, and now covered by
+  `crates/htap-server/tests/parallel.rs` (including the new `test_group_by_with_variable_does_not_parallelize`
+  negative case) using the test-telemetry `LocalServer::last_query_parallel_workers()` accessor to assert more
+  than one worker actually ran.
+
+### External-review round: scope clarification, per-operator telemetry, partition caps, and a second brick-risk close
+
+A second, external-review pass over this ADR's diff found the memory budget's scope was under-specified and
+two more brick-risk-shaped gaps, all fixed and covered by tests before this section was written:
+
+- **Memory budget scope.** The budget and every spill path apply to `Route::Query` only. A single-table
+  `SELECT` with `ORDER BY`, `GROUP BY`, or a plain aggregate and no join routes to `Route::OlapScan` instead,
+  which has no memory budget and never spills — by design, since that narrow path predates this ADR and was
+  never in scope for it. Several early spill tests were silently exercising the unbudgeted `Route::OlapScan`
+  path (their `SELECT` had no join) and were rewritten to use a shape that actually reaches `Route::Query`.
+  The budget itself only bounds each operator's own working memory (hash tables, sort runs, aggregate state,
+  partition buffers); it does not bound the rows a non-pipelined executor materializes between operators — a
+  disclosed, not hidden, limit of "memory budget," not "memory bound."
+- **Spill telemetry became per-operator.** The original diff's spill telemetry was coarse enough that an
+  `ORDER BY` spill test could pass because its `JOIN` spilled instead of its sort. `LocalServer` now exposes
+  one accessor per operator kind (`last_query_hash_join_spilled`, `last_query_group_by_spilled`,
+  `last_query_sort_spilled`, `last_query_distinct_spilled`, `last_query_set_operation_spilled`,
+  `last_query_window_spilled`), and every spill test in `crates/htap-server/tests/spill.rs` now asserts its own
+  named operator actually spilled.
+- **Partition counts and depth, made explicit and bounded.** Hash-join spill partition count is sized from the
+  input and the remaining budget, capped at 128 (windows share this cap, to bound open file descriptors and the
+  writer buffers the budget doesn't count); `GROUP BY` and the set operators each spill into their own
+  fixed 16 partitions (a separate constant from the hash-join cap, not shared machinery, and — unlike the
+  hash-join/window cap — not scaled by input size or the remaining budget: an input much larger than roughly
+  16x the budget fails with the memory-budget error instead of spilling successfully; budget-sized
+  partitioning for `GROUP BY`/the set operators is a deferred improvement); window spilling
+  hash-partitions by the `PARTITION BY` key and evaluates one window partition at a time (no `PARTITION BY` is
+  a single partition). In every case, a partition that still doesn't fit — skew, or the partition-count cap —
+  fails with the memory-budget error rather than recursing into a second spill level; an agent's attempt at
+  recursive re-spill during this round caused a stack overflow and was reverted, which is why "one level, then
+  fail" is now stated as a hard design constraint here, not an implementation detail that might change.
+  `GROUP BY` spill additionally reserves each partition's rows as they are read back and releases that
+  reservation before in-memory aggregation runs, to avoid double-charging the same bytes on the way in — but
+  the rows themselves are still resident while the released charge is re-applied to the aggregate state, so
+  peak memory during one partition's aggregation can approach about twice the budget. This is disclosed as an
+  imprecision in the budget's accounting, not a correctness defect: the query still completes with the right
+  answer, or fails cleanly if truly out of memory.
+- **`EXPLAIN` on DDL, and catalog statistics get their own validation.** `EXPLAIN`/`EXPLAIN ANALYZE` on
+  `CREATE TABLE` (and other DDL) now works, rather than being an unhandled or silently-wrong case. Catalog
+  statistics (`TableStats`) are now structurally validated on every publish — column count, null count,
+  distinct count, min/max type agreement, `min <= max`, and finiteness — with no `HTAPCAT1` format change.
+- **Float overflow now errors instead of silently going non-finite.** `+`/`-`/`*`/`/` and `SUM`/`AVG` overflow
+  return `"DOUBLE value is out of range"` (MySQL-compatible); division by zero is unchanged and still yields
+  `NULL`. The motivating risk was concrete, not theoretical: `serde_json`, used for both row mutation payloads
+  and catalog statistics, encodes a non-finite float as JSON `null`, which then fails to decode back into a
+  non-`Option` float field. On the row path this was already caught before this round — confusingly, but
+  safely — by `RowstoreParticipant::decode_payload` running inside 2PC `prepare`, i.e. before commit, so an
+  undecodable mutation was refused rather than corrupting anything; the catalog statistics path had no
+  equivalent incidental protection and was the real brick risk, now closed by rejecting non-finite bounds
+  during `ANALYZE TABLE` and by the `TableStats` structural validation above. The narrow analytic scan path's
+  own `SUM` accumulator (`crates/htap-server/src/olap.rs`) had no equivalent overflow check as of this
+  writing; this was recorded as an unverified-beyond-code-inspection gap, not claimed as fixed — closed in
+  the second external-review round below.
+- **Two cost-quality-only weaknesses, confirmed not to affect correctness.** An external reviewer specifically
+  checked whether the optimizer's leaf-cost and outer-join cardinality estimation weaknesses could change a
+  result, not just a plan choice, and confirmed they cannot: outer joins are never reordered by the DP/greedy
+  join-reordering step, and null-padding of an outer join's unmatched rows is independent of which side was
+  chosen as the hash build side. Left open, and disclosed rather than fixed in this round: window evaluation
+  carries every materialized column of the joined input into its spill partitions, not just the columns the
+  query needs (measured 8 columns / ~424 B per row where 3 are needed) — a column-trimming improvement, not
+  attempted here.
+
+### Second external-review round: a float-decode precaution, non-finite coverage completed, and two disclosed limits
+
+A second, independent storage review of this ADR's diff found one theoretical `serde_json` risk (not
+demonstrated), confirmed the analytic path's `SUM` gap noted above was real, and flagged two more
+non-blocking limitations:
+
+- **`serde_json`'s `float_roundtrip` feature, enabled workspace-wide, is a precaution, not a bug fix.** The
+  review's claim was that `serde_json`'s default ("best-effort precision") float parser could decode a stored
+  `DOUBLE` one ULP off from the value that was encoded. Tested directly with the feature switched off, the
+  default parser round-tripped 50,000 random finite bit patterns plus adjacent doubles, subnormals, the
+  extremes, and `-0.0` bit-identically on this `serde_json` version — no drift was demonstrated. The feature
+  is kept anyway because it guarantees exact round-trips regardless of `serde_json` version, at some cost in
+  parse speed; there is no on-disk format change, only a parsing-library behavior. Covered by
+  `crates/htap-common/src/types.rs::types::tests::test_serde_json_float64_roundtrips_bit_identically` (the
+  committed bit-identity check, run with the feature enabled), the strengthened
+  `crates/htap-server/tests/session_recovery.rs::test_double_values_round_trip_bit_identically_after_reopen`
+  (bit-identity across a `LocalServer` close/reopen), and
+  `crates/htap-server/tests/spill.rs::test_spilled_set_operations_and_distinct_preserve_awkward_doubles`
+  (bit-identity through a spilled `DISTINCT`/set-operation round-trip).
+- **Spilled set operations and `SELECT DISTINCT` emit rows by source index, not by re-decoding.** Both now
+  look up the original row by the index recorded when it was written to the spill file, instead of keying a
+  map by the decoded row. This makes their correctness independent of JSON round-trip exactness — hardening
+  in response to the review's concern, not a fix for a demonstrated bug (the encode/decode path is exact per
+  the point above regardless).
+- **Spill partition cap tightened to 128 for hash join and window.** The cap introduced in the first
+  external-review round (above) was 256; this round lowered it to 128 to bound open file descriptors and the
+  writer buffers the memory budget does not itself count. `GROUP BY` and the set operators keep their
+  separate, fixed-16-partition constant (see the partition-counts bullet above), which is now recorded there
+  as a disclosed, not-yet-fixed limitation for large inputs.
+- **Non-finite float coverage completed: `CAST` from a string, non-finite literals, and the analytic path's
+  `SUM` all now return `"DOUBLE value is out of range"`.** `CAST('nan'/'inf'/'1e999' AS DOUBLE)` and
+  out-of-range float literals (e.g. `1e400`) are rejected the same way `+`/`-`/`*`/`/`/`SUM`/`AVG` overflow
+  already were; the analytic scan path's own `SUM` accumulator (flagged as an open, unverified gap in the
+  first external-review round above) is now checked identically to the general executor's `SUM`. The
+  transaction layer's pre-commit payload decode remains the confirmed reason a non-finite value could never
+  become durable even before any of these checks existed. Covered by
+  `crates/htap-server/tests/query_exec.rs::{test_non_finite_double_casts_and_literals_are_rejected,
+  test_non_finite_cast_update_fails_at_statement_and_leaves_value_unchanged,
+  test_analytic_float_sum_overflow_returns_out_of_range_error, test_float_sum_overflow_returns_out_of_range_error}`.
+- **`ANALYZE`'s min/max bound reservation now reserves before swapping.** `AnalyzeAccumulator::replace_bound`
+  reserves the replacement value's memory first and only then drops the old reservation and installs the new
+  bound, so a failed reservation leaves the previous bound and its accounting exact instead of leaving a
+  bound with no matching reservation. Covered by
+  `crates/htap-server/src/analyze.rs::analyze::tests::replace_bound_preserves_existing_reservation_when_budget_is_exhausted`.
+- **Disclosed, not fixed.** `ANALYZE TABLE` fully materializes each partition before reserving its memory, so
+  usage can overshoot before the check runs, and a partition whose estimate lands above the budget fails
+  `ANALYZE` outright. The abandoned-spill sweep at `LocalServer::open` only logs a failure to remove the
+  directory rather than returning an error; a stale file left behind by a failed sweep can collide once with
+  a statement id reused after a process restart (`SpillWriter::create` opens with `create_new(true)`), and
+  that one statement fails with an `AlreadyExists` I/O error that heals on its own once that id has been
+  consumed.
+
+### Test Evidence
+
+See `docs/PROGRESS.md`'s Phase 14 row for the full, verified test list (statistics, optimizer, `EXPLAIN`,
+spilling, and parallelism, each cross-checked against `cargo test -p <crate> -- --list`). Cross-references:
+ADR-017 (the general query executor and R5's syntactic shape gate this ADR extends without weakening), ADR-022
+(the `JoinTree`/flat-lowering design this ADR's "one join evaluator" change supersedes — flat-lowering is now
+always applied at bind time rather than being a separate fast path the executor chooses between), ADR-004/008/
+009 (durability invariants — the only on-disk change in this ADR is the additive `HTAPCAT1` v3 -> v4 bump;
+spill files are explicitly outside the durability contract by decision 2 above).

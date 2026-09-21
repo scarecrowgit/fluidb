@@ -80,6 +80,25 @@ pub fn bind(statement: &Statement, catalog: &CatalogSnapshot) -> Result<BoundSta
             )
         }
         Statement::ShowGrants { for_ } => bind_show_grants(for_.as_ref()),
+        Statement::Analyze(analyze) => bind_analyze_table(analyze, catalog),
+        Statement::Explain {
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement: inner,
+            format,
+            options,
+            ..
+        } => {
+            if *verbose || *query_plan || *estimate || format.is_some() || options.is_some() {
+                return Err(HtapError::Unsupported("unsupported EXPLAIN option".into()));
+            }
+            Ok(BoundStatement::Explain {
+                inner: Box::new(bind(inner, catalog)?),
+                analyze: *analyze,
+            })
+        }
         Statement::Drop { .. } => crate::binder_query::bind_drop(statement),
         Statement::ShowTables { .. }
         | Statement::ShowDatabases { .. }
@@ -309,6 +328,38 @@ fn bind_show_grants(for_username: Option<&GranteeName>) -> Result<BoundStatement
     Ok(BoundStatement::ShowGrants(ShowGrantsStatement {
         for_username: for_username.map(bind_grantee_name).transpose()?,
     }))
+}
+
+fn bind_analyze_table(
+    stmt: &sqlparser::ast::Analyze,
+    catalog: &CatalogSnapshot,
+) -> Result<BoundStatement> {
+    let table_name = stmt
+        .table_name
+        .as_ref()
+        .ok_or_else(|| HtapError::InvalidArgument("ANALYZE requires a table name".into()))?;
+    let table_name = extract_unqualified_name(table_name)?;
+
+    if catalog.table_by_name(&table_name).is_none() {
+        return Err(table_not_found(&table_name));
+    }
+    if stmt.for_columns {
+        return Err(HtapError::Unsupported(
+            "column lists in ANALYZE TABLE are not supported".into(),
+        ));
+    }
+    if stmt.noscan {
+        return Err(HtapError::Unsupported(
+            "NOSCAN in ANALYZE TABLE is not supported".into(),
+        ));
+    }
+    if stmt.partitions.is_some() {
+        return Err(HtapError::Unsupported(
+            "partition-scoped ANALYZE TABLE is not supported".into(),
+        ));
+    }
+
+    Ok(BoundStatement::AnalyzeTable(table_name))
 }
 
 fn extract_unqualified_name(name: &ObjectName) -> Result<String> {

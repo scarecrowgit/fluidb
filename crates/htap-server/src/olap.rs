@@ -646,6 +646,11 @@ impl Accumulator {
                             None => *v,
                             Some(s) => *s + *v,
                         };
+                        if !next.is_finite() {
+                            return Err(HtapError::InvalidArgument(
+                                "DOUBLE value is out of range in 'SUM'".into(),
+                            ));
+                        }
                         *sum = Some(next);
                     }
                     other => {

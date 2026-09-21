@@ -254,8 +254,18 @@ pub(crate) fn check_privileges(
             &select.table,
             PrivilegeSet::SELECT,
         ),
+        BoundStatement::AnalyzeTable(table_name) => check_table_privilege(
+            username,
+            account.id,
+            catalog,
+            table_name,
+            PrivilegeSet::SELECT,
+        ),
         BoundStatement::Query(query) => {
             check_query_privileges(username, account.id, query, catalog)
+        }
+        BoundStatement::Explain { inner, .. } => {
+            check_privileges(principal, inner.as_ref(), catalog)
         }
         BoundStatement::Update(update) => {
             check_table_privilege(

@@ -559,6 +559,8 @@ dependencies = [
  "htap-coord",
  "htap-movement",
  "htap-rowstore",
+ "htap-server",
+ "htap-sql",
  "htap-txn",
  "tempfile",
 ]

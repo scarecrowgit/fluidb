@@ -35,11 +35,19 @@ components are **deliberately not implemented** and are out of scope for this lo
   `NEWDECIMAL` parameters are kept as text and bound as a numeric literal (no arbitrary-precision decimal
   type); `TIME`-typed parameters are rejected. See "Prepared statements" below.
 - **No TPC-C or TPC-H compliance:** The system does not implement the TPC-C or TPC-H benchmark specifications, relational transaction models, or analytical query profiles. Microbenchmarks evaluate isolated internal subsystem performance only.
-- **No cost-based optimization, vectorized execution, or worker-pool parallelism above the per-partition
-  scan:** The general query executor (see "Supported SQL Subset" below) handles joins (including arbitrarily
-  nested join trees, kept purely structural — it never reorders/commutes/estimates cost), window functions,
-  correlated subqueries (one level deep only), recursive CTEs, `EXCEPT`/`INTERSECT`, and other set operations
-  over materialized logical rows held in memory, with no spilling and no cost-based planner.
+- **No vectorized execution, and no worker-pool parallelism or memory-bounded spilling for outer joins:** The
+  general query executor (see "Supported SQL Subset" below) handles joins (including arbitrarily nested join
+  trees), window functions, correlated subqueries (one level deep only), recursive CTEs, `EXCEPT`/
+  `INTERSECT`, and other set operations over materialized logical rows in memory. As of Phase 14, this
+  executor has statistics-driven cost-based join reordering (`ANALYZE TABLE`, `htap_sql::optimize`, enabled
+  by default), `EXPLAIN`/`EXPLAIN ANALYZE`, a per-statement memory budget with disk spilling, and bounded
+  parallelism for `GROUP BY` and `INNER`/`CROSS` hash joins — see "Cost-based optimization, `EXPLAIN`,
+  spilling, and parallelism (Phase 14)" below. Still not implemented: a vectorized/pipelined operator engine,
+  and worker-pool parallelism or memory-bounded spilling specifically for `LEFT`/`RIGHT`/`FULL` joins (which
+  stay single-threaded and, while not structurally excluded from spilling, are not exercised by a spill test
+  either). The memory budget and spilling apply to this general executor only: a single-table `SELECT` with
+  `ORDER BY`, `GROUP BY`, or a plain aggregate and no join routes to the narrow analytic scan path instead,
+  which has no memory budget and never spills, by design.
 - **No physical reclamation on `DROP TABLE`:** Dropping a table removes it from the catalog in one CAS;
   the rowstore data and columnar segments of its tablets stay on disk, unreachable (dropped identifiers are
   never reissued, so they can never be aliased by a new table, but disk space is not freed).
@@ -180,9 +188,9 @@ fn main() -> Result<()> {
 }
 ```
 
-Deferred on this path: `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, `LIMIT BY`, non-partition
-`ALTER TABLE`, and cost-based optimization (the join-tree evaluator above is purely structural and never
-reorders/commutes/estimates cost) — see "Unsupported & Deferred SQL & Partition Features" below.
+Deferred on this path: `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, `LIMIT BY`, and non-partition
+`ALTER TABLE`. Cost-based join reordering is implemented as of Phase 14 (`htap_sql::optimize`, enabled by
+default) — see "Unsupported & Deferred SQL & Partition Features" below.
 
 ---
 
@@ -463,9 +471,13 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
   `htap-server::query_exec`:
   - Joins: `INNER`/`LEFT`/`RIGHT`/`CROSS`/`FULL OUTER`, `NATURAL`/`USING` with real column coalescing, table
     aliases, qualified names, `*`/`t.*`, and arbitrarily nested parenthesized join trees (e.g.
-    `a LEFT JOIN (b JOIN c ON ...) ON ...`) — a purely left-deep, any-join-kind shape lowers to the original
-    flat hash-join executor unchanged; a genuinely nested/parenthesized shape uses a separate recursive
-    evaluator, pinned byte-identical to the flat one by a mandatory differential test.
+    `a LEFT JOIN (b JOIN c ON ...) ON ...`) — a left-deep, flat `JoinSpec` chain is synthesized into the same
+    tree shape at bind time, so one join evaluator (`evaluate_join_tree`) runs every join, whether written
+    flat or explicitly parenthesized (a separate flat-loop executor existed through Phase 13 and was removed
+    in Phase 14; a differential test still pins a flat-written query and its explicitly-parenthesized
+    equivalent to identical results). As of Phase 14, an `INNER`/`CROSS` join component may be cost-reordered
+    by `htap_sql::optimize` before execution (see "Cost-based optimization, `EXPLAIN`, spilling, and
+    parallelism (Phase 14)" below).
   - Expressions: arithmetic (`+ - * / % DIV`, `/` always widens to `Float64`, `DIV` truncates and stays
     `Int64`, checked overflow), comparisons (incl. column-vs-column), `AND`/`OR`/`NOT`, `IS [NOT] NULL`/
     `TRUE`/`FALSE`, `LIKE`, `IN (list)`, `BETWEEN`, `CASE`, `CAST`, and scalar functions `UPPER`/`LOWER`/
@@ -490,9 +502,13 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
     a converted `Column`/`Converting` table is consistent. Per-slot partition pruning and single-leaf
     predicate pushdown apply as above, except a conjunct on the null-supplying side of an outer join is kept
     as a residual filter rather than pushed down.
-  - Limits: intermediate results (scanned rows, hash tables, groups, window partitions, recursive working
-    tables) are held in memory without bounds — no spilling, no cost-based planning (the join tree above is
-    purely structural), and no worker-pool parallelism above the per-slot scan.
+  - Limits (see "Cost-based optimization, `EXPLAIN`, spilling, and parallelism (Phase 14)" below for the
+    full contract): a per-statement memory budget (default 256 MiB) bounds hash joins, `GROUP BY`,
+    `ORDER BY`, `DISTINCT`/`EXCEPT`/`INTERSECT`, and window partitions, spilling to disk one level deep and
+    failing cleanly if a partition is still over budget after that; `LEFT`/`RIGHT`/`FULL` joins and non-equi/
+    `CROSS` joins are not parallelized, and are not covered by a spill test even though the spill code path
+    is not itself join-kind-restricted. Bounded parallelism covers `GROUP BY` and `INNER`/`CROSS` hash joins
+    only. Recursive CTE working tables remain in memory without a budget.
   - R5 is preserved structurally: a purely syntactic shape test (`is_narrow_select_shape`) runs before any
     deep binding, so a complete-PK lookup or narrow scan keeps its existing route unchanged, and a clause
     that would otherwise be silently dropped (`LIMIT`, alias, join, `OR` on a PK lookup) instead falls
@@ -543,6 +559,27 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
   SHOW COLUMNS FROM orders;
   DESCRIBE orders;
   ```
+- **`ANALYZE TABLE`** (`Route::CatalogDdl`, Phase 14):
+  ```sql
+  ANALYZE TABLE orders;
+  ```
+  Scans every partition at one MVCC snapshot and records an exact row count and, per column, null count,
+  min, max, and an exact distinct count (capped at a configurable limit — past the cap, `distinct_count` is
+  reported as unknown rather than approximated). Publishes by catalog CAS of only the `stats` field.
+  `FOR COLUMNS`, `NOSCAN`, and partition-scoped forms are rejected. Statistics are table-level (aggregated
+  across partitions) and never expire automatically. `ANALYZE TABLE` counts as DDL, so like
+  `CREATE TABLE`/`DROP TABLE` it is rejected inside an open transaction — see "Cost-based optimization,
+  `EXPLAIN`, spilling, and parallelism (Phase 14)" below.
+- **`EXPLAIN` / `EXPLAIN ANALYZE`** (Phase 14):
+  ```sql
+  EXPLAIN SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id;
+  EXPLAIN ANALYZE SELECT * FROM orders WHERE amount > 100;
+  ```
+  Renders the query's plan (one row per node: `node_id`, `parent_id`, `operation`, `table`, `est_rows`,
+  `estimate_source`, `build_side`). For a complete-PK point lookup or a narrow single-table scan, renders a
+  single-node plan and never invokes the cost-based optimizer — preserving R5 through `EXPLAIN` too.
+  `EXPLAIN ANALYZE` additionally executes the statement and reports the root node's actual row count and
+  elapsed time. `verbose`/`query_plan`/`estimate`/non-default `format`, and nested `EXPLAIN`, are rejected.
 
 ### Partitioned Table Support (SQL DDL & Native Admin API)
 
@@ -576,11 +613,23 @@ Partitioned tables can be defined via SQL DDL or via the native `LocalServer` ad
 ### Unsupported & Deferred SQL & Partition Features
 Direct `SegmentReader` pushdown optimization is implemented for the compact base path (single leaf pushdown), used by `Route::OlapScan` and, per slot, `Route::Query`. Simple unqualified source/projected column `ORDER BY` is implemented for `AnalyticSelect`; the general query path additionally supports joins (including `FULL OUTER`/`NATURAL`/`USING` and arbitrarily nested join trees), CTEs (including `WITH RECURSIVE`), expressions (including integer `DIV`), aliases, full `ORDER BY`/`GROUP BY` (including ordinals), `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, window functions, correlated subqueries, `EXCEPT`/`INTERSECT`, and `UPDATE`/`DELETE` by filter/`TRUNCATE`/`INSERT ... SELECT`/`DROP TABLE`/`SHOW` (see "General `SELECT`" and the bullets above). The following features are still explicitly deferred:
 - Compound `AND` pushdown beyond one leaf, and `!=` pushdown (evaluated as residual SQL filters).
-- Vectorized aggregation, vectorized/pipelined operator execution, and worker-pool parallelism for the general query path (each slot's own partition scan still uses the narrow path's scan workers; joins/grouping/ordering/windows run single-threaded in memory).
-- Cost-based query optimization (the join tree is purely structural — it never reorders/commutes/estimates cost), `LIMIT BY`.
+- Vectorized aggregation and vectorized/pipelined operator execution for the general query path (each slot's
+  own partition scan still uses the narrow path's scan workers; as of Phase 14, `GROUP BY` and `INNER`/`CROSS`
+  hash joins are bounded-parallel and memory-budgeted with disk spilling — see "Cost-based optimization,
+  `EXPLAIN`, spilling, and parallelism (Phase 14)" below — but filter/`ORDER BY`/`DISTINCT`/set-operation/
+  window stages and `LEFT`/`RIGHT`/`FULL` joins still run single-threaded, and `LEFT`/`RIGHT`/`FULL`/non-equi/
+  `CROSS` joins are not parallelized).
+- `LIMIT BY`. (Cost-based join reordering is implemented as of Phase 14 — see below — not deferred.)
 - `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, non-partition `ALTER TABLE`.
-- Memory bounds/spilling for the general query path, physical reclamation of data on `DROP TABLE`.
-- Multi-tablet or distributed scans, distributed fanout, resource quotas, disk spilling, query cancellation (conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented locally).
+- Memory-bounded spilling for non-equi/`CROSS` joins on the general query path (evaluated by an in-memory
+  nested loop with no budget check at all — a genuine gap, unlike `LEFT`/`RIGHT`/`FULL` equi-hash joins, whose
+  spilling is not itself kind-restricted in code but is exercised by a test only for `INNER` joins; memory
+  budgeting and spilling for `GROUP BY` and `INNER` equi-hash joins is implemented and tested as of Phase 14),
+  physical reclamation of data on `DROP TABLE`.
+- Multi-tablet or distributed scans, distributed fanout, resource quotas, query cancellation (conservative
+  finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global
+  merge/order are implemented locally; local disk spilling for the general query path is implemented as of
+  Phase 14 — see below — distributed spill/fanout is not).
 - DataFusion and Apache Arrow integration.
 - Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, and broader string/date/`DATE`/`DECIMAL`/`EXTRACT`/`SUBSTRING`/`INTERVAL`/view functions. (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
 - **MySQL Partition DDL & Partition Lifecycle Boundary:**
@@ -626,6 +675,89 @@ General query executor, `UPDATE`, `DROP TABLE`, and `SHOW`/`DESCRIBE` (Phase 9) 
 - **`crates/htap-wire/tests/wire_server.rs`:** `test_general_sql_over_wire` (joins, `UPDATE`, `SHOW`/`DESCRIBE`, `DROP TABLE` over the MySQL wire protocol).
 
 *(Local embedded prototype only; no production claim.)*
+
+---
+
+## Cost-based optimization, `EXPLAIN`, spilling, and parallelism (Phase 14)
+
+Phase 14 added statistics, a cost-based optimizer stage, `EXPLAIN`/`EXPLAIN ANALYZE`, memory-bounded
+execution with disk spilling, and bounded intra-query parallelism to the general query executor
+(`Route::Query`) only — `Route::RowstorePointRead` and `Route::OlapScan` are byte-for-byte unchanged. See
+ADR-023 in `docs/DECISIONS.md` and `docs/PROGRESS.md`'s Phase 14 row for the full contract and evidence.
+
+- **Statistics:** `ANALYZE TABLE t` (see "Supported SQL Subset" above) records exact per-table row count and
+  per-column null count/min/max/capped-exact-distinct-count, published by catalog CAS. The `HTAPCAT1` catalog
+  envelope bumped format version 3 -> 4 to carry `TableDescriptor.stats`; a version-3-or-earlier catalog still
+  decodes with no statistics. Published statistics are structurally validated before they are accepted (column
+  count, null count, distinct count, min/max type agreement, `min <= max`, and finite float bounds) — no
+  further format change.
+- **Scope: the general executor only.** Every item below applies to `Route::Query`. A single-table `SELECT`
+  with `ORDER BY`, `GROUP BY`, or a plain aggregate (no join) routes to the narrow analytic scan path
+  (`Route::OlapScan`) instead, which has no memory budget and never spills — this is by design, not an
+  oversight, and is why several spill tests below use a join or another shape that reaches the general
+  executor.
+- **Cost-based optimization:** `htap_sql::optimize`, a storage-agnostic stage enabled by default for every
+  general query, estimates row counts/selectivities from statistics (falling back to disclosed defaults when
+  absent), classifies predicates by provenance to avoid the classic outer-join placement traps, and reorders
+  `INNER`/`CROSS` join components (subset dynamic programming up to 8 relations, greedy above that) under an
+  always-on conservation validator that falls back to the unoptimized plan on any internal inconsistency
+  rather than risking a wrong result.
+- **`EXPLAIN`/`EXPLAIN ANALYZE`:** see "Supported SQL Subset" above.
+- **Spilling:** a per-statement memory budget (default 256 MiB) bounds each operator's own working memory
+  (hash tables, sort runs, aggregate state, partition buffers) — it does not bound the rows a non-pipelined
+  executor materializes between operators. One level of disk spilling — non-durable scratch under
+  `<root>/spill/`, swept in full on every `LocalServer::open` — covers hash joins, `GROUP BY`, `ORDER BY`,
+  `DISTINCT`/`EXCEPT`/`INTERSECT`, and window functions. Hash-join partition count is sized from the input and
+  the remaining budget, capped at 128 (windows share this cap, to bound open file descriptors and the writer
+  buffers the budget doesn't count); `GROUP BY` and the set operators each partition into their own fixed 16
+  partitions. A partition that still doesn't fit after that one level — skew, or the partition-count cap —
+  fails cleanly with the memory-budget error rather than recursing into a second spill level. Unlike hash
+  join/window, `GROUP BY`'s and the set operators' fixed 16-partition count does not scale with input size or
+  the remaining budget: an input much larger than roughly 16x the budget fails with the memory-budget error
+  rather than spilling successfully (observed: a set operation over 4,096 awkward-double rows failed at a
+  64 KiB budget, and succeeded at 1,536 rows). Budget-sized partitioning for these operators, like the hash
+  join's, is a deferred improvement. Window spilling
+  hash-partitions by the `PARTITION BY` key and evaluates one window partition at a time (a window with no
+  `PARTITION BY` is a single partition). `GROUP BY` spill reserves each partition's rows as they are read back,
+  then releases that reservation before in-memory aggregation runs (to avoid double-charging the same bytes) —
+  peak memory during one partition's aggregation can therefore approach about twice the budget: a disclosed
+  imprecision, not an exact bound.
+- **Spill telemetry:** `LocalServer` exposes per-operator test-telemetry accessors —
+  `last_query_hash_join_spilled()`, `last_query_group_by_spilled()`, `last_query_sort_spilled()`,
+  `last_query_distinct_spilled()`, `last_query_set_operation_spilled()`, `last_query_window_spilled()` — each
+  reporting whether that operator kind spilled in the caller thread's most recent statement. Every spill test
+  asserts its named operator actually spilled, not merely that the statement succeeded.
+- **Float semantics:** `+`, `-`, `*`, `/`, and `SUM`/`AVG` overflow return `"DOUBLE value is out of range"`
+  (MySQL-compatible) instead of producing `NaN`/`Infinity`; division by zero still yields `NULL`. This closes a
+  brick risk: `serde_json` (used to encode rows and catalog statistics) cannot represent a non-finite float, so
+  an unchecked one could be written and then fail to decode. On the row path this was already caught, if
+  confusingly, by the 2PC participant's own pre-commit payload decode; the catalog statistics path had no such
+  incidental protection and is now closed by rejecting non-finite bounds up front and by statistics structural
+  validation (see "Statistics" above). `CAST(... AS DOUBLE)` from a string and non-finite float literals are
+  rejected the same way, and the narrow analytic scan path's own `SUM` aggregator now carries the same
+  overflow check.
+- **Parallelism:** bounded intra-query parallelism (`std::thread::scope`, no new dependency) for `GROUP BY`
+  above a size threshold and for `INNER`/`CROSS` hash joins; `LEFT`/`RIGHT`/`FULL` joins stay single-threaded.
+  One shared worker budget per statement keeps a join nested inside a parallel `GROUP BY` from multiplying
+  thread counts.
+- **New `LocalServer` settings** (Rust builder API only — no `htapd` CLI flag yet; see `docs/OPERATIONS.md`):
+  `with_query_memory_budget`/`query_memory_budget()` (default 256 MiB), `with_query_parallelism`/
+  `query_parallelism()` (default `available_parallelism()`), and `with_analyze_distinct_limit`/
+  `analyze_distinct_limit()` (default 200,000).
+- **Stated behavior, not silently assumed:** `ANALYZE TABLE` is gated by the "no DDL inside an open
+  transaction" rule exactly like `CREATE TABLE`/`DROP TABLE` are — it is rejected inside any open transaction
+  and the transaction survives the rejection, and `EXPLAIN ANALYZE` follows the transaction rules of the
+  statement it executes while plain `EXPLAIN` remains permitted (`crates/htap-server/tests/session.rs::{test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives, test_explain_analyze_wrapping_ddl_rejected_inside_open_transaction, test_explain_analyze_wrapping_insert_rejected_inside_read_only_transaction}`, `crates/htap-server/tests/explain.rs::test_plain_explain_select_permitted_inside_open_transaction`).
+- **Disclosed gaps, not silently assumed:** Hash-join
+  spilling is not itself restricted to a join kind in code, but only `INNER`-join spilling is covered by a
+  test. Window evaluation carries every materialized column of the joined input into its spill partitions, not
+  just the columns the query needs (measured: 8 columns / ~424 B per row where 3 are needed), so window
+  partitions are larger than necessary under a budget; a column-trimming improvement is deferred. The
+  optimizer's leaf-cost and outer-join cardinality estimates are cost-quality-only weaknesses — they can pick a
+  worse plan but never change results: outer joins are never reordered, and null-padding is independent of
+  which side was chosen to build. The planned shared binder leaf-helper extraction between `htap_sql::binder`
+  and `htap_sql::binder_query` (`docs/PROBLEMS.md` P2) was not delivered — the two binder entry points are kept
+  deliberately separate so R5 stays structural, but each still holds its own copy of that leaf-level logic.
 
 ---
 

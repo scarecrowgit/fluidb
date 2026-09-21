@@ -13,6 +13,8 @@ htap-convert = { path = "../htap-convert" }
 htap-coord = { path = "../htap-coord" }
 htap-movement = { path = "../htap-movement" }
 htap-rowstore = { path = "../htap-rowstore" }
+htap-server = { path = "../htap-server" }
+htap-sql = { path = "../htap-sql" }
 htap-txn = { path = "../htap-txn" }
 criterion = { workspace = true }
 tempfile = { workspace = true }

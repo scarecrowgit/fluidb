@@ -4568,3 +4568,195 @@ fn test_correlated_subquery_through_window_spec() {
         vec![Row::new(vec![Value::Int64(1), Value::Int64(1)])]
     );
 }
+
+#[test]
+fn test_correlated_subquery_is_optimized_once_per_statement() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_rows (id INT PRIMARY KEY, value INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_rows (id INT PRIMARY KEY, value INT);")
+        .unwrap();
+
+    let values = (1..=32)
+        .map(|id| format!("({id}, {})", id * 10))
+        .collect::<Vec<_>>()
+        .join(", ");
+    server
+        .execute(&format!(
+            "INSERT INTO outer_rows (id, value) VALUES {values};"
+        ))
+        .unwrap();
+    server
+        .execute(&format!(
+            "INSERT INTO inner_rows (id, value) VALUES {values};"
+        ))
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_rows o \
+             WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.id = o.id) \
+             ORDER BY o.id;",
+        )
+        .len(),
+        32
+    );
+    assert_eq!(server.last_query_optimizer_invocations(), 2);
+}
+
+#[test]
+fn test_float_sum_overflow_returns_out_of_range_error() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE float_sum_left (id INT PRIMARY KEY, value DOUBLE);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE float_sum_right (id INT PRIMARY KEY, value DOUBLE);")
+        .unwrap();
+
+    let values = (1..=512)
+        .map(|id| format!("({id}, 1e308)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for table in ["float_sum_left", "float_sum_right"] {
+        server
+            .execute(&format!("INSERT INTO {table} (id, value) VALUES {values};"))
+            .unwrap();
+    }
+
+    for sql in [
+        "SELECT SUM(l.value) FROM float_sum_left l \
+         JOIN float_sum_right r ON l.id = r.id;",
+        "SELECT l.id % 2, SUM(l.value) FROM float_sum_left l \
+         JOIN float_sum_right r ON l.id = r.id \
+         GROUP BY l.id % 2;",
+    ] {
+        let err = server.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DOUBLE value is out of range in 'SUM'"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn test_float_avg_overflow_returns_out_of_range_error() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE float_avg_left (id INT PRIMARY KEY, value DOUBLE);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE float_avg_right (id INT PRIMARY KEY, value DOUBLE);")
+        .unwrap();
+
+    let values = (1..=512)
+        .map(|id| format!("({id}, 1e308)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for table in ["float_avg_left", "float_avg_right"] {
+        server
+            .execute(&format!("INSERT INTO {table} (id, value) VALUES {values};"))
+            .unwrap();
+    }
+
+    for sql in [
+        "SELECT AVG(l.value) FROM float_avg_left l \
+         JOIN float_avg_right r ON l.id = r.id;",
+        "SELECT l.id % 2, AVG(l.value) FROM float_avg_left l \
+         JOIN float_avg_right r ON l.id = r.id \
+         GROUP BY l.id % 2;",
+    ] {
+        let err = server.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DOUBLE value is out of range in 'AVG'"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn test_non_finite_double_casts_and_literals_are_rejected() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    for sql in [
+        "SELECT CAST('nan' AS DOUBLE);",
+        "SELECT CAST('inf' AS DOUBLE);",
+        "SELECT CAST('1e999' AS DOUBLE);",
+    ] {
+        let err = server.execute(sql).unwrap_err();
+        assert!(matches!(err, HtapError::InvalidArgument(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains("DOUBLE value is out of range in 'CAST'"),
+            "{err}"
+        );
+    }
+
+    let err = server.execute("SELECT 1e400;").unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("DOUBLE value is out of range in literal"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_non_finite_cast_update_fails_at_statement_and_leaves_value_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE float_values (id INT PRIMARY KEY, value DOUBLE);")
+        .unwrap();
+    server
+        .execute("INSERT INTO float_values (id, value) VALUES (1, 1.0);")
+        .unwrap();
+
+    // UPDATE evaluates and validates the cast before committing its write.
+    let err = server
+        .execute("UPDATE float_values SET value = CAST('1e999' AS DOUBLE) WHERE id = 1;")
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("DOUBLE value is out of range in 'CAST'"),
+        "{err}"
+    );
+
+    // The failed statement did not write a non-finite value or partially update the row.
+    assert_eq!(
+        rows(&server, "SELECT value FROM float_values WHERE id = 1;"),
+        vec![Row::new(vec![Value::Float64(1.0)])]
+    );
+}
+
+#[test]
+fn test_analytic_float_sum_overflow_returns_out_of_range_error() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE analytic_float_sum (id INT PRIMARY KEY, value DOUBLE);")
+        .unwrap();
+    server
+        .execute("INSERT INTO analytic_float_sum (id, value) VALUES (1, 1e308), (2, 1e308);")
+        .unwrap();
+
+    let err = server
+        .execute("SELECT SUM(value) FROM analytic_float_sum;")
+        .unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("DOUBLE value is out of range in 'SUM'"),
+        "{err}"
+    );
+}

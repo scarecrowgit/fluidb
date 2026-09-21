@@ -95,6 +95,32 @@ fn test_account_without_grants_gets_identical_error_to_missing_table() {
 }
 
 #[test]
+fn test_explain_masks_unprivileged_table_as_missing() {
+    let (_dir, server) = setup();
+    let mut session = user_session(&server);
+
+    let existing = session.execute("EXPLAIN SELECT * FROM a").unwrap_err();
+    let missing = session.execute("EXPLAIN SELECT * FROM zzz").unwrap_err();
+
+    assert!(matches!(&existing, HtapError::NotFound(_)));
+    assert!(matches!(&missing, HtapError::NotFound(_)));
+    assert_masked("a", existing, missing);
+}
+
+#[test]
+fn test_analyze_table_masks_unprivileged_table_as_missing() {
+    let (_dir, server) = setup();
+    let mut session = user_session(&server);
+
+    let existing = session.execute("ANALYZE TABLE a").unwrap_err();
+    let missing = session.execute("ANALYZE TABLE zzz").unwrap_err();
+
+    assert!(matches!(&existing, HtapError::NotFound(_)));
+    assert!(matches!(&missing, HtapError::NotFound(_)));
+    assert_masked("a", existing, missing);
+}
+
+#[test]
 fn test_select_grant_allows_point_analytic_and_general_query_but_not_insert() {
     let (_dir, server) = setup();
     server.execute("GRANT SELECT ON a TO u").unwrap();

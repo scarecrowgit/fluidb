@@ -415,16 +415,7 @@ fn select_correlated_outer_refs(select: &SelectBody) -> Vec<Expr> {
 
     let mut refs = Vec::new();
 
-    for join in &select.joins {
-        if let Some(on) = &join.on {
-            collect_expr_refs(on, &mut refs);
-        }
-    }
-    if select.tree_only {
-        if let Some(tree) = &select.join_tree {
-            collect_join_tree_refs(tree, &mut refs);
-        }
-    }
+    collect_join_tree_refs(&select.join_tree, &mut refs);
     if let Some(filter) = &select.filter {
         collect_expr_refs(filter, &mut refs);
     }
@@ -1049,19 +1040,11 @@ fn bind_select_body(
         // HAVING without GROUP BY / aggregates behaves like WHERE over the projected row.
     }
 
-    let (joins, tree_only) = match join_tree.as_ref() {
-        Some(tree @ JoinTree::Join { .. }) => match lower_to_flat(tree) {
-            Some(joins) => (joins, false),
-            None => (Vec::new(), true),
-        },
-        Some(JoinTree::Leaf(_)) | None => (joins, false),
-    };
+    let join_tree = join_tree.unwrap_or_else(|| left_deep_join_tree(&joins));
 
     let mut body = SelectBody {
         slots,
-        joins,
         join_tree,
-        tree_only,
         visible_schemas,
         filter,
         group_by: group_by.clone(),
@@ -1260,24 +1243,7 @@ fn validate_recursive_reference(query: &BoundQuery, cte_name: &str) -> Result<()
     }
 
     let working_slot = working_slots[0];
-    for join in &select.joins {
-        let null_supplying = match join.kind {
-            JoinKind::Left => join.right_slot == working_slot,
-            JoinKind::Right => working_slot < join.right_slot,
-            JoinKind::Full => working_slot <= join.right_slot,
-            JoinKind::Inner | JoinKind::Cross => false,
-        };
-        if null_supplying {
-            return Err(invalid(
-                "recursive CTE cannot be referenced on the null-supplying side of an outer join",
-            ));
-        }
-    }
-    if select
-        .join_tree
-        .as_ref()
-        .is_some_and(|tree| tree_slot_is_null_supplying(tree, working_slot))
-    {
+    if tree_slot_is_null_supplying(&select.join_tree, working_slot) {
         return Err(invalid(
             "recursive CTE cannot be referenced on the null-supplying side of an outer join",
         ));
@@ -1661,28 +1627,17 @@ fn tree_slot_range(tree: &JoinTree) -> (usize, usize) {
     }
 }
 
-fn lower_to_flat(tree: &JoinTree) -> Option<Vec<JoinSpec>> {
-    match tree {
-        JoinTree::Leaf(_) => Some(Vec::new()),
-        JoinTree::Join {
-            kind,
-            left,
-            right,
-            on,
-        } => {
-            let JoinTree::Leaf(right_slot) = right.as_ref() else {
-                return None;
-            };
-            let mut joins = lower_to_flat(left)?;
-            joins.push(JoinSpec {
-                kind: *kind,
-                right_slot: *right_slot,
-                on: on.clone(),
-                equi_key_types: join_equi_key_types(on.as_ref(), (*right_slot, *right_slot)),
-            });
-            Some(joins)
-        }
+fn left_deep_join_tree(joins: &[JoinSpec]) -> JoinTree {
+    let mut tree = JoinTree::Leaf(0);
+    for join in joins {
+        tree = JoinTree::Join {
+            kind: join.kind,
+            left: Box::new(tree),
+            right: Box::new(JoinTree::Leaf(join.right_slot)),
+            on: join.on.clone(),
+        };
     }
+    tree
 }
 
 fn join_equi_key_types(
@@ -3960,10 +3915,13 @@ fn bind_literal(v: &sql::Value) -> Result<Expr> {
             if let Ok(i) = n.parse::<i64>() {
                 Value::Int64(i)
             } else {
-                Value::Float64(
-                    n.parse::<f64>()
-                        .map_err(|_| invalid(format!("invalid numeric literal {n}")))?,
-                )
+                let value = n
+                    .parse::<f64>()
+                    .map_err(|_| invalid(format!("invalid numeric literal {n}")))?;
+                if !value.is_finite() {
+                    return Err(invalid("DOUBLE value is out of range in literal"));
+                }
+                Value::Float64(value)
             }
         }
         sql::Value::SingleQuotedString(s)

@@ -317,14 +317,8 @@ pub enum SetOpKind {
 pub struct SelectBody {
     /// FROM slots in order (empty for `SELECT <constants>`).
     pub slots: Vec<TableSlot>,
-    /// Joins; `joins[i]` joins slot `i + 1`.
-    ///
-    /// Retained alongside [`Self::join_tree`] for existing left-deep execution paths.
-    pub joins: Vec<JoinSpec>,
-    /// Recursive FROM/join structure, absent for a FROM-less select.
-    pub join_tree: Option<JoinTree>,
-    /// Whether execution must use the join tree instead of the flattened join chain.
-    pub tree_only: bool,
+    /// Recursive FROM/join structure. A FROM-less select uses a synthetic leaf.
+    pub join_tree: JoinTree,
     /// Visible schema for every join-tree node, in post-order.
     pub visible_schemas: Vec<VisibleSchema>,
     /// `WHERE` predicate.
