@@ -3004,7 +3004,7 @@ fn test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max() {
     store.compare_and_set(1, next.clone()).unwrap();
     let bytes = fs::read(temp.path().join("CATALOG")).unwrap();
     assert_eq!(&bytes[8..10], &FORMAT_VERSION.to_le_bytes());
-    assert_eq!(FORMAT_VERSION, 4);
+    assert_eq!(FORMAT_VERSION, 5);
     let reloaded = LocalCatalogStore::open(temp.path())
         .unwrap()
         .load()

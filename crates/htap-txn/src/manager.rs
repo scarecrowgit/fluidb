@@ -3,13 +3,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use htap_common::fs::atomic_publish;
 use htap_common::{HtapError, Result, Version};
 use parking_lot::{Mutex, RwLock};
 
-use crate::journal::{Journal, JournalOptions, JournalRecord};
+use crate::checkpoint::{self, CheckpointBaseline};
+use crate::journal::{encode_frame, Journal, JournalOptions, JournalRecord};
 use crate::participant::{
     CommittedTransaction, ParticipantId, ParticipantWork, TransactionId, TransactionRequest,
     TxnParticipant,
@@ -121,6 +123,13 @@ impl Transaction {
 
 /// Report returned following journal crash recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointReport {
+    /// Whether journal records were compacted.
+    pub compacted: bool,
+}
+
+/// Report returned following journal crash recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryReport {
     /// Transactions successfully committed and published during recovery.
     pub committed_txns: Vec<TransactionId>,
@@ -176,6 +185,15 @@ struct RecoveryLatch {
     cause: RecoveryCause,
 }
 
+/// Journal state folded against the durable checkpoint high-water marks.
+struct FoldResult {
+    max_txn_id: u64,
+    max_version: Version,
+    intents: BTreeMap<TransactionId, (Version, Vec<ParticipantWork>)>,
+    commits: BTreeMap<TransactionId, Version>,
+    aborts: BTreeSet<TransactionId>,
+}
+
 /// Synchronous local transaction manager.
 ///
 /// Orchestrates 2PC across local participants using deterministic ID ordering
@@ -186,11 +204,21 @@ pub struct TransactionManager {
     commit_append_hook: Mutex<Option<JournalHook>>,
     commit_sync_hook: Mutex<Option<JournalHook>>,
     abort_append_hook: Mutex<Option<JournalHook>>,
+    #[cfg(test)]
+    checkpoint_after_baseline_hook: Mutex<Option<JournalHook>>,
+    #[cfg(test)]
+    checkpoint_rewrite_failure_hook: Mutex<Option<JournalHook>>,
+    #[cfg(test)]
+    checkpoint_after_rewrite_hook: Mutex<Option<JournalHook>>,
     journal: Mutex<Journal>,
+    checkpoint_baseline: Mutex<CheckpointBaseline>,
+    configured_max_journal_size: u64,
+    checkpoint_trigger_threshold: u64,
     participants: RwLock<BTreeMap<ParticipantId, Arc<dyn TxnParticipant>>>,
     next_txn_id: AtomicU64,
     next_version: Mutex<Version>,
     visible_version: Mutex<Version>,
+    recovery_completed: AtomicBool,
     /// Set by [`Self::commit`] whenever it returns `DurablePending`; see [`RecoveryLatch`].
     recovery_required: Mutex<Option<RecoveryLatch>>,
 }
@@ -204,11 +232,21 @@ impl TransactionManager {
             commit_append_hook: Mutex::new(None),
             commit_sync_hook: Mutex::new(None),
             abort_append_hook: Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_after_baseline_hook: Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_rewrite_failure_hook: Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_after_rewrite_hook: Mutex::new(None),
+            configured_max_journal_size: journal.options().max_journal_size,
+            checkpoint_trigger_threshold: journal.options().max_journal_size / 2,
             journal: Mutex::new(journal),
+            checkpoint_baseline: Mutex::new(CheckpointBaseline::default()),
             participants: RwLock::new(BTreeMap::new()),
             next_txn_id: AtomicU64::new(1),
             next_version: Mutex::new(Version::new(2)),
             visible_version: Mutex::new(Version::INITIAL),
+            recovery_completed: AtomicBool::new(false),
             recovery_required: Mutex::new(None),
         }
     }
@@ -278,14 +316,25 @@ impl TransactionManager {
 
     /// Open or create a transaction manager with default journal options at `path`.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let journal = Journal::open(path)?;
-        Ok(Self::new(journal))
+        Self::open_with_options(JournalOptions::new(path))
     }
 
     /// Open or create a transaction manager using explicit journal options.
     pub fn open_with_options(opts: JournalOptions) -> Result<Self> {
-        let journal = Journal::open_with_options(opts)?;
-        Ok(Self::new(journal))
+        let baseline = checkpoint::load_checkpoint(&opts.path)?.unwrap_or_default();
+        let configured_max_journal_size = opts.max_journal_size;
+        let journal = Journal::open_for_bootstrap(&opts)?;
+        let mut manager = Self::new(journal);
+        *manager.checkpoint_baseline.lock() = baseline;
+        manager.configured_max_journal_size = configured_max_journal_size;
+        manager.checkpoint_trigger_threshold = configured_max_journal_size / 2;
+        Ok(manager)
+    }
+
+    /// Set the journal size threshold that triggers opportunistic checkpointing.
+    pub fn with_checkpoint_trigger_bytes(mut self, threshold: u64) -> Self {
+        self.checkpoint_trigger_threshold = threshold;
+        self
     }
 
     /// Register a participant with the manager.
@@ -340,6 +389,36 @@ impl TransactionManager {
         F: FnOnce(&mut Journal) -> Result<()> + Send + 'static,
     {
         *self.abort_append_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Sets a one-shot test hook after checkpoint baseline publication and before journal rewrite.
+    #[cfg(test)]
+    fn set_checkpoint_after_baseline_hook<F>(&self, hook: F)
+    where
+        F: FnOnce(&mut Journal) -> Result<()> + Send + 'static,
+    {
+        *self.checkpoint_after_baseline_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Sets a one-shot test hook before atomic checkpoint journal publication.
+    ///
+    /// Returning an error simulates an `atomic_publish` failure and exercises the rewrite
+    /// failure cleanup path.
+    #[cfg(test)]
+    fn set_checkpoint_rewrite_failure_hook<F>(&self, hook: F)
+    where
+        F: FnOnce(&mut Journal) -> Result<()> + Send + 'static,
+    {
+        *self.checkpoint_rewrite_failure_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Sets a one-shot test hook after checkpoint journal rewrite and before handle reopen.
+    #[cfg(test)]
+    fn set_checkpoint_after_rewrite_hook<F>(&self, hook: F)
+    where
+        F: FnOnce(&mut Journal) -> Result<()> + Send + 'static,
+    {
+        *self.checkpoint_after_rewrite_hook.lock() = Some(Box::new(hook));
     }
 
     /// Allocate a new monotonic transaction ID.
@@ -661,12 +740,29 @@ impl TransactionManager {
 
         txn.state = TxnState::Committed;
         let participant_ids = sorted_works.into_iter().map(|w| w.participant_id).collect();
-        Ok(CommittedTransaction {
+        let committed = CommittedTransaction {
             transaction_id: txn.id,
             version,
             snapshot: txn.read_version,
             participant_ids,
-        })
+        };
+
+        // Compaction is opportunistic: the transaction is already committed, so checkpoint
+        // failures must not change the commit result. A later commit or open can retry it.
+        drop(_decision_guard);
+        let should_checkpoint =
+            self.journal.lock().valid_bytes() > self.checkpoint_trigger_threshold;
+        if should_checkpoint {
+            if let Err(error) = self.checkpoint() {
+                tracing::warn!(
+                    txn_id = %txn.id,
+                    %error,
+                    "opportunistic transaction journal checkpoint failed"
+                );
+            }
+        }
+
+        Ok(committed)
     }
 
     /// Abort an active transaction, rolling back participants and writing an Abort journal entry.
@@ -753,6 +849,263 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Fold journal records against checkpoint high-water marks and verify record consistency.
+    fn fold_and_verify(
+        &self,
+        records: &[JournalRecord],
+        baseline: &CheckpointBaseline,
+    ) -> Result<FoldResult> {
+        let mut intents = BTreeMap::new();
+        let mut commits = BTreeMap::new();
+        let mut aborts = BTreeSet::new();
+        let mut max_txn_id = baseline.txn_id_high_water;
+        let mut max_version = baseline.version_high_water;
+
+        for record in records {
+            max_txn_id = max_txn_id.max(record.txn_id().as_u64());
+
+            match record {
+                JournalRecord::Intent {
+                    txn_id,
+                    snapshot,
+                    participants,
+                } => {
+                    intents.insert(*txn_id, (*snapshot, participants.clone()));
+                }
+                JournalRecord::Commit { txn_id, version } => {
+                    max_version = max_version.max(*version);
+                    commits.insert(*txn_id, *version);
+                }
+                JournalRecord::Abort { txn_id } => {
+                    aborts.insert(*txn_id);
+                }
+            }
+        }
+
+        for txn_id in commits.keys() {
+            if aborts.contains(txn_id) {
+                return Err(HtapError::Corruption(format!(
+                    "malformed journal: transaction {txn_id} contains both commit and abort records"
+                )));
+            }
+            if !intents.contains_key(txn_id) {
+                return Err(HtapError::Corruption(format!(
+                    "committed transaction {txn_id} missing corresponding intent in journal"
+                )));
+            }
+        }
+
+        Ok(FoldResult {
+            max_txn_id,
+            max_version,
+            intents,
+            commits,
+            aborts,
+        })
+    }
+
+    /// Compact the transaction journal when it exceeds the configured size limit.
+    pub fn checkpoint(&self) -> Result<CheckpointReport> {
+        let _decision_guard = self.decision_lock.lock();
+
+        if !self.recovery_completed.load(Ordering::Acquire) {
+            return Err(HtapError::Conflict(
+                "transaction journal checkpoint requires successful recovery first".to_string(),
+            ));
+        }
+
+        if self.recovery_required() || self.journal.lock().is_poisoned() {
+            return Ok(CheckpointReport { compacted: false });
+        }
+
+        let records = {
+            let mut journal = self.journal.lock();
+            journal
+                .recover_records_with_max_journal_size(
+                    self.configured_max_journal_size
+                        .max(crate::journal::RECOVERY_BOOTSTRAP_MAX_BYTES),
+                )?
+                .0
+        };
+        let baseline = self.checkpoint_baseline.lock().clone();
+        let folded = self.fold_and_verify(&records, &baseline)?;
+
+        let retained_ids: BTreeSet<TransactionId> = folded
+            .intents
+            .keys()
+            .filter(|txn_id| {
+                !folded.commits.contains_key(txn_id) && !folded.aborts.contains(txn_id)
+            })
+            .copied()
+            .collect();
+        let retained: Vec<JournalRecord> = records
+            .iter()
+            .filter(|record| {
+                matches!(record, JournalRecord::Intent { txn_id, .. } if retained_ids.contains(txn_id))
+            })
+            .cloned()
+            .collect();
+
+        let new_baseline = CheckpointBaseline {
+            txn_id_high_water: folded.max_txn_id,
+            version_high_water: folded.max_version,
+        };
+        if retained.len() == folded.intents.len() && new_baseline == baseline {
+            return Ok(CheckpointReport { compacted: false });
+        }
+
+        for participant in self.participants.read().values() {
+            if let Some(engine_version) = participant.committed_version() {
+                if engine_version != folded.max_version {
+                    return Err(HtapError::Corruption(format!(
+                        "participant {} committed_version {engine_version} does not match \
+                         transaction journal max_version {}; refusing checkpoint",
+                        participant.id(),
+                        folded.max_version
+                    )));
+                }
+            }
+        }
+
+        checkpoint::publish_checkpoint(&self.journal.lock().options().path, &new_baseline)?;
+
+        #[cfg(test)]
+        if let Some(hook) = self.checkpoint_after_baseline_hook.lock().take() {
+            hook(&mut self.journal.lock())?;
+        }
+
+        let journal_opts = self.journal.lock().options().clone();
+        let journal_path = journal_opts.path.clone();
+        let max_frame_size = journal_opts.max_frame_size;
+        let mut journal_bytes = Vec::new();
+        for record in &retained {
+            journal_bytes.extend_from_slice(&encode_frame(record, max_frame_size)?);
+        }
+
+        let journal_dir = journal_path.parent().ok_or_else(|| {
+            HtapError::InvalidArgument(format!(
+                "journal path {} has no parent directory",
+                journal_path.display()
+            ))
+        })?;
+        let journal_name = journal_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                HtapError::InvalidArgument(format!(
+                    "journal path {} has no valid file name",
+                    journal_path.display()
+                ))
+            })?;
+        let tmp_name = format!(".{journal_name}.checkpoint.tmp");
+
+        // This hook simulates an atomic publication failure before touching the journal path.
+        let rewrite_failure: Result<()> = {
+            #[cfg(test)]
+            {
+                match self.checkpoint_rewrite_failure_hook.lock().take() {
+                    Some(hook) => hook(&mut self.journal.lock()),
+                    None => Ok(()),
+                }
+            }
+
+            #[cfg(not(test))]
+            {
+                Ok(())
+            }
+        };
+
+        let rewrite_result = rewrite_failure.and_then(|_| {
+            atomic_publish(
+                journal_dir,
+                &tmp_name,
+                journal_name,
+                &journal_bytes,
+                None,
+                true,
+            )
+        });
+
+        if let Err(err) = rewrite_result {
+            // Any rewrite error leaves the durability of the replacement unknown, regardless of
+            // whether reopening the resulting path succeeds. Latch before attempting cleanup so
+            // no later commit can proceed on a successfully reopened but untrusted journal.
+            self.latch_recovery_required(
+                0,
+                Version::INITIAL,
+                &format!("checkpoint journal rewrite failed: {err}"),
+                RecoveryCause::JournalIo,
+            );
+
+            // Reopen for handle safety only. Its outcome cannot make the rewrite trustworthy, and
+            // the original atomic_publish error remains the checkpoint result.
+            if let Ok(journal) = Journal::open_with_options(journal_opts.clone()) {
+                *self.journal.lock() = journal;
+            }
+
+            return Err(err);
+        }
+
+        // Atomic publication has succeeded, but the manager still holds the old journal handle.
+        // This hook models a crash in that window and therefore runs before any reopen attempt.
+        #[cfg(test)]
+        if let Some(hook) = self.checkpoint_after_rewrite_hook.lock().take() {
+            if let Err(err) = hook(&mut self.journal.lock()) {
+                self.latch_recovery_required(
+                    0,
+                    Version::INITIAL,
+                    &format!("checkpoint failed after journal rewrite: {err}"),
+                    RecoveryCause::JournalIo,
+                );
+                return Err(err);
+            }
+        }
+
+        match Journal::open_with_options(journal_opts) {
+            Ok(journal) => {
+                *self.journal.lock() = journal;
+                *self.checkpoint_baseline.lock() = new_baseline;
+                Ok(CheckpointReport { compacted: true })
+            }
+            Err(err) => {
+                self.latch_recovery_required(
+                    0,
+                    Version::INITIAL,
+                    &format!("checkpoint journal reopen failed: {err}"),
+                    RecoveryCause::JournalIo,
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// Finalize startup after [`Self::recover`] has completed and all participants are registered.
+    ///
+    /// The caller must invoke this exactly once after recovery, before accepting normal
+    /// operations. Until this method runs, the journal remains at the temporary bootstrap size
+    /// limit of 2 GiB. This method performs a best-effort checkpoint to compact the journal, then
+    /// re-enforces the configured journal size limit so the bootstrap limit never persists beyond
+    /// the recovery window.
+    pub fn finalize_open(&self) -> Result<()> {
+        if !self.recovery_completed.load(Ordering::Acquire) {
+            return Err(HtapError::Conflict(
+                "finalizing transaction manager open requires successful recovery first"
+                    .to_string(),
+            ));
+        }
+
+        if let Err(error) = self.checkpoint() {
+            tracing::warn!(%error, "transaction journal checkpoint during open failed");
+        }
+
+        let _decision_guard = self.decision_lock.lock();
+        let mut opts = self.journal.lock().options().clone();
+        opts.max_journal_size = self.configured_max_journal_size;
+        let journal = Journal::open_with_options(opts)?;
+        *self.journal.lock() = journal;
+        Ok(())
+    }
+
     /// Recover state from the journal.
     ///
     /// Replays logged records, completes apply/publish for transactions with a durable
@@ -825,44 +1178,19 @@ impl TransactionManager {
             return Err(err);
         }
 
-        let mut intents: BTreeMap<TransactionId, (Version, Vec<ParticipantWork>)> = BTreeMap::new();
-        let mut commits: BTreeMap<TransactionId, Version> = BTreeMap::new();
-        let mut aborts: BTreeSet<TransactionId> = BTreeSet::new();
+        let baseline = self.checkpoint_baseline.lock().clone();
+        let FoldResult {
+            max_txn_id: effective_max_txn_id,
+            max_version: effective_max_version,
+            mut intents,
+            commits,
+            aborts,
+        } = self.fold_and_verify(&records, &baseline)?;
 
-        let mut max_txn_id = 0u64;
-        let mut max_version = Version::INITIAL;
-
-        for rec in records {
-            max_txn_id = max_txn_id.max(rec.txn_id().as_u64());
-            if let Some(v) = rec.version() {
-                max_version = max_version.max(v);
-            }
-
-            match rec {
-                JournalRecord::Intent {
-                    txn_id,
-                    snapshot,
-                    participants,
-                } => {
-                    intents.insert(txn_id, (snapshot, participants));
-                }
-                JournalRecord::Commit { txn_id, version } => {
-                    commits.insert(txn_id, version);
-                }
-                JournalRecord::Abort { txn_id } => {
-                    aborts.insert(txn_id);
-                }
-            }
-        }
-
-        // Recovery must reject Commit+Abort for the same txn as corruption; Abort only valid before durable Commit.
-        for txn_id in commits.keys() {
-            if aborts.contains(txn_id) {
-                return Err(HtapError::Corruption(format!(
-                    "malformed journal: transaction {txn_id} contains both commit and abort records"
-                )));
-            }
-        }
+        // Downstream recovery uses these effective high-water marks, which include both the
+        // durable checkpoint baseline and all records still present in the journal.
+        let max_txn_id = effective_max_txn_id;
+        let max_version = effective_max_version;
 
         // Keep participant registry lock out of participant method calls by cloning first
         let registry_snapshot = self.participants.read().clone();
@@ -1019,6 +1347,8 @@ impl TransactionManager {
                 }
             }
         }
+
+        self.recovery_completed.store(true, Ordering::Release);
 
         Ok(RecoveryReport {
             committed_txns,
@@ -1273,6 +1603,515 @@ mod tests {
         assert!(matches!(
             err2,
             HtapError::CounterOverflow { counter: "txn_id" }
+        ));
+    }
+
+    fn checkpoint_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        TransactionManager,
+        Arc<MockStore>,
+        TransactionId,
+        TransactionId,
+        TransactionId,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("txn.journal");
+        let manager = TransactionManager::open(&journal_path).unwrap();
+        let store = Arc::new(MockStore::new(ParticipantId::new(1)));
+        manager.register_participant(Arc::clone(&store) as Arc<dyn TxnParticipant>);
+        manager.recover().unwrap();
+
+        let mut committed = manager.begin().unwrap();
+        committed.add_participant(1, b"committed");
+        manager.commit(&mut committed).unwrap();
+
+        let mut aborted = manager.begin().unwrap();
+        aborted.add_participant(1, b"aborted");
+        manager.abort(&mut aborted).unwrap();
+
+        // An Intent without a decision must survive compaction and remain in doubt after restart.
+        let in_doubt = manager.next_txn_id().unwrap();
+        manager
+            .journal
+            .lock()
+            .append(&JournalRecord::Intent {
+                txn_id: in_doubt,
+                snapshot: manager.visible_version(),
+                participants: vec![ParticipantWork::new(ParticipantId::new(1), b"in-doubt")],
+            })
+            .unwrap();
+        manager.journal.lock().sync().unwrap();
+
+        (
+            dir,
+            journal_path,
+            manager,
+            store,
+            committed.id(),
+            aborted.id(),
+            in_doubt,
+        )
+    }
+
+    fn reopen_checkpoint_fixture(
+        journal_path: &std::path::Path,
+        store: Arc<MockStore>,
+    ) -> (TransactionManager, RecoveryReport) {
+        let reopened = TransactionManager::open(journal_path).unwrap();
+        reopened.register_participant(store);
+        let report = reopened.recover().unwrap();
+        (reopened, report)
+    }
+
+    #[test]
+    fn test_checkpoint_crash_after_baseline_before_rewrite_preserves_evidence() {
+        let (_dir, journal_path, manager, store, committed, aborted, in_doubt) =
+            checkpoint_fixture();
+
+        manager.set_checkpoint_after_baseline_hook(|_| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated crash after checkpoint baseline publication",
+            )))
+        });
+        assert!(manager.checkpoint().is_err());
+
+        let baseline = checkpoint::load_checkpoint(&journal_path).unwrap().unwrap();
+        assert_eq!(baseline.txn_id_high_water, in_doubt.as_u64());
+        assert_eq!(baseline.version_high_water, Version::new(2));
+
+        drop(manager);
+        let (_reopened, report) = reopen_checkpoint_fixture(&journal_path, store);
+        assert_eq!(report.max_version, Version::new(2));
+        assert!(!report.aborted_txns.contains(&committed));
+        assert!(report.aborted_txns.contains(&aborted));
+        assert!(report.unresolved_txns.contains(&in_doubt));
+    }
+
+    #[test]
+    fn test_checkpoint_crash_mid_rewrite_recovers_torn_replacement() {
+        let (_dir, journal_path, manager, store, committed, aborted, in_doubt) =
+            checkpoint_fixture();
+
+        // This hook runs after baseline publication.  A malformed replacement journal models a
+        // crash while its temporary file is being written; the original journal remains intact.
+        manager.set_checkpoint_after_baseline_hook(|journal| {
+            journal.inject_partial_write_fault_for_test(1);
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated partial checkpoint journal rewrite",
+            )))
+        });
+        assert!(manager.checkpoint().is_err());
+
+        drop(manager);
+        let (_reopened, report) = reopen_checkpoint_fixture(&journal_path, store);
+        assert_eq!(report.max_version, Version::new(2));
+        assert!(!report.aborted_txns.contains(&committed));
+        assert!(report.aborted_txns.contains(&aborted));
+        assert!(report.unresolved_txns.contains(&in_doubt));
+    }
+
+    #[test]
+    fn test_checkpoint_crash_after_rewrite_before_handle_reopen_preserves_evidence() {
+        let (_dir, journal_path, manager, store, committed, aborted, in_doubt) =
+            checkpoint_fixture();
+
+        manager.set_checkpoint_after_rewrite_hook(|_| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated crash after checkpoint journal rewrite",
+            )))
+        });
+        assert!(manager.checkpoint().is_err());
+
+        drop(manager);
+        let (_reopened, report) = reopen_checkpoint_fixture(&journal_path, store);
+        assert_eq!(report.max_version, Version::new(2));
+        assert!(!report.aborted_txns.contains(&committed));
+        assert!(!report.aborted_txns.contains(&aborted));
+        assert!(report.unresolved_txns.contains(&in_doubt));
+    }
+
+    #[test]
+    fn test_checkpoint_shrinks_journal_after_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txn.journal");
+        let manager = TransactionManager::open(&path).unwrap();
+        manager.register_participant(Arc::new(MockStore::new(ParticipantId::new(1))));
+        manager.recover().unwrap();
+
+        for _ in 0..32 {
+            let mut txn = manager.begin().unwrap();
+            txn.add_participant(1, vec![b'x'; 1024]);
+            manager.commit(&mut txn).unwrap();
+        }
+
+        let before = std::fs::metadata(&path).unwrap().len();
+        assert!(manager.checkpoint().unwrap().compacted);
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "checkpoint must reduce journal bytes");
+    }
+
+    #[test]
+    fn test_checkpoint_compacts_journal_that_exceeds_configured_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txn.journal");
+        let max_journal_size = 100 * 1024;
+        let manager = TransactionManager::open_with_options(
+            JournalOptions::new(&path).with_max_journal_size(max_journal_size),
+        )
+        .unwrap()
+        .with_checkpoint_trigger_bytes(u64::MAX);
+        manager.register_participant(Arc::new(MockStore::new(ParticipantId::new(1))));
+        manager.recover().unwrap();
+        manager.finalize_open().unwrap();
+
+        let mut txn = manager.begin().unwrap();
+        // JSON encoding of this byte payload makes the durable Intent exceed 100 KiB.
+        txn.add_participant(1, vec![b'x'; 30 * 1024]);
+        manager.commit(&mut txn).unwrap();
+
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > max_journal_size,
+            "the transaction must exceed the configured journal limit before checkpointing"
+        );
+        assert!(manager.checkpoint().unwrap().compacted);
+        assert!(
+            std::fs::metadata(&path).unwrap().len() < max_journal_size,
+            "checkpoint must rewrite the oversized journal below its configured limit"
+        );
+
+        drop(manager);
+
+        // A normal, non-bootstrap Journal open must accept the compacted result.
+        Journal::open_with_options(
+            JournalOptions::new(&path).with_max_journal_size(max_journal_size),
+        )
+        .unwrap();
+
+        let reopened = TransactionManager::open_with_options(
+            JournalOptions::new(&path).with_max_journal_size(max_journal_size),
+        )
+        .unwrap();
+        reopened.register_participant(Arc::new(MockStore::new(ParticipantId::new(1))));
+        reopened.recover().unwrap();
+    }
+
+    #[test]
+    fn test_checkpoint_reopen_has_fewer_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txn.journal");
+        let manager = TransactionManager::open(&path).unwrap();
+        manager.register_participant(Arc::new(MockStore::new(ParticipantId::new(1))));
+        manager.recover().unwrap();
+
+        for _ in 0..16 {
+            let mut txn = manager.begin().unwrap();
+            txn.add_participant(1, b"payload");
+            manager.commit(&mut txn).unwrap();
+        }
+
+        let before = manager.journal.lock().read_all().unwrap().len();
+        manager.checkpoint().unwrap();
+        drop(manager);
+
+        let reopened = TransactionManager::open(&path).unwrap();
+        let after = reopened.journal.lock().read_all().unwrap().len();
+        assert!(
+            after < before,
+            "committed Intent/Commit records must be compacted away"
+        );
+    }
+
+    #[test]
+    fn test_small_journal_limit_is_sustained_by_opportunistic_checkpointing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txn.journal");
+        let limit = 1_048_576_u64;
+        let manager = TransactionManager::open_with_options(
+            JournalOptions::new(&path).with_max_journal_size(limit),
+        )
+        .unwrap();
+        manager.register_participant(Arc::new(MockStore::new(ParticipantId::new(1))));
+        manager.recover().unwrap();
+        manager.finalize_open().unwrap();
+
+        let payload = vec![b'x'; 32 * 1024];
+        let mut committed_bytes = 0_u64;
+        for _ in 0..64 {
+            let mut txn = manager.begin().unwrap();
+            txn.add_participant(1, payload.clone());
+            manager.commit(&mut txn).unwrap();
+            committed_bytes += payload.len() as u64;
+        }
+
+        assert!(
+            committed_bytes > limit,
+            "workload must exceed the configured journal limit; without checkpointing this fails"
+        );
+        assert!(
+            std::fs::metadata(&path).unwrap().len() < limit,
+            "opportunistic checkpointing must keep the durable journal below its limit"
+        );
+    }
+
+    #[test]
+    fn test_finalize_open_restores_configured_journal_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("txn.journal");
+        let small_limit = 1_048_576_u64;
+        let large_limit = 10 * small_limit;
+
+        // Keep all committed records so the journal intentionally exceeds the later limit.
+        let manager = TransactionManager::open_with_options(
+            JournalOptions::new(&journal_path).with_max_journal_size(large_limit),
+        )
+        .unwrap()
+        .with_checkpoint_trigger_bytes(u64::MAX);
+        manager.register_participant(Arc::new(MockStore::new(ParticipantId::new(1))));
+
+        for _ in 0..40 {
+            let mut txn = manager.begin().unwrap();
+            txn.add_participant(1, vec![b'x'; 32 * 1024]);
+            manager.commit(&mut txn).unwrap();
+        }
+
+        assert!(
+            std::fs::metadata(&journal_path).unwrap().len() > small_limit,
+            "journal must exceed the configured limit before bootstrap reopen"
+        );
+        let max_version = Version::new(manager.next_version().get() - 1);
+        drop(manager);
+
+        // Opening uses the bootstrap limit, allowing recovery-time compaction of an oversized file.
+        let reopened = TransactionManager::open_with_options(
+            JournalOptions::new(&journal_path).with_max_journal_size(small_limit),
+        )
+        .unwrap();
+        reopened.register_participant(Arc::new(MockStore::new(ParticipantId::new(1))));
+        reopened.recover().unwrap();
+        assert!(
+            std::fs::metadata(&journal_path).unwrap().len() > small_limit,
+            "bootstrap open must not rewrite the journal"
+        );
+
+        let checkpoint_path = journal_path.parent().unwrap().join("txn.checkpoint");
+        reopened.finalize_open().unwrap();
+
+        assert!(
+            std::fs::metadata(&journal_path).unwrap().len() < small_limit,
+            "finalize_open must checkpoint before restoring the configured limit"
+        );
+        assert!(checkpoint_path.exists());
+
+        let report = reopened.recover().unwrap();
+        assert_eq!(report.max_version, max_version);
+    }
+
+    #[test]
+    fn test_recovery_uses_checkpoint_baseline_high_water_marks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let journal_path = temp_dir.path().join("journal");
+
+        checkpoint::publish_checkpoint(
+            &journal_path,
+            &CheckpointBaseline {
+                txn_id_high_water: 100,
+                version_high_water: Version::new(7),
+            },
+        )
+        .unwrap();
+
+        {
+            let mut journal = Journal::open(&journal_path).unwrap();
+            journal
+                .append(&JournalRecord::Intent {
+                    txn_id: TransactionId::new(101),
+                    snapshot: Version::new(7),
+                    participants: vec![],
+                })
+                .unwrap();
+            journal
+                .append(&JournalRecord::Commit {
+                    txn_id: TransactionId::new(101),
+                    version: Version::new(8),
+                })
+                .unwrap();
+            journal.sync().unwrap();
+        }
+
+        let tm = TransactionManager::open(&journal_path).unwrap();
+        let report = tm.recover().unwrap();
+
+        assert_eq!(report.committed_txns, vec![TransactionId::new(101)]);
+        assert_eq!(report.max_version, Version::new(8));
+        assert_eq!(report.visible_version, Version::new(8));
+        assert_eq!(tm.next_version(), Version::new(9));
+        assert_eq!(tm.next_txn_id().unwrap(), TransactionId::new(102));
+    }
+
+    #[test]
+    fn test_journal_rewrite_failure_after_rename_latches_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("txn.journal");
+        let manager = TransactionManager::open(&journal_path).unwrap();
+        let store = Arc::new(MockStore::new(ParticipantId::new(1)));
+        manager.register_participant(Arc::clone(&store) as Arc<dyn TxnParticipant>);
+        manager.recover().unwrap();
+
+        let mut committed_ids = Vec::new();
+        let mut last_version = Version::INITIAL;
+        for payload in [b"first".as_slice(), b"second", b"third"] {
+            let mut txn = manager.begin().unwrap();
+            txn.add_participant(1, payload);
+            let committed = manager.commit(&mut txn).unwrap();
+            committed_ids.push(committed.transaction_id);
+            last_version = committed.version;
+        }
+
+        manager.set_checkpoint_rewrite_failure_hook(|_| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated checkpoint journal rewrite failure",
+            )))
+        });
+
+        let err = manager.checkpoint().unwrap_err();
+        assert!(matches!(err, HtapError::Io(_)));
+        assert!(manager.recovery_required());
+
+        // The rewrite failure leaves journal durability uncertain. The recovery latch prevents
+        // any later commit from proceeding until the manager is reopened.
+        let mut blocked = manager.begin().unwrap();
+        blocked.add_participant(1, b"must-not-commit");
+        assert!(matches!(
+            manager.commit(&mut blocked),
+            Err(HtapError::RecoveryRequired { .. })
+        ));
+
+        drop(manager);
+
+        // The original journal still contains the transaction evidence, while the checkpoint
+        // baseline preserves the transaction and version high-water marks.
+        let reopened = TransactionManager::open(&journal_path).unwrap();
+        reopened.register_participant(store);
+        let report = reopened.recover().unwrap();
+
+        assert_eq!(report.max_version, last_version);
+        assert_eq!(report.visible_version, last_version);
+        assert_eq!(
+            reopened.next_version(),
+            last_version.checked_next().unwrap()
+        );
+        assert_eq!(
+            reopened.next_txn_id().unwrap().as_u64(),
+            committed_ids.last().unwrap().as_u64() + 1
+        );
+        assert!(report.unresolved_txns.is_empty());
+        assert!(!reopened.recovery_required());
+    }
+
+    #[test]
+    fn test_checkpoint_refused_before_recovery() {
+        let temp = NamedTempFile::new().unwrap();
+        let manager = TransactionManager::open(temp.path()).unwrap();
+
+        let err = manager.checkpoint().unwrap_err();
+        assert!(matches!(
+            err,
+            HtapError::Conflict(message)
+                if message.contains("requires successful recovery first")
+        ));
+    }
+
+    #[test]
+    fn test_fold_rejects_commit_without_intent() {
+        let temp = NamedTempFile::new().unwrap();
+        let manager = TransactionManager::open(temp.path()).unwrap();
+
+        // Establish a successfully recovered manager so checkpointing is permitted.
+        manager.recover().unwrap();
+
+        // Introduce an orphan Commit only after recovery, ensuring checkpoint's fold performs
+        // the consistency check rather than recover() rejecting the malformed journal first.
+        manager
+            .journal
+            .lock()
+            .append(&JournalRecord::Commit {
+                txn_id: TransactionId::new(1),
+                version: Version::new(2),
+            })
+            .unwrap();
+        manager.journal.lock().sync().unwrap();
+
+        let err = manager.checkpoint().unwrap_err();
+        assert!(matches!(
+            err,
+            HtapError::Corruption(message)
+                if message.contains("missing corresponding intent")
+        ));
+    }
+
+    #[test]
+    fn test_checkpoint_rejects_participant_version_mismatch() {
+        struct VersionedStore {
+            id: ParticipantId,
+            committed_version: Version,
+        }
+
+        impl TxnParticipant for VersionedStore {
+            fn id(&self) -> ParticipantId {
+                self.id
+            }
+
+            fn prepare(&self, _snapshot: Version, _payload: &[u8]) -> Result<()> {
+                Ok(())
+            }
+
+            fn apply(
+                &self,
+                _txn_id: TransactionId,
+                _version: Version,
+                _payload: &[u8],
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn abort(&self, _txn_id: TransactionId) -> Result<()> {
+                Ok(())
+            }
+
+            fn publish(&self, _txn_id: TransactionId, _version: Version) -> Result<()> {
+                Ok(())
+            }
+
+            fn committed_version(&self) -> Option<Version> {
+                Some(self.committed_version)
+            }
+        }
+
+        let temp = NamedTempFile::new().unwrap();
+        let manager = TransactionManager::open(temp.path()).unwrap();
+        manager.recover().unwrap();
+        manager.register_participant(Arc::new(VersionedStore {
+            id: ParticipantId::new(1),
+            committed_version: Version::new(2),
+        }));
+
+        manager
+            .journal
+            .lock()
+            .append(&JournalRecord::Intent {
+                txn_id: TransactionId::new(1),
+                snapshot: Version::INITIAL,
+                participants: vec![],
+            })
+            .unwrap();
+        manager.journal.lock().sync().unwrap();
+
+        let err = manager.checkpoint().unwrap_err();
+        assert!(matches!(
+            err,
+            HtapError::Corruption(message)
+                if message.contains("does not match transaction journal max_version")
         ));
     }
 }

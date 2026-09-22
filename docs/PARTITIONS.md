@@ -112,7 +112,7 @@ To maintain data integrity and avoid lossy dialect workarounds, non-supported pa
 - **Multi-column COLUMNS:** Multi-column keys like `RANGE COLUMNS (a, b)` or `LIST COLUMNS (a, b)` are rejected by the binder with `HtapError::Unsupported("multi-column partitioning is not supported")`.
 - **Malformed / Non-Final MAXVALUE:** Non-final `MAXVALUE` partitions are rejected by the binder with `HtapError::InvalidArgument`. Malformed MAXVALUE syntax (e.g. within compound tuples) fails at parse time.
 - **Generic AST partition_by:** Generic non-MySQL AST `partition_by` is rejected by the binder with `HtapError::Unsupported`.
-- **Deferred Lifecycle & Physical Capabilities:** Physical data migration for populated partition reorganization, physical storage reclamation (space of dropped partitions or demoted column files), delete vectors, background compaction, autonomous background conversion scheduler, hash/key partitioning, and distributed lifecycle coordination remain deferred.
+- **Deferred Lifecycle & Physical Capabilities:** Physical data migration for populated partition reorganization; physical storage reclamation for `ALTER TABLE ... DROP/REORGANIZE PARTITION` (which only ever operates on empty source partitions, so this is a currently-inert gap) or demoted column files; delete vectors; delta-to-base background columnar compaction; autonomous background conversion scheduler; hash/key partitioning; and distributed lifecycle coordination remain deferred. As of Phase 15, `DROP TABLE`'s own rowstore/columnar/movement artifacts are physically reclaimed by `LocalServer::reclaim_tick`/`compaction_tick` — see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" in `docs/ARCHITECTURE.md`. Its `CompactionInput.dropped_partition_ids`/`protected_partition_ids` operate on catalog `PartitionId` values, which — like table/tablet/replica ids — are allocated from the persisted `id_high_water` mark and are never reissued (see "Catalog identifier high-water mark" in `docs/ARCHITECTURE.md`), so a compaction pass can never confuse a dropped partition's id with a newly created one's.
 
 ---
 
@@ -548,7 +548,7 @@ To maintain rigorous production invariants, HTAP explicitly delineates implement
 | Capability / Area | Status in Local Server | Architectural / Deferred Status |
 |---|---|---|
 | **SQL Partition DDL** | Supported for finite `RANGE [COLUMNS]` (including `MAXVALUE`) and `LIST [COLUMNS]`; unpartitioned creates `p0` | Options, subpartitioning, expressions, multi-column COLUMNS, and non-final MAXVALUE rejected |
-| **Partition Lifecycle DDL** | Supported via SQL `ALTER TABLE <table> ADD/DROP/REORGANIZE PARTITION` and native `LocalServer::alter_partitions` on empty sources | Data migration for populated reorganization, physical storage reclamation, and automatic split/merge deferred |
+| **Partition Lifecycle DDL** | Supported via SQL `ALTER TABLE <table> ADD/DROP/REORGANIZE PARTITION` and native `LocalServer::alter_partitions` on empty sources | Data migration for populated reorganization, physical storage reclamation for this ALTER path (empty partitions only, so currently inert), and automatic split/merge deferred |
 | **Topology Specification** | Finite `PartitionTopology::Range` (with optional unbounded upper) and `List` via SQL DDL or `LocalServer::create_partitioned_table` | Catch-all `DEFAULT` options deferred |
 | **Tablet Sharding / Hashing** | Exactly 1 bucket-0 tablet per partition | Hash bucket rings, sub-partitioning, and dynamic tablet splitting deferred |
 | **Replica Topology** | Exactly 1 local leader replica on `NodeId(1)` | Multi-node replica placement, Raft consensus groups, and failover deferred |
@@ -556,7 +556,7 @@ To maintain rigorous production invariants, HTAP explicitly delineates implement
 | **Point Reads / Deletes** | Partition-routed point read (`Engine::get`) and delete | Distributed point lookup RPC fanout deferred |
 | **OLAP Execution** | Conservative range/list pruning; bounded local workers; deterministic merge | Distributed scan fanout across remote nodes deferred |
 | **OLAP Resource Controls** | Bounded in-process worker pool (`scan_workers`) | Disk spilling, query cancellation tokens, and CPU/memory quotas deferred |
-| **Storage Conversion** | Partition-scoped Row->Column conversion (`convert_table_to_column`); Column->Row metadata demotion (`convert_table_to_row`) retaining rowstore and column files; explicit ticks; fail-closed validation | Background compaction, autonomous scheduler, delete vectors, physical storage reclamation, and distributed conversion deferred |
+| **Storage Conversion** | Partition-scoped Row->Column conversion (`convert_table_to_column`); Column->Row metadata demotion (`convert_table_to_row`) retaining rowstore and column files; explicit ticks; fail-closed validation | Delta-to-base background columnar compaction, autonomous scheduler, delete vectors, physical reclamation of demoted column files, and distributed conversion deferred (the rowstore's own generic LSM compaction and `DROP TABLE` artifact reclamation are implemented as of Phase 15 — see `docs/ARCHITECTURE.md`) |
 
 ### Catalog Metadata vs. Physical Serving
 

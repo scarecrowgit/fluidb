@@ -178,23 +178,57 @@ including remaining disclosed gaps: the planned shared binder leaf-helper extrac
 own copy of that logic; and window evaluation carries every materialized column of the joined input into its
 spill partitions rather than only the columns the query needs, inflating partition size under a budget (a
 column-trimming improvement is deferred).
+Phase 15 has a completed local MVP for narrow rowstore compaction and garbage collection, `DROP TABLE`
+physical artifact reclamation, and transaction journal checkpointing — no vectorized/columnar/query change,
+`Route::RowstorePointRead`/`Route::OlapScan`/`Route::Query` byte-for-byte unchanged. `Engine::compact_once`
+(`crates/htap-rowstore/src/engine.rs`) merges one *contiguous* run of the manifest's SST list at a time
+(entry-count tiered selection, or an explicit id set for `DROP TABLE`'s forced priority path), splicing the
+merged output into that run's original manifest position rather than prepending it, so a newer, unselected
+SST always still wins a shared key — a live resurrection bug an initial draft had, fixed and pinned by
+`crates/htap-rowstore/tests/compaction_ordering.rs`. Per key, every version above a computed GC horizon is kept
+unconditionally, and among versions at or below it only the single newest survives (`Put` or `Delete`, never
+elided). The rowstore `MANIFEST` envelope (`HTAPMAN1`) bumps to format version 3 to carry
+`committed_version_high_water` and `gc_low_water`, both monotonic and refusing to publish a regression;
+`Engine::get`/`scan_partition`/`prepare`'s first-writer-wins check reject a real (non-sentinel) snapshot below
+`gc_low_water` with a clear error. `Engine::open` now takes an exclusive advisory lock on
+`<rowstore>/LOCK` for the engine's whole lifetime, rejecting a second `Engine::open` on the same directory in
+or out of process. A per-tablet lease set in `LocalDataMover` (already used for movement I/O mutual exclusion)
+gates compaction the same way: `DROP TABLE`'s tablets get an all-or-nothing forced lease,
+the ordinary tiered pass gets a best-effort partial lease that protects only the busy tablets' SSTs and still
+makes progress on the rest. `DROP TABLE` marks its artifacts `pending_reclaim` in the same catalog CAS that
+removes the table (`HTAPCAT1` bumps to format version 5); `LocalServer::reclaim_tick`/`compaction_tick`
+delete column-store and movement artifacts (including that tablet's movement job records) and drive rowstore
+purge confirmation to completion across as many ticks as it takes, removing the `pending_reclaim` entry only
+once both are done. `TransactionManager::checkpoint()` (a new `HTAPTXC1` envelope) compacts `txn.journal` by
+dropping resolved `Intent`/`Commit`/`Abort` records past a durable checkpoint baseline, triggered
+opportunistically after a commit and finalized once at `LocalServer::open`; any error partway through the
+journal rewrite unconditionally latches `RecoveryRequired` rather than risking a stale, untrusted handle. See
+ADR-024 for the full design (including the bug the storage-review panel found and the accepted
+non-durable-lease precondition), the "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase
+15)" and "Transaction journal checkpoint (Phase 15)" sections below, and `docs/PROGRESS.md`'s Phase 15 row for
+the full test evidence. Disclosed, not fixed: the rowstore is one shared keyspace, so a busy (leased) tablet
+blocks compaction of every SST that contains or spans it, not just its own rows; the explicit-SST-id
+compaction path (used by `compaction_tick`'s convergence loop) compacts only the first contiguous run per
+`compact_once` call, so a caller may need several calls to fully process one preview's candidate set; and the
+movement/reclaim lease set is intentionally non-durable (see ADR-024's stated precondition).
+
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
 remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
-physical data migration for populated partition reorganization, physical rowstore reclamation, delete vectors, compaction,
+physical data migration for populated partition reorganization, delete vectors on columnar segments, background compaction folding rowstore deltas into new columnar segments (distinct from the rowstore's own LSM compaction, implemented as of Phase 15 — see above),
 autonomous background conversion scheduling, compound AND pushdown beyond one leaf, != pushdown, vectorized aggregation / operator pipelines,
 LIMIT BY, UPDATE with joins/subqueries/ORDER BY/LIMIT, non-partition ALTER,
 vectorized/pipelined execution, worker-pool parallelism for `LEFT`/`RIGHT`/`FULL` joins (structural; the general
 executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spillable as of Phase 14 — see above),
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
-physical reclamation on DROP TABLE, semi-join rewrites of IN/EXISTS, broader string/date function coverage,
+physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), semi-join rewrites of IN/EXISTS, broader string/date function coverage,
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
-idle-transaction timeout/reaping, MVCC garbage collection, IPC/multiprocess access,
+idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command), IPC/multiprocess access,
 Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors; server-side cursors via `COM_STMT_FETCH`, exact DECIMAL, and `TIME`-typed bound parameters also remain deferred — see "Prepared statements and binary protocol (Phase 11)" below);
-note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation remain deferred).
+note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation of demoted column files remain deferred — this is unrelated to Phase 15's `DROP TABLE` reclaim, which only reclaims a *dropped* table's artifacts, not a demoted table's retained column files).
 See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
@@ -244,7 +278,7 @@ flowchart TD
         plan_df["DataFusion/Arrow"]
         plan_coord["distributed Coordinator Raft/ZooKeeper"]
         plan_remote["multi-tablet/remote serving"]
-        plan_compact["delete vectors/compaction"]
+        plan_compact["delete vectors / columnar delta compaction"]
 
         plan_coord -.->|"planned cluster consensus"| plan_remote
         plan_df -.->|"planned distributed scan"| plan_remote
@@ -255,7 +289,7 @@ flowchart TD
     class plan_df,plan_coord,plan_remote,plan_compact planned;
 ```
 
-The current active path operates entirely in-process within `LocalServer` for `EmbeddedClient`, and over a loopback-by-default synchronous MySQL text- and binary-protocol connection (`htap-wire` `WireServer`, `htapd`) for `RemoteClient`, without distributed dependencies: queries are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and `SnapshotPinned` manifest-less partitions). In contrast, the planned target architecture—including DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with background compaction—is deferred and strictly separated from active execution paths.
+The current active path operates entirely in-process within `LocalServer` for `EmbeddedClient`, and over a loopback-by-default synchronous MySQL text- and binary-protocol connection (`htap-wire` `WireServer`, `htapd`) for `RemoteClient`, without distributed dependencies: queries are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and `SnapshotPinned` manifest-less partitions). In contrast, the planned target architecture—including DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with columnar delta-to-base background compaction (the rowstore's own LSM compaction and DROP TABLE artifact reclaim are implemented as of Phase 15 — see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" below)—is deferred and strictly separated from active execution paths.
 
 ### Current In-Process Execution Call Flow (Implemented Local Slice)
 
@@ -917,7 +951,7 @@ placeholder-in-`ORDER BY` coverage via `test_case_in_order_by_resolves_output_sc
 
 ## Dual-format storage
 
-**Status: `implemented (local MVP)`** (`htap-rowstore`, `htap-colstore`, and local row-to-column conversion and Column-to-Row metadata demotion via `htap-convert` are implemented as local MVPs; physical data migration for populated partition reorganization, physical storage reclamation, delete vectors, compaction, autonomous conversion scheduler, and distributed conversion are planned/deferred).
+**Status: `implemented (local MVP)`** (`htap-rowstore`, `htap-colstore`, and local row-to-column conversion and Column-to-Row metadata demotion via `htap-convert` are implemented as local MVPs; the rowstore's own LSM compaction and `DROP TABLE` physical artifact reclamation are implemented as narrow local MVPs as of Phase 15 (see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" below); physical data migration for populated partition reorganization, delete vectors, delta-to-base background compaction folding rowstore deltas into new columnar segments, autonomous conversion scheduler, and distributed conversion remain planned/deferred).
 
 | Format | Crate | Structure | Status |
 | ------ | ----- | --------- | ------ |
@@ -960,14 +994,15 @@ in the named source file, not an assertion.
 
 | Magic | Crate / file | Versions written | Versions accepted on read | CRC covers | Size-check mode | Payload cap | Truncated-tail behavior |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `HTAPCAT1` | `htap-catalog/src/local.rs` (catalog snapshot) | 4 | 1..=4 | payload only | `TruncatedThenTrailing` (two distinct errors) | 64 MiB | Rejected as `HtapError::Corruption` with a truncated- or trailing-bytes message; version 1/2/3 payloads missing newer fields (including Phase 14's `TableDescriptor.stats`) decode via `#[serde(default)]`. |
+| `HTAPCAT1` | `htap-catalog/src/local.rs` (catalog snapshot) | 5 | 1..=5 | payload only | `TruncatedThenTrailing` (two distinct errors) | 64 MiB | Rejected as `HtapError::Corruption` with a truncated- or trailing-bytes message; version 1-4 payloads missing newer fields (including Phase 14's `TableDescriptor.stats` and Phase 15's `pending_reclaim`) decode via `#[serde(default)]`; a version-5-labeled payload missing `pending_reclaim` is rejected instead, since a v5 writer always includes it. |
 | `HTAPCRD1` | `htap-coord/src/lib.rs` (coordinator state) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 64 MiB | Rejected as `HtapError::Corruption`. |
 | `HTAPJOB1` | `htap-movement/src/job.rs` (movement job) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 16 MiB | Rejected as `HtapError::Corruption`. |
 | `HTAPMNF1` | `htap-movement/src/tablet.rs` (tablet package manifest) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 16 MiB | Rejected as `HtapError::Corruption`. |
 | `HTAPTBM1` | `htap-convert/src/lib.rs` (tablet column manifest) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 64 MiB | Rejected as `HtapError::Corruption`. |
-| `HTAPMAN1` | `htap-rowstore/src/manifest.rs` (rowstore manifest) | 2 (v1 legacy still written by `encode_v1`, used only in tests) | 1..=2 | payload only | **`ExactMatch`** (one "manifest size mismatch" error, no separate truncated/trailing message) | 64 MiB | Rejected as `HtapError::Corruption("manifest size mismatch: ...")`; this is the one envelope that gates WAL/SST manifest recovery and deliberately kept its stricter, single-message check instead of being unified onto the other five's two-step check. |
+| `HTAPMAN1` | `htap-rowstore/src/manifest.rs` (rowstore manifest) | 3 (v1 legacy still written by `encode_v1`, used only in tests) | 1..=3 | payload only | **`ExactMatch`** (one "manifest size mismatch" error, no separate truncated/trailing message) | 64 MiB | Rejected as `HtapError::Corruption("manifest size mismatch: ...")`; this is the one envelope that gates WAL/SST manifest recovery and deliberately kept its stricter, single-message check instead of being unified onto the other five's two-step check. Version 3 (Phase 15) adds `committed_version_high_water`/`gc_low_water`; both watermarks are derived from existing state for v1/v2 payloads (`gc_low_water` defaults to `Version::INITIAL`) and a v3 payload's external-apply ledger max version exceeding its own `committed_version_high_water` is additionally rejected as `Corruption` at decode time. |
+| `HTAPTXC1` | `htap-txn/src/checkpoint.rs` (transaction journal checkpoint baseline) | 1 | 1..=1 | payload only | `TruncatedThenTrailing` | 1 KiB (`CHECKPOINT_MAX_PAYLOAD_BYTES`) | Rejected as `HtapError::Corruption`; absent file (never checkpointed yet) is `Ok(None)`, treated as baseline `(0, Version::INITIAL)`. New in Phase 15 — see "Transaction journal checkpoint (Phase 15)" below. |
 | Bare frame (WAL) | `htap-rowstore/src/wal.rs::{encode_frame, read_segment}` | n/a (no magic/version) | n/a | payload only | n/a (length-vs-remaining-bytes check) | 64 MiB (`MAX_PAYLOAD_BYTES`) | `read_segment` stops at the first bad frame with no torn-vs-mid-log distinction; everything before the bad frame is kept. |
-| Bare frame (journal) | `htap-txn/src/journal.rs::{encode_frame, decode_frame_slice}` | n/a | n/a | payload only | n/a | 16 MiB default (`DEFAULT_MAX_FRAME_SIZE`, configurable via `JournalOptions::with_max_frame_size`) | Distinguishes a repairable torn final frame (`FrameStatus::TornFinal`, safe to truncate-and-repair) from mid-log corruption (`FrameStatus::Corrupt`, refused) via `has_valid_frame_ahead` look-ahead. |
+| Bare frame (journal) | `htap-txn/src/journal.rs::{encode_frame, decode_frame_slice}` | n/a | n/a | payload only | n/a | 16 MiB default (`DEFAULT_MAX_FRAME_SIZE`, configurable via `JournalOptions::with_max_frame_size`) | Distinguishes a repairable torn final frame (`FrameStatus::TornFinal`, safe to truncate-and-repair) from mid-log corruption (`FrameStatus::Corrupt`, refused) via `has_valid_frame_ahead` look-ahead. As of Phase 15, `Journal::open_for_bootstrap` (crate-private) temporarily raises the effective size ceiling to 2 GiB during `TransactionManager::open`/`recover`, so a full journal can still be read and folded against a checkpoint baseline before `finalize_open` re-enforces the configured `max_journal_size`. |
 
 `htap-colstore/src/segment.rs` (`HTAPCOL1`) and `htap-rowstore/src/sst.rs` (`HTAPSST1`) are not whole-file
 envelopes in this shape (magic-only header, format version in a trailing footer, per-block framing) and were
@@ -984,14 +1019,334 @@ Verified against a golden-bytes test per envelope (see [`docs/PROGRESS.md`](./PR
 
 ---
 
+## Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)
+
+**Status: `implemented (local MVP)`** (`htap-rowstore`, `htap-movement`, `htap-catalog`, `htap-server`; a narrow
+local slice — see disclosed limitations below).
+
+### `Engine::compact_once` and candidate selection
+
+`Engine::compact_once(input: CompactionInput) -> Result<CompactionReport>` (`crates/htap-rowstore/src/engine.rs`)
+runs under `commit_lock` for its whole duration, mirroring `flush_locked`. Candidate selection
+(`select_compaction_candidates`) groups SSTs into tiers by `floor(log_4(entry_count.max(1)))` — not byte size,
+since neither `SstMetadata` nor `ManifestSstEntry` carries one — and picks the smallest tier with four or more
+members, capped by `EngineOptions::{max_compaction_input_ssts, max_compaction_input_entries}` (defaults 16 and
+2,000,000). `DROP TABLE`'s forced-priority path additionally selects any SST that might contain a dropped
+partition, bypassing the four-member tier minimum (a single isolated SST is a valid forced-priority run of
+length 1). `CompactionInput.protected_partition_ids` excludes any SST overlapping those partitions from
+selection entirely — this is what lets a busy (leased) tablet make the rest of a tier's candidates still
+progress. `CompactionInput.explicit_sst_ids`, when set, uses exactly those ids (minus protected ones) instead
+of re-selecting; the caller (`compaction_tick`) may need several `compact_once` calls to fully process one
+preview's candidate set, since only one contiguous manifest sub-run is compacted per call.
+
+**Contiguous-run selection and in-place splice (the critical fix — see ADR-024, decision 1).** Every selected
+set of SST ids must form one contiguous run in the manifest's current order; `compact_once` verifies this
+against both the manifest and `read_state.ssts` before merging and again before swapping, returning
+`HtapError::Corruption` rather than silently proceeding if either check fails. The merged output is spliced
+into that run's *original* start index in both the manifest's SST list and `read_state.ssts` — never
+prepended — so an SST that was newer than the run stays newer and one that was older stays older. An initial
+draft prepended the output to index 0, which could make a genuinely newer, unselected SST's `Put` or `Delete`
+lose to older compacted data for a shared key; this is pinned as a named regression by
+`crates/htap-rowstore/tests/compaction_ordering.rs` (`test_non_newest_compaction_run_keeps_newer_ssts_authoritative`,
+`test_selected_tombstone_never_resurrects_older_unselected_value`).
+
+**Tombstone retention rule (unchanged in intent from the original design, reconfirmed against the ordering
+fix).** Per key, every version strictly above `input.gc_horizon` is kept unconditionally; among versions at or
+below the horizon, only the single newest survives — whether it is a `Put` or a `Delete`, never elided. This is
+safe under any partial-compaction schedule, including one that only ever compacts non-adjacent sub-runs around
+a busy tablet (`test_scattered_dropped_partition_is_purged_over_contiguous_passes`,
+`test_sandwiched_partition_becomes_exactly_absent_in_one_pass`). Full-coverage tombstone elision remains
+explicitly deferred.
+
+`Engine::preview_compaction_candidates(dropped_partition_ids, protected_partition_ids) ->
+CompactionPreview{ sst_ids, partition_ids }` reports the exact SST ids `compact_once` would touch and the exact
+partition ids present in them (falling back to each SST's conservative min/max partition range only if a
+selected SST cannot be scanned) — used by `compaction_tick` to know precisely which tablets it needs a lease
+for before calling `compact_once` for real. `Engine::partitions_possibly_present_in_ssts`/
+`partitions_possibly_present_in_memtables` support purge confirmation (below) with the same exact-presence
+contract, closing an earlier conservative-range check that could never report a sandwiched dropped partition
+as fully absent.
+
+### Manifest watermarks (`HTAPMAN1` format version 3)
+
+The rowstore `MANIFEST` gains `committed_version_high_water` and `gc_low_water` (both `Version`), published in
+the same atomic-publish call as every SST-set change (flush or compaction), under `commit_lock`. Both only
+ever rise: `committed_version_high_water` advances to `max(existing, read_state.committed_version)` on every
+publish; `gc_low_water` advances to `max(existing, input.gc_horizon)` only on a compaction pass that actually
+publishes (a no-op or preview pass never advances it). `Manifest::atomic_publish` refuses — returns an error
+without writing — rather than clamps if either new value would be lower than what is currently on disk,
+mirroring `checkpoint::publish_checkpoint`'s precedent below. `Engine::open`'s recovered committed version is
+`max(manifest high-water, every SST's max_version, every replayed WAL commit)`, never dropping the SST/WAL
+terms even though the manifest term is new. `Engine::get`, `scan_partition`, and `prepare`'s first-writer-wins
+check reject a real (non-`u64::MAX`-sentinel) snapshot below `gc_low_water` with a clear error instead of
+silently returning collapsed, no-longer-fully-versioned data — closing the "a pinned movement read below the
+horizon gets wrong data" finding for every caller at once, verified by
+`crates/htap-rowstore/tests/gc_low_water.rs::test_gc_low_water_rejects_old_snapshots_and_persists_across_reopen`.
+v1/v2 manifests still decode (`gc_low_water` defaults to `Version::INITIAL`, the high-water is derived exactly
+as before); a v3 payload additionally cross-checks its external-apply ledger's max version against
+`committed_version_high_water`, rejecting the combination as `Corruption` if the ledger is ahead — that
+combination cannot arise from any code path that writes v3.
+
+**`gc_horizon` is clamped to `visible_version` before use, with no exemption on the write side (storage-review
+"X batch" fix, re-clamped in a follow-up "Y batch" pass).** `compact_once` computes
+`effective_gc_horizon = input.gc_horizon.min(read_state.visible_version)` and uses that one clamped value both
+to decide which versions collapse and to advance `gc_low_water`, on every publishing pass. An earlier draft
+already clamped the horizon for the collapse decision but carried a write-side exemption that skipped raising
+`gc_low_water` whenever a caller passed the `u64::MAX` "collapse everything" sentinel (reasoning it was purely
+a write-side signal) — so a `u64::MAX`-horizon compaction could actually collapse versions while the read-side
+floor never rose to cover them, letting a real snapshot at an older, now-collapsed version silently read stale
+data instead of being rejected with the "below GC low-water" error. The exemption was removed first ("X batch"
+fix), but that fix clamped to `committed_version`, not `visible_version`; a second review found this could
+raise `gc_low_water` *above* `visible_version` whenever `apply_external` had advanced `committed_version`
+without yet publishing it (a 2PC/external-apply commit is committed before it is made visible), rejecting
+every fresh snapshot with "below GC low-water" even though no snapshot can ever exceed `visible_version`
+anyway. The clamp now uses `visible_version` ("Y batch" fix); `committed_version` is unaffected and still feeds
+`committed_version_high_water` (above) on every publish. `crates/htap-rowstore/tests/horizon_clamp.rs::{test_infinite_gc_horizon_is_clamped_to_committed_version, test_infinite_gc_horizon_does_not_exceed_visible_version}` — the first test's committed and visible versions happen to coincide, so it does not by itself distinguish the two watermarks; the second builds a committed-ahead-of-visible scenario with `apply_external`/no `publish`, proving the horizon and thus `gc_low_water` never exceed `visible_version`.
+
+**`gc_low_water` is mirrored into `read_state`, so readers never take `commit_lock` (storage-review fix).** An
+initial implementation had `Engine::get`/`scan_partition` read `gc_low_water` via
+`self.commit_lock.lock().manifest.gc_low_water` — a lock-order hazard for the hot read path, since the
+documented rule is `commit_lock` before `read_state`, never the reverse, and a pure reader taking `commit_lock`
+at all could block behind a concurrent writer. `ReadState` now carries its own `gc_low_water` field, mirrored
+from `commit_guard.manifest.gc_low_water` under `commit_lock` at the exact points `read_state.ssts` is already
+swapped (`Engine::open`'s initial load, `flush_locked`, `compact_once`), so `get`/`scan_partition` only ever
+acquire `read_state.read()`. Verified by a real concurrent-thread test:
+`crates/htap-rowstore/tests/concurrent_reads.rs::test_concurrent_reads_do_not_deadlock_with_flush_and_compaction`.
+
+### The engine's own directory lock
+
+`Engine::open` now acquires an exclusive advisory `flock` on `<rowstore>/LOCK` for the engine's entire
+lifetime, so a second `Engine::open` on the same directory — in the same process or a different one — fails.
+This is a separate lock file from the server's root `<root>/LOCK`; the root lock is always acquired first
+(`LocalServer::open`), so the two cannot form an ordering cycle. Every test helper that used to open a second,
+unlocked `Engine` directly against a live server's rowstore directory (unsafe: two independent manifest
+writers) was audited and fixed to drop the prior engine handle first.
+
+### Movement/reclaim lease exclusion and `flush_roll_and_gc`
+
+`LocalDataMover`'s per-tablet lease set (`crates/htap-movement/src/job.rs`) is shared by movement I/O and both
+compaction paths: `try_acquire_reclaim_lease` (all-or-nothing, for `DROP TABLE`'s small forced-priority
+tablet set) and `acquire_reclaim_leases_best_effort` (partial, for the ordinary size-tiered pass — acquires
+whichever tablets are free and reports the rest as denied, so one busy tablet does not stall the whole tick).
+A lease is always acquired *before* the engine call it protects, never after — see ADR-024, decision 3, for
+the full lock-ordering argument and the accepted non-durable-lease precondition. `Engine::flush_roll_and_gc()`
+drains memtables through the existing `flush_locked` (publishing the manifest), force-rolls the WAL to a fresh
+segment, and garbage-collects WAL segments up to the newly committed version, all under one `commit_lock`
+acquisition — used by purge confirmation (below) so no replayable row of an already-compacted, dropped
+partition survives a crash-and-restart from an un-rolled WAL segment
+(`crates/htap-rowstore/tests/wal_purge.rs::test_wal_gc_does_not_resurrect_purged_partition_after_reopen`).
+
+**Exports hold their tablet lease for the whole scan-and-write (storage-review "X batch" fix).**
+`copy_to_csv_writer`/`copy_to_jsonl_writer`/`export_to_file` (`crates/htap-movement/src/export.rs`) acquire the
+same per-tablet movement lease `acquire_tablet_leases` returns and hold it as an RAII guard for the export's
+entire pinned-snapshot scan and write, not just around individual steps. This makes export and reclaim
+mutually exclusive on the same tablet in either direction: an export attempted while a reclaim lease is held
+fails with `HtapError::Conflict`, and a reclaim lease cannot be acquired while an export is in flight.
+Verified by `crates/htap-movement/tests/export_leasing.rs::exports_hold_tablet_leases_against_reclaim`.
+
+### `DROP TABLE` physical reclamation and `pending_reclaim` (`HTAPCAT1` format version 5)
+
+`execute_drop_table` appends one `PendingReclaim{ table_id, table_name, catalog_generation,
+dropped: Vec<DroppedPartitionArtifact{partition_id, tablet_id}>, created_at_unix_ms,
+colstore_and_movement_reclaimed: false, rowstore_purge_confirmed: false }` onto `CatalogSnapshot.pending_reclaim`
+in the *same* CAS that removes the table/partition/tablet/replica rows — never a follow-up write.
+`CatalogSnapshot::validate` rejects a `(partition_id, tablet_id)` pair overlapping a still-live row, or
+duplicated across entries. `LocalServer::reclaim_tick()` (and the best-effort call `execute_drop_table` itself
+makes right after its CAS) reclaims column-store and movement artifacts for each entry's tablets — an entire
+`colstore/tablet-<id>/` directory plus any movement package/job directories referencing that tablet
+(`LocalDataMover::delete_tablet_movement_artifacts`) — under the tablet's reclaim lease, and sets
+`colstore_and_movement_reclaimed = true` once every tablet in the entry is either reclaimed or already
+absent. `LocalServer::compaction_tick()` additionally treats every `!rowstore_purge_confirmed` entry's
+partitions as forced-priority `dropped_partition_ids`, compacts them (holding the forced lease for the whole
+tick), and — once `partitions_possibly_present_in_ssts`/`_in_memtables` both report absent (calling
+`flush_roll_and_gc` once if only the memtable check still shows presence) — sets
+`rowstore_purge_confirmed = true`. An entry is removed from the catalog only once both flags are true, which
+may take several `compaction_tick` calls for a large or contended table. `LocalServer::open` runs a
+crash-recovery pass (`auto_fail_abandoned_jobs = true`) that fails any `Running` movement job record found at
+startup before attempting reclaim — sound because `ProcessLock` exclusivity proves any such record is
+provably abandoned dead work with no live reader (the crash that orphaned it also killed the only process that
+could have been reading it).
+
+**`delete_tablet_movement_artifacts` fsyncs its parent directories (storage-review "X batch" fix).** After
+removing a tablet's package directory and its referencing job directories,
+`LocalDataMover::delete_tablet_movement_artifacts` now calls `sync_dir` on the tablets directory, the jobs
+directory, and the movement root, so a crash immediately after deletion cannot leave those removed entries
+resurrectable from stale directory metadata on reopen — the same temp-write/fsync/rename/sync-dir contract
+(ADR-008/009) every other owned-state deletion in this workspace already follows.
+
+### GC horizon
+
+`compaction_tick()` computes one GC horizon per call, under `execution_lock` for the tick's entire duration,
+as `min(TransactionManager::visible_version(), the minimum over every currently-registered pinned session
+snapshot, the minimum over every in-flight conversion's snapshot_version)`, then subtracts a configurable,
+default-zero `LocalServer::with_gc_horizon_retention_slack`. `CompactionTickReport` reports both the resulting
+`gc_horizon` and which of the three sources limited it (`GcHorizonSource::{VisibleVersion, PinnedSession,
+Conversion}`), for operability. Neither a rowstore-conversion `base_version` nor a movement job's
+`pinned_version` field is used as a horizon source: the former was proven unnecessary by tracing every
+compact-read caller's actual snapshot usage, and the latter was found unsound (a movement job's default
+`pinned_version: None` is never written back to its durable job record once a fresh snapshot is resolved in
+memory, so a horizon source reading it would silently miss the common case) — both are replaced by the
+lease-based structural exclusion above. See ADR-024 for the full derivation and the monotonicity argument.
+
+**Convergence cap fallback (storage-review fix).** Before calling `compact_once`, `compaction_tick` runs a
+convergence loop (bounded at `MAX_ITERATIONS = 8`): each pass previews the candidate SSTs, requests best-effort
+leases for their tablets, and adds every denied tablet's partitions to `protected_partition_ids` for the next
+pass, repeating until a pass adds no new protection. If the loop still has not stabilized when the cap is
+reached, `compaction_tick` skips the `compact_once` call for that tick entirely (an unstable candidate set
+could otherwise select an SST whose protection status changes mid-rewrite) but still runs
+`flush_roll_and_gc`, purge confirmation, the removal CAS, and `reclaim_tick_locked` exactly as it would on a
+converged tick — only the SST-rewriting step is skipped, not the whole tick's other maintenance work — and
+reports `ran: true` with `reason: Some("compaction candidate protection did not converge")` rather than
+silently doing nothing or returning an error. Verified by
+`crates/htap-server/tests/compaction_convergence.rs::leased_dropped_tablets_are_all_protected_in_one_tick`.
+
+**`entries_purged` only counts confirmed CAS successes (storage-review "X batch" fix).**
+`CompactionTickReport.entries_purged` used to count every `pending_reclaim` entry the tick attempted to mark
+`rowstore_purge_confirmed`, regardless of whether the catalog CAS actually landed — a lost race against a
+concurrent catalog writer (`HtapError::Conflict`, silently retried on the next tick) could make the report
+overstate how many entries were durably confirmed. It is now assigned only inside the CAS's `Ok(())` branch,
+so it reports `confirmed.len()` on success and `0` on a lost race, never an attempted-but-unpublished count.
+
+### Disclosed limitations
+
+- **Shared-keyspace protection is per SST, not per row.** The rowstore is one shared keyspace; a flushed SST
+  can hold rows from every partition written since the previous flush. A movement- or reclaim-leased (busy)
+  partition therefore blocks compaction of *every* SST that contains or spans it, not just that partition's
+  own rows. Partial progress around a busy tablet is possible only for SSTs that do not include that
+  partition at all.
+- **The explicit-SST-id compaction path compacts only the first contiguous run per `compact_once` call.**
+  After removing protected ids, `compaction_tick`'s convergence loop may need several calls to fully process
+  one preview's candidate set, and a scattered dropped partition purges over as many contiguous sub-run
+  passes as it takes.
+- **Compaction is explicit-tick-only and blocks all SQL for its duration**, matching `conversion_tick`'s
+  existing operational model — there is no background compaction thread, and no SQL statement to trigger a
+  flush or a tick (tests force SSTs by dropping the server, opening the engine directly, flushing, and
+  reopening the server).
+- **Movement/reclaim leases are non-durable**, lost on crash — sound today only because nothing that survives
+  such a crash can still be reading the tablet the lease protected (see ADR-024's stated precondition, which
+  a future resumable-movement-job feature would break).
+- **A resurrected row from an un-rolled WAL segment is a disk leak, not visible corruption** — it lands under
+  a partition id that is never reused, so no live query can reach it, but `flush_roll_and_gc` only runs when
+  purge confirmation actually calls it, not on every compaction.
+- **A `compact_once` error after its manifest publish leaves the in-memory manifest stale until reopen
+  (liveness only, no data loss).** `compact_once` writes and fsyncs `MANIFEST` before assigning the new value
+  to `commit_guard.manifest`; if something between those two steps fails (e.g. the `EngineIoOp::
+  CompactionAfterManifestPublish` test fault-injection point, modeling a directory-fsync-adjacent error), the
+  on-disk file already reflects the new SST set and watermarks, but the in-memory copy does not. A later flush
+  builds its own new manifest from the stale in-memory copy and tries to publish it; `Manifest::atomic_publish`'s
+  regression-refusal check (decision 2 above) compares against the file actually on disk and correctly refuses
+  the resulting apparent regression, so no corruption occurs — but every flush is refused until the engine is
+  reopened (a fresh `Engine::open` re-reads `MANIFEST` from disk, resolving the staleness).
+- **A flush's new SST reader can fail to open after the manifest already lists it (liveness only, no data
+  loss).** `flush_locked` publishes the manifest (adding the new SST) before calling `SstReader::open` on that
+  same SST; if the open fails, the function returns `Err` with the manifest already updated but
+  `read_state.ssts` never getting the new reader inserted. A later `compact_once` that selects a run including
+  that SST id finds `read_guard.ssts` missing a reader for an id the manifest lists, and fails safely with
+  `HtapError::Corruption("manifest references an SST absent from read state during compaction")` rather than
+  silently compacting a truncated view — until the engine is reopened, which reloads both structures from the
+  same on-disk manifest and is therefore always consistent again.
+- **An undecodable movement job directory is skipped by reclaim, never deleted or reported (liveness only).**
+  `LocalDataMover::delete_tablet_movement_artifacts`'s job-directory scan now skips (rather than fails on) a
+  `JOB` file it cannot decode while looking for records belonging to the target tablet — closing a finding
+  that one corrupt, *unrelated* tablet's job directory could otherwise block reclamation of a different,
+  healthy tablet. The corrupt directory itself is left in place indefinitely; there is no separate sweep or
+  report for it. Verified by
+  `crates/htap-movement/tests/corrupt_job_isolation.rs::corrupt_unrelated_job_does_not_block_tablet_artifact_reclamation`.
+
+---
+
+## Transaction journal checkpoint (Phase 15)
+
+**Status: `implemented (local MVP)`** (`htap-txn`).
+
+`txn.journal` previously only ever grew (see `docs/LIMITATIONS.md`'s prior "no compaction" bullet); a
+long-running root could eventually make `LocalServer::open` fail once `max_journal_size` was exceeded, even
+though every individual append had succeeded. `TransactionManager::checkpoint()` closes this for the journal
+itself (the separate `MANIFEST` v2 external-apply-ledger cap, `MAX_APPLIED_EXTERNAL_TXNS`, is untouched and
+remains a distinct, still-open limitation — the two must not be conflated).
+
+**`txn.checkpoint` (`HTAPTXC1`, format version 1).** `crates/htap-txn/src/checkpoint.rs` persists
+`CheckpointBaseline{ txn_id_high_water, version_high_water }` adjacent to `txn.journal`, built on the same
+shared `htap_common::envelope`/`fs` helpers every other durable file in this workspace uses (temp write ->
+`sync_all` -> rename -> `sync_dir`). An absent file (never checkpointed) is `Ok(None)`, treated as baseline
+`(0, Version::INITIAL)`; a corrupt file is `HtapError::Corruption`, never silently falls back to zero.
+`publish_checkpoint` itself refuses to write a baseline that regresses either field below what is currently on
+disk.
+
+**`TransactionManager::checkpoint() -> Result<CheckpointReport>`**, under `decision_lock` for its entire body
+(mirroring `commit`/`abort`): refuses (`compacted: false`, not `Err`) before `recover()` has ever run, or while
+latched/poisoned. It re-derives the fold of every journal record against the current baseline
+(`fold_and_verify`, a lock-free helper shared with `recover()`), cross-checks that every participant whose
+`committed_version()` reports a concrete value equals the fold's effective maximum exactly (refusing without
+touching disk on a mismatch), computes the set of still-unresolved `Intent` records (verbatim — never
+synthesizing an `Abort`), and — only if anything is droppable or either high-water mark advanced — publishes
+the new baseline *first*, then atomically rewrites `txn.journal` to exactly the retained records, then reopens
+the live `Journal` handle. **Any error from the rewrite step or the subsequent reopen unconditionally latches
+`RecoveryCause::JournalIo`** before attempting any cleanup — including when a defensive re-open of the old
+handle (for file-descriptor safety only, never for trust) happens to succeed — because a rewrite error leaves
+the durability of the replacement unknown regardless of what happens next. See ADR-024, decision 4, for the
+full rationale and the exact regression this closes.
+
+**Bootstrap and finalization.** `Journal::open_for_bootstrap` (crate-private) temporarily raises the effective
+open-time size ceiling to 2 GiB (`RECOVERY_BOOTSTRAP_MAX_BYTES`) so `TransactionManager::open`/`recover()` can
+still read and fold a journal that has grown past its configured `max_journal_size` before a checkpoint has
+had a chance to shrink it. `LocalServer::open` calls `TransactionManager::finalize_open()` immediately after
+`recover()`: a best-effort `checkpoint()`, then one more `Journal::open_with_options` at the *configured*
+(non-bootstrapped) size limit — the call that fails with `Corruption` if the checkpoint could not shrink the
+file enough. A post-commit opportunistic trigger (`commit()`'s success path, after its decision-lock guard is
+dropped) calls `checkpoint()` best-effort whenever the journal's valid byte count exceeds half of
+`configured_max_journal_size` (`with_checkpoint_trigger_bytes`), so a long-running workload keeps the journal
+small without ever needing an explicit operator action; the trigger's own failure never fails the commit that
+triggered it.
+
+**`checkpoint()` reads records through the bootstrap ceiling, not the live handle's own configured limit
+(storage-review "X batch" fix).** `checkpoint()` calls
+`journal.recover_records_with_max_journal_size(self.configured_max_journal_size.max(RECOVERY_BOOTSTRAP_MAX_BYTES))`
+rather than the journal handle's own `options().max_journal_size`. An earlier draft read through the handle's
+own limit, which by the time `checkpoint()` runs after `finalize_open` is the *configured* limit — so a
+journal one oversized commit had already pushed past that limit could never be read back for checkpointing at
+all, and the opportunistic post-commit trigger above would fail on every subsequent commit instead of
+shrinking the file. Reading through `max(configured_max_journal_size, RECOVERY_BOOTSTRAP_MAX_BYTES)` instead —
+not a fixed 2 GiB cap, which would itself refuse a journal between 2 GiB and a larger configured
+`max_journal_size` — lets a journal within that ceiling but over the configured limit still be folded and
+rewritten back under it, exactly like the initial `open`/`recover()` bootstrap read already did. No test
+covers the more-than-2-GiB case, since it would require constructing a journal over 2 GiB. Verified by
+`manager::tests::test_checkpoint_compacts_journal_that_exceeds_configured_limit` (an oversized commit is
+checkpointed back under the configured limit, then a normal, non-bootstrap `Journal::open_with_options` accepts
+the result) and `manager::tests::test_finalize_open_restores_configured_journal_limit` (a bootstrap-ceiling
+reopen must not itself rewrite the journal; only `finalize_open`'s subsequent checkpoint-then-reopen does).
+
+Verified by `crates/htap-txn/src/{checkpoint.rs,manager.rs}` unit tests (`checkpoint_round_trips`,
+`absent_checkpoint_returns_none`, `corrupted_checkpoint_crc_is_rejected`,
+`future_checkpoint_version_is_rejected`, `publish_refuses_regressing_txn_id_high_water`,
+`publish_refuses_regressing_version_high_water`, `checkpoint_envelope_matches_golden_bytes`,
+`checkpoint_with_trailing_bytes_is_rejected`, `truncated_checkpoint_is_rejected`,
+`test_checkpoint_shrinks_journal_after_commits`, `test_checkpoint_reopen_has_fewer_records`,
+`test_small_journal_limit_is_sustained_by_opportunistic_checkpointing`,
+`test_recovery_uses_checkpoint_baseline_high_water_marks`, `test_checkpoint_refused_before_recovery`,
+`test_checkpoint_rejects_participant_version_mismatch`,
+`test_checkpoint_crash_after_baseline_before_rewrite_preserves_evidence`,
+`test_checkpoint_crash_mid_rewrite_recovers_torn_replacement`,
+`test_checkpoint_crash_after_rewrite_before_handle_reopen_preserves_evidence`,
+`test_checkpoint_compacts_journal_that_exceeds_configured_limit`,
+`test_finalize_open_restores_configured_journal_limit`) and
+`crates/htap-server/tests/reclaim.rs::test_open_finalizes_and_compacts_oversized_transaction_journal` (a real
+end-to-end oversized-journal self-heal through `LocalServer::open`).
+
+---
+
 ## Catalog identifier high-water mark (Phase 9)
 
 **Status: `implemented (local MVP)`** (`htap-catalog`).
 
 `DROP TABLE` (see "Query routing" above) removes a table and its partitions/tablets/replicas from the
-catalog, but does not physically reclaim the rowstore data or columnar segments that belonged to those
-partitions/tablets — they remain on disk, unreachable, keyed by the dropped identifiers. To guarantee a
-dropped identifier can never be reissued and accidentally alias that unreachable data, `CatalogSnapshot`
+catalog in one CAS. As of Phase 15, that same CAS also marks the dropped tablets `pending_reclaim`, and
+`LocalServer::reclaim_tick`/`compaction_tick` physically reclaim the rowstore data and columnar segments that
+belonged to those partitions/tablets over as many ticks as it takes (see "Rowstore compaction, garbage
+collection, and DROP TABLE reclaim (Phase 15)" above) — reclamation is real but eventual and tier-driven, not
+instant, so a dropped identifier's bytes may still be on disk, unreachable, for a time after the `DROP TABLE`
+statement returns. To guarantee a dropped identifier can never be reissued and accidentally alias that
+still-unreclaimed data in the meantime, `CatalogSnapshot`
 persists `id_high_water: IdHighWater { table, partition, tablet, replica }` (`crates/htap-catalog/src/model.rs`):
 every allocator (`CREATE TABLE`, `ALTER TABLE ADD/REORGANIZE PARTITION`, and `DROP TABLE`'s own bookkeeping)
 allocates the next id from `max(persisted high-water, live maximum id currently in the catalog) + 1`, and
@@ -1037,8 +1392,13 @@ persists the new high-water mark in the same catalog CAS as the mutation.
   the persisted mark in the snapshot it stages so the next allocation (local or via a future `plan_placement`
   call) still starts above every replica id ever used.
 - **Scope:** This closes the identifier-reuse hazard for `DROP TABLE` and `ALTER TABLE ... DROP PARTITION`
-  (and, via `htap-coord`, for removed replicas); it does not perform physical reclamation of the dropped
-  rowstore, columnar, or movement-package data, which remains deferred (see `docs/LIMITATIONS.md`).
+  (and, via `htap-coord`, for removed replicas). As of Phase 15, `DROP TABLE`'s rowstore, columnar, and
+  movement-package data is physically reclaimed (see above) — but only eventually, tier-driven, and only for
+  `DROP TABLE`; `ALTER TABLE ... DROP PARTITION` (which only ever operated on empty partitions) allocates no
+  new `pending_reclaim` entry and reclaims nothing, remaining a documented gap (see `docs/LIMITATIONS.md`).
+  This identifier-reuse guard therefore still matters even after Phase 15: reclamation can lag well behind the
+  `DROP TABLE` statement's own return, and a new table/partition/tablet/replica must never be allocated an id
+  that still names unreclaimed data on disk.
 
 Verified in `crates/htap-catalog/tests/catalog_recovery.rs`
 (`test_catalog_v1_envelope_decodes_and_counters_fall_back_to_live_max`,
@@ -1065,7 +1425,7 @@ by the same fail-loud version check. Verified by `crates/htap-catalog/tests/cata
 
 ## Freshness: delta store and merge-on-read
 
-**Status: `implemented (local MVP)`** (authoritative rowstore base-plus-delta freshness overlay implemented for local conversion; delete vectors and background base compaction are planned/deferred).
+**Status: `implemented (local MVP)`** (authoritative rowstore base-plus-delta freshness overlay implemented for local conversion; delete vectors on columnar segments and delta-to-base background compaction (folding accumulated rowstore deltas forward into new columnar segments) are planned/deferred; the rowstore's own LSM compaction, which physically collapses superseded MVCC versions and reclaims dropped-partition bytes generically across every partition including converted ones, is implemented as of Phase 15 — see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" above).
 
 A partition converted to or held in column format still accepts writes. In the Phase 4 local MVP,
 those writes land directly in the authoritative **row store**, which acts as the live delta store:
@@ -1073,7 +1433,7 @@ those writes land directly in the authoritative **row store**, which acts as the
 - Historical reads prior to the conversion base version read directly from the rowstore.
 - Materialized partition scans via the converter API (`LocalConverter::read_column_partition` / `htap_convert::read_column_partition`, verified in `crates/htap-convert/tests/materialization.rs`) scan the columnar base segments up to the conversion snapshot version and overlay rowstore mutations (`Put` and `Delete`) committed after that base version up to the target snapshot. Note that `read_column_partition` is a standalone converter query API, not SQL execution.
 - Online transactional writes (`INSERT` via `Route::RowstoreWrite`; `DELETE` — point-key, filtered, or `TRUNCATE` since Phase 13 — via `Route::RowstoreDelete`) and point reads (`SELECT` by primary key, `Route::RowstorePointRead`) execute directly against the row store, ensuring zero read or write interruption during and after conversion (verified in `crates/htap-server/tests/local_server.rs`).
-- Bitmap delete vectors directly on columnar segments, physical rowstore reclamation, and background compaction folding deltas into new columnar segments are explicitly deferred.
+- Bitmap delete vectors directly on columnar segments and background compaction folding deltas into new columnar segments (advancing a conversion's base forward) are explicitly deferred. Generic rowstore-side physical reclamation of superseded MVCC versions (the rowstore's own LSM compaction, unrelated to the columnar base) is implemented as of Phase 15 — see above — but it collapses old row versions in place; it does not fold deltas into the columnar base or advance `ConversionDescriptor.snapshot_version`.
 
 ---
 
@@ -1107,7 +1467,7 @@ A router inspects the **bound** statement and the partition's **storage descript
   - **Fast-path point lookups:** Complete-PK `SELECT` extracts the partition key value from the primary key, routes directly to the partition's row tablet, and takes the `Route::RowstorePointRead` path to invoke `Engine::get`. It strictly bypasses analytical planning and conversion.
   - **Multi-partition OLAP scans:** `AnalyticSelect` (`Route::OlapScan`) scans partitions of the table at a single visible snapshot and evaluates global or grouped projections, filters, and aggregates: conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented for narrow local OLAP; distributed fanout, disk spilling, query cancellation, and resource quotas remain deferred.
   - **Storage conversion & demotion:** `LocalServer::convert_table` performs conversion on single-partition tables. Table-wide conversion is available via `LocalServer::convert_table_to_column(table_name)` returning a `TableConversionReport`. Metadata demotion from Column back to Row storage is supported via `LocalServer::convert_table_to_row(table_name)`, which clears catalog `column_manifest` references via CAS while retaining rowstore data (authoritative throughout) and existing column segment files on disk. Explicit policy ticks (`conversion_tick`, `tick`) execute synchronously, resuming persisted jobs only without autonomous background scheduling. Startup validation on `LocalServer::open` fails closed (returning `HtapError::Corruption` or `HtapError::Io` depending on the cause) if catalog metadata and `<root>/colstore` manifests conflict.
-  - **Deferred capabilities:** Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), delete vectors, background compaction, autonomous background conversion scheduler, hash tablets, distributed/remote partition serving across network nodes, replica failover, and an inter-node distributed-serving network protocol remain deferred (the client-facing MySQL wire protocol is implemented; see the "Network layer" section above).
+  - **Deferred capabilities:** Populated partition data migration during reorganization, physical storage reclamation for `ALTER TABLE ... DROP/REORGANIZE PARTITION` (which only ever operates on empty source partitions, so this is a currently-inert gap, not an observed data leak) or demoted column files, delete vectors, delta-to-base background compaction, autonomous background conversion scheduler, hash tablets, distributed/remote partition serving across network nodes, replica failover, and an inter-node distributed-serving network protocol remain deferred (the client-facing MySQL wire protocol is implemented; see the "Network layer" section above). `DROP TABLE`'s own artifacts *are* physically reclaimed as of Phase 15 — see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" above — this bullet is about the separate `ALTER TABLE` partition-lifecycle path.
   - **Test evidence:** Verified by server partition tests in `crates/htap-server/tests/local_server.rs` (`test_sql_range_partitioning_ddl_and_maxvalue_routing`, `test_sql_list_partitioning_ddl_and_routing`, `test_server_sql_alter_partition_lifecycle`, `test_server_alter_partitions_drop_empty_and_populated_guard`, `test_server_alter_partitions_reorganize_empty_and_populated_guard`, `test_server_convert_table_multi_partition_reports_and_demotion_equivalence`, `test_server_conversion_tick_idempotent_and_resume_snapshot_pinned`, `test_server_open_fail_closed_missing_or_corrupt_manifest`, `test_partitioned_native_range_topology_catalog_reopen_continuation`, `test_partitioned_native_list_topology_catalog_reopen_continuation`, `test_partitioned_boundary_unmatched_null_type_errors`, `test_partitioned_multi_row_insert_spanning_partitions_one_version_point_delete`, `test_partitioned_composite_pk_partition_key_not_first`, `test_partitioned_olap_across_partitions_and_empty_aggregate`, `test_convert_table_multi_partition_guard`, `test_partitioned_empty_topology_rejection_no_catalog_mutation`), catalog recovery tests in `crates/htap-catalog/tests/catalog_recovery.rs` (`test_partitioning_legacy_decode_and_reopen`, `test_range_partitioning_routing_and_boundaries`, `test_list_partitioning_routing`, `test_partitioning_duplicate_violations`, `test_range_overlap_and_order_violations`, `test_partitioning_type_and_null_violations`, `test_partitioning_ownership_and_method_consistency`, `test_partitioning_cas_and_reopen_lifecycle`, `test_partition_alteration_add_range_and_list`, `test_partition_alteration_drop_range_and_list`, `test_partition_alteration_reorganize_contiguous`, `test_partition_alteration_cas_and_reopen`), parser tests in `crates/htap-sql/tests/parse_bind.rs` (`test_mysql_partition_ddl_parsed_and_bound`, `test_mysql_partition_ddl_negative_parser_and_binder`, `test_mysql_alter_partition_parsed_and_bound`, `test_mysql_alter_partition_negative`, `test_negative_create_table`), and conversion tests in `crates/htap-convert/tests/materialization.rs` (`test_demote_partition_to_row_clearing_manifest_and_retained_data`, `test_conversion_tick_resumes_snapshot_pinned`).
 - **Explicitly Deferred OLAP & SQL Capabilities:** Direct SegmentReader pushdown optimization is implemented for the compact base path (single leaf pushdown), used by both `Route::OlapScan` and, per slot, by `Route::Query`. Simple unqualified source/projected column `ORDER BY` is implemented for the narrow `AnalyticSelect` path with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break; the general query path (`Route::Query`, Phase 9, extended Phase 13) additionally supports joins (including `FULL OUTER`/`NATURAL`/`USING` and arbitrarily nested join trees), CTEs (`WITH`, including `WITH RECURSIVE`), expressions (including integer `DIV`), aliases, `ORDER BY`/`GROUP BY` of expressions/aliases/ordinals, aggregate ordering, `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG` and `DISTINCT` aggregates, window functions, correlated subqueries (one level deep), and `EXCEPT`/`INTERSECT` — see "General query executor" below and `docs/PROGRESS.md`'s Phase 13 row. Phase 14 added `ANALYZE TABLE`, a cost-based optimizer stage (`htap_sql::optimize`, enabled by default), `EXPLAIN`/`EXPLAIN ANALYZE`, memory-bounded execution with disk spilling, and bounded parallelism for `GROUP BY`/`INNER`/`CROSS` joins to the general query path only — see "Phase 14" above, ADR-023, and `docs/PROGRESS.md`'s Phase 14 row. Still deferred on every path: `LIMIT BY`, compound `AND` pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, worker-pool parallelism for `LEFT`/`RIGHT`/`FULL` joins (memory-bounded spilling for these join kinds is not itself kind-restricted in code, but is exercised by a test only for `INNER` joins), memory-bounded spilling for non-equi/`CROSS` joins (a genuine gap — evaluated by an in-memory nested loop with no budget check at all), statistics histograms and per-partition statistics, multi-tablet or distributed partition scans, resource quotas/cancellation, DataFusion/Arrow integration, and full MySQL dialect breadth.
 
@@ -1214,7 +1574,7 @@ delta survives a subsequent `conversion_tick` that resumes and completes the con
 
 - **Single execution lock:** `LocalServer` serializes all SQL execution (`execute`) and table conversion (`convert_table`) via an internal `execution_lock` (`parking_lot::Mutex<()>`).
 - **Single partition/tablet/leader topology:** `LocalServer` requires tables to have exactly one partition (`partitions.len() == 1`), exactly one tablet (`partition.tablets.len() == 1`), and exactly one healthy leader replica (`is_leader == true`, `healthy == true`). Any topology violation returns `HtapError::Unsupported`.
-- **ProcessLock isolation:** `LocalServer::open` acquires an exclusive, non-blocking OS advisory `ProcessLock` (`<root>/LOCK` via `flock`). Low-level APIs in `htap-rowstore` (`Engine`, `Wal`, `MemTable`, `SstReader`), `htap-txn` (`TransactionManager`, `Journal`), and `htap-catalog` do **not** take the server's `ProcessLock` or `execution_lock`; their concurrency is governed by internal read-write locks and mutexes, enabling isolated unit testing and direct library embedding.
+- **ProcessLock isolation:** `LocalServer::open` acquires an exclusive, non-blocking OS advisory `ProcessLock` (`<root>/LOCK` via `flock`). Low-level APIs in `htap-rowstore` (`Wal`, `MemTable`, `SstReader`), `htap-txn` (`TransactionManager`, `Journal`), and `htap-catalog` do **not** take the server's root `ProcessLock` or `execution_lock`; their concurrency is governed by internal read-write locks and mutexes, enabling isolated unit testing and direct library embedding. As of Phase 15, `htap_rowstore::Engine::open` is the one exception: it acquires its own, separate exclusive lock at `<rowstore>/LOCK` for the engine's lifetime (a second `Engine::open` against the same rowstore directory fails) — this is not the server's root `ProcessLock`, and `LocalServer` always acquires the root lock first, so the two cannot form an ordering cycle; see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" above.
 
 ### Verification and test coverage
 
@@ -1766,14 +2126,16 @@ StorageDescriptor::Column
 
 ### Explicitly deferred features
 
-- **Physical reverse transcoding & file reclamation:** Physical reverse data transcoding and physical storage/file reclamation (space of dropped partitions or demoted column files) remain deferred.
+- **Physical reverse transcoding & demoted-file reclamation:** Physical reverse data transcoding and physical reclamation of demoted (`Column -> Row`) column files remain deferred. This is unrelated to `DROP TABLE`'s own artifact reclamation, implemented as of Phase 15 (see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" above): demotion clears catalog metadata but keeps the table and its column files, which a future `convert_table_to_column` may reference again.
 - **Autonomous background scheduler:** Conversion and demotion advance strictly via explicit synchronous calls (`conversion_tick`, `tick`, `convert_table_to_column`, `convert_table_to_row`); `tick` resumes persisted jobs only, with no autonomous background scheduling.
 - **Delete vectors:** Per-segment bitmap delete vectors on columnar segments are deferred; deletions are
   tracked via rowstore tombstones in the base-plus-delta overlay.
-- **Physical rowstore reclamation:** Converted rows remain in the rowstore SSTs and WAL; physical space
-  reclamation / truncation of converted rowstore history is deferred.
-- **Compaction:** Background merge-on-read compaction folding accumulated rowstore deltas into new columnar
-  segments is deferred.
+- **Delta-to-base background compaction:** Background merge-on-read compaction folding accumulated rowstore
+  deltas into new columnar segments (advancing a conversion's base forward) is deferred. As of Phase 15, the
+  rowstore's own LSM compaction (`Engine::compact_once`, unrelated to columnar conversion) does physically
+  collapse superseded MVCC versions and reclaim disk space in the rowstore generically, including for
+  converted tables' historical row versions — see "Rowstore compaction, garbage collection, and DROP TABLE
+  reclaim (Phase 15)" above — but it never touches the columnar base or `ConversionDescriptor.snapshot_version`.
 - **Vectorized aggregation, compound pushdown, and distributed OLAP scans:** Direct `SegmentReader` pushdown optimization is now implemented for the compact base path (projection-aware compact reads and single safe predicate leaf pushdown). This narrow `AnalyticSelect`/`Route::OlapScan` path itself still only supports a single unaliased table with no joins/CTEs/windows (those route through the general `Route::Query` path instead — see "General query executor scope and deferred features" in `docs/LIMITATIONS.md` for the full contract); vectorized aggregation, vectorized operator pipelines, compound `AND` pushdown beyond one leaf, `!=` pushdown, and multi-tablet/distributed scans remain deferred on every path.
 - **Full partition and table conversion semantics:** Conversions across multi-tablet sharded partitions,
   range/list partition boundaries, and distributed multi-node coordinated cutovers are deferred to Phase 5
@@ -1847,7 +2209,7 @@ The rowstore remains the single authority for all writes and point reads:
 - **No autonomous background scheduler:** Conversion and demotion execute strictly via synchronous method calls (`conversion_tick`, `tick`, `convert_table_to_column`, `convert_table_to_row`); `tick()` resumes persisted jobs only without initiating new conversions, and no autonomous background scheduler thread or daemon is implemented.
 - **Fail-closed startup storage validation:** `LocalServer::open` validates that catalog metadata for `Column` and `Converting` partitions matches `<root>/colstore` manifests and segments on disk, failing closed (returning `HtapError::Corruption` or `HtapError::Io` depending on the cause) on any mismatch.
 - **No delete vectors:** Column segments have no bitmap delete vectors; deletions post-base are tracked as rowstore tombstones in the delta overlay.
-- **No rowstore reclamation or compaction:** Converted rows are not purged from the rowstore, and deltas are not merged back into base columnar files via background compaction.
+- **No delta-to-base background compaction:** Rowstore deltas accumulated after a conversion's base snapshot are never merged back into new base columnar files; `ConversionDescriptor.snapshot_version` never advances on its own. As of Phase 15, the rowstore's own LSM compaction (`Engine::compact_once`, generic, unrelated to columnar conversion) does physically collapse superseded MVCC versions and reclaim dropped-partition bytes in the rowstore, including for converted tables — see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" above — but it never touches the columnar base or the conversion's own state.
 
 ### Transaction boundary, 2PC journal, and crash recovery
 

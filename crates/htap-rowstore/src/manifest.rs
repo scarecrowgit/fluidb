@@ -39,8 +39,10 @@
 //!
 //! # Format Compatibility
 //!
-//! Format v1 manifests contain only the SST sequence. When decoded, their external
-//! transaction ledger defaults to empty. New manifests are always written in format v2.
+//! Format v1 manifests contain only the SST sequence. Format v2 adds the external
+//! transaction ledger. Their committed-version high-water is derived from SST metadata
+//! and their GC low-water defaults to [`Version::INITIAL`]. New manifests are written
+//! in format v3 with both watermarks encoded after the ledger.
 //!
 //! # Atomic Publication
 //!
@@ -67,8 +69,11 @@ pub const FORMAT_VERSION_V1: u16 = 1;
 /// Manifest format version 2 (SST sequence + external transaction ledger).
 pub const FORMAT_VERSION_V2: u16 = 2;
 
+/// Manifest format version 3 (SST sequence, ledger, and version watermarks).
+pub const FORMAT_VERSION_V3: u16 = 3;
+
 /// Current manifest format version.
-pub const FORMAT_VERSION: u16 = FORMAT_VERSION_V2;
+pub const FORMAT_VERSION: u16 = FORMAT_VERSION_V3;
 
 /// Fixed manifest header size (8 magic + 2 format + 4 payload_len + 4 crc32c = 18 bytes).
 const HEADER_LEN: usize = 18;
@@ -126,12 +131,16 @@ impl ManifestLedgerEntry {
 }
 
 /// Authoritative record of published SSTs and applied external transactions in the LSM store.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     /// Ordered list of registered SSTs, newest first.
     pub ssts: Vec<ManifestSstEntry>,
     /// Complete ledger of applied external transactions.
     pub applied_txns: Vec<ManifestLedgerEntry>,
+    /// Highest committed version covered by a published manifest.
+    pub committed_version_high_water: Version,
+    /// Oldest snapshot version whose history is retained.
+    pub gc_low_water: Version,
 }
 
 impl Manifest {
@@ -140,6 +149,8 @@ impl Manifest {
         Self {
             ssts: Vec::new(),
             applied_txns: Vec::new(),
+            committed_version_high_water: Version::INITIAL,
+            gc_low_water: Version::INITIAL,
         }
     }
 
@@ -148,7 +159,17 @@ impl Manifest {
         ssts: Vec<ManifestSstEntry>,
         applied_txns: Vec<ManifestLedgerEntry>,
     ) -> Self {
-        Self { ssts, applied_txns }
+        let committed_version_high_water = ssts
+            .iter()
+            .filter_map(|sst| sst.max_version)
+            .max()
+            .unwrap_or(Version::INITIAL);
+        Self {
+            ssts,
+            applied_txns,
+            committed_version_high_water,
+            gc_low_water: Version::INITIAL,
+        }
     }
 
     /// Prepend a newly published SST to the manifest.
@@ -156,7 +177,7 @@ impl Manifest {
         self.ssts.insert(0, entry);
     }
 
-    /// Encode the manifest to bytes in format v2 including header, format version, and CRC32-C.
+    /// Encode the manifest to bytes in format v3 including header, format version, and CRC32-C.
     pub fn encode(&self) -> Result<Vec<u8>> {
         if self.ssts.len() > MAX_SST_COUNT as usize {
             return Err(HtapError::InvalidArgument(format!(
@@ -190,12 +211,14 @@ impl Manifest {
             }
         }
 
-        // Append external ledger count and entries (format v2)
+        // Append external ledger count and entries.
         payload.extend_from_slice(&(self.applied_txns.len() as u32).to_le_bytes());
         for entry in &self.applied_txns {
             payload.extend_from_slice(&entry.txn_id.to_le_bytes());
             payload.extend_from_slice(&entry.version.get().to_le_bytes());
         }
+        payload.extend_from_slice(&self.committed_version_high_water.get().to_le_bytes());
+        payload.extend_from_slice(&self.gc_low_water.get().to_le_bytes());
 
         let payload_len = u32::try_from(payload.len()).map_err(|_| {
             HtapError::InvalidArgument("manifest payload length exceeds u32".into())
@@ -205,7 +228,7 @@ impl Manifest {
                 "manifest payload length {payload_len} exceeds maximum {MAX_MANIFEST_PAYLOAD_BYTES}"
             )));
         }
-        Ok(encode_envelope(HEADER_MAGIC, FORMAT_VERSION_V2, &payload))
+        Ok(encode_envelope(HEADER_MAGIC, FORMAT_VERSION_V3, &payload))
     }
 
     /// Encode the manifest to bytes in legacy format v1 (SST sequence only, no external ledger).
@@ -237,7 +260,7 @@ impl Manifest {
         let (version, payload) = decode_envelope(
             bytes,
             HEADER_MAGIC,
-            FORMAT_VERSION_V1..=FORMAT_VERSION_V2,
+            FORMAT_VERSION_V1..=FORMAT_VERSION_V3,
             MAX_MANIFEST_PAYLOAD_BYTES,
             SizeCheckMode::ExactMatch,
         )
@@ -370,7 +393,6 @@ impl Manifest {
         }
 
         let applied_txns = if version == FORMAT_VERSION_V1 {
-            // v1 has no ledger; decode as empty ledger
             if !cursor.is_empty() {
                 return Err(HtapError::Corruption(format!(
                     "manifest v1 has {} trailing leftover bytes",
@@ -379,7 +401,6 @@ impl Manifest {
             }
             Vec::new()
         } else {
-            // v2 has ledger_count and ledger entries
             if cursor.len() < 4 {
                 return Err(HtapError::Corruption(
                     "manifest payload too short for external ledger count".into(),
@@ -394,7 +415,6 @@ impl Manifest {
                 )));
             }
 
-            // Reject oversized counts before allocation: each entry is 16 bytes (8 txn_id + 8 version).
             let required_bytes = (ledger_count as usize)
                 .checked_mul(16)
                 .ok_or_else(|| HtapError::Corruption("ledger count causes byte overflow".into()))?;
@@ -409,11 +429,6 @@ impl Manifest {
             let mut seen_ids = std::collections::HashSet::with_capacity(ledger_count as usize);
 
             for _ in 0..ledger_count {
-                if cursor.len() < 16 {
-                    return Err(HtapError::Corruption(
-                        "truncated ledger entry in manifest".into(),
-                    ));
-                }
                 let txn_id = u64::from_le_bytes(cursor[0..8].try_into().unwrap());
                 let ver = u64::from_le_bytes(cursor[8..16].try_into().unwrap());
                 cursor = &cursor[16..];
@@ -423,7 +438,6 @@ impl Manifest {
                         "manifest ledger entry txn_id cannot be zero".into(),
                     ));
                 }
-
                 if !seen_ids.insert(txn_id) {
                     return Err(HtapError::Corruption(format!(
                         "duplicate transaction id {txn_id} in manifest ledger"
@@ -435,18 +449,51 @@ impl Manifest {
                     version: Version::new(ver),
                 });
             }
-
-            if !cursor.is_empty() {
-                return Err(HtapError::Corruption(format!(
-                    "manifest has {} trailing leftover bytes",
-                    cursor.len()
-                )));
-            }
-
             txns
         };
 
-        Ok(Manifest { ssts, applied_txns })
+        let derived_high_water = ssts
+            .iter()
+            .filter_map(|sst| sst.max_version)
+            .max()
+            .unwrap_or(Version::INITIAL);
+        let (committed_version_high_water, gc_low_water) = if version == FORMAT_VERSION_V3 {
+            if cursor.len() < 16 {
+                return Err(HtapError::Corruption(
+                    "manifest payload too short for version watermarks".into(),
+                ));
+            }
+            let committed = Version::new(u64::from_le_bytes(cursor[0..8].try_into().unwrap()));
+            let gc = Version::new(u64::from_le_bytes(cursor[8..16].try_into().unwrap()));
+            cursor = &cursor[16..];
+            (committed, gc)
+        } else {
+            (derived_high_water, Version::INITIAL)
+        };
+
+        if !cursor.is_empty() {
+            return Err(HtapError::Corruption(format!(
+                "manifest has {} trailing leftover bytes",
+                cursor.len()
+            )));
+        }
+
+        if version == FORMAT_VERSION_V3 {
+            if let Some(max_ledger_version) = applied_txns.iter().map(|entry| entry.version).max() {
+                if max_ledger_version > committed_version_high_water {
+                    return Err(HtapError::Corruption(format!(
+                        "manifest ledger version {max_ledger_version} exceeds committed-version high-water {committed_version_high_water}"
+                    )));
+                }
+            }
+        }
+
+        Ok(Manifest {
+            ssts,
+            applied_txns,
+            committed_version_high_water,
+            gc_low_water,
+        })
     }
 
     /// Read a manifest from a file path. Returns `Ok(None)` if file does not exist.
@@ -498,8 +545,42 @@ impl Manifest {
 
     /// Atomically publish the manifest: write `dir/MANIFEST.tmp` -> fsync -> rename -> fsync `dir`.
     pub fn atomic_publish(dir: &Path, manifest: &Manifest) -> Result<()> {
+        if let Some(current) = Self::read_from_file(&dir.join("MANIFEST"))? {
+            if manifest.committed_version_high_water < current.committed_version_high_water {
+                return Err(HtapError::InvalidArgument(format!(
+                    "manifest committed-version high-water cannot move backward from {} to {}",
+                    current.committed_version_high_water, manifest.committed_version_high_water
+                )));
+            }
+            if manifest.gc_low_water < current.gc_low_water {
+                return Err(HtapError::InvalidArgument(format!(
+                    "manifest GC low-water cannot move backward from {} to {}",
+                    current.gc_low_water, manifest.gc_low_water
+                )));
+            }
+        }
+        if let Some(max_ledger_version) = manifest
+            .applied_txns
+            .iter()
+            .map(|entry| entry.version)
+            .max()
+        {
+            if max_ledger_version > manifest.committed_version_high_water {
+                return Err(HtapError::InvalidArgument(format!(
+                    "manifest ledger version {max_ledger_version} exceeds committed-version high-water {}",
+                    manifest.committed_version_high_water
+                )));
+            }
+        }
+
         let encoded = manifest.encode()?;
         atomic_publish(dir, "MANIFEST.tmp", "MANIFEST", &encoded, None, false)
+    }
+}
+
+impl Default for Manifest {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -586,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_v2_round_trip_with_ledger() {
+    fn test_manifest_v3_round_trip_with_ledger() {
         let mut manifest = Manifest::new();
         manifest.prepend(ManifestSstEntry {
             id: 1,
@@ -600,11 +681,12 @@ mod tests {
         manifest
             .applied_txns
             .push(ManifestLedgerEntry::new(102, Version::new(5)));
+        manifest.committed_version_high_water = Version::new(10);
 
         let bytes = manifest.encode().unwrap();
-        // Check that format_version in bytes is 2
+        // Check that format_version in bytes is 3.
         let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-        assert_eq!(version, FORMAT_VERSION_V2);
+        assert_eq!(version, FORMAT_VERSION_V3);
 
         let decoded = Manifest::decode(&bytes).unwrap();
         assert_eq!(manifest, decoded);
@@ -634,20 +716,21 @@ mod tests {
         let manifest = Manifest::new();
         let mut bytes = manifest.encode().unwrap();
 
-        // Unknown version 3
-        bytes[8..10].copy_from_slice(&3u16.to_le_bytes());
-        // Recompute CRC? Header version is outside payload, but version check happens before CRC
+        // Version 99 is outside the supported v1-v3 range.
+        bytes[8..10].copy_from_slice(&99u16.to_le_bytes());
         let err = Manifest::decode(&bytes).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unsupported manifest format version"));
+        assert_eq!(
+            err.to_string(),
+            "Corruption error: unsupported manifest format version: 99"
+        );
 
-        // Unknown version 0
+        // Version 0 is also outside the supported range.
         bytes[8..10].copy_from_slice(&0u16.to_le_bytes());
         let err0 = Manifest::decode(&bytes).unwrap_err();
-        assert!(err0
-            .to_string()
-            .contains("unsupported manifest format version"));
+        assert_eq!(
+            err0.to_string(),
+            "Corruption error: unsupported manifest format version: 0"
+        );
     }
 
     #[test]
@@ -882,14 +965,13 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_v2_golden_bytes() {
-        let manifest = Manifest::new();
-        let bytes = manifest.encode().unwrap();
+    fn test_manifest_v3_golden_bytes() {
+        let bytes = Manifest::new().encode().unwrap();
         assert_eq!(
             bytes,
             [
-                72, 84, 65, 80, 77, 65, 78, 49, 2, 0, 8, 0, 0, 0, 138, 178, 40, 140, 0, 0, 0, 0, 0,
-                0, 0, 0,
+                72, 84, 65, 80, 77, 65, 78, 49, 3, 0, 24, 0, 0, 0, 55, 156, 203, 63, 0, 0, 0, 0, 0,
+                0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
             ]
         );
     }
@@ -995,7 +1077,7 @@ mod tests {
         let err = Manifest::read_from_file(&path).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Corruption error: manifest size mismatch: expected 26 bytes, got 27"
+            "Corruption error: manifest size mismatch: expected 42 bytes, got 43"
         );
     }
 }

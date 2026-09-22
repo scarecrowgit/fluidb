@@ -147,6 +147,7 @@ pub fn copy_from_csv_reader<R: Read>(
 ) -> Result<CopyReport> {
     options.validate()?;
     let start_instant = Instant::now();
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.tablet_id])?;
 
     let job = mover.start_copy(MovementJobKind::Import, options)?;
     if job.is_complete() {
@@ -273,6 +274,7 @@ pub fn copy_from_jsonl_reader<R: Read>(
 ) -> Result<CopyReport> {
     options.validate()?;
     let start_instant = Instant::now();
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.tablet_id])?;
 
     let job = mover.start_copy(MovementJobKind::Import, options)?;
     if job.is_complete() {
@@ -374,6 +376,7 @@ pub fn copy_from_csv(
 ) -> Result<CopyReport> {
     options.validate()?;
     let start_instant = Instant::now();
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.tablet_id])?;
 
     let job = mover.start_copy(MovementJobKind::Import, options)?;
     if job.is_complete() {
@@ -504,6 +507,7 @@ pub fn copy_from_jsonl(
 ) -> Result<CopyReport> {
     options.validate()?;
     let start_instant = Instant::now();
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.tablet_id])?;
 
     let job = mover.start_copy(MovementJobKind::Import, options)?;
     if job.is_complete() {

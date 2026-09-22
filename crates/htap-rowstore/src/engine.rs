@@ -38,12 +38,12 @@
 //! tombstone immediately yields `Ok(None)` and terminates search. Older layers are never
 //! consulted, preventing resurrection of deleted rows.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use htap_common::Mutation;
-use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Version};
+use htap_common::{read_file_exact_bounded, HtapError, ProcessLock, Result, Row, Version};
 use parking_lot::{Mutex, RwLock};
 
 pub use crate::manifest::MAX_APPLIED_EXTERNAL_TXNS;
@@ -51,11 +51,64 @@ use htap_common::fs::{atomic_publish, sync_dir};
 
 use crate::manifest::{Manifest, ManifestLedgerEntry, ManifestSstEntry};
 use crate::memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
-use crate::sst::{SstOptions, SstReader, SstWriter};
+use crate::sst::{SstMetadata, SstOptions, SstReader, SstWriter};
 use crate::wal::{Wal, WalOptions, WalRecord};
 
 /// Default memtable capacity in bytes before triggering an automatic flush (4 MiB).
 pub const DEFAULT_MEMTABLE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default maximum number of SSTs selected for one compaction pass.
+pub const DEFAULT_MAX_COMPACTION_INPUT_SSTS: usize = 16;
+
+/// Default maximum number of SST entries selected for one compaction pass.
+pub const DEFAULT_MAX_COMPACTION_INPUT_ENTRIES: u64 = 2_000_000;
+
+/// Inputs controlling one synchronous SST compaction pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionInput {
+    /// Partitions whose entries are unconditionally removed from selected SSTs.
+    pub dropped_partition_ids: HashSet<u64>,
+    /// Partitions whose overlapping SSTs must not be rewritten in this pass.
+    pub protected_partition_ids: HashSet<u64>,
+    /// Explicit SST IDs to compact instead of using automatic selection.
+    ///
+    /// SSTs overlapping protected partitions are excluded, which may split this set
+    /// into multiple contiguous manifest runs. Each call compacts only the first
+    /// non-empty run, so callers may need several calls to fully process the set.
+    pub explicit_sst_ids: Option<HashSet<u64>>,
+    /// MVCC horizon below which only each key's newest version is retained.
+    pub gc_horizon: Version,
+}
+
+/// Results and accounting for one synchronous SST compaction pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionReport {
+    /// Whether this pass selected and replaced any SSTs.
+    pub compacted: bool,
+    /// IDs of the SSTs removed from the manifest.
+    pub input_sst_ids: Vec<u64>,
+    /// ID of the replacement SST, if surviving entries required one.
+    pub output_sst_id: Option<u64>,
+    /// Number of entries read from selected SSTs.
+    pub entries_in: u64,
+    /// Number of entries written to the replacement SST.
+    pub entries_out: u64,
+    /// Number of entries removed because their partition was dropped.
+    pub dropped_by_partition: u64,
+    /// Number of historical versions collapsed at or below the GC horizon.
+    pub collapsed_versions: u64,
+}
+
+/// Exact SST and partition selection preview for one compaction pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionPreview {
+    /// Exact SST IDs selected for compaction, in manifest order.
+    pub sst_ids: Vec<u64>,
+    /// Exact partition IDs present in the selected SSTs when readable.
+    ///
+    /// Falls back to conservative SST metadata partition ranges if reading an SST fails.
+    pub partition_ids: HashSet<u64>,
+}
 
 /// Point-in-time MVCC snapshot version for isolation queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +161,10 @@ impl PreparedTransaction {
 pub enum EngineIoOp {
     /// Writing an SST file during flush.
     SstWrite,
+    /// Writing an SST output file during compaction.
+    CompactionOutputWrite,
+    /// Compaction published its manifest but has not swapped read state.
+    CompactionAfterManifestPublish,
     /// Writing the visible watermark marker file during publish.
     VisibleMarkerWrite,
 }
@@ -128,6 +185,10 @@ pub struct EngineOptions {
     pub wal: WalOptions,
     /// Optional test-oriented fault hook invoked at named I/O boundaries.
     pub io_fault_hook: Option<IoFaultHook>,
+    /// Maximum number of SSTs selected for a single compaction pass.
+    pub max_compaction_input_ssts: usize,
+    /// Maximum number of entries selected for a single compaction pass.
+    pub max_compaction_input_entries: u64,
     /// Effective cap on the number of entries the applied-external-transactions ledger can hold,
     /// enforced by [`Engine::prepare`]/[`Engine::apply_prepared`]/[`Engine::apply_external`].
     /// Defaults to [`MAX_APPLIED_EXTERNAL_TXNS`], the hard on-disk manifest format bound; this
@@ -148,6 +209,11 @@ impl std::fmt::Debug for EngineOptions {
                 "io_fault_hook",
                 &self.io_fault_hook.as_ref().map(|_| "<io_fault_hook>"),
             )
+            .field("max_compaction_input_ssts", &self.max_compaction_input_ssts)
+            .field(
+                "max_compaction_input_entries",
+                &self.max_compaction_input_entries,
+            )
             .field("max_applied_external_txns", &self.max_applied_external_txns)
             .finish()
     }
@@ -164,6 +230,8 @@ impl EngineOptions {
             dir,
             memtable_bytes: DEFAULT_MEMTABLE_BYTES,
             io_fault_hook: None,
+            max_compaction_input_ssts: DEFAULT_MAX_COMPACTION_INPUT_SSTS,
+            max_compaction_input_entries: DEFAULT_MAX_COMPACTION_INPUT_ENTRIES,
             max_applied_external_txns: MAX_APPLIED_EXTERNAL_TXNS,
         }
     }
@@ -196,6 +264,20 @@ impl EngineOptions {
     #[must_use]
     pub fn with_io_fault_hook(mut self, hook: IoFaultHook) -> Self {
         self.io_fault_hook = Some(hook);
+        self
+    }
+
+    /// Set the maximum number of SSTs selected for one compaction pass.
+    #[must_use]
+    pub fn with_max_compaction_input_ssts(mut self, max_input_ssts: usize) -> Self {
+        self.max_compaction_input_ssts = max_input_ssts;
+        self
+    }
+
+    /// Set the maximum number of entries selected for one compaction pass.
+    #[must_use]
+    pub fn with_max_compaction_input_entries(mut self, max_input_entries: u64) -> Self {
+        self.max_compaction_input_entries = max_input_entries;
         self
     }
 
@@ -265,14 +347,22 @@ struct ReadState {
     ssts: Vec<Arc<SstReader>>,
     visible_version: Version,
     committed_version: Version,
+    gc_low_water: Version,
 }
 
 /// LSM row store engine.
+///
+/// Opening an engine acquires an exclusive advisory `flock` on `<rowstore>/LOCK`.
+/// Because the lock applies to independently opened file descriptors, a second open in the
+/// same process also fails. The server's root lock uses a different file in the parent directory.
+/// The root lock is always acquired first, so the two locks cannot form an ordering cycle.
+/// The row-store lock is held for the entire lifetime of the engine.
 #[derive(Debug)]
 pub struct Engine {
     options: EngineOptions,
     commit_lock: Mutex<CommitState>,
     read_state: RwLock<ReadState>,
+    _process_lock: ProcessLock,
 }
 
 impl Engine {
@@ -290,6 +380,8 @@ impl Engine {
     /// 7. Set `visible_version = max(SST max_versions, replayed commit versions)`.
     pub fn open(options: EngineOptions) -> Result<Self> {
         std::fs::create_dir_all(&options.dir)?;
+        let process_lock = ProcessLock::acquire(&options.dir)?;
+
         let wal_dir = options.dir.join("wal");
         std::fs::create_dir_all(&wal_dir)?;
         let sst_dir = options.dir.join("sst");
@@ -297,7 +389,7 @@ impl Engine {
 
         // 2. Read and validate MANIFEST
         let manifest_path = options.dir.join("MANIFEST");
-        let manifest = Manifest::read_from_file(&manifest_path)?.unwrap_or_default();
+        let manifest = Manifest::read_from_file(&manifest_path)?.unwrap_or_else(Manifest::new);
 
         let mut sst_readers = Vec::with_capacity(manifest.ssts.len());
         let mut max_sst_id = 0u64;
@@ -454,9 +546,8 @@ impl Engine {
         }
 
         // 7. visible_version from VISIBLE marker (defaults to INITIAL if absent);
-        //    committed_version = max(SST max_versions, replayed commit versions)
-        //    Note: committed_version is NOT inferred solely from the manifest ledger.
-        let mut recovered_version = Version::INITIAL;
+        //    committed_version = max(manifest high-water, SST max_versions, WAL commits).
+        let mut recovered_version = manifest.committed_version_high_water;
         for sst_meta in &manifest.ssts {
             if let Some(v) = sst_meta.max_version {
                 recovered_version = recovered_version.max(v);
@@ -473,6 +564,7 @@ impl Engine {
             )));
         }
 
+        let gc_low_water = manifest.gc_low_water;
         let commit_state = CommitState {
             wal,
             next_sst_id,
@@ -486,12 +578,14 @@ impl Engine {
             ssts: sst_readers,
             visible_version,
             committed_version: recovered_version,
+            gc_low_water,
         };
 
         Ok(Self {
             options,
             commit_lock: Mutex::new(commit_state),
             read_state: RwLock::new(read_state),
+            _process_lock: process_lock,
         })
     }
 
@@ -536,6 +630,12 @@ impl Engine {
     /// Only if a source returns `None` does search continue to older sources.
     pub fn get(&self, partition_id: u64, key: &[u8], snapshot: Snapshot) -> Result<Option<Row>> {
         let read_guard = self.read_state.read();
+        if snapshot.version.get() != u64::MAX && snapshot.version < read_guard.gc_low_water {
+            return Err(HtapError::InvalidArgument(format!(
+                "snapshot version {} is below GC low-water {}",
+                snapshot.version, read_guard.gc_low_water
+            )));
+        }
         let effective_version = snapshot.version.min(read_guard.visible_version);
 
         // 1. Active memtable
@@ -621,6 +721,14 @@ impl Engine {
         // check for the 2PC path already ran with the transaction's actual snapshot in the
         // `RowstoreParticipant::prepare` step that always precedes this re-prepare.
         if snapshot.version.get() != u64::MAX {
+            let gc_low_water = self.commit_lock.lock().manifest.gc_low_water;
+            if snapshot.version < gc_low_water {
+                return Err(HtapError::InvalidArgument(format!(
+                    "snapshot version {} is below GC low-water {}",
+                    snapshot.version, gc_low_water
+                )));
+            }
+
             // Storage-reviewer fix-pass finding: the applied-external-transactions ledger cap was
             // previously only enforced at apply time (`apply_prepared_locked`/`apply_external`),
             // so a full ledger let a 2PC transaction durably journal its Intent and Commit records
@@ -1001,6 +1109,12 @@ impl Engine {
         snapshot: Snapshot,
     ) -> Result<Vec<MemtableEntry>> {
         let read_guard = self.read_state.read();
+        if snapshot.version.get() != u64::MAX && snapshot.version < read_guard.gc_low_water {
+            return Err(HtapError::InvalidArgument(format!(
+                "snapshot version {} is below GC low-water {}",
+                snapshot.version, read_guard.gc_low_water
+            )));
+        }
         let effective_version = snapshot.version.min(read_guard.visible_version);
 
         let mut map: std::collections::BTreeMap<InternalKey, ValueKind> =
@@ -1091,10 +1205,444 @@ impl Engine {
         Ok(result)
     }
 
+    /// Compact one size-tiered SST candidate set while preserving MVCC visibility.
+    pub fn compact_once(&self, input: CompactionInput) -> Result<CompactionReport> {
+        let mut commit_guard = self.commit_lock.lock();
+
+        let (metadata_by_id, selected_readers) = {
+            let read_guard = self.read_state.read();
+            let metadata_by_id: HashMap<u64, SstMetadata> = read_guard
+                .ssts
+                .iter()
+                .map(|reader| (reader.metadata().id, reader.metadata().clone()))
+                .collect();
+            let metadata_refs: HashMap<u64, &SstMetadata> = metadata_by_id
+                .iter()
+                .map(|(&id, metadata)| (id, metadata))
+                .collect();
+            let selected_ids = if let Some(explicit_sst_ids) = &input.explicit_sst_ids {
+                let eligible_explicit_ids: HashSet<u64> = explicit_sst_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        metadata_refs.get(id).is_some_and(|metadata| {
+                            !sst_overlaps_partitions(metadata, &input.protected_partition_ids)
+                        })
+                    })
+                    .collect();
+
+                contiguous_sst_runs(&commit_guard.manifest, &eligible_explicit_ids)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+            } else {
+                let ssts_with_dropped_partitions =
+                    find_ssts_with_partitions(&read_guard.ssts, &input.dropped_partition_ids)?;
+                select_compaction_candidates(
+                    &commit_guard.manifest,
+                    &ssts_with_dropped_partitions,
+                    &input.protected_partition_ids,
+                    &metadata_refs,
+                    self.options.max_compaction_input_ssts,
+                    self.options.max_compaction_input_entries,
+                )
+            };
+            let selected: HashSet<u64> = selected_ids.iter().copied().collect();
+            let readers = read_guard
+                .ssts
+                .iter()
+                .filter(|reader| selected.contains(&reader.metadata().id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (metadata_by_id, (selected_ids, readers))
+        };
+
+        let (input_sst_ids, selected_readers) = selected_readers;
+        if input_sst_ids.is_empty() {
+            return Ok(CompactionReport {
+                compacted: false,
+                input_sst_ids,
+                output_sst_id: None,
+                entries_in: 0,
+                entries_out: 0,
+                dropped_by_partition: 0,
+                collapsed_versions: 0,
+            });
+        }
+
+        if selected_readers.len() != input_sst_ids.len() {
+            return Err(HtapError::Corruption(
+                "manifest references an SST absent from read state during compaction".into(),
+            ));
+        }
+
+        let input_start_index = commit_guard
+            .manifest
+            .ssts
+            .iter()
+            .position(|entry| entry.id == input_sst_ids[0])
+            .ok_or_else(|| {
+                HtapError::Corruption(format!(
+                    "selected SST {} is absent from manifest during compaction",
+                    input_sst_ids[0]
+                ))
+            })?;
+        let input_end_index = input_start_index + input_sst_ids.len();
+        let manifest_run = commit_guard
+            .manifest
+            .ssts
+            .get(input_start_index..input_end_index)
+            .ok_or_else(|| {
+                HtapError::Corruption("selected compaction run extends beyond the manifest".into())
+            })?;
+        if !manifest_run
+            .iter()
+            .map(|entry| entry.id)
+            .eq(input_sst_ids.iter().copied())
+        {
+            return Err(HtapError::Corruption(
+                "selected compaction SSTs are not contiguous in manifest order".into(),
+            ));
+        }
+
+        let mut merged: BTreeMap<(u64, Vec<u8>), BTreeMap<Version, ValueKind>> = BTreeMap::new();
+        let mut entries_in = 0u64;
+        for reader in &selected_readers {
+            for entry in reader.iter()? {
+                let entry = entry?;
+                entries_in = entries_in
+                    .checked_add(1)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "compaction_entries_in",
+                    })?;
+                let versions = merged
+                    .entry((entry.key.partition_id, entry.key.user_key.clone()))
+                    .or_default();
+                if let Some(existing) = versions.insert(entry.key.version, entry.value.clone()) {
+                    if existing != entry.value {
+                        return Err(HtapError::Corruption(format!(
+                            "conflicting values for internal key {:?} during compaction",
+                            entry.key
+                        )));
+                    }
+                }
+            }
+        }
+
+        let (committed_version, effective_gc_horizon) = {
+            let read_guard = self.read_state.read();
+            (
+                read_guard.committed_version,
+                input.gc_horizon.min(read_guard.visible_version),
+            )
+        };
+        let mut output_entries = Vec::new();
+        let mut dropped_by_partition = 0u64;
+        let mut collapsed_versions = 0u64;
+        for ((partition_id, user_key), versions) in merged {
+            if input.dropped_partition_ids.contains(&partition_id) {
+                dropped_by_partition = dropped_by_partition
+                    .checked_add(versions.len() as u64)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "compaction_dropped_entries",
+                    })?;
+                continue;
+            }
+
+            let newest_at_or_below_horizon = versions
+                .range(..=effective_gc_horizon)
+                .next_back()
+                .map(|(&version, value)| (version, value.clone()));
+
+            for (&version, value) in &versions {
+                if version > effective_gc_horizon
+                    || newest_at_or_below_horizon
+                        .as_ref()
+                        .is_some_and(|(newest, _)| *newest == version)
+                {
+                    output_entries.push(MemtableEntry {
+                        key: InternalKey {
+                            partition_id,
+                            user_key: user_key.clone(),
+                            version,
+                        },
+                        value: value.clone(),
+                    });
+                } else {
+                    collapsed_versions =
+                        collapsed_versions
+                            .checked_add(1)
+                            .ok_or(HtapError::CounterOverflow {
+                                counter: "compaction_collapsed_versions",
+                            })?;
+                }
+            }
+        }
+        output_entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+
+        let input_paths = input_sst_ids
+            .iter()
+            .map(|id| {
+                metadata_by_id
+                    .get(id)
+                    .map(|metadata| metadata.path.clone())
+                    .ok_or_else(|| {
+                        HtapError::Corruption(format!(
+                            "selected SST {id} has no metadata during compaction"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let (output_sst_id, output_reader, output_meta) = if output_entries.is_empty() {
+            (None, None, None)
+        } else {
+            let sst_id = commit_guard.next_sst_id;
+            let next_sst_id = sst_id
+                .checked_add(1)
+                .ok_or(HtapError::CounterOverflow { counter: "sst_id" })?;
+            let sst_dir = self.options.dir.join("sst");
+            let tmp_path = sst_dir.join(format!("{sst_id}.sst.tmp"));
+            let sst_path = sst_dir.join(format!("{sst_id}.sst"));
+
+            if let Some(hook) = &self.options.io_fault_hook {
+                hook(EngineIoOp::CompactionOutputWrite)?;
+            }
+            let meta = match SstWriter::write(
+                &tmp_path,
+                sst_id,
+                output_entries.iter().cloned(),
+                &self.options.sst,
+            ) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = std::fs::rename(&tmp_path, &sst_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(HtapError::Io(error));
+            }
+            sync_dir(&sst_dir)?;
+            let reader = Arc::new(SstReader::open(&sst_path)?);
+            commit_guard.next_sst_id = next_sst_id;
+            (Some(sst_id), Some(reader), Some(meta))
+        };
+
+        let mut new_manifest = commit_guard.manifest.clone();
+        new_manifest.ssts.drain(input_start_index..input_end_index);
+        if let Some(meta) = output_meta.as_ref() {
+            new_manifest
+                .ssts
+                .insert(input_start_index, ManifestSstEntry::from(meta));
+        }
+        new_manifest.committed_version_high_water = new_manifest
+            .committed_version_high_water
+            .max(committed_version);
+        if output_meta.is_some() || !input_sst_ids.is_empty() {
+            new_manifest.gc_low_water = new_manifest.gc_low_water.max(effective_gc_horizon);
+        }
+        {
+            let read_guard = self.read_state.read();
+            let read_run = read_guard
+                .ssts
+                .get(input_start_index..input_end_index)
+                .ok_or_else(|| {
+                    HtapError::Corruption(
+                        "selected compaction run extends beyond read state".into(),
+                    )
+                })?;
+            if !read_run
+                .iter()
+                .map(|reader| reader.metadata().id)
+                .eq(input_sst_ids.iter().copied())
+            {
+                return Err(HtapError::Corruption(
+                    "selected compaction SSTs are not contiguous in read state order".into(),
+                ));
+            }
+        }
+
+        Manifest::atomic_publish(&self.options.dir, &new_manifest)?;
+        if let Some(hook) = &self.options.io_fault_hook {
+            hook(EngineIoOp::CompactionAfterManifestPublish)?;
+        }
+        commit_guard.manifest = new_manifest;
+
+        // The compactor releases its input reader clones before replacing shared readers.
+        drop(selected_readers);
+
+        {
+            let mut read_guard = self.read_state.write();
+            read_guard.ssts.drain(input_start_index..input_end_index);
+            if let Some(reader) = output_reader {
+                read_guard.ssts.insert(input_start_index, reader);
+            }
+            read_guard.gc_low_water = commit_guard.manifest.gc_low_water;
+        }
+
+        for path in input_paths {
+            let _ = std::fs::remove_file(path);
+        }
+
+        Ok(CompactionReport {
+            compacted: true,
+            input_sst_ids,
+            output_sst_id,
+            entries_in,
+            entries_out: output_entries.len() as u64,
+            dropped_by_partition,
+            collapsed_versions,
+        })
+    }
+
+    /// Preview the exact SSTs and partitions that a compaction pass could rewrite.
+    ///
+    /// If an SST cannot be scanned, partition IDs conservatively fall back to its metadata
+    /// partition range so callers do not incorrectly treat a partition as unaffected.
+    pub fn preview_compaction_candidates(
+        &self,
+        dropped_partition_ids: &HashSet<u64>,
+        protected_partition_ids: &HashSet<u64>,
+    ) -> CompactionPreview {
+        let commit_guard = self.commit_lock.lock();
+        let read_guard = self.read_state.read();
+        let metadata_by_id: HashMap<u64, SstMetadata> = read_guard
+            .ssts
+            .iter()
+            .map(|reader| (reader.metadata().id, reader.metadata().clone()))
+            .collect();
+        let metadata_refs: HashMap<u64, &SstMetadata> = metadata_by_id
+            .iter()
+            .map(|(&id, metadata)| (id, metadata))
+            .collect();
+        let ssts_with_dropped_partitions =
+            match find_ssts_with_partitions(&read_guard.ssts, dropped_partition_ids) {
+                Ok(sst_ids) => sst_ids,
+                Err(_) => {
+                    return CompactionPreview {
+                        sst_ids: Vec::new(),
+                        partition_ids: HashSet::new(),
+                    };
+                }
+            };
+        let sst_ids = select_compaction_candidates(
+            &commit_guard.manifest,
+            &ssts_with_dropped_partitions,
+            protected_partition_ids,
+            &metadata_refs,
+            self.options.max_compaction_input_ssts,
+            self.options.max_compaction_input_entries,
+        );
+
+        let conservative_partition_ids = || {
+            let mut partition_ids = HashSet::new();
+            for id in &sst_ids {
+                if let Some(metadata) = metadata_by_id.get(id) {
+                    if let (Some(min_key), Some(max_key)) = (&metadata.min_key, &metadata.max_key) {
+                        partition_ids.extend(min_key.partition_id..=max_key.partition_id);
+                    }
+                }
+            }
+            partition_ids
+        };
+
+        let selected_ids: HashSet<u64> = sst_ids.iter().copied().collect();
+        let mut partition_ids = HashSet::new();
+        for reader in read_guard
+            .ssts
+            .iter()
+            .filter(|reader| selected_ids.contains(&reader.metadata().id))
+        {
+            let iter = match reader.iter() {
+                Ok(iter) => iter,
+                Err(_) => {
+                    return CompactionPreview {
+                        sst_ids: sst_ids.clone(),
+                        partition_ids: conservative_partition_ids(),
+                    };
+                }
+            };
+            for entry in iter {
+                match entry {
+                    Ok(entry) => {
+                        partition_ids.insert(entry.key.partition_id);
+                    }
+                    Err(_) => {
+                        return CompactionPreview {
+                            sst_ids: sst_ids.clone(),
+                            partition_ids: conservative_partition_ids(),
+                        };
+                    }
+                }
+            }
+        }
+
+        CompactionPreview {
+            sst_ids,
+            partition_ids,
+        }
+    }
+
+    /// Return requested partition IDs represented by entries in published SSTs.
+    pub fn partitions_possibly_present_in_ssts(&self, ids: &HashSet<u64>) -> HashSet<u64> {
+        let read_guard = self.read_state.read();
+        let mut present = HashSet::new();
+        for reader in &read_guard.ssts {
+            let iter = match reader.iter() {
+                Ok(iter) => iter,
+                Err(_) => return ids.clone(),
+            };
+            for entry in iter {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => return ids.clone(),
+                };
+                if ids.contains(&entry.key.partition_id) {
+                    present.insert(entry.key.partition_id);
+                }
+            }
+        }
+        present
+    }
+
+    /// Return requested partition IDs represented by active or immutable memtable entries.
+    pub fn partitions_possibly_present_in_memtables(&self, ids: &HashSet<u64>) -> HashSet<u64> {
+        let read_guard = self.read_state.read();
+        let mut present = HashSet::new();
+        for entry in read_guard.active.iter() {
+            if ids.contains(&entry.key.partition_id) {
+                present.insert(entry.key.partition_id);
+            }
+        }
+        for memtable in &read_guard.immutables {
+            for entry in memtable.iter() {
+                if ids.contains(&entry.key.partition_id) {
+                    present.insert(entry.key.partition_id);
+                }
+            }
+        }
+        present
+    }
+
     /// Flush the active memtable to a new SST file on disk.
     pub fn flush(&self) -> Result<()> {
         let mut commit_guard = self.commit_lock.lock();
         self.flush_locked(&mut commit_guard)
+    }
+
+    /// Flush all memtables, roll the WAL, and garbage collect WAL segments.
+    ///
+    /// The commit lock remains held across all three operations so the manifest
+    /// covering the committed version is durable before WAL evidence is removed.
+    pub fn flush_roll_and_gc(&self) -> Result<()> {
+        let mut commit_guard = self.commit_lock.lock();
+        self.flush_locked(&mut commit_guard)?;
+        let committed_version = self.read_state.read().committed_version;
+        commit_guard.wal.force_roll()?;
+        let _ = commit_guard.wal.gc(committed_version)?;
+        Ok(())
     }
 
     /// Internal flush implementation under the commit mutex.
@@ -1183,8 +1731,12 @@ impl Engine {
             sync_dir(&sst_dir)?;
 
             // 4. Write and fsync MANIFEST
+            let committed_version = self.read_state.read().committed_version;
             let mut new_manifest = commit_guard.manifest.clone();
             new_manifest.prepend(ManifestSstEntry::from(&meta));
+            new_manifest.committed_version_high_water = new_manifest
+                .committed_version_high_water
+                .max(committed_version);
             let mut ledger_entries: Vec<ManifestLedgerEntry> = commit_guard
                 .applied_txns
                 .iter()
@@ -1201,6 +1753,7 @@ impl Engine {
                 let mut read_guard = self.read_state.write();
                 read_guard.ssts.insert(0, reader);
                 read_guard.immutables.retain(|m| !Arc::ptr_eq(m, &to_flush));
+                read_guard.gc_low_water = commit_guard.manifest.gc_low_water;
             }
 
             // 6. Checkpoint WAL and GC superseded segments
@@ -1246,6 +1799,158 @@ impl Engine {
     }
 }
 
+/// Return SST IDs that contain at least one entry from the requested partitions.
+///
+/// SSTs whose metadata range overlaps a requested partition but whose entries no longer
+/// contain that partition are omitted, avoiding repeated compaction of already-cleaned SSTs.
+fn find_ssts_with_partitions(
+    readers: &[Arc<SstReader>],
+    partition_ids: &HashSet<u64>,
+) -> Result<HashSet<u64>> {
+    let mut matching_sst_ids = HashSet::new();
+    if partition_ids.is_empty() {
+        return Ok(matching_sst_ids);
+    }
+
+    for reader in readers {
+        for entry in reader.iter()? {
+            let entry = entry?;
+            if partition_ids.contains(&entry.key.partition_id) {
+                matching_sst_ids.insert(reader.metadata().id);
+                break;
+            }
+        }
+    }
+
+    Ok(matching_sst_ids)
+}
+
+/// Return contiguous manifest-order runs containing only IDs from `selected_ids`.
+fn contiguous_sst_runs(manifest: &Manifest, selected_ids: &HashSet<u64>) -> Vec<Vec<u64>> {
+    let mut runs = Vec::new();
+    let mut current = Vec::new();
+
+    for entry in &manifest.ssts {
+        if selected_ids.contains(&entry.id) {
+            current.push(entry.id);
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+
+    runs
+}
+
+fn sst_overlaps_partitions(metadata: &SstMetadata, partition_ids: &HashSet<u64>) -> bool {
+    match (&metadata.min_key, &metadata.max_key) {
+        (Some(min_key), Some(max_key)) => partition_ids.iter().any(|partition_id| {
+            *partition_id >= min_key.partition_id && *partition_id <= max_key.partition_id
+        }),
+        _ => false,
+    }
+}
+
+/// Select compaction candidates using metadata only, without touching engine state.
+fn select_compaction_candidates(
+    manifest: &Manifest,
+    ssts_with_dropped_partitions: &HashSet<u64>,
+    protected_partition_ids: &HashSet<u64>,
+    ssts_by_id: &HashMap<u64, &SstMetadata>,
+    max_input_ssts: usize,
+    max_input_entries: u64,
+) -> Vec<u64> {
+    if max_input_ssts == 0 || max_input_entries == 0 {
+        return Vec::new();
+    }
+
+    let eligible = |id: u64| {
+        ssts_by_id
+            .get(&id)
+            .is_some_and(|metadata| !sst_overlaps_partitions(metadata, protected_partition_ids))
+    };
+    let tier_for = |entry_count: u64| {
+        if entry_count == 0 {
+            0
+        } else {
+            (u64::BITS - 1 - entry_count.leading_zeros()) / 2
+        }
+    };
+    let select_prefix = |start: usize, end: usize| {
+        let mut selected = Vec::new();
+        let mut selected_entries = 0u64;
+        for entry in &manifest.ssts[start..end] {
+            if selected.len() >= max_input_ssts {
+                break;
+            }
+            let entries = ssts_by_id[&entry.id].entry_count;
+            if entries > max_input_entries.saturating_sub(selected_entries) {
+                break;
+            }
+            selected_entries += entries;
+            selected.push(entry.id);
+        }
+        selected
+    };
+
+    let mut run_start = 0usize;
+    while run_start < manifest.ssts.len() {
+        let first = &manifest.ssts[run_start];
+        if !eligible(first.id) {
+            run_start += 1;
+            continue;
+        }
+
+        let tier = tier_for(ssts_by_id[&first.id].entry_count);
+        let mut run_end = run_start + 1;
+        while run_end < manifest.ssts.len() {
+            let entry = &manifest.ssts[run_end];
+            if !eligible(entry.id) || tier_for(ssts_by_id[&entry.id].entry_count) != tier {
+                break;
+            }
+            run_end += 1;
+        }
+
+        if run_end - run_start >= 4 {
+            let selected = select_prefix(run_start, run_end);
+            if !selected.is_empty() {
+                return selected;
+            }
+        }
+        run_start = run_end;
+    }
+
+    let mut run_start = 0usize;
+    while run_start < manifest.ssts.len() {
+        let first = &manifest.ssts[run_start];
+        let forced = eligible(first.id) && ssts_with_dropped_partitions.contains(&first.id);
+        if !forced {
+            run_start += 1;
+            continue;
+        }
+
+        let mut run_end = run_start + 1;
+        while run_end < manifest.ssts.len() {
+            let entry = &manifest.ssts[run_end];
+            let forced = eligible(entry.id) && ssts_with_dropped_partitions.contains(&entry.id);
+            if !forced {
+                break;
+            }
+            run_end += 1;
+        }
+
+        let selected = select_prefix(run_start, run_end);
+        if !selected.is_empty() {
+            return selected;
+        }
+        run_start = run_end;
+    }
+
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,6 +1959,83 @@ mod tests {
 
     fn make_row(val: i64) -> Row {
         Row::new(vec![Value::Int64(val)])
+    }
+
+    #[test]
+    fn preview_skips_protected_run_and_selects_next_eligible_tier() {
+        fn metadata(id: u64, partition_id: u64, entry_count: u64) -> SstMetadata {
+            SstMetadata {
+                id,
+                path: PathBuf::from(format!("{id}.sst")),
+                entry_count,
+                min_key: Some(InternalKey {
+                    partition_id,
+                    user_key: vec![],
+                    version: Version::INITIAL,
+                }),
+                max_key: Some(InternalKey {
+                    partition_id,
+                    user_key: vec![u8::MAX],
+                    version: Version::INITIAL,
+                }),
+                min_version: Some(Version::INITIAL),
+                max_version: Some(Version::INITIAL),
+            }
+        }
+
+        let manifest = Manifest {
+            ssts: (1..=8)
+                .map(|id| ManifestSstEntry {
+                    id,
+                    entry_count: if id <= 4 { 4 } else { 16 },
+                    min_version: Some(Version::INITIAL),
+                    max_version: Some(Version::INITIAL),
+                })
+                .collect(),
+            applied_txns: vec![],
+            committed_version_high_water: Version::INITIAL,
+            gc_low_water: Version::INITIAL,
+        };
+        let metadata = (1..=8)
+            .map(|id| {
+                let partition_id = if id <= 4 { 10 } else { 20 };
+                let entry_count = if id <= 4 { 4 } else { 16 };
+                (id, metadata(id, partition_id, entry_count))
+            })
+            .collect::<HashMap<_, _>>();
+        let metadata_refs = metadata
+            .iter()
+            .map(|(&id, metadata)| (id, metadata))
+            .collect::<HashMap<_, _>>();
+
+        let protected = HashSet::from([10]);
+        let selected = select_compaction_candidates(
+            &manifest,
+            &HashSet::new(),
+            &protected,
+            &metadata_refs,
+            DEFAULT_MAX_COMPACTION_INPUT_SSTS,
+            DEFAULT_MAX_COMPACTION_INPUT_ENTRIES,
+        );
+
+        assert_eq!(selected, vec![5, 6, 7, 8]);
+        assert!(selected
+            .iter()
+            .all(|id| { !sst_overlaps_partitions(metadata_refs[id], &protected) }));
+    }
+
+    #[test]
+    fn test_engine_directory_lock_blocks_concurrent_open_and_allows_reopen() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(EngineOptions::new(dir.path())).unwrap();
+
+        let err = Engine::open(EngineOptions::new(dir.path())).unwrap_err();
+        assert!(matches!(err, HtapError::Conflict(_)));
+
+        drop(engine);
+
+        let reopened = Engine::open(EngineOptions::new(dir.path())).unwrap();
+        drop(reopened);
     }
 
     #[test]
@@ -1437,6 +2219,8 @@ mod tests {
                 max_version: None,
             }],
             applied_txns: vec![],
+            committed_version_high_water: Version::INITIAL,
+            gc_low_water: Version::INITIAL,
         };
         Manifest::atomic_publish(dir.path(), &manifest).unwrap();
 

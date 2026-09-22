@@ -660,6 +660,8 @@ impl Session {
     /// Opens a new [`OpenTxn`] pinning the current visible MVCC version as the read snapshot.
     fn open_new_txn(&mut self, read_only: bool) {
         let snapshot = Snapshot::new(self.server.txn_manager.visible_version());
+        self.server
+            .register_pinned_snapshot(self.id, snapshot.version);
         self.state = SessionState::InTxn(OpenTxn {
             snapshot,
             read_only,
@@ -1219,11 +1221,13 @@ impl Session {
 
         if let Some(reason) = open_txn.poisoned.clone() {
             self.state = SessionState::Idle;
+            self.server.unregister_pinned_snapshot(self.id);
             return Err(HtapError::Conflict(reason));
         }
 
         if open_txn.read_only || open_txn.write_set.is_empty() {
             self.state = SessionState::Idle;
+            self.server.unregister_pinned_snapshot(self.id);
             return Ok(());
         }
 
@@ -1242,6 +1246,7 @@ impl Session {
             if !still_valid {
                 // A genuine conflict, not an infrastructure failure: the transaction is aborted.
                 self.state = SessionState::Idle;
+                self.server.unregister_pinned_snapshot(self.id);
                 return Err(HtapError::Conflict(format!(
                     "table dropped or partition altered during transaction (partition {partition_id})"
                 )));
@@ -1288,12 +1293,16 @@ impl Session {
         let mut txn = Transaction::new(txn_id, open_txn.snapshot.version);
         txn.set_request(request);
         match self.server.txn_manager.commit(&mut txn) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.server.unregister_pinned_snapshot(self.id);
+                Ok(())
+            }
             Err(HtapError::DurablePending {
                 txn_id,
                 version,
                 reason,
             }) => {
+                self.server.unregister_pinned_snapshot(self.id);
                 self.state = SessionState::CommitOutcomePending {
                     txn_id,
                     version,
@@ -1324,7 +1333,10 @@ impl Session {
                 })
             }
             // `self.state` is already `Idle` (aborted) from the `mem::replace` above.
-            Err(err) => Err(err),
+            Err(err) => {
+                self.server.unregister_pinned_snapshot(self.id);
+                Err(err)
+            }
         }
     }
 
@@ -1342,6 +1354,9 @@ impl Session {
     pub fn rollback(&mut self) -> Result<()> {
         if matches!(self.state, SessionState::CommitOutcomePending { .. }) {
             return Err(outcome_pending_error(&self.state));
+        }
+        if matches!(self.state, SessionState::InTxn(_)) {
+            self.server.unregister_pinned_snapshot(self.id);
         }
         self.state = SessionState::Idle;
         Ok(())

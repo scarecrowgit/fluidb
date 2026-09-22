@@ -40,8 +40,8 @@ pub use import::{
 pub use job::{
     decode_job, encode_job, sync_dir, validate_job_id, CopyOptions, CopyReport, DataFormat,
     JobCounters, LocalDataMover, MovementJob, MovementJobKind, MovementJobPhase,
-    MovementJobRequest, MovementJobState, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, JOB_FILE_NAME,
-    JOB_TMP_FILE_NAME, MAX_JOB_PAYLOAD_BYTES,
+    MovementJobRequest, MovementJobState, ReclaimLeaseGuard, TabletReclaimOutcome, FORMAT_VERSION,
+    HEADER_LEN, HEADER_MAGIC, JOB_FILE_NAME, JOB_TMP_FILE_NAME, MAX_JOB_PAYLOAD_BYTES,
 };
 pub use tablet::{
     clone_tablet, decode_manifest, encode_manifest, repair_tablet, verify_package,

@@ -353,17 +353,22 @@ Option **(c)**.
   Metadata-only `Column -> Row` demotion is implemented via catalog CAS (see ADR-015), while physical
   reverse transcoding is not implemented. This narrow `Route::OlapScan` analytical-scan path itself does
   not support joins/CTEs/windows (those are handled system-wide by the separate general query executor,
-  `Route::Query` — see ADR-017/ADR-022). Columnar bitmap delete vectors, physical rowstore reclamation,
-  delta-to-base background compaction, autonomous background conversion scheduling, vectorized aggregation,
-  vectorized operator pipelines, and distributed multi-tablet conversion are explicitly deferred on every path.
+  `Route::Query` — see ADR-017/ADR-022). Columnar bitmap delete vectors, delta-to-base background compaction
+  (folding rowstore deltas into new columnar segments), autonomous background conversion scheduling,
+  vectorized aggregation, vectorized operator pipelines, and distributed multi-tablet conversion are
+  explicitly deferred on every path (the rowstore's own generic LSM compaction and `DROP TABLE` artifact
+  reclamation are implemented as of Phase 15 — see ADR-024 — but do not touch the columnar side).
 
 ### Consequences
 
 - Zero downtime or blocking for online point reads and writes throughout conversion.
 - Crash-safe and resumable: any crash during conversion resumes from the persisted phase and
   pinned snapshot without duplicate manifest generation or orphaned segment leaks.
-- Storage footprint temporarily retains rowstore data post-conversion because physical rowstore
-  reclamation is deferred.
+- Storage footprint temporarily retains rowstore data post-conversion because delta-to-base background
+  compaction (folding accumulated rowstore deltas forward into new columnar segments) is deferred; as of
+  Phase 15 (ADR-024), the rowstore's own generic LSM compaction does collapse superseded MVCC versions and
+  reclaim disk space in the rowstore, including for converted tables' historical row versions, but it never
+  folds deltas into the columnar base or advances a conversion's own snapshot version.
 - Physical reverse transcoding is unsupported (metadata demotion back to Row is supported via ADR-015).
 
 ### How to reverse it
@@ -1069,6 +1074,15 @@ mutates conversion state), ADR-009 (durable synchronous local coordinator — un
 `UPDATE` go through the same unfenced `CatalogStore::compare_and_set` / `TransactionManager` paths as other
 non-coordinator-mediated local operations), and ADR-001 (structural R5 separation, extended rather than
 weakened by the syntactic shape gate in decision 2 above).
+
+**Superseded in part by ADR-024 (Phase 15).** This ADR's "DROP TABLE metadata-only" title and its decision
+text describing `DROP TABLE` as a single catalog CAS with no physical reclamation are historically accurate
+for Phase 9 but no longer describe the current contract: as of Phase 15, that same CAS also marks the dropped
+tablets `pending_reclaim`, and `LocalServer::reclaim_tick`/`compaction_tick` physically reclaim their
+rowstore, columnar, and movement artifacts over as many maintenance calls as it takes. The catalog format
+bump this ADR introduced (v1 -> v2, `id_high_water`) and the identifier-reuse guarantee it establishes are
+unchanged and remain load-bearing: reclamation is eventual, not instant, so the reuse guarantee still matters
+for the window between `DROP TABLE` and full reclaim. See ADR-024 for the compaction/reclaim design.
 
 ---
 
@@ -2801,3 +2815,435 @@ ADR-017 (the general query executor and R5's syntactic shape gate this ADR exten
 always applied at bind time rather than being a separate fast path the executor chooses between), ADR-004/008/
 009 (durability invariants — the only on-disk change in this ADR is the additive `HTAPCAT1` v3 -> v4 bump;
 spill files are explicitly outside the durability contract by decision 2 above).
+
+---
+
+## ADR-024: Contiguous-run rowstore compaction with in-place splice; manifest watermarks that refuse to regress; lease-before-engine ordering; a checkpoint latch on any rewrite error; and DROP TABLE artifact reclamation via the same leases
+
+`Status: Accepted`
+`Date: 2026-09-22`
+
+### Context
+
+Three things were named `deferred` since Phase 4/ADR-004: `DROP TABLE` never physically reclaimed rowstore or
+columnar bytes (`docs/LIMITATIONS.md`, `docs/ARCHITECTURE.md:185,192,1076`), the rowstore LSM never compacted
+its SSTs, and `txn.journal` only ever grew, eventually blocking `LocalServer::open` once
+`max_journal_size` is exceeded (`docs/LIMITATIONS.md`'s "no compaction" bullets). Phase 15 delivers a narrow
+local slice of all three: `Engine::compact_once` (tier-selected, entry-count-bounded SST merging with an
+MVCC-safe tombstone rule), a per-tablet reclaim/movement lease set that gates both compaction and `DROP
+TABLE` artifact deletion, a `pending_reclaim` catalog entry (`HTAPCAT1` v5) that drives colstore/movement
+cleanup and rowstore purge confirmation to completion across ticks, and `TransactionManager::checkpoint()`
+(a new `HTAPTXC1` envelope) that compacts `txn.journal` in place. None of this is StarRocks's design translated
+into Rust; StarRocks is read-only reference material never copied per `ATTRIBUTION.md`, and this ADR
+re-derives each mechanism from this codebase's own existing invariants — the LSM's newest-layer-wins read
+order, the single shared MVCC version domain (ADR-004), and the manager-wide decision lock 2PC already uses
+(ADR-018).
+
+An initial implementation was reviewed by a storage-review panel (`cx/gpt-5.6-terra-review` + `reasoner`) and
+found one critical bug and several high/medium ones before any of this shipped; the decisions below are the
+post-review design, not the first draft, and the bug is recorded here because it shapes decision 1.
+
+### Decision 1 — Compaction selects and replaces only a *contiguous* run of the manifest's SST list, spliced in place
+
+**The bug the panel found.** The first implementation selected a compaction tier by entry-count regardless of
+manifest position, then published the merged output by *prepending* it to `read_state.ssts` (index 0) and to
+the manifest. `Engine::get`/`scan_partition` resolve a key by returning from the first SST layer (searched
+newest-first) that holds any version at or below the snapshot. Manifest order is the newest-first read order
+by construction (`Engine`'s doc comment: "an ordered (newest-first) list of immutable on-disk `SstReader`s").
+Prepending a merged run built from arbitrary, non-adjacent SSTs to index 0 makes it look newer than every SST
+above it in the *old* order that were not selected — so a newer, unselected `Put` or `Delete` for the same key
+sitting in one of those un-selected-but-now-apparently-older SSTs would silently lose to the compacted output.
+This is a live-data resurrection bug, not a cosmetic one: it can un-delete a row.
+
+**Decision.** `select_compaction_candidates` (and the new `explicit_sst_ids` path, decision 5 below) must pick
+only SST ids that form one contiguous run in the manifest's current order — verified structurally in
+`compact_once` by checking `commit_guard.manifest.ssts[input_start_index..input_end_index]`'s ids exactly equal
+`input_sst_ids` before merging, and again against `read_state.ssts` at the same indices before swapping,
+returning `HtapError::Corruption` if either check fails rather than silently proceeding. The merged output is
+spliced into that same run's original start index in both the manifest's SST list and `read_state.ssts` — never
+prepended — so every SST that was newer than the run stays newer, and every SST that was older stays older.
+Forced dropped-partition selection (used by `DROP TABLE` reclaim) may pick a run of length 1 (a single isolated
+SST); the normal tier-size minimum does not apply to it, since correctness (removing dropped-partition rows)
+does not depend on batching. When a candidate set has gaps — a protected partition, an excluded SST, or an
+explicit id list with holes — the caller compacts one contiguous sub-run at a time, over as many
+`compact_once` calls as it takes; this is exactly decision 5's rationale.
+
+**Why not the rejected alternative (max-across-layers merge).** `reasoner` and `cx/gpt-5.5`, consulted as a
+panel, considered making the read path resolve ties by explicit per-version comparison across every layer
+instead of first-hit-wins by position. Rejected: it would have to be threaded into every read path that
+currently exits early on the first hit (`Engine::get`, `scan_partition`, the first-writer-wins prepare check),
+turning an O(1) fast-path exit into an O(layers) scan for every read, permanently, to fix a compaction-only
+bug. Keeping the invariant "manifest position is read priority, unconditionally" and fixing compaction to
+respect it is strictly cheaper and does not touch the hot read path at all.
+
+**Consequence.** A dropped partition scattered across several non-adjacent SSTs interleaved with live SSTs
+purges over several passes, one contiguous sub-run (or singleton) per pass — see decision 5's regression test
+naming this explicitly. A movement- or reclaim-leased tablet that happens to sit in the middle of an otherwise
+compactable tier breaks that tier into two sub-runs around it, and only the sub-runs outside the lease make
+progress that tick (decision 3's "shared keyspace" limitation, disclosed in `docs/LIMITATIONS.md`).
+
+### Decision 2 — `HTAPMAN1` bumps to format v3 to carry two watermarks that only ever rise, refusing to publish a regression
+
+**Committed-version high-water (`committed_version_high_water`).** Every manifest publish — flush or
+compaction — sets it to `max(existing value, read_state.committed_version)` under `commit_lock`, in the same
+atomic-publish call that changes the SST set. `Engine::open`'s recovered committed version is
+`max(manifest high-water, every SST's max_version, every replayed WAL commit)` — the manifest term is added
+without dropping the other two, so a manifest that is stale relative to the WAL (a crash between WAL commit
+and the next flush) still recovers correctly; the manifest term exists specifically to survive the case a WAL
+segment holding the last commit for an already-compacted, already-dropped partition gets garbage collected
+(decision 4) before a flush would otherwise have recorded that version. **Gc low-water (`gc_low_water`).**
+Every *actually publishing* compaction call sets it to `max(existing value, effective_gc_horizon)`, where
+`effective_gc_horizon = input.gc_horizon.min(visible_version)` is the same clamped horizon used to decide
+which versions collapse (an X-batch review fix: an earlier draft raised `gc_low_water` to the unclamped
+`input.gc_horizon` but exempted the `u64::MAX` "collapse everything" sentinel from raising it at all, so a
+`u64::MAX`-horizon compaction could collapse versions without the read floor ever rising to cover them — see
+`docs/PROGRESS.md`'s Phase 15 row, X2 — and a follow-up Y-batch review found the X-batch fix itself clamped to
+`committed_version`, not `visible_version`, which could raise `gc_low_water` above `visible_version` whenever
+`apply_external` had committed ahead of what was published, rejecting every fresh snapshot; `committed_version`
+still feeds `committed_version_high_water` above, unaffected) — a no-op pass (`compacted: false`) or a pure
+preview never advances it.
+`Engine::get`, `scan_partition`, and `prepare`'s
+first-writer-wins check (whenever the snapshot carries a real version, not the `u64::MAX` sentinel used by
+`apply_external`'s re-prepare and txn recovery replay) reject a snapshot below `gc_low_water` with a clear
+error rather than silently returning collapsed, no-longer-fully-versioned data. **Both watermarks refuse to
+regress**, mirroring `checkpoint::publish_checkpoint`'s precedent (ADR-below/decision 4): if a manifest publish
+would lower either field from what is currently on disk, `Manifest::atomic_publish` returns an error instead
+of writing the file. **Decode:** v1/v2 payloads derive the high-water exactly as `Engine::open` already did
+before this phase and default `gc_low_water` to `Version::INITIAL`; a v3 payload cross-checks its external-apply
+ledger's max version against `committed_version_high_water` at decode time, rejecting a v3 file where the
+ledger is ahead of the watermark as `HtapError::Corruption` — that combination cannot arise from any code path
+that writes v3, so seeing it means the file was hand-edited or corrupted in a structured way a raw CRC failure
+would not catch. v1..=v3 all still decode; an unknown version is still hard-rejected.
+
+**Why in the existing envelope, not a sibling file (architect consult).** A second `<rowstore>/GC` file would
+let the SST-set edit and the watermark edit publish non-atomically — exactly the two-file consistency hazard
+ADR-below/decision 4 rejected for `txn.checkpoint` vs. `txn.journal`, and the one the architect explicitly
+flagged when consulted on this format choice. `HTAPMAN1` already publishes the whole SST set atomically via
+`Manifest::atomic_publish`; adding two more `u64`-sized fields to the same payload costs nothing structurally
+and keeps the "one manifest publish = one consistent view" invariant Phase 1 established.
+
+**Sequencing invariant this decision depends on, stated explicitly:** a manifest publish that raises
+`committed_version_high_water` to cover some version *V* must land before any WAL garbage collection that could
+remove the last WAL evidence of *V*. This already held for ordinary flushes (`flush_locked` publishes the
+manifest, then nothing GCs the WAL until a later, separate call); decision 3's `flush_roll_and_gc` preserves it
+by construction (one method, one `commit_lock` acquisition, flush-then-roll-then-GC in that order, never two
+public calls a caller could reorder or interleave).
+
+### Decision 3 — Movement/reclaim leases are acquired before any engine call, all-or-nothing for `DROP TABLE`'s forced set and best-effort for the ordinary tiered pass; `flush_roll_and_gc` is one atomic engine method, not two
+
+**The ordering rule.** `LocalDataMover`'s per-tablet lease set (`active_tablet_leases`, split into a movement
+side and a `reclaim_tablet_leases` marker) is always acquired by the caller — `compaction_tick`, or a
+movement job's `copy_from_csv_reader`/`clone_tablet`/etc. — *before* that caller touches rowstore or colstore
+state for the tablets in question, and released only after that state has been touched and (for compaction)
+published. Movement acquires its lease before tablet I/O and before its own commit lock (documented directly
+in `LocalDataMover`'s doc comment); `compaction_tick` acquires reclaim leases (all-or-nothing for the
+`pending_reclaim`-forced set via `try_acquire_reclaim_lease`, best-effort for the ordinary tier via
+`acquire_reclaim_leases_best_effort`) before calling `Engine::preview_compaction_candidates`/`compact_once`,
+never the reverse. This closes a real race two external reviewers (`reasoner`, `cx/gpt-5.5`) converged on
+independently: a lease acquired *after* selecting candidate SSTs could still let a movement job start reading
+a tablet mid-compaction, since selection and rewrite are not instantaneous. Lock ordering has no cycle to
+prove safe here — the movement-lease mutex is never held while acquiring `commit_lock` or `execution_lock`,
+and `compaction_tick` always acquires the lease first — but it is worth stating as an explicit invariant
+(mirroring `engine.rs`'s own documented `commit_lock`-before-`read_state` rule) precisely because it is easy to
+get backwards by accident in a future change.
+
+**Why leases are non-durable (accepted, with a stated precondition).** The lease set lives only in
+`LocalDataMover`'s in-process mutex; a crash loses every lease. This is sound for exactly one reason, stated
+here because it stops being true the moment a future phase changes it: **a protection mechanism only needs to
+outlive the reader it protects, and today, nothing in this codebase can survive the crash that would drop a
+lease and still be reading the tablet that lease protected** — a movement job always re-resolves a fresh
+snapshot on resume (`tablet.rs`/`export.rs`'s `options.pinned_version.map(Snapshot::new).unwrap_or_else(||
+engine.snapshot())` pattern) rather than continuing a stale in-flight read across a restart. If a future phase
+makes a movement job resumable against a *fixed, historical* pinned snapshot across a process restart, this
+precondition breaks and the lease set must become durable (e.g. persisted in the job record) at that point —
+this is a standing precondition to re-check before that feature ships, not merely a note.
+
+**One atomic `flush_roll_and_gc`, not two composed public calls.** Purge confirmation (draining the WAL of a
+dropped partition's last replayable rows before declaring `rowstore_purge_confirmed`) needs a flush, a WAL
+segment roll, and a WAL GC to all happen under one `commit_lock` acquisition, in that order, so decision 2's
+sequencing invariant cannot be violated by a caller flushing, releasing the lock, and rolling/GC-ing later
+(during which window a concurrent commit could advance state the roll/GC would then act on inconsistently).
+`Wal::gc` already refuses to remove the active segment and `Wal::roll_segment` was already private; this phase
+adds one crate-private forced-roll entry point and one new public `Engine::flush_roll_and_gc()` that takes
+`commit_lock` once and performs all three steps, rather than exposing `flush()` and a hypothetical
+`roll_and_gc()` as two separate public methods a caller could call out of order or with an intervening commit.
+A first implementation rolled unconditionally on every call and collided with an existing segment file on the
+second call in the same tick (`AlreadyExists`); the fix picks a fresh segment id every call, keeping the
+method idempotent under repeated invocation within one tick.
+
+**Consequence, disclosed as low-medium severity, not fixed here:** because the WAL roll/GC step only runs when
+purge confirmation actually calls it, a row belonging to an already-dropped, already-compacted-out partition
+can in principle still be replayed from an un-rolled WAL segment after a crash, landing back in a memtable
+under a partition id that is provably never reused (`IdHighWater`) and therefore unreachable by any live
+query — a disk leak, not visible corruption. Decision 2's version-counter floor and this WAL-roll mechanism are
+complementary, not redundant: one bounds what a *snapshot* can see, the other bounds what the *WAL replay on
+restart* can resurrect.
+
+### Decision 4 — `TransactionManager::checkpoint()` latches `RecoveryRequired` on *any* error from the journal rewrite step, unconditionally
+
+**The problem.** Checkpointing publishes a new `txn.checkpoint` baseline (`HTAPTXC1`, magic already reserved in
+`CLAUDE.md`), then atomically rewrites `txn.journal` to contain only the still-unresolved records, then reopens
+the live `Journal` handle. Between "the rewrite's `atomic_publish` call returns" and "the handle is confirmed
+reopened," several distinct failures are possible (the rename succeeds but the directory fsync fails; the
+rename itself fails; the file is fine but reopening a fresh handle against it fails). A first pass only latched
+`RecoveryRequired` on some of these paths and let the journal-open step happen with `?`, so an error partway
+through could return `Err` to the caller while quietly leaving the manager holding a stale in-memory `Journal`
+handle referencing a file that had already been replaced or partially replaced on disk — “unknown state”
+returned to the caller as if it were an ordinary retryable error.
+
+**Decision.** Any error from `atomic_publish`'s rewrite call, from that point's `#[cfg(test)]` fault-injection
+hook, or from the subsequent `Journal::open_with_options` reopen call latches
+`RecoveryCause::JournalIo` **before** attempting any cleanup, unconditionally — including the case where the
+rewrite itself failed but a defensive re-open of the *old* handle (for FD safety only, never for trust) happens
+to succeed. The rationale, stated in the code's own comment: "any rewrite error leaves the durability of the
+replacement unknown, regardless of whether reopening the resulting path succeeds." Once latched, every other
+commit is refused with `HtapError::RecoveryRequired` (the same manager-wide latch ADR-018 introduced for 2PC),
+and only `recover()` (in-process, for a `JournalIo` cause specifically) or a full manager reopen clears it. A
+directory-sync failure injected right after the rename step is the concrete regression test for this: the
+manager must refuse further commits with `RecoveryRequired` from that point, and only a clean `recover()` (or
+reopen) restores normal operation — never a bare retry of `checkpoint()` on the same, now-untrusted handle.
+
+**Additional guards adopted alongside this fix (T2):** `checkpoint()` and `finalize_open()` both refuse
+(`compacted: false`, not `Err`) before `recover()` has ever run — mirroring `recover()`'s own poisoned/latched
+guard — since folding un-recovered records against a checkpoint baseline would be meaningless. The record-fold
+step now rejects a `Commit` record with no matching prior `Intent` as `HtapError::Corruption` rather than
+silently accepting it, closing a hole where a hand-corrupted or partially-truncated journal could be folded
+into a checkpoint without detection. Before dropping any record as resolved, `checkpoint()` cross-checks that
+every participant whose `committed_version()` reports a concrete value equals the fold's effective maximum
+version exactly, refusing without touching disk on any mismatch — the same kind of defense-in-depth
+cross-check `recover()` already performs.
+
+### Decision 5 — `DROP TABLE` marks artifacts `pending_reclaim` in the same CAS that removes the table; reclamation completes only once both column-store/movement and rowstore sides confirm, across as many ticks as needed; the movement reclaim callback also deletes that tablet's job records (S2)
+
+**Catalog: `HTAPCAT1` v4 -> v5.** `execute_drop_table` appends one `PendingReclaim{ table_id, table_name,
+catalog_generation, dropped: Vec<DroppedPartitionArtifact{partition_id, tablet_id}>, created_at_unix_ms,
+colstore_and_movement_reclaimed: false, rowstore_purge_confirmed: false }` onto `CatalogSnapshot.pending_reclaim`
+in the exact same CAS that removes the table/partition/tablet/replica rows — never a follow-up CAS, so there is
+no window where a table is gone from the catalog but its reclaim intent is not yet durable. `validate()`
+rejects a `(partition_id, tablet_id)` pair that overlaps any still-live partition/tablet row or is duplicated
+across `pending_reclaim` entries; it does not itself remove an entry — that is caller logic (`reclaim_tick`/
+`compaction_tick`), once both flags are true. A v5 payload missing the `pending_reclaim` key is
+`HtapError::Corruption`; v1-v4 payloads decode it as an empty vec via `#[serde(default)]`; this is structurally
+independent of Phase 14's per-table `stats` field, since a dropped table's row (and its `stats`) is removed
+from `next.tables` in the same CAS that adds the `PendingReclaim` entry — there is no orphaned-stats case.
+
+**Two independent completion flags, not one.** Column-store and movement artifact deletion (an entire
+`colstore/tablet-<id>/` directory, plus any movement package/job directories referencing that tablet — decision
+below) is fast and can complete synchronously inside `execute_drop_table` itself (best-effort, swallowing
+errors — a slow or leased tablet just leaves the flag false for a retry on the next tick). Rowstore purge is
+tier-driven and can take several `compaction_tick` calls. Making the fast path wait for the slow one for no
+correctness reason would tie unrelated cleanup timelines together; the catalog entry itself is only removed
+once both flags are true.
+
+**S2 — the reclaim callback also deletes that tablet's movement job records, not just its package directory.**
+The initial implementation only removed `<movement>/tablets/<tablet_id>/`, leaving behind
+`<movement>/jobs/<job_id>/` directories for any job that had ever targeted the now-dropped tablet — a
+leftover-but-harmless disk leak that the review round flagged as incomplete reclamation, not a correctness bug
+(a job record referencing a dropped tablet id can never collide with a future one, since tablet ids are never
+reissued). `LocalDataMover::delete_tablet_movement_artifacts` now also scans `<movement>/jobs/`, reads each job
+record, and removes any job directory whose `tablet_id` matches, alongside the package directory — both under
+the same reclaim-lease precondition (`HtapError::Conflict` if called without holding the lease), and both
+idempotent on retry (a missing directory is not an error).
+
+**Why this belongs in `compact_once`'s lease set rather than a separate mechanism.** A dropped table's tablet
+ids need the *same* mutual exclusion against a still-Running movement job that the ordinary tiered compaction
+path needs against a busy tablet (decision 3) — reusing one lease set for both, rather than inventing a
+second "drop-pending" lock, means there is exactly one place a future reader of movement state has to check
+for correctness, not two.
+
+### Consequences (cross-cutting)
+
+- **Compaction is tier-driven and explicit-tick-only, not instant or automatic**, matching `conversion_tick`'s
+  existing precedent (determinism, test repeatability) — `compaction_tick()` has no background thread and
+  blocks all SQL for its duration (accepted trade-off, same as `conversion_tick`), bounded by
+  `max_compaction_input_ssts`/`max_compaction_input_entries`.
+- **The shared rowstore keyspace means SST-level, not row-level, protection**: one SST holds rows from every
+  partition written in the same flush window, so a movement-leased tablet blocks compaction of *every* SST
+  that contains or spans it, not just that tablet's own rows — disclosed in `docs/LIMITATIONS.md`, not solved
+  here (a per-partition physical SST layout would remove this, at a cost this phase does not spend).
+- **Tombstones are never elided**, even below `gc_low_water` — per key, every version above the GC horizon is
+  kept unconditionally, and among versions at or below it, the single newest survives whether it is a `Put`
+  or a `Delete`, so a partial compaction schedule can never resurrect an older value hidden behind a
+  tombstone that a *different*, not-yet-compacted SST still holds above it in read order (decision 1's fix is
+  what makes this true; the rule itself was unchanged from the original design and reconfirmed against the
+  ordering fix by the same review panel).
+- **`gc_low_water` is a hard floor for reads, not a soft hint** — an explicit transaction (or movement job)
+  pinned below it via `LocalServer.pinned_snapshots`/a conversion's `snapshot_version` cannot silently receive
+  collapsed data; it gets a clear error instead. The GC horizon itself is computed once per tick as
+  `min(TransactionManager::visible_version(), every open session's pinned snapshot, every in-flight
+  conversion's snapshot_version)`, minus a configurable, default-zero `gc_horizon_retention_slack` — never a
+  `base_version`/movement-`pinned_version` source, both of which an earlier draft of this design relied on and
+  which independent review found unsound (a movement job's default-`None` pinned_version is never written
+  back to its durable job record, so a horizon source reading it would silently miss the common case).
+
+### Post-review fixes (storage-review "V batch")
+
+A second storage-review pass, after the fixes in decisions 1-5 above had already landed, found three further
+issues — one correctness/liveness hazard in the read path and two liveness-only convergence/isolation gaps —
+none of which reopens any decision above:
+
+- **`gc_low_water` mirrored into `read_state` so readers never take `commit_lock`.** `Engine::get`/
+  `scan_partition` originally read `gc_low_water` via `self.commit_lock.lock().manifest.gc_low_water` — a
+  lock-order hazard for the hot read path, since the engine's own documented rule is `commit_lock` before
+  `read_state`, never the reverse, and a pure reader taking `commit_lock` at all could block behind a
+  concurrent writer holding it for an unrelated flush or compaction. `ReadState` now carries its own
+  `gc_low_water` field, mirrored from `commit_guard.manifest.gc_low_water` under `commit_lock` at the exact
+  points `read_state.ssts` is already swapped (`Engine::open`, `flush_locked`, `compact_once`), so `get`/
+  `scan_partition` only ever take `read_state.read()`. Verified by a real concurrent-thread test:
+  `crates/htap-rowstore/tests/concurrent_reads.rs::test_concurrent_reads_do_not_deadlock_with_flush_and_compaction`.
+- **`compaction_tick`'s protection-convergence loop has a bounded, safe fallback.** The loop that adds every
+  lease-denied tablet's partitions to `protected_partition_ids` and re-previews (bounded at 8 iterations) is
+  now confirmed to protect every denied partition on every pass; if it still has not stabilized when the cap
+  is reached, `compaction_tick` skips the `compact_once` rewrite for that tick alone — never an unstable
+  candidate set whose protection status could change mid-rewrite — but still runs `flush_roll_and_gc`, purge
+  confirmation, the removal CAS, and `reclaim_tick_locked`, reporting `ran: true` with an explicit
+  non-convergence reason. Verified by
+  `crates/htap-server/tests/compaction_convergence.rs::leased_dropped_tablets_are_all_protected_in_one_tick`.
+- **Reclaim no longer fails on an undecodable job file belonging to a different tablet.**
+  `LocalDataMover::delete_tablet_movement_artifacts`'s job-directory scan used to propagate any decode error
+  it hit while looking for the target tablet's own job records, so one corrupt, unrelated tablet's `JOB` file
+  could block reclamation of a different, healthy tablet. It now skips an undecodable entry instead of
+  failing the whole scan (a real limitation, not silently hidden: the corrupt directory itself is never
+  deleted or reported — see `docs/LIMITATIONS.md`). Verified by
+  `crates/htap-movement/tests/corrupt_job_isolation.rs::corrupt_unrelated_job_does_not_block_tablet_artifact_reclamation`.
+
+Two further liveness-only gaps were disclosed rather than fixed in this round (both fail safely, neither loses
+data): a `compact_once` error occurring after its manifest publish but before the in-memory manifest is
+updated leaves the in-memory copy stale until the engine reopens, refusing every subsequent flush in the
+meantime; and a flush whose new SST reader fails to open *after* the manifest already lists that SST leaves a
+later compaction touching it failing safely with `Corruption` until reopen. Both are documented in
+`docs/LIMITATIONS.md`'s "Rowstore compaction, garbage collection, and DROP TABLE reclaim scope and deferred
+features".
+
+### Post-review fixes (storage-review "X batch")
+
+A third, whole-diff storage-review pass found and fixed five further issues — two correctness/liveness
+hazards in the write and export paths, one durability-hardening fix, one accounting fix, and one recovery
+availability fix — none of which reopens any decision above:
+
+- **Exports now hold their tablet lease for the whole scan-and-write (X1).** COPY TO CSV/JSONL and file export
+  (`crates/htap-movement/src/export.rs`) previously did not consistently hold their per-tablet movement lease
+  across the entire scan-and-write on every code path, leaving a window where a reclaim lease — and therefore
+  `compact_once`/`DROP TABLE` reclamation — could be acquired against a tablet an export was still reading.
+  The lease is now held for the export's full duration, so the two are mutually exclusive in either direction:
+  an export attempted while a reclaim lease is held fails with `HtapError::Conflict` rather than racing it.
+  Verified by `crates/htap-movement/tests/export_leasing.rs::exports_hold_tablet_leases_against_reclaim`.
+- **`compact_once`'s GC horizon clamp has no write-side exemption (X2; corrected to clamp against
+  `visible_version` rather than `committed_version` in the "Y batch" follow-up below).** `effective_gc_horizon`
+  is now the one value used both to decide which versions collapse and to advance `gc_low_water`, on every
+  publishing pass, including the `u64::MAX` "collapse everything" sentinel. An earlier draft exempted that
+  sentinel from raising `gc_low_water` at all, reasoning it was a write-side-only signal — but the
+  corresponding collapse still happened, so a real snapshot at an older, now-collapsed version could silently
+  read stale data instead of being rejected with the "below GC low-water" error decision 2 relies on. Verified
+  by `crates/htap-rowstore/tests/horizon_clamp.rs::test_infinite_gc_horizon_is_clamped_to_committed_version`.
+- **Tablet artifact deletion fsyncs its parent directories (X3).**
+  `LocalDataMover::delete_tablet_movement_artifacts` now calls `sync_dir` on the tablets directory, the jobs
+  directory, and the movement root after removing a tablet's package directory and its referencing job
+  directories, so a crash immediately after deletion cannot leave those directory entries resurrectable from
+  stale directory metadata on reopen — the same durability contract (ADR-008/009) every other owned-state
+  deletion in this workspace already follows.
+- **`checkpoint()` reads the journal through `max(configured_max_journal_size, RECOVERY_BOOTSTRAP_MAX_BYTES)`,
+  not the configured limit (X4; corrected below in the "Y batch" follow-up to not be a fixed 2 GiB cap).** An
+  earlier draft's `checkpoint()` read the live journal through the manager's normal handle, already reopened
+  at the *configured* `max_journal_size` by the time `checkpoint()` runs — so a journal a single oversized
+  commit had pushed past that limit could never be checkpointed at all, and the opportunistic post-commit
+  checkpoint (decision 4's own trigger) failed on every subsequent commit instead of shrinking the file.
+  `checkpoint()` now reads through the larger of the configured limit and the 2 GiB bootstrap ceiling
+  `TransactionManager::open`/`recover()` already use, so a journal within that ceiling but over the configured
+  limit can still be folded and rewritten back under it. Verified by
+  `manager::tests::test_checkpoint_compacts_journal_that_exceeds_configured_limit`
+  and `manager::tests::test_finalize_open_restores_configured_journal_limit`, both in
+  `crates/htap-txn/src/manager.rs`.
+- **`compaction_tick`'s `entries_purged` counts only confirmed CAS successes (X5).** It previously counted every
+  `pending_reclaim` entry the tick attempted to mark `rowstore_purge_confirmed`, regardless of whether the
+  catalog CAS marking them actually landed; a lost race against a concurrent catalog writer (`HtapError::
+  Conflict`, silently retried on the next tick) could make the report overstate how many entries were durably
+  confirmed on that call. `entries_purged` is now assigned only inside the CAS's `Ok(())` branch.
+
+**Two latent API hazards disclosed, not fixed, by this round (neither is reachable today).**
+`TransactionManager::new` does not itself load the durable checkpoint baseline (`checkpoint_baseline` defaults
+to `CheckpointBaseline::default()`); its only caller, `open_with_options`, immediately overwrites it with the
+loaded baseline right after, so no code path today can observe the gap. And the checkpoint file name
+(`txn.checkpoint`, `CHECKPOINT_FILE` in `crates/htap-txn/src/checkpoint.rs`) is fixed per directory — two
+`Journal`s opened against the same directory would silently share one baseline file — but `LocalServer` always
+gives each root exactly one `txn.journal`, so this cannot arise through any path this workspace exercises.
+Both are recorded in `docs/LIMITATIONS.md`'s "Transaction journal checkpoint scope and deferred features" as
+standing preconditions to re-check before either constraint changes (a future multi-journal-per-directory or
+manually-constructed-`TransactionManager` feature would need to address them first).
+
+### Post-review fixes (storage-review "Y batch")
+
+A fourth storage re-review pass corrected two of the "X batch" fixes above and found three further issues:
+
+- **X2 corrected: clamp to `visible_version`, not `committed_version`.** The "X batch" fix computed
+  `effective_gc_horizon = input.gc_horizon.min(committed_version)`. This is unsound: `apply_external` can
+  advance `committed_version` before the corresponding `publish` call advances `visible_version` (a 2PC or
+  external-apply commit is durable and counted in `committed_version` before it is made visible), so clamping
+  to `committed_version` could raise `gc_low_water` above `visible_version` and reject every fresh snapshot —
+  no snapshot is ever bounded by anything but `visible_version`, so this was strictly worse than the bug X2
+  fixed. The clamp is now `effective_gc_horizon = input.gc_horizon.min(read_state.visible_version)`;
+  `committed_version_high_water` (decision 2) is unaffected, since it is still fed from `committed_version`
+  directly, not from the clamped horizon. Verified by the existing
+  `test_infinite_gc_horizon_is_clamped_to_committed_version` (whose committed and visible versions happen to
+  coincide) plus a new test, `crates/htap-rowstore/tests/horizon_clamp.rs::test_infinite_gc_horizon_does_not_exceed_visible_version`,
+  which commits via `apply_external` without publishing to construct a committed-ahead-of-visible state and
+  proves the horizon (and therefore `gc_low_water`) never exceeds `visible_version`.
+- **X4 corrected: the read ceiling is `max(configured_max_journal_size, RECOVERY_BOOTSTRAP_MAX_BYTES)`, not a
+  fixed 2 GiB cap.** A fixed 2 GiB ceiling would itself refuse to read a journal larger than 2 GiB but smaller
+  than a *larger-than-2-GiB* configured `max_journal_size` — the exact failure mode X4 was fixing, just moved
+  to a different threshold. `checkpoint()`'s formula was in fact already `max(...)`, not a fixed constant; this
+  correction is to the ADR's/docs' description of it, not to the code. No test covers the more-than-2-GiB case,
+  since it would require constructing a journal over 2 GiB.
+- **Y3 — `delete_tablet_movement_artifacts` tolerates a missing `jobs/` directory.** An earlier draft
+  propagated the `NotFound` error from opening `movement/jobs/` for the job-record scan, so a tablet reclaimed
+  on a root that had never run a movement job (and therefore never created that directory) failed reclamation
+  outright instead of treating "no jobs ever existed" as "no jobs reference this tablet." A missing `jobs/`
+  directory is now treated as empty, and the parent-directory `sync_dir` calls (X3) still run. Verified by
+  `crates/htap-movement/tests/missing_jobs_dir.rs::reclaim_succeeds_when_jobs_directory_is_missing`.
+- **Y4 — the colstore reclaim step fsyncs `<root>/colstore` after deleting a tablet's colstore directory.**
+  `LocalServer::reclaim_tick_locked`'s colstore-deletion callback now calls `sync_dir` on the colstore root
+  immediately after `std::fs::remove_dir_all` on the tablet's colstore directory, before
+  `delete_tablet_movement_artifacts` runs and before the catalog CAS that marks
+  `colstore_and_movement_reclaimed`, so a crash right after removal cannot leave the removed directory
+  resurrectable from stale directory metadata — closing the same class of gap X3/Y3 close on the movement
+  side, on the colstore side. No dedicated test: an fsync's durability effect is not observable without crash
+  injection, which this pass did not add for this specific call site.
+
+**F5 disclosed, not fixed: `LocalDataMover`'s global lease mutex is held across the whole reclaim-deletion
+critical section.** `delete_tablet_movement_artifacts` acquires the same single mutex every lease
+acquire/release path uses and holds it for its entire body: the tablets-directory and job-record deletions,
+the job-directory scan, and all three `sync_dir` calls from X3. Every lease operation for *any* tablet — not
+just the one being reclaimed — stalls behind one tablet's reclaim deletion for that duration. This is a
+performance/liveness cost, not a correctness one: no data race results, only reduced concurrency during
+reclaim. Recorded in `docs/LIMITATIONS.md`'s rowstore-compaction "Completed local MVP" list.
+
+**Also corrected in this pass: a pre-existing test-count error in `docs/PROGRESS.md`'s Phase 15 row.**
+`crates/htap-txn/src/checkpoint.rs` has 9 unit tests, not 7 — `checkpoint_with_trailing_bytes_is_rejected` and
+`truncated_checkpoint_is_rejected` were omitted from the named list in an earlier pass. Both are now named.
+
+### Test evidence
+
+See `docs/PROGRESS.md`'s Phase 15 row for the full, verified test list. Named regression tests worth calling
+out here because they pin exactly the bugs this ADR describes:
+`crates/htap-rowstore/tests/compaction_ordering.rs::{test_non_newest_compaction_run_keeps_newer_ssts_authoritative,
+test_selected_tombstone_never_resurrects_older_unselected_value, test_sandwiched_partition_becomes_exactly_absent_in_one_pass,
+test_scattered_dropped_partition_is_purged_over_contiguous_passes}` (decision 1),
+`crates/htap-rowstore/tests/{manifest_v3.rs,gc_low_water.rs,purge_reopen.rs}` (decision 2),
+`crates/htap-server/tests/{tier_shift_protection.rs,compaction_tick.rs}` (decision 3),
+`crates/htap-txn/src/manager.rs`'s `test_checkpoint_crash_*`/`test_checkpoint_refused_before_recovery`/
+`test_checkpoint_rejects_participant_version_mismatch` unit tests (decision 4), and
+`crates/htap-server/tests/{reclaim.rs,movement_artifacts_reclaim.rs,sandwiched_purge.rs,purge_no_resurrection.rs}`
+plus `crates/htap-catalog/tests/catalog_recovery.rs`'s v5 tests (decision 5); and, for the post-review "V
+batch" fixes above, `crates/htap-rowstore/tests/concurrent_reads.rs`,
+`crates/htap-server/tests/compaction_convergence.rs`, and `crates/htap-movement/tests/corrupt_job_isolation.rs`.
+For the "X batch" fixes above: `crates/htap-movement/tests/export_leasing.rs` (X1),
+`crates/htap-rowstore/tests/horizon_clamp.rs` (X2), `crates/htap-txn/src/manager.rs`'s
+`test_checkpoint_compacts_journal_that_exceeds_configured_limit`/`test_finalize_open_restores_configured_journal_limit`
+(X4), and `crates/htap-server/tests/compaction_tick.rs::dropped_table_is_purged_from_rowstore_before_pending_entry_is_removed`
+(X5, the existing `entries_purged` assertion; X3 has no dedicated new test — see `docs/PROGRESS.md`'s Phase 15
+row). For the "Y batch" fixes above: `crates/htap-rowstore/tests/horizon_clamp.rs::test_infinite_gc_horizon_does_not_exceed_visible_version`
+(X2's correction) and `crates/htap-movement/tests/missing_jobs_dir.rs` (Y3; Y4 and F5 have no dedicated test —
+see `docs/PROGRESS.md`'s Phase 15 row). Cross-references: ADR-004 (the
+single shared MVCC version domain both watermarks and the GC horizon build on), ADR-008/009 (durability
+invariants — every new envelope here follows the same temp-write/fsync/rename/sync-dir + magic/version/CRC32C
+contract), ADR-018 (the manager-wide recovery latch decision 4 reuses verbatim).

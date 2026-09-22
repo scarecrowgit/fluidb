@@ -48,9 +48,20 @@ components are **deliberately not implemented** and are out of scope for this lo
   either). The memory budget and spilling apply to this general executor only: a single-table `SELECT` with
   `ORDER BY`, `GROUP BY`, or a plain aggregate and no join routes to the narrow analytic scan path instead,
   which has no memory budget and never spills, by design.
-- **No physical reclamation on `DROP TABLE`:** Dropping a table removes it from the catalog in one CAS;
-  the rowstore data and columnar segments of its tablets stay on disk, unreachable (dropped identifiers are
-  never reissued, so they can never be aliased by a new table, but disk space is not freed).
+- **`DROP TABLE` reclaims its own artifacts, eventually, not instantly:** Dropping a table removes it from the
+  catalog and marks its tablets `pending_reclaim` in the same CAS. Column-store directories and movement
+  artifacts are deleted as soon as a per-tablet lease is available; rowstore bytes are purged by the same
+  tier-driven `Engine::compact_once` LSM compaction described below, which can take several `compaction_tick`
+  calls to fully clear a large or contended table. Dropped identifiers are never reissued, so unreclaimed data
+  can never be aliased by a new table in the meantime. Still not implemented: reclamation for `ALTER TABLE ...
+  DROP/REORGANIZE PARTITION` (which only ever operates on empty partitions) and for demoted (`Column -> Row`)
+  column files.
+- **No vectorized/columnar delta-to-base background compaction:** The rowstore's own LSM compaction
+  (`Engine::compact_once`) collapses superseded MVCC versions and reclaims dropped-partition bytes as an
+  explicit, synchronous `compaction_tick()` — no background thread, no SQL trigger, and a movement- or
+  reclaim-leased (busy) partition blocks compaction of every SST that contains or spans it (the rowstore is
+  one shared keyspace, so protection is per SST, not per row). Folding accumulated rowstore deltas forward
+  into new columnar segments, and delete vectors on columnar segments, remain deferred.
 - **Exclusive Process Ownership (No Concurrent Multiprocess Operation):** `LocalServer` and `LocalCoordinator` enforce exclusive ownership of their root directory using an OS-level advisory lock (`<root>/LOCK` via `flock`). Concurrent access or duplicate opens by multiple processes against the same root directory (or its symlink aliases) are strictly rejected with `HtapError::Conflict`. This is single-process exclusive ownership, not concurrent shared-root operation; concurrent multiprocess writers are not supported. Low-level standalone subsystem instances (`htap_rowstore::Engine::open`, `htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) do not acquire this lock and remain unsafe for concurrent shared-root use.
 
 ---
@@ -181,7 +192,9 @@ fn main() -> Result<()> {
     server.execute("SHOW TABLES;")?;
     server.execute("DESCRIBE customers;")?;
 
-    // DROP TABLE is metadata-only: catalog CAS, no physical reclamation of dropped data.
+    // DROP TABLE removes the table from the catalog in one CAS; its rowstore/columnar/movement
+    // artifacts are physically reclaimed eventually by compaction_tick/reclaim_tick (Phase 15),
+    // not necessarily by the time this call returns.
     server.execute("DROP TABLE orders;")?;
 
     Ok(())
@@ -550,8 +563,9 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
   DROP TABLE IF EXISTS orders;
   ```
   Removes the table and its partitions/tablets/replicas in one catalog CAS; refuses while any partition is
-  `Converting`. Metadata-only — the dropped tablets' rowstore data and columnar segments are not physically
-  reclaimed, but their identifiers are never reissued.
+  `Converting`. That same CAS marks the dropped tablets `pending_reclaim`: their rowstore data and columnar
+  segments are physically reclaimed by `compaction_tick`/`reclaim_tick` over as many calls as it takes, not
+  necessarily by the time this statement returns; their identifiers are never reissued in the meantime.
 - **`SHOW` / `DESCRIBE`** (`Route::CatalogRead`, answered from the catalog only):
   ```sql
   SHOW TABLES LIKE 'ord%';
@@ -624,8 +638,11 @@ Direct `SegmentReader` pushdown optimization is implemented for the compact base
 - Memory-bounded spilling for non-equi/`CROSS` joins on the general query path (evaluated by an in-memory
   nested loop with no budget check at all — a genuine gap, unlike `LEFT`/`RIGHT`/`FULL` equi-hash joins, whose
   spilling is not itself kind-restricted in code but is exercised by a test only for `INNER` joins; memory
-  budgeting and spilling for `GROUP BY` and `INNER` equi-hash joins is implemented and tested as of Phase 14),
-  physical reclamation of data on `DROP TABLE`.
+  budgeting and spilling for `GROUP BY` and `INNER` equi-hash joins is implemented and tested as of Phase 14).
+  (Physical reclamation of `DROP TABLE`'s own artifacts is implemented, eventually, as of Phase 15 — see
+  "Scope Exclusions" and "Rowstore compaction, `DROP TABLE` reclaim, and journal checkpoint (Phase 15)" above;
+  physical reclamation for `ALTER TABLE ... DROP/REORGANIZE PARTITION` and for demoted column files remains
+  deferred.)
 - Multi-tablet or distributed scans, distributed fanout, resource quotas, query cancellation (conservative
   finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global
   merge/order are implemented locally; local disk spilling for the general query path is implemented as of
@@ -637,7 +654,7 @@ Direct `SegmentReader` pushdown optimization is implemented for the compact base
   - Supported SQL lifecycle DDL: `ALTER TABLE <table> ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` for strict finite range and list forms and final `MAXVALUE` where supported, gated by empty-source rowstore checks before catalog mutation.
   - Native lifecycle API: `LocalServer::alter_partitions` provides programmatic partition management with candidate catalog validation, atomic CAS, empty safety, and checked ID allocation without ID burn.
   - Unsupported partitioning forms: Partition options (`ENGINE`, `COMMENT`, `TABLESPACE`, `DATA DIRECTORY`), `SUBPARTITION`, `LIST DEFAULT`, expressions in partition keys, multi-column `COLUMNS`, and non-final/malformed `MAXVALUE` are strictly rejected with parse or binder errors.
-  - Deferred partition & conversion capabilities: Populated partition data migration during reorganization, physical storage reclamation (space of dropped partitions or demoted column files is not physically reclaimed), delete vectors, background compaction, autonomous background conversion scheduler, hash tablets / multiple tablets per partition, distributed/remote partition movement, replica consensus/HA, and an inter-node replication/movement network protocol remain deferred (the client-facing MySQL wire protocol is implemented; see "Network server (`htapd`)" above).
+  - Deferred partition & conversion capabilities: Populated partition data migration during reorganization, physical storage reclamation for `ALTER TABLE ... DROP/REORGANIZE PARTITION` (empty partitions only, so currently inert) or demoted column files, delete vectors, delta-to-base background columnar compaction, autonomous background conversion scheduler, hash tablets / multiple tablets per partition, distributed/remote partition movement, replica consensus/HA, and an inter-node replication/movement network protocol remain deferred (the client-facing MySQL wire protocol is implemented; see "Network server (`htapd`)" above). `DROP TABLE`'s own rowstore/columnar/movement artifacts are physically reclaimed as of Phase 15 — see "Scope Exclusions" above.
 
 ### Verification & Test Evidence
 
@@ -758,6 +775,70 @@ ADR-023 in `docs/DECISIONS.md` and `docs/PROGRESS.md`'s Phase 14 row for the ful
   which side was chosen to build. The planned shared binder leaf-helper extraction between `htap_sql::binder`
   and `htap_sql::binder_query` (`docs/PROBLEMS.md` P2) was not delivered — the two binder entry points are kept
   deliberately separate so R5 stays structural, but each still holds its own copy of that leaf-level logic.
+
+---
+
+## Rowstore compaction, `DROP TABLE` reclaim, and journal checkpoint (Phase 15)
+
+Phase 15 added narrow local MVPs for rowstore LSM compaction with a real MVCC-safe garbage-collection horizon,
+physical reclamation of a dropped table's rowstore/columnar/movement artifacts, and crash-safe compaction of
+`txn.journal` — no query-execution or on-disk row/column format change; `Route::RowstorePointRead`/
+`Route::OlapScan`/`Route::Query` are byte-for-byte unchanged. See ADR-024 in `docs/DECISIONS.md` and
+`docs/PROGRESS.md`'s Phase 15 row for the full contract and evidence.
+
+- **`Engine::compact_once`** selects one *contiguous* run of the manifest's SST list (entry-count tiered, or
+  an explicit id set for `DROP TABLE`'s forced-priority path) and splices its merged output into that run's
+  original manifest position, never prepending it — an initial draft did prepend, and could resurrect a stale
+  value hidden behind a tombstone in a newer, unselected SST; fixed and pinned by
+  `crates/htap-rowstore/tests/compaction_ordering.rs`. Per key, every version above a computed GC horizon is
+  kept unconditionally; among versions at or below it, only the single newest survives (`Put` or `Delete`,
+  never elided).
+- **`HTAPMAN1` bumps to format version 3** to carry `committed_version_high_water` and `gc_low_water`, both
+  monotonic and refusing to publish a regression; a read at a real snapshot below `gc_low_water` now fails
+  with a clear error instead of silently returning collapsed data. `Engine::open` also now takes an exclusive
+  lock on `<rowstore>/LOCK` for its whole lifetime.
+- **`DROP TABLE` now physically reclaims its artifacts**, eventually: the same catalog CAS that removes the
+  table marks its tablets `pending_reclaim` (`HTAPCAT1` bumps to format version 5).
+  `LocalServer::reclaim_tick`/`compaction_tick` delete column-store directories and movement artifacts
+  (including that tablet's movement job records) under a per-tablet lease, and drive rowstore purge
+  confirmation to completion across as many `compaction_tick` calls as it takes.
+- **`TransactionManager::checkpoint()`** (a new `HTAPTXC1` envelope, `txn.checkpoint`) compacts `txn.journal`
+  by dropping resolved `Intent`/`Commit`/`Abort` records past a durable baseline, triggered opportunistically
+  after a commit and finalized once at `LocalServer::open`. Any error partway through the journal rewrite
+  unconditionally latches `RecoveryRequired` rather than risking a stale, untrusted handle.
+- **Disclosed, not fixed:** the rowstore is one shared keyspace, so a busy (leased) tablet blocks compaction
+  of every SST that contains or spans it, not just its own rows; the explicit-SST-id compaction path compacts
+  only the first contiguous run per call, so a scattered dropped partition purges over several passes;
+  compaction is explicit-tick-only with no background thread or SQL trigger; and movement/reclaim leases are
+  intentionally non-durable (sound only because nothing that survives a crash can still be reading the tablet
+  a lease protected — see ADR-024). Two latent, currently-unreachable API hazards: `TransactionManager::new`
+  does not itself load the durable checkpoint baseline (its only caller, `open_with_options`, overwrites it
+  right after), and the `txn.checkpoint` file name is fixed per directory (unreachable since `LocalServer`
+  always uses one `txn.journal` per data root) — see `docs/LIMITATIONS.md`.
+- **A review round ("X batch") fixed five further issues:** exports now hold their tablet lease for the
+  whole scan-and-write, so they can no longer race a reclaim lease on the same tablet; `compact_once`'s GC
+  horizon clamp has no write-side exemption for the `u64::MAX` sentinel, so `gc_low_water` always rises to
+  match what actually collapsed; tablet artifact deletion now fsyncs its parent directories; the journal
+  checkpoint reads through a raised ceiling `open`/`recover()` also use, so an already-oversized journal
+  can still be checkpointed back under its configured limit; and `compaction_tick`'s `entries_purged` now
+  counts only confirmations whose catalog CAS actually succeeded.
+- **A follow-up storage re-review ("Y batch") corrected two of those fixes and found three more:** the GC
+  horizon clamp is now against `visible_version`, not `committed_version` — clamping to `committed_version`
+  could raise `gc_low_water` above `visible_version` whenever `apply_external` had committed ahead of what was
+  published, rejecting every fresh snapshot; the checkpoint's read ceiling is
+  `max(configured_max_journal_size, 2 GiB)`, not a fixed 2 GiB cap, which would itself refuse a journal between
+  2 GiB and a larger configured limit; tablet artifact deletion now tolerates a missing `movement/jobs/`
+  directory instead of failing reclamation outright; the colstore reclaim step now fsyncs `<root>/colstore`
+  after deleting a tablet's colstore directory; and `LocalDataMover`'s single global lease mutex being held
+  across an entire reclaim deletion (stalling every other tablet's lease operations meanwhile) is disclosed as
+  a performance-only limitation, not fixed.
+
+Verified by `crates/htap-rowstore/tests/{compaction.rs,compaction_ordering.rs,manifest_v3.rs,purge_reopen.rs,
+gc_low_water.rs,wal_purge.rs,preview_sst_ids.rs,horizon_clamp.rs}`, `crates/htap-server/tests/{compaction_tick.rs,reclaim.rs,
+sandwiched_purge.rs,tier_shift_protection.rs,movement_artifacts_reclaim.rs,purge_no_resurrection.rs}`,
+`crates/htap-movement/tests/{leasing.rs,movement_fixes.rs,export_leasing.rs,missing_jobs_dir.rs}`, `crates/htap-txn/src/manager.rs`'s
+`test_checkpoint_*` unit tests, and `crates/htap-catalog/tests/catalog_recovery.rs`'s v5 tests — see
+`docs/PROGRESS.md`'s Phase 15 row for the full, named list.
 
 ---
 

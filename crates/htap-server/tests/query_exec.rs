@@ -3078,14 +3078,9 @@ fn test_drop_table_reopen_and_no_id_reuse() {
                 && cat.tablets.is_empty()
                 && cat.replicas.is_empty()
         );
-        // The colstore files of the dropped tablets are left on disk (no reclamation).
-        assert!(dir
-            .path()
-            .join("colstore")
-            .read_dir()
-            .unwrap()
-            .next()
-            .is_some());
+        // DROP immediately reclaims the colstore directories of the dropped tablets.
+        let colstore = dir.path().join("colstore");
+        assert!(!colstore.exists() || colstore.read_dir().unwrap().next().is_none());
 
         // New tables never reuse the dropped identifiers.
         server

@@ -388,6 +388,9 @@ pub fn clone_tablet(
     // Resolve topology and enforce local one-tablet topology
     let topology = resolve_clone_topology(catalog, options)?;
 
+    // Acquire the movement lease before persisting a Running job.
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.source_tablet_id])?;
+
     // Register job in LocalDataMover to track lifecycle
     let job_request = MovementJobRequest {
         job_id: options.job_id.clone(),
@@ -404,7 +407,7 @@ pub fn clone_tablet(
     };
     let job = mover.start_job(job_request)?;
     if job.is_complete() {
-        return verify_package(mover, options, catalog);
+        return verify_package_internal(mover, options, catalog);
     }
     if job.is_failed() {
         return Err(HtapError::Conflict(format!(
@@ -532,7 +535,16 @@ pub fn verify_package(
     catalog: &dyn CatalogStore,
 ) -> Result<TabletPackageManifest> {
     options.validate()?;
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.source_tablet_id])?;
 
+    verify_package_internal(mover, options, catalog)
+}
+
+fn verify_package_internal(
+    mover: &LocalDataMover,
+    options: &TabletCloneOptions,
+    catalog: &dyn CatalogStore,
+) -> Result<TabletPackageManifest> {
     let manifest_path = mover.tablet_manifest_path(
         options.source_tablet_id,
         options.target_replica_id,
@@ -738,10 +750,13 @@ pub fn repair_tablet(
     options: &TabletCloneOptions,
     catalog: &dyn CatalogStore,
 ) -> Result<ReplicaDescriptor> {
-    // 1. Strictly validate package first; refuse repair if corrupt or mismatched
-    let manifest = verify_package(mover, options, catalog)?;
+    options.validate()?;
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.source_tablet_id])?;
 
-    // 2. CAS loop to update replica health
+    // 1. Strictly validate package first; refuse repair if corrupt or mismatched.
+    let manifest = verify_package_internal(mover, options, catalog)?;
+
+    // 2. CAS loop to update replica health while the tablet remains leased.
     let mut attempts = 0;
     loop {
         attempts += 1;

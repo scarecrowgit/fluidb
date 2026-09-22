@@ -4,6 +4,7 @@
 //! deterministic participant ordering, and crash recovery.
 #![forbid(unsafe_code)]
 
+pub mod checkpoint;
 pub mod journal;
 pub mod manager;
 pub mod participant;

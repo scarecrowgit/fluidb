@@ -21,6 +21,9 @@ pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 /// Default maximum total journal size (64 MiB) to reject oversized journals before allocation.
 pub const DEFAULT_MAX_JOURNAL_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Largest journal accepted temporarily while opening so recovery can compact it.
+pub(crate) const RECOVERY_BOOTSTRAP_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Conservative fixed overhead, in bytes, added by [`intent_frame_size_bound`] on top of a
 /// payload's own JSON-number-array encoding, covering everything in an `Intent` journal frame
 /// that isn't already accounted for per-participant by
@@ -467,13 +470,25 @@ impl Journal {
         Ok(journal)
     }
 
+    /// Open a journal with a bounded temporary recovery ceiling.
+    pub(crate) fn open_for_bootstrap(opts: &JournalOptions) -> Result<Self> {
+        let mut bootstrap_opts = opts.clone();
+        bootstrap_opts.max_journal_size = opts.max_journal_size.max(RECOVERY_BOOTSTRAP_MAX_BYTES);
+        Self::open_with_options(bootstrap_opts)
+    }
+
     /// Scans the entire journal, validating CRC32C checksums and frame bounds.
     pub fn scan(&mut self) -> Result<JournalScan> {
+        self.scan_with_max_journal_size(self.opts.max_journal_size)
+    }
+
+    /// Scans the journal with a caller-provided total-size ceiling while retaining this journal's
+    /// configured frame-size limit.
+    fn scan_with_max_journal_size(&mut self, max_journal_size: u64) -> Result<JournalScan> {
         let file_len = self.file.metadata()?.len();
-        if file_len > self.opts.max_journal_size {
+        if file_len > max_journal_size {
             return Err(HtapError::Corruption(format!(
-                "journal file size {file_len} exceeds maximum allowed size {}",
-                self.opts.max_journal_size
+                "journal file size {file_len} exceeds maximum allowed size {max_journal_size}"
             )));
         }
 
@@ -675,7 +690,12 @@ impl Journal {
     /// Returns the number of bytes truncated. Returns an error if unrecoverable
     /// middle-of-log corruption is found.
     pub fn repair_torn_final(&mut self) -> Result<u64> {
-        let scan = self.scan()?;
+        self.repair_torn_final_with_max_journal_size(self.opts.max_journal_size)
+    }
+
+    /// Repairs a torn final record using an overridden total-size ceiling.
+    fn repair_torn_final_with_max_journal_size(&mut self, max_journal_size: u64) -> Result<u64> {
+        let scan = self.scan_with_max_journal_size(max_journal_size)?;
         if let Some((_, reason)) = scan.middle_corrupt {
             return Err(HtapError::Corruption(format!(
                 "cannot repair torn-final on journal with middle corruption: {reason}"
@@ -936,7 +956,16 @@ impl Journal {
     /// repaired/truncated and an explanation is returned. If `auto_repair_torn_final` is false,
     /// torn records produce an error. Middle corruption produces an error regardless of options.
     pub fn recover_records(&mut self) -> Result<(Vec<JournalRecord>, Option<String>)> {
-        let scan = self.scan()?;
+        self.recover_records_with_max_journal_size(self.opts.max_journal_size)
+    }
+
+    /// Recovers records with an overridden total-size ceiling, retaining the configured frame
+    /// size limit. Used during bootstrap and checkpoint compaction of an oversized journal.
+    pub(crate) fn recover_records_with_max_journal_size(
+        &mut self,
+        max_journal_size: u64,
+    ) -> Result<(Vec<JournalRecord>, Option<String>)> {
+        let scan = self.scan_with_max_journal_size(max_journal_size)?;
         if let Some((offset, reason)) = scan.middle_corrupt {
             return Err(HtapError::Corruption(format!(
                 "journal middle corruption at offset {offset}: {reason}"
@@ -946,7 +975,8 @@ impl Journal {
         let mut torn_explanation = None;
         if let Some((offset, reason)) = scan.torn_final {
             if self.opts.auto_repair_torn_final {
-                let bytes_truncated = self.repair_torn_final()?;
+                let bytes_truncated =
+                    self.repair_torn_final_with_max_journal_size(max_journal_size)?;
                 torn_explanation = Some(format!(
                     "torn final record at offset {offset} ({bytes_truncated} bytes truncated): {reason}"
                 ));

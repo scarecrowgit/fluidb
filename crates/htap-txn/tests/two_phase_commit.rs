@@ -293,6 +293,7 @@ fn test_commit_after_durable_pending_is_rejected_until_recovery() {
     // consumed (no Commit record was ever written for it), so it is reissued to the next
     // transaction that actually commits.
     drop(manager);
+    drop(engine);
     let engine2 = Arc::new(Engine::open(EngineOptions::new(rowstore_dir.path())).unwrap());
     let participant2 = Arc::new(RowstoreParticipant::new(
         participant_id,

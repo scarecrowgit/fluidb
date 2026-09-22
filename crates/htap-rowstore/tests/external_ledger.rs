@@ -4,8 +4,8 @@ use tempfile::tempdir;
 use htap_common::{HtapError, Mutation, Row, Value, Version};
 use htap_rowstore::{
     Engine, EngineOptions, Manifest, ManifestLedgerEntry, ManifestSstEntry, Snapshot, WalOptions,
-    FORMAT_VERSION_V1, FORMAT_VERSION_V2, MAX_APPLIED_EXTERNAL_TXNS, MAX_MANIFEST_PAYLOAD_BYTES,
-    MAX_SST_COUNT,
+    FORMAT_VERSION, FORMAT_VERSION_V1, FORMAT_VERSION_V2, FORMAT_VERSION_V3,
+    MAX_APPLIED_EXTERNAL_TXNS, MAX_MANIFEST_PAYLOAD_BYTES, MAX_SST_COUNT,
 };
 
 fn make_row(val: i64) -> Row {
@@ -28,7 +28,9 @@ fn count_wal_segments(wal_dir: &Path) -> Vec<String> {
 
 #[test]
 fn test_manifest_v2_codec_invariants_and_error_handling() {
-    // 1. Manifest v2 round-trip with ledger
+    assert_eq!(FORMAT_VERSION, FORMAT_VERSION_V3);
+    assert_eq!(FORMAT_VERSION, 3);
+
     let mut manifest = Manifest::new();
     manifest.prepend(ManifestSstEntry {
         id: 1,
@@ -43,15 +45,16 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
         .applied_txns
         .push(ManifestLedgerEntry::new(101, Version::new(5)));
 
+    // encode() now emits the current v3 format.
+    manifest.committed_version_high_water = Version::new(8);
     let bytes = manifest.encode().unwrap();
     assert_eq!(
         u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
-        FORMAT_VERSION_V2
+        FORMAT_VERSION_V3
     );
-    let decoded = Manifest::decode(&bytes).unwrap();
-    assert_eq!(manifest, decoded);
+    assert_eq!(Manifest::decode(&bytes).unwrap(), manifest);
 
-    // 2. Format v1 fixture decodes as empty ledger
+    // The v1 fixture remains readable and has no external transaction ledger.
     let v1_bytes = manifest.encode_v1();
     assert_eq!(
         u16::from_le_bytes(v1_bytes[8..10].try_into().unwrap()),
@@ -61,7 +64,27 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
     assert_eq!(decoded_v1.ssts, manifest.ssts);
     assert!(decoded_v1.applied_txns.is_empty());
 
-    // 3. Unknown format version rejected
+    // A hand-built v2 manifest remains readable.
+    let mut v2_payload = Vec::new();
+    v2_payload.extend_from_slice(&0u32.to_le_bytes()); // 0 SSTs
+    v2_payload.extend_from_slice(&1u32.to_le_bytes()); // 1 ledger entry
+    v2_payload.extend_from_slice(&42u64.to_le_bytes());
+    v2_payload.extend_from_slice(&7u64.to_le_bytes());
+    let v2_crc = crc32c::crc32c(&v2_payload);
+    let mut v2_bytes = Vec::new();
+    v2_bytes.extend_from_slice(b"HTAPMAN1");
+    v2_bytes.extend_from_slice(&FORMAT_VERSION_V2.to_le_bytes());
+    v2_bytes.extend_from_slice(&(v2_payload.len() as u32).to_le_bytes());
+    v2_bytes.extend_from_slice(&v2_crc.to_le_bytes());
+    v2_bytes.extend_from_slice(&v2_payload);
+    let decoded_v2 = Manifest::decode(&v2_bytes).unwrap();
+    assert!(decoded_v2.ssts.is_empty());
+    assert_eq!(
+        decoded_v2.applied_txns,
+        vec![ManifestLedgerEntry::new(42, Version::new(7))]
+    );
+
+    // Unknown format version rejected.
     let mut bad_version_bytes = bytes.clone();
     bad_version_bytes[8..10].copy_from_slice(&99u16.to_le_bytes());
     let err = Manifest::decode(&bad_version_bytes).unwrap_err();
@@ -70,7 +93,7 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
         .to_string()
         .contains("unsupported manifest format version"));
 
-    // 4. Oversized payload rejected
+    // Oversized payload rejected.
     let mut oversized_payload_bytes = Vec::new();
     oversized_payload_bytes.extend_from_slice(b"HTAPMAN1");
     oversized_payload_bytes.extend_from_slice(&FORMAT_VERSION_V2.to_le_bytes());
@@ -80,7 +103,7 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
     assert!(matches!(err, HtapError::Corruption(_)));
     assert!(err.to_string().contains("exceeds maximum"));
 
-    // 5. Oversized SST count rejected
+    // Oversized SST count rejected.
     let mut payload = Vec::new();
     payload.extend_from_slice(&(MAX_SST_COUNT + 1).to_le_bytes());
     let crc = crc32c::crc32c(&payload);
@@ -94,7 +117,7 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
     assert!(matches!(err, HtapError::Corruption(_)));
     assert!(err.to_string().contains("SST count"));
 
-    // 6. Oversized ledger count rejected
+    // Oversized ledger count rejected.
     let mut payload = Vec::new();
     payload.extend_from_slice(&0u32.to_le_bytes()); // 0 SSTs
     payload.extend_from_slice(&((MAX_APPLIED_EXTERNAL_TXNS as u32) + 1).to_le_bytes());
@@ -109,7 +132,7 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
     assert!(matches!(err, HtapError::Corruption(_)));
     assert!(err.to_string().contains("ledger count"));
 
-    // 7. Ledger count exceeds payload buffer rejected before allocation
+    // Ledger count exceeding the remaining payload is rejected before allocation.
     let mut payload = Vec::new();
     payload.extend_from_slice(&0u32.to_le_bytes()); // 0 SSTs
     payload.extend_from_slice(&10_000u32.to_le_bytes()); // claims 10k entries
@@ -127,7 +150,7 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
         .to_string()
         .contains("too short for external ledger count"));
 
-    // 8. Zero txn_id rejected
+    // Zero transaction ID rejected.
     let mut zero_txn_manifest = Manifest::new();
     zero_txn_manifest
         .applied_txns
@@ -137,7 +160,7 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
     assert!(matches!(err, HtapError::Corruption(_)));
     assert!(err.to_string().contains("txn_id cannot be zero"));
 
-    // 9. Duplicate txn_id rejected
+    // Duplicate transaction ID rejected.
     let mut dup_payload = Vec::new();
     dup_payload.extend_from_slice(&0u32.to_le_bytes()); // 0 SSTs
     dup_payload.extend_from_slice(&2u32.to_le_bytes()); // 2 entries
@@ -156,9 +179,9 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
     assert!(matches!(err, HtapError::Corruption(_)));
     assert!(err.to_string().contains("duplicate transaction id 42"));
 
-    // 10. Trailing leftover bytes rejected
+    // Trailing leftover bytes rejected.
     let mut trailing_payload = dup_payload;
-    trailing_payload.truncate(4 + 4 + 16); // 1 entry of 16 bytes, but update count to 1
+    trailing_payload.truncate(4 + 4 + 16);
     trailing_payload[4..8].copy_from_slice(&1u32.to_le_bytes());
     trailing_payload.extend_from_slice(b"trailing_junk");
     let crc = crc32c::crc32c(&trailing_payload);
@@ -172,7 +195,7 @@ fn test_manifest_v2_codec_invariants_and_error_handling() {
     assert!(matches!(err, HtapError::Corruption(_)));
     assert!(err.to_string().contains("trailing leftover bytes"));
 
-    // 11. CRC corruption rejected
+    // CRC corruption rejected.
     let mut corrupted = bytes;
     let last = corrupted.len() - 1;
     corrupted[last] ^= 0x55;
@@ -286,6 +309,7 @@ fn test_cap_rejection_unchanged_state() {
             .applied_txns
             .push(ManifestLedgerEntry::new(i, Version::new(2)));
     }
+    manifest.committed_version_high_water = Version::new(2);
 
     // Write mock SST file for id 1 so Engine::open succeeds
     let sst_dir = dir.path().join("sst");
@@ -453,18 +477,33 @@ fn test_tiny_wal_segment_wal_gc_target_deleted_then_exact_reapply_succeeds() {
 fn test_recovery_does_not_infer_committed_version_solely_from_ledger() {
     let dir = tempdir().unwrap();
 
-    // Create a manifest with an external ledger entry at version 100, but no SSTs
-    let mut manifest = Manifest::new();
-    manifest
-        .applied_txns
-        .push(ManifestLedgerEntry::new(1, Version::new(100)));
+    // Write a v2 manifest directly: no SSTs and one ledger entry at v100.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes()); // 0 SSTs
+    payload.extend_from_slice(&1u32.to_le_bytes()); // 1 ledger entry
+    payload.extend_from_slice(&1u64.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
 
-    Manifest::atomic_publish(dir.path(), &manifest).unwrap();
+    let crc = crc32c::crc32c(&payload);
+    let mut manifest_bytes = Vec::new();
+    manifest_bytes.extend_from_slice(b"HTAPMAN1");
+    manifest_bytes.extend_from_slice(&FORMAT_VERSION_V2.to_le_bytes());
+    manifest_bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    manifest_bytes.extend_from_slice(&crc.to_le_bytes());
+    manifest_bytes.extend_from_slice(&payload);
+    std::fs::write(dir.path().join("MANIFEST"), manifest_bytes).unwrap();
 
     let engine = Engine::open(EngineOptions::new(dir.path())).unwrap();
-    // committed_version must NOT be inferred solely from the ledger
     assert_eq!(engine.committed_version(), Version::INITIAL);
     assert_eq!(engine.visible_version(), Version::INITIAL);
+
+    // A v3 manifest cannot retain a ledger version above its committed high-water mark.
+    let mut v3_manifest = Manifest::new();
+    v3_manifest
+        .applied_txns
+        .push(ManifestLedgerEntry::new(1, Version::new(100)));
+    let err = Manifest::atomic_publish(dir.path(), &v3_manifest).unwrap_err();
+    assert!(matches!(err, HtapError::InvalidArgument(_)));
 }
 
 #[test]

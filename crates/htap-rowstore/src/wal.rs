@@ -516,6 +516,16 @@ impl Wal {
         &self.opts
     }
 
+    /// Force creation of a new active segment at the next LSN.
+    pub(crate) fn force_roll(&mut self) -> Result<()> {
+        // An earlier forced roll may already have created an empty active
+        // segment. Reuse it until a record is appended.
+        if self.active_len == 0 {
+            return Ok(());
+        }
+        self.roll_segment()
+    }
+
     /// Start a new active segment named after the next LSN.
     fn roll_segment(&mut self) -> Result<()> {
         // Flush the outgoing segment so a crash right after the roll cannot
@@ -1186,6 +1196,45 @@ mod tests {
             assert_eq!(*lsn, Lsn::new(i as u64));
             assert_eq!(*rec, put(1, i as i64));
         }
+    }
+
+    #[test]
+    fn repeated_forced_rolls_reuse_the_empty_active_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(WalOptions::new(dir.path())).unwrap();
+
+        wal.append(&put(1, 1)).unwrap();
+        wal.append_commit(&commit(1, 2)).unwrap();
+
+        wal.force_roll().unwrap();
+        let paths_after_first_roll = wal.segment_paths();
+        assert_eq!(paths_after_first_roll.len(), 2);
+        assert_eq!(wal.current_lsn(), Lsn::new(2));
+
+        // The first roll creates 00000000000000000002.wal without consuming
+        // LSN 2. Before the fix, a second roll tried to create that file again,
+        // received AlreadyExists, bumped next_lsn to 3, and left a gap that
+        // replay rejected. Idle rolls must instead reuse the empty segment.
+        wal.force_roll().unwrap();
+        wal.force_roll().unwrap();
+        assert_eq!(wal.segment_paths(), paths_after_first_roll);
+        assert_eq!(wal.current_lsn(), Lsn::new(2));
+        drop(wal);
+
+        let mut wal = Wal::open(WalOptions::new(dir.path())).unwrap();
+        wal.force_roll().unwrap();
+        assert_eq!(wal.segment_paths(), paths_after_first_roll);
+        assert_eq!(wal.current_lsn(), Lsn::new(2));
+
+        assert_eq!(wal.append(&put(2, 2)).unwrap(), Lsn::new(2));
+        wal.append_commit(&commit(2, 3)).unwrap();
+        drop(wal);
+
+        let replay = Wal::replay(dir.path()).unwrap();
+        assert_eq!(replay.truncated_at, None);
+        assert_eq!(replay.committed_records().len(), 2);
+        assert_eq!(replay.committed_txn_ids(), HashSet::from([1, 2]));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]

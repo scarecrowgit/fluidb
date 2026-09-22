@@ -864,6 +864,34 @@ impl ReplicaDescriptor {
     }
 }
 
+/// Artifact identifiers retained for deferred reclamation after a partition is dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedPartitionArtifact {
+    /// Identifier of the dropped partition.
+    pub partition_id: PartitionId,
+    /// Identifier of a tablet formerly owned by the dropped partition.
+    pub tablet_id: TabletId,
+}
+
+/// Deferred physical reclamation work for dropped partition artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReclaim {
+    /// Identifier of the table from which the artifacts were dropped.
+    pub table_id: TableId,
+    /// Name of the table from which the artifacts were dropped.
+    pub table_name: String,
+    /// Catalog generation at which the artifacts were dropped.
+    pub catalog_generation: u64,
+    /// Dropped partition and tablet artifacts awaiting reclamation.
+    pub dropped: Vec<DroppedPartitionArtifact>,
+    /// Unix timestamp in milliseconds when this entry was created.
+    pub created_at_unix_ms: u64,
+    /// Whether column-store and movement artifacts have been reclaimed.
+    pub colstore_and_movement_reclaimed: bool,
+    /// Whether row-store purge has been confirmed.
+    pub rowstore_purge_confirmed: bool,
+}
+
 /// An immutable point-in-time snapshot of the complete cluster catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CatalogSnapshot {
@@ -886,6 +914,9 @@ pub struct CatalogSnapshot {
     pub tablets: Vec<TabletDescriptor>,
     /// All replicas across tablets.
     pub replicas: Vec<ReplicaDescriptor>,
+    /// Deferred physical reclamation work for dropped partition artifacts.
+    #[serde(default)]
+    pub pending_reclaim: Vec<PendingReclaim>,
     /// Highest identifiers ever allocated, persisted so that identifiers of dropped objects
     /// are never reissued (rowstore and columnar data are keyed by these ids and are not
     /// physically reclaimed on drop). Catalogs written before this field existed decode
@@ -1096,6 +1127,7 @@ impl CatalogSnapshot {
             partitions: Vec::new(),
             tablets: Vec::new(),
             replicas: Vec::new(),
+            pending_reclaim: Vec::new(),
             id_high_water: IdHighWater::default(),
         }
     }
@@ -1121,6 +1153,7 @@ impl CatalogSnapshot {
             partitions,
             tablets,
             replicas,
+            pending_reclaim: Vec::new(),
             id_high_water: IdHighWater::default(),
         }
     }
@@ -1131,11 +1164,13 @@ impl CatalogSnapshot {
         self
     }
 
-    /// Copies account metadata from an existing catalog snapshot when deriving a successor.
+    /// Copies account metadata and pending reclamation state from an existing catalog snapshot
+    /// when deriving a successor.
     pub fn with_account_state_from(mut self, source: &CatalogSnapshot) -> Self {
         self.accounts = source.accounts.clone();
         self.grants = source.grants.clone();
         self.accounts_initialized = source.accounts_initialized;
+        self.pending_reclaim = source.pending_reclaim.clone();
         self
     }
 
@@ -1882,6 +1917,34 @@ impl CatalogSnapshot {
     ///   - Each tablet references exactly the replicas that claim it.
     ///   - No orphaned or duplicate entity references.
     pub fn validate(&self) -> Result<()> {
+        let live_partition_ids: HashSet<PartitionId> = self
+            .partitions
+            .iter()
+            .map(|partition| partition.id)
+            .collect();
+        let live_tablet_ids: HashSet<TabletId> =
+            self.tablets.iter().map(|tablet| tablet.id).collect();
+        let mut seen_dropped_artifacts = HashSet::new();
+
+        for reclaim in &self.pending_reclaim {
+            for artifact in &reclaim.dropped {
+                if live_partition_ids.contains(&artifact.partition_id)
+                    || live_tablet_ids.contains(&artifact.tablet_id)
+                {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "pending reclaim artifact ({}, {}) overlaps a live partition or tablet",
+                        artifact.partition_id, artifact.tablet_id
+                    )));
+                }
+                if !seen_dropped_artifacts.insert((artifact.partition_id, artifact.tablet_id)) {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "duplicate pending reclaim artifact ({}, {})",
+                        artifact.partition_id, artifact.tablet_id
+                    )));
+                }
+            }
+        }
+
         let mut seen_account_ids = HashSet::with_capacity(self.accounts.len());
         let mut seen_usernames = HashSet::with_capacity(self.accounts.len());
 
@@ -2774,7 +2837,7 @@ mod tests {
             1,
         );
 
-        let snapshot = CatalogSnapshot::new(
+        let mut snapshot = CatalogSnapshot::new(
             1,
             vec![table.clone()],
             vec![partition.clone()],
@@ -2799,6 +2862,56 @@ mod tests {
         assert_eq!(snapshot.tablet_replicas(TabletId::new(100)), vec![&replica]);
 
         assert!(snapshot.validate().is_ok());
+
+        snapshot.pending_reclaim = vec![PendingReclaim {
+            table_id: TableId::new(1),
+            table_name: "users".into(),
+            catalog_generation: 2,
+            dropped: vec![DroppedPartitionArtifact {
+                partition_id: PartitionId::new(10),
+                tablet_id: TabletId::new(100),
+            }],
+            created_at_unix_ms: 1,
+            colstore_and_movement_reclaimed: false,
+            rowstore_purge_confirmed: false,
+        }];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("overlaps a live partition or tablet"));
+
+        snapshot.pending_reclaim = vec![
+            PendingReclaim {
+                table_id: TableId::new(1),
+                table_name: "users".into(),
+                catalog_generation: 2,
+                dropped: vec![DroppedPartitionArtifact {
+                    partition_id: PartitionId::new(20),
+                    tablet_id: TabletId::new(200),
+                }],
+                created_at_unix_ms: 1,
+                colstore_and_movement_reclaimed: false,
+                rowstore_purge_confirmed: false,
+            },
+            PendingReclaim {
+                table_id: TableId::new(1),
+                table_name: "users".into(),
+                catalog_generation: 3,
+                dropped: vec![DroppedPartitionArtifact {
+                    partition_id: PartitionId::new(20),
+                    tablet_id: TabletId::new(200),
+                }],
+                created_at_unix_ms: 2,
+                colstore_and_movement_reclaimed: true,
+                rowstore_purge_confirmed: true,
+            },
+        ];
+        assert!(snapshot
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate pending reclaim artifact"));
 
         let empty = CatalogSnapshot::empty();
         assert_eq!(empty.generation, 0);

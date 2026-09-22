@@ -15,6 +15,7 @@
 //!   guarded by an internal mutex and synchronously flushed via `fsync` (including
 //!   the containing directory). Multi-process concurrent access is not supported.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -670,10 +671,65 @@ pub fn sync_dir(path: &Path) -> Result<()> {
 /// - **Synchronous & Serialized**: All job transitions and state mutations are guarded
 ///   by an internal mutex and synchronously committed to disk via atomic rename and fsync.
 ///   Multi-process concurrency is not supported.
+#[derive(Debug, Default)]
+struct LocalDataMoverState {
+    active_tablet_leases: HashSet<TabletId>,
+    reclaim_tablet_leases: HashSet<TabletId>,
+}
+
+/// Result of attempting to reclaim artifacts associated with a tablet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabletReclaimOutcome {
+    /// Reclamation was skipped because the tablet is currently leased.
+    Skipped {
+        /// Whether the tablet is currently protected by a movement or reclamation lease.
+        leased: bool,
+    },
+    /// The tablet artifacts were reclaimed.
+    Reclaimed {
+        /// Identifier of the tablet whose artifacts were reclaimed.
+        tablet_id: TabletId,
+    },
+}
+
+/// RAII guard for one or more movement-I/O tablet leases.
+#[derive(Debug)]
+pub(crate) struct TabletLease<'a> {
+    mover: &'a LocalDataMover,
+    tablet_ids: HashSet<TabletId>,
+}
+
+impl Drop for TabletLease<'_> {
+    fn drop(&mut self) {
+        self.mover.release_tablet_leases(&self.tablet_ids);
+    }
+}
+
+/// RAII guard for one or more compaction/reclamation tablet leases.
+#[derive(Debug)]
+pub struct ReclaimLeaseGuard<'a> {
+    mover: &'a LocalDataMover,
+    tablet_ids: HashSet<TabletId>,
+}
+
+impl ReclaimLeaseGuard<'_> {
+    /// Return the tablet IDs held by this guard.
+    pub fn tablet_ids(&self) -> &HashSet<TabletId> {
+        &self.tablet_ids
+    }
+}
+
+impl Drop for ReclaimLeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.mover.release_tablet_leases(&self.tablet_ids);
+    }
+}
+
+/// Local coordinator for durable, single-node data movement operations.
 #[derive(Debug)]
 pub struct LocalDataMover {
     root_dir: PathBuf,
-    lock: parking_lot::Mutex<()>,
+    lock: parking_lot::Mutex<LocalDataMoverState>,
 }
 
 impl LocalDataMover {
@@ -686,8 +742,244 @@ impl LocalDataMover {
 
         Ok(Self {
             root_dir,
-            lock: parking_lot::Mutex::new(()),
+            lock: parking_lot::Mutex::new(LocalDataMoverState::default()),
         })
+    }
+
+    /// Acquire movement-I/O leases for all requested tablets.
+    ///
+    /// Movement and reclaim leases are mutually exclusive for the same tablet.
+    /// Acquire this non-durable lease before any tablet I/O and before acquiring
+    /// a transaction commit lock; it is valid only while no protected reader can
+    /// survive a crash. Acquisition is all-or-nothing and returns
+    /// [`HtapError::Conflict`] if any requested tablet is already leased.
+    pub(crate) fn acquire_tablet_leases(&self, tablet_ids: &[TabletId]) -> Result<TabletLease<'_>> {
+        let requested: HashSet<TabletId> = tablet_ids.iter().copied().collect();
+        let mut state = self.lock.lock();
+
+        if let Some(tablet_id) = requested
+            .iter()
+            .find(|tablet_id| state.active_tablet_leases.contains(tablet_id))
+        {
+            return Err(HtapError::Conflict(format!(
+                "tablet {} is already leased for movement or reclamation",
+                tablet_id.0
+            )));
+        }
+
+        state.active_tablet_leases.extend(requested.iter().copied());
+        drop(state);
+
+        Ok(TabletLease {
+            mover: self,
+            tablet_ids: requested,
+        })
+    }
+
+    /// Release movement or reclamation leases for the given tablets.
+    fn release_tablet_leases(&self, tablet_ids: &HashSet<TabletId>) {
+        let mut state = self.lock.lock();
+        for tablet_id in tablet_ids {
+            state.active_tablet_leases.remove(tablet_id);
+            state.reclaim_tablet_leases.remove(tablet_id);
+        }
+    }
+
+    /// Attempt to acquire reclamation leases for all requested tablets.
+    ///
+    /// Movement and reclaim leases are mutually exclusive for the same tablet.
+    /// A movement operation must acquire its lease before tablet I/O and before
+    /// its commit lock. These non-durable leases are valid only while no
+    /// protected reader can survive a crash. Acquisition is all-or-nothing: if
+    /// any tablet is already leased, no leases are acquired and `None` is returned.
+    pub fn try_acquire_reclaim_lease(
+        &self,
+        tablet_ids: &[TabletId],
+    ) -> Option<ReclaimLeaseGuard<'_>> {
+        let requested: HashSet<TabletId> = tablet_ids.iter().copied().collect();
+        let mut state = self.lock.lock();
+
+        if requested
+            .iter()
+            .any(|tablet_id| state.active_tablet_leases.contains(tablet_id))
+        {
+            return None;
+        }
+
+        state.active_tablet_leases.extend(requested.iter().copied());
+        state
+            .reclaim_tablet_leases
+            .extend(requested.iter().copied());
+        drop(state);
+
+        Some(ReclaimLeaseGuard {
+            mover: self,
+            tablet_ids: requested,
+        })
+    }
+
+    /// Acquire reclamation leases for every currently unleased tablet.
+    ///
+    /// Movement and reclaim leases are mutually exclusive for the same tablet.
+    /// Movement acquires its lease before tablet I/O and before its commit lock.
+    /// These non-durable leases are valid only while no protected reader can
+    /// survive a crash. Returns the lease guard together with the set of tablets
+    /// that could not be acquired because they were already leased.
+    pub fn acquire_reclaim_leases_best_effort(
+        &self,
+        tablet_ids: &[TabletId],
+    ) -> (ReclaimLeaseGuard<'_>, HashSet<TabletId>) {
+        let requested: HashSet<TabletId> = tablet_ids.iter().copied().collect();
+        let mut acquired = HashSet::new();
+        let mut denied = HashSet::new();
+        let mut state = self.lock.lock();
+
+        for tablet_id in requested {
+            if state.active_tablet_leases.contains(&tablet_id) {
+                denied.insert(tablet_id);
+            } else {
+                state.active_tablet_leases.insert(tablet_id);
+                state.reclaim_tablet_leases.insert(tablet_id);
+                acquired.insert(tablet_id);
+            }
+        }
+        drop(state);
+
+        (
+            ReclaimLeaseGuard {
+                mover: self,
+                tablet_ids: acquired,
+            },
+            denied,
+        )
+    }
+
+    /// Reclaim artifacts for a tablet when it is not currently leased.
+    ///
+    /// The reclamation lease remains held while `also_delete` runs and is
+    /// released whether the callback succeeds or fails.
+    pub fn reclaim_tablet_artifacts(
+        &self,
+        tablet_id: TabletId,
+        also_delete: impl FnOnce() -> Result<()>,
+    ) -> Result<TabletReclaimOutcome> {
+        let guard = match self.try_acquire_reclaim_lease(&[tablet_id]) {
+            Some(guard) => guard,
+            None => return Ok(TabletReclaimOutcome::Skipped { leased: true }),
+        };
+
+        also_delete()?;
+        drop(guard);
+
+        Ok(TabletReclaimOutcome::Reclaimed { tablet_id })
+    }
+
+    /// Delete all persisted movement artifacts belonging to a tablet.
+    ///
+    /// The caller must hold a reclaim lease for `tablet_id`. Missing package or job
+    /// directories are ignored so reclamation remains idempotent.
+    pub fn delete_tablet_movement_artifacts(&self, tablet_id: TabletId) -> Result<()> {
+        let state = self.lock.lock();
+        if !state.reclaim_tablet_leases.contains(&tablet_id) {
+            return Err(HtapError::Conflict(format!(
+                "tablet {} must be held by a reclaim lease before deleting movement artifacts",
+                tablet_id.0
+            )));
+        }
+
+        let package_dir = self.tablets_dir().join(tablet_id.0.to_string());
+        match fs::remove_dir_all(&package_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(HtapError::Io(e)),
+        }
+
+        if let Ok(entries) = fs::read_dir(self.jobs_dir()) {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+
+                let job_id = match entry.file_name().into_string() {
+                    Ok(job_id) if validate_job_id(&job_id).is_ok() => job_id,
+                    _ => continue,
+                };
+                let job = match self.read_job_file_locked(&job_id) {
+                    Ok(Some(job)) => job,
+                    Ok(None) | Err(HtapError::Corruption(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+
+                if job.tablet_id == tablet_id {
+                    match fs::remove_dir_all(entry.path()) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(HtapError::Io(e)),
+                    }
+                }
+            }
+        } else if let Err(e) = fs::read_dir(self.jobs_dir()) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(HtapError::Io(e));
+            }
+        }
+
+        let tablets_dir = self.tablets_dir();
+        if tablets_dir.exists() {
+            sync_dir(&tablets_dir)?;
+        }
+        let jobs_dir = self.jobs_dir();
+        if jobs_dir.exists() {
+            sync_dir(&jobs_dir)?;
+        }
+        if self.root_dir.exists() {
+            sync_dir(&self.root_dir)?;
+        }
+
+        Ok(())
+    }
+
+    /// Mark a running job for the given tablet as failed after its work was abandoned.
+    ///
+    /// Returns the failed job ID, or `None` if no running job targets the tablet.
+    pub fn fail_abandoned_running_job(&self, tablet_id: TabletId) -> Result<Option<String>> {
+        let _guard = self.lock.lock();
+        let jobs_dir = self.jobs_dir();
+
+        for entry in fs::read_dir(&jobs_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let job_id = match entry.file_name().into_string() {
+                Ok(job_id) if validate_job_id(&job_id).is_ok() => job_id,
+                _ => continue,
+            };
+
+            let mut job = match self.read_job_file_locked(&job_id) {
+                Ok(Some(job)) => job,
+                Ok(None) | Err(HtapError::Corruption(_)) => continue,
+                Err(error) => return Err(error),
+            };
+
+            if job.tablet_id != tablet_id || job.phase != MovementJobPhase::Running {
+                continue;
+            }
+
+            job.phase = MovementJobPhase::Failed;
+            job.report = None;
+            job.error = Some(format!(
+                "movement job abandoned while reclaiming tablet {}",
+                tablet_id.0
+            ));
+            self.persist_job_locked(&job)?;
+
+            return Ok(Some(job_id));
+        }
+
+        Ok(None)
     }
 
     /// Return the root directory of this data mover.

@@ -65,6 +65,7 @@ pub fn copy_to_csv_writer<W: Write>(
     options.validate()?;
     let start_instant = Instant::now();
 
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.tablet_id])?;
     let job = mover.start_copy(MovementJobKind::Export, options)?;
     if job.is_complete() {
         return Ok(job.to_report(0));
@@ -134,6 +135,7 @@ pub fn copy_to_jsonl_writer<W: Write>(
     options.validate()?;
     let start_instant = Instant::now();
 
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.tablet_id])?;
     let job = mover.start_copy(MovementJobKind::Export, options)?;
     if job.is_complete() {
         return Ok(job.to_report(0));
@@ -222,6 +224,7 @@ fn export_to_file(
     options.validate()?;
     let start_instant = Instant::now();
 
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.tablet_id])?;
     let job = mover.start_copy(MovementJobKind::Export, options)?;
     if job.is_complete() {
         return Ok(job.to_report(0));

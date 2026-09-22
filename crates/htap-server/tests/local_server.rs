@@ -3209,6 +3209,10 @@ fn test_partition_storage_format_row_column_converting_equivalence() {
         .execute("SELECT id, val FROM hybrid WHERE id >= 100 ORDER BY id;")
         .unwrap();
 
+    // Release the server's rowstore lock before opening a separate engine for conversion.
+    let colstore_dir = server.colstore_dir().to_path_buf();
+    drop(server);
+
     // Now configure p1 as Column storage and p2 as Converting storage:
     let snap = cat_store.load().unwrap().unwrap();
     let p1_id = snap.partitions[1].id;
@@ -3223,10 +3227,14 @@ fn test_partition_storage_format_row_column_converting_equivalence() {
             ))
             .unwrap(),
         ),
-        server.colstore_dir(),
+        colstore_dir,
         htap_convert::SegmentOptions::default(),
     );
     converter.convert_partition(p1_id).unwrap();
+    drop(converter);
+
+    // Reopen the server after the converter releases its rowstore engine lock.
+    let server = LocalServer::open(dir.path()).unwrap();
 
     // Modify p2 in catalog to Converting storage with SnapshotPinned phase
     let mut snap2 = cat_store.load().unwrap().unwrap();

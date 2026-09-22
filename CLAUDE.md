@@ -29,7 +29,7 @@ Read before non-trivial work: `docs/ARCHITECTURE.md` (component statuses), `docs
   - Durable writes go temp file → `sync_all` → `rename` → `sync_dir`, using the crate's existing
     `atomic_publish` / `write_atomic` / `sync_dir` helpers; never write a published file in place.
   - Every on-disk envelope has a magic (`HTAPSST1`, `HTAPMAN1`, `HTAPCAT1`, `HTAPCOL1`, `HTAPVIS1`, `HTAPTBM1`,
-    `HTAPJOB1`, `HTAPCRD1`, `HTAPMNF1`) plus CRC32C. A layout change bumps the format version, keeps or explicitly
+    `HTAPJOB1`, `HTAPCRD1`, `HTAPMNF1`, `HTAPTXC1`) plus CRC32C. A layout change bumps the format version, keeps or explicitly
     rejects old versions, and adds a recovery test.
   - Rowstore is authoritative during conversion (base-plus-delta overlay); `DurablePending` must never be reported as committed.
   - R5: complete-PK point reads route to `RowstorePointRead` and never touch the analytical path.

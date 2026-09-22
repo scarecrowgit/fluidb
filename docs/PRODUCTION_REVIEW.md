@@ -1,7 +1,10 @@
 # Production Architecture & Hardening Review
 
 **Date:** 2026-09-10  
-**Status:** Audit & Hardening Record  
+**Status:** Audit & Hardening Record (point-in-time snapshot — not kept current phase-by-phase; see
+`docs/ARCHITECTURE.md`, `docs/LIMITATIONS.md`, and `docs/PROGRESS.md` for the current contract). One
+specific item below is now stale as of Phase 15 and is annotated in place: item 1 in section 4 and the
+matching roadmap line in section 5 (`txn.journal` compaction).  
 **Target:** Local HTAP Database Engine (`LocalServer` / `LocalCoordinator`)
 
 ---
@@ -96,8 +99,8 @@ The following critical and high-severity architectural issues have been verified
 
 The following limitations and architectural boundaries remain explicitly open:
 
-1. **No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks New External Applies:**
-   Neither the transaction journal (`txn.journal`) nor the rowstore `MANIFEST` v2 external apply ledger implements compaction, pruning, or coordinated retention. The external ledger enforces a hard cap (`MAX_APPLIED_EXTERNAL_TXNS = 1_000_000`). Once this cap is saturated, subsequent new external transaction applies are rejected with `HtapError::InvalidArgument` (there is no `CapacityExceeded` variant); a Phase 10 fix pass moved this check into `Engine::prepare` as well, so it is now caught before any journal write for a real 2PC/direct-commit transaction, not only at apply time. `txn.journal`'s own `max_journal_size` (default 64 MiB) is likewise checked only at open, not on every append, so a long-running root can grow the journal past it without any single write failing, only to have a later `LocalServer::open` fail with `HtapError::Corruption`. Coordinated journal and ledger retention tied to participant checkpoints remains future work; see `docs/LIMITATIONS.md`.
+1. **[Stale as of Phase 15 — `txn.journal` is now checkpointed] No Journal/Ledger Compaction or Coordinated Retention; Ledger Hard Cap Blocks New External Applies:**
+   As of Phase 15, `TransactionManager::checkpoint()` (a new `HTAPTXC1` baseline envelope, `txn.checkpoint`) compacts `txn.journal` by dropping resolved `Intent`/`Commit`/`Abort` records past a durable baseline, triggered opportunistically after a commit and finalized once at `LocalServer::open`; see `docs/ARCHITECTURE.md`'s "Transaction journal checkpoint (Phase 15)" and `docs/LIMITATIONS.md`'s matching section for the full contract and remaining gaps (best-effort, not guaranteed; refuses while recovery is required or the journal is poisoned). The rest of this item is unchanged and still current: the rowstore `MANIFEST` v2 external apply ledger still implements no compaction, pruning, or coordinated retention, and still enforces a hard cap (`MAX_APPLIED_EXTERNAL_TXNS = 1_000_000`). Once this cap is saturated, subsequent new external transaction applies are rejected with `HtapError::InvalidArgument` (there is no `CapacityExceeded` variant); a Phase 10 fix pass moved this check into `Engine::prepare` as well, so it is now caught before any journal write for a real 2PC/direct-commit transaction, not only at apply time. `txn.journal`'s own `max_journal_size` (default 64 MiB) is still checked only at open, not on every append; Phase 15's checkpoint narrows, but does not eliminate, the case where a long-running root grows the journal past it (a workload dominated by long-lived, unresolved `Intent`s has nothing to checkpoint). Coordinated retention for the external-apply ledger specifically remains future work; see `docs/LIMITATIONS.md`.
 
 2. **Possible Later Flush-Boundary Duplicate SST Publication After Crash:**
    If a crash occurs immediately after an SST file is published to disk but before reader registration, manifest update, or checkpoint advance, a subsequent reopen/flush cycle may republish duplicate SST data. Full resolution requires a future staged flush recovery mechanism.
@@ -135,7 +138,9 @@ The following limitations and architectural boundaries remain explicitly open:
                                        v
 +-----------------------------------------------------------------------------+
 | P1 — Near-Term Robustness & Lifecycle                                       |
-| - Coordinated journal and MANIFEST v2 ledger retention/compaction           |
+| - txn.journal checkpoint/compaction: DONE (Phase 15, TransactionManager::   |
+|   checkpoint(), HTAPTXC1)                                                   |
+| - MANIFEST v2 external-apply ledger retention/compaction: still open       |
 | - Staged flush recovery to eliminate duplicate SST publication risks        |
 | - Standalone subsystem process-lock encapsulation (Engine, Catalog, Mover)  |
 | - Mandatory coordinator fencing across all direct CatalogStore mutations    |

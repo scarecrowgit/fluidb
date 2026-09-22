@@ -21,7 +21,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use htap_catalog::local::LocalCatalogStore;
-use htap_catalog::model::TableStats;
+use htap_catalog::model::{DroppedPartitionArtifact, PendingReclaim, TableStats};
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{Account, Grant, PrivilegeScope};
 pub use htap_catalog::{
@@ -33,19 +33,23 @@ pub use htap_catalog::{
 };
 use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
+use htap_common::fs::sync_dir;
 use htap_common::lock::ProcessLock;
 use htap_common::password::{constant_time_eq_20, hash_native_password};
 use htap_common::types::{ColumnDef, Mutation, Row, Schema, Value};
+use htap_common::Version;
 pub use htap_convert::{
     ConversionAction, ConversionErrorCategory, ConversionPolicy, ConversionTarget,
     ConversionTickReport, PartitionConversionReport, Predicate, SegmentOptions,
     TableConversionReport,
 };
+use htap_movement::job::TabletReclaimOutcome;
 use htap_movement::{
     CopyOptions, CopyReport, LocalDataMover, MovementJob, TabletCloneOptions, TabletPackageManifest,
 };
+use htap_rowstore::CompactionReport;
 pub use htap_rowstore::Snapshot;
-use htap_rowstore::{Engine, EngineOptions};
+use htap_rowstore::{CompactionInput, Engine, EngineOptions};
 use htap_sql::ast::{
     AnalyticSelect, BoundPartitioning, BoundStatement, CreateTable, DeleteStatement, DeleteTarget,
     Insert, InsertSource, PointSelect, UpdateStatement, UpdateTarget,
@@ -140,6 +144,45 @@ pub struct BootstrapReport {
     pub config_password_matches_root: Option<bool>,
 }
 
+/// Report describing deferred dropped-table reclamation work.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReclaimReport {
+    /// Tables whose artifacts remain protected by an active movement or reclamation lease.
+    pub blocked_by_active_job: Vec<TableId>,
+    /// Tables whose column-store artifacts are reclaimed but await row-store purge confirmation.
+    pub colstore_movement_only_pending: Vec<TableId>,
+}
+
+/// The source that limited a compaction garbage-collection horizon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcHorizonSource {
+    /// The transaction manager's current visible version was the limiting source.
+    VisibleVersion,
+    /// A session's pinned transaction snapshot was the limiting source.
+    PinnedSession(SessionId),
+    /// An in-flight partition conversion snapshot was the limiting source.
+    Conversion(PartitionId),
+}
+
+/// Report describing one compaction maintenance tick.
+#[derive(Debug, Clone)]
+pub struct CompactionTickReport {
+    /// Whether compaction ran. It is false when recovery is required.
+    pub ran: bool,
+    /// Why compaction did not run.
+    pub reason: Option<&'static str>,
+    /// The garbage-collection horizon used for this tick.
+    pub gc_horizon: Version,
+    /// The source that limited `gc_horizon`.
+    pub gc_horizon_limiting_source: GcHorizonSource,
+    /// The result of each attempted compaction iteration.
+    pub per_iteration_reports: Vec<CompactionReport>,
+    /// Number of dropped-table partition entries confirmed purged from rowstore storage.
+    pub entries_purged: usize,
+    /// Number of tablets skipped because their movement/reclaim lease was unavailable.
+    pub denied_tablet_count: usize,
+}
+
 /// Synchronous local database server.
 ///
 /// Encapsulates catalog metadata management, transactional write logging,
@@ -151,12 +194,14 @@ pub struct LocalServer {
     txn_manager: TransactionManager,
     data_mover: LocalDataMover,
     execution_lock: Mutex<()>,
+    pinned_snapshots: Mutex<std::collections::BTreeMap<SessionId, Version>>,
     colstore_dir: PathBuf,
     data_root: PathBuf,
     scan_workers: usize,
     query_parallelism: usize,
     query_memory_budget: usize,
     analyze_distinct_limit: usize,
+    gc_horizon_retention_slack: u64,
     next_session_id: AtomicU64,
 }
 
@@ -283,6 +328,7 @@ impl LocalServer {
         txn_manager.register_participant(participant);
 
         txn_manager.recover()?;
+        txn_manager.finalize_open()?;
 
         let movement_dir = canonical_root.join("movement");
         let data_mover = LocalDataMover::new(movement_dir)?;
@@ -293,21 +339,27 @@ impl LocalServer {
         Self::validate_storage_state_on_open(&catalog, &colstore_dir)?;
         Self::migrate_legacy_id_high_water(&catalog, &colstore_dir)?;
 
-        Ok(Self {
+        let server = Self {
             _lock: lock_guard,
             catalog,
             engine,
             txn_manager,
             data_mover,
             execution_lock: Mutex::new(()),
+            pinned_snapshots: Mutex::new(std::collections::BTreeMap::new()),
             colstore_dir,
             data_root: canonical_root,
             scan_workers: DEFAULT_SCAN_WORKERS,
             query_parallelism: default_query_parallelism(),
             query_memory_budget: DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
             analyze_distinct_limit: DEFAULT_ANALYZE_DISTINCT_LIMIT,
+            gc_horizon_retention_slack: 0,
             next_session_id: AtomicU64::new(1),
-        })
+        };
+        if let Err(error) = server.reclaim_tick_locked(true) {
+            eprintln!("failed to reclaim dropped table artifacts on open: {error}");
+        }
+        Ok(server)
     }
 
     /// Initializes the root superuser account once.
@@ -455,6 +507,428 @@ impl LocalServer {
     /// Returns the configured exact-distinct limit used by `ANALYZE TABLE`.
     pub fn analyze_distinct_limit(&self) -> usize {
         self.analyze_distinct_limit
+    }
+
+    /// Configures the number of recent MVCC versions retained behind the oldest active horizon.
+    pub fn with_gc_horizon_retention_slack(mut self, slack: u64) -> Self {
+        self.gc_horizon_retention_slack = slack;
+        self
+    }
+
+    /// Sets the number of recent MVCC versions retained behind the oldest active horizon.
+    pub fn set_gc_horizon_retention_slack(&mut self, slack: u64) {
+        self.gc_horizon_retention_slack = slack;
+    }
+
+    /// Returns the configured compaction GC-horizon retention slack.
+    pub fn gc_horizon_retention_slack(&self) -> u64 {
+        self.gc_horizon_retention_slack
+    }
+
+    /// Registers the MVCC version pinned by an open session transaction.
+    pub(crate) fn register_pinned_snapshot(&self, session_id: SessionId, version: Version) {
+        self.pinned_snapshots.lock().insert(session_id, version);
+    }
+
+    /// Removes a session's pinned MVCC version.
+    ///
+    /// This operation is idempotent so transaction cleanup paths can safely call it after
+    /// checking only the session's prior state.
+    pub(crate) fn unregister_pinned_snapshot(&self, session_id: SessionId) {
+        self.pinned_snapshots.lock().remove(&session_id);
+    }
+
+    /// Returns the oldest MVCC version pinned by an open session transaction.
+    fn oldest_pinned_snapshot(&self) -> Option<(SessionId, Version)> {
+        self.pinned_snapshots
+            .lock()
+            .iter()
+            .min_by_key(|(_, version)| **version)
+            .map(|(session_id, version)| (*session_id, *version))
+    }
+
+    /// Reclaims deferred artifacts from dropped tables.
+    pub fn reclaim_tick(&self) -> Result<ReclaimReport> {
+        let _guard = self.execution_lock.lock();
+        self.reclaim_tick_locked(false)
+    }
+
+    /// Reclaims deferred dropped-table artifacts while `execution_lock` is held.
+    fn reclaim_tick_locked(&self, auto_fail_abandoned_jobs: bool) -> Result<ReclaimReport> {
+        let snapshot = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+        let mut reclaimed_tablets = std::collections::HashSet::new();
+        let mut blocked_tables = std::collections::HashSet::new();
+
+        for entry in &snapshot.pending_reclaim {
+            for artifact in &entry.dropped {
+                if auto_fail_abandoned_jobs {
+                    self.data_mover
+                        .fail_abandoned_running_job(artifact.tablet_id)?;
+                }
+
+                match self
+                    .data_mover
+                    .reclaim_tablet_artifacts(artifact.tablet_id, || {
+                        std::fs::remove_dir_all(htap_convert::tablet_dir(
+                            &self.colstore_dir,
+                            artifact.tablet_id,
+                        ))
+                        .or_else(|error| -> Result<()> {
+                            if error.kind() == std::io::ErrorKind::NotFound {
+                                Ok(())
+                            } else {
+                                Err(error.into())
+                            }
+                        })?;
+                        sync_dir(&self.colstore_dir)?;
+                        self.data_mover
+                            .delete_tablet_movement_artifacts(artifact.tablet_id)
+                    })? {
+                    TabletReclaimOutcome::Reclaimed { tablet_id } => {
+                        reclaimed_tablets.insert(tablet_id);
+                    }
+                    TabletReclaimOutcome::Skipped { leased: true } => {
+                        blocked_tables.insert(entry.table_id);
+                    }
+                    TabletReclaimOutcome::Skipped { leased: false } => {}
+                }
+            }
+        }
+
+        let mut candidates = std::collections::HashSet::new();
+        for entry in &snapshot.pending_reclaim {
+            if !blocked_tables.contains(&entry.table_id)
+                && entry
+                    .dropped
+                    .iter()
+                    .all(|artifact| reclaimed_tablets.contains(&artifact.tablet_id))
+            {
+                candidates.insert((entry.table_id, entry.catalog_generation));
+            }
+        }
+
+        for attempt in 0..2 {
+            let current = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+            let mut next = current.clone();
+            let mut changed = false;
+            for entry in &mut next.pending_reclaim {
+                if candidates.contains(&(entry.table_id, entry.catalog_generation))
+                    && !entry.colstore_and_movement_reclaimed
+                {
+                    entry.colstore_and_movement_reclaimed = true;
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+
+            next.generation =
+                current
+                    .generation
+                    .checked_add(1)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "catalog_generation",
+                    })?;
+            match self.catalog.compare_and_set(current.generation, next) {
+                Ok(()) => break,
+                Err(HtapError::Conflict(_)) if attempt == 0 => continue,
+                Err(HtapError::Conflict(_)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+
+        let current = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+        let mut report = ReclaimReport {
+            blocked_by_active_job: blocked_tables.into_iter().collect(),
+            colstore_movement_only_pending: current
+                .pending_reclaim
+                .iter()
+                .filter(|entry| {
+                    entry.colstore_and_movement_reclaimed && !entry.rowstore_purge_confirmed
+                })
+                .map(|entry| entry.table_id)
+                .collect(),
+        };
+        report.blocked_by_active_job.sort_unstable();
+        report.blocked_by_active_job.dedup();
+        report.colstore_movement_only_pending.sort_unstable();
+        report.colstore_movement_only_pending.dedup();
+
+        let mut next = current.clone();
+        next.pending_reclaim.retain(|entry| {
+            !(entry.colstore_and_movement_reclaimed && entry.rowstore_purge_confirmed)
+        });
+        if next.pending_reclaim.len() != current.pending_reclaim.len() {
+            next.generation =
+                current
+                    .generation
+                    .checked_add(1)
+                    .ok_or(HtapError::CounterOverflow {
+                        counter: "catalog_generation",
+                    })?;
+            match self.catalog.compare_and_set(current.generation, next) {
+                Ok(()) | Err(HtapError::Conflict(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Runs one bounded rowstore compaction and dropped-partition reclamation maintenance tick.
+    ///
+    /// Compaction is skipped while transaction recovery is required. Otherwise the garbage-
+    /// collection horizon is bounded by the transaction manager's visible version, every open
+    /// session snapshot, every in-flight conversion snapshot, and the configured retention
+    /// slack. Movement leases protect tablets from concurrent compaction or reclamation.
+    pub fn compaction_tick(&self) -> Result<CompactionTickReport> {
+        const MAX_ITERATIONS: usize = 8;
+
+        let _guard = self.execution_lock.lock();
+        let visible_version = self.txn_manager.visible_version();
+        if self.txn_manager.recovery_required() {
+            return Ok(CompactionTickReport {
+                ran: false,
+                reason: Some("recovery pending"),
+                gc_horizon: visible_version,
+                gc_horizon_limiting_source: GcHorizonSource::VisibleVersion,
+                per_iteration_reports: Vec::new(),
+                entries_purged: 0,
+                denied_tablet_count: 0,
+            });
+        }
+
+        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+        let mut limiting_version = visible_version;
+        let mut limiting_source = GcHorizonSource::VisibleVersion;
+
+        if let Some((session_id, version)) = self.oldest_pinned_snapshot() {
+            if version < limiting_version {
+                limiting_version = version;
+                limiting_source = GcHorizonSource::PinnedSession(session_id);
+            }
+        }
+
+        for partition in &catalog.partitions {
+            let Some(conversion) = partition.conversion.as_ref() else {
+                continue;
+            };
+            if conversion.snapshot_version < limiting_version {
+                limiting_version = conversion.snapshot_version;
+                limiting_source = GcHorizonSource::Conversion(partition.id);
+            }
+        }
+
+        let gc_horizon = Version::new(
+            limiting_version
+                .get()
+                .saturating_sub(self.gc_horizon_retention_slack),
+        );
+
+        let mut dropped_partition_ids = std::collections::HashSet::new();
+        let mut dropped_partition_to_tablets = std::collections::HashMap::new();
+        let mut entry_leases = Vec::new();
+        let mut forced_lease_tablets = std::collections::HashSet::new();
+        let mut denied_tablets = std::collections::HashSet::new();
+        let mut forced_protected_partition_ids = std::collections::HashSet::new();
+
+        // Acquire movement leases before asking the engine to select or rewrite SSTs.
+        for entry in catalog
+            .pending_reclaim
+            .iter()
+            .filter(|entry| !entry.rowstore_purge_confirmed)
+        {
+            let tablet_ids: Vec<TabletId> = entry
+                .dropped
+                .iter()
+                .map(|artifact| artifact.tablet_id)
+                .collect();
+
+            match self.data_mover.try_acquire_reclaim_lease(&tablet_ids) {
+                Some(lease) => {
+                    forced_lease_tablets.extend(tablet_ids);
+                    for artifact in &entry.dropped {
+                        dropped_partition_ids.insert(artifact.partition_id.as_u64());
+                        dropped_partition_to_tablets
+                            .entry(artifact.partition_id.as_u64())
+                            .or_insert_with(Vec::new)
+                            .push(artifact.tablet_id);
+                    }
+                    entry_leases.push(lease);
+                }
+                None => {
+                    denied_tablets.extend(tablet_ids);
+                    forced_protected_partition_ids.extend(
+                        entry
+                            .dropped
+                            .iter()
+                            .map(|artifact| artifact.partition_id.as_u64()),
+                    );
+                }
+            }
+        }
+
+        let mut protected_partition_ids = forced_protected_partition_ids;
+        let stable_preview = {
+            let mut stable = None;
+
+            for _ in 0..MAX_ITERATIONS {
+                let preview = self.engine.preview_compaction_candidates(
+                    &dropped_partition_ids,
+                    &protected_partition_ids,
+                );
+                let candidates = &preview.partition_ids;
+                let candidate_tablets: Vec<TabletId> = candidates
+                    .iter()
+                    .flat_map(|partition_id| {
+                        catalog
+                            .partition(PartitionId::new(*partition_id))
+                            .map(|partition| partition.tablets.clone())
+                            .or_else(|| dropped_partition_to_tablets.get(partition_id).cloned())
+                            .unwrap_or_default()
+                    })
+                    .filter(|tablet_id| !forced_lease_tablets.contains(tablet_id))
+                    .collect();
+
+                let (tiered_guard, iteration_denied) = self
+                    .data_mover
+                    .acquire_reclaim_leases_best_effort(&candidate_tablets);
+                denied_tablets.extend(iteration_denied.iter().copied());
+
+                let denied_partitions: std::collections::HashSet<u64> = candidates
+                    .iter()
+                    .filter(|partition_id| {
+                        catalog
+                            .partition(PartitionId::new(**partition_id))
+                            .is_some_and(|partition| {
+                                partition
+                                    .tablets
+                                    .iter()
+                                    .any(|tablet_id| iteration_denied.contains(tablet_id))
+                            })
+                            || dropped_partition_to_tablets.get(partition_id).is_some_and(
+                                |tablet_ids| {
+                                    tablet_ids
+                                        .iter()
+                                        .any(|tablet_id| iteration_denied.contains(tablet_id))
+                                },
+                            )
+                    })
+                    .copied()
+                    .collect();
+
+                if !denied_partitions.is_empty() {
+                    let mut added_protection = false;
+                    for partition_id in denied_partitions {
+                        added_protection |= protected_partition_ids.insert(partition_id);
+                    }
+                    if added_protection {
+                        drop(tiered_guard);
+                        continue;
+                    }
+                }
+
+                stable = Some((preview, tiered_guard));
+                break;
+            }
+
+            stable
+        };
+
+        let compaction_converged = stable_preview.is_some();
+        let mut per_iteration_reports = Vec::new();
+        if let Some((stable_preview, stable_lease_guard)) = stable_preview {
+            let explicit_sst_ids = std::collections::HashSet::from_iter(stable_preview.sst_ids);
+            let report = self.engine.compact_once(CompactionInput {
+                dropped_partition_ids: dropped_partition_ids.clone(),
+                protected_partition_ids: protected_partition_ids.clone(),
+                gc_horizon,
+                explicit_sst_ids: Some(explicit_sst_ids),
+            })?;
+            per_iteration_reports.push(report);
+            drop(stable_lease_guard);
+        }
+
+        let confirmation_candidates: Vec<_> = catalog
+            .pending_reclaim
+            .iter()
+            .filter(|entry| !entry.rowstore_purge_confirmed)
+            .filter(|entry| {
+                entry
+                    .dropped
+                    .iter()
+                    .all(|artifact| !denied_tablets.contains(&artifact.tablet_id))
+            })
+            .collect();
+
+        if !confirmation_candidates.is_empty() {
+            self.engine.flush_roll_and_gc()?;
+        }
+
+        let mut confirmed = Vec::new();
+        for entry in confirmation_candidates {
+            let ids: std::collections::HashSet<u64> = entry
+                .dropped
+                .iter()
+                .map(|artifact| artifact.partition_id.as_u64())
+                .collect();
+
+            if self
+                .engine
+                .partitions_possibly_present_in_memtables(&ids)
+                .is_empty()
+                && self
+                    .engine
+                    .partitions_possibly_present_in_ssts(&ids)
+                    .is_empty()
+            {
+                confirmed.push((entry.table_id, entry.catalog_generation));
+            }
+        }
+
+        let mut entries_purged = 0;
+        if !confirmed.is_empty() {
+            let current = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+            let mut next = current.clone();
+            let mut changed = false;
+            for entry in &mut next.pending_reclaim {
+                if confirmed.contains(&(entry.table_id, entry.catalog_generation))
+                    && !entry.rowstore_purge_confirmed
+                {
+                    entry.rowstore_purge_confirmed = true;
+                    changed = true;
+                }
+            }
+            if changed {
+                next.generation =
+                    current
+                        .generation
+                        .checked_add(1)
+                        .ok_or(HtapError::CounterOverflow {
+                            counter: "catalog_generation",
+                        })?;
+                match self.catalog.compare_and_set(current.generation, next) {
+                    Ok(()) => entries_purged = confirmed.len(),
+                    Err(HtapError::Conflict(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        drop(entry_leases);
+        self.reclaim_tick_locked(false)?;
+
+        Ok(CompactionTickReport {
+            ran: true,
+            reason: (!compaction_converged)
+                .then_some("compaction candidate protection did not converge"),
+            gc_horizon,
+            gc_horizon_limiting_source: limiting_source,
+            per_iteration_reports,
+            entries_purged,
+            denied_tablet_count: denied_tablets.len(),
+        })
     }
 
     /// Returns a borrowing façade for server-integrated data movement operations.
@@ -1930,7 +2404,32 @@ impl LocalServer {
                 PrivilegeScope::Table(granted_table_id) if *granted_table_id == table_id
             )
         });
+        next.pending_reclaim.push(PendingReclaim {
+            table_id,
+            table_name: drop.table.clone(),
+            catalog_generation: next_generation,
+            dropped: dropped_partitions
+                .iter()
+                .flat_map(|partition| {
+                    partition.tablets.iter().copied().map(move |tablet_id| {
+                        DroppedPartitionArtifact {
+                            partition_id: partition.id,
+                            tablet_id,
+                        }
+                    })
+                })
+                .collect(),
+            created_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            colstore_and_movement_reclaimed: false,
+            rowstore_purge_confirmed: false,
+        });
         self.catalog.compare_and_set(catalog.generation, next)?;
+        if let Err(error) = self.reclaim_tick_locked(false) {
+            eprintln!("failed to reclaim dropped table artifacts: {error}");
+        }
         Ok(StatementResult::ddl(1))
     }
 

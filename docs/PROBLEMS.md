@@ -22,7 +22,9 @@ crate:
 | little-endian byte decoding with manual bounds checks | each of the files above, e.g. `htap-colstore/src/encoding.rs` and `htap-rowstore/src/sst.rs` |
 
 **Why it mattered.** Every copy had to be right for the CLAUDE.md durability invariants to hold. Phase 15 (DROP
-reclaim, journal compaction) and Phase 16 (multiprocess ownership) add more durable files. The power-loss safety
+reclaim, rowstore compaction/GC, journal checkpoint — now done, see the Schedule below) added three new durable
+files/format bumps (`HTAPMAN1` v3, `HTAPCAT1` v5, `HTAPTXC1`) built on exactly the Stage R helpers this section
+describes, confirming the investment; Phase 16 (multiprocess ownership) will add more. The power-loss safety
 phase would have had to audit every copy.
 
 **Fix (shipped, stage R).** Added one shared module to `htap-common` (`fs.rs`, `envelope.rs`, `bytecursor.rs`)
@@ -122,9 +124,10 @@ dedicated stage.
 | done | Phase 13 — SQL breadth | — |
 | **done** | **Stage R — shared durability primitives** | P1 |
 | **done** | **Phase 14 — CBO, spill, parallelism** | P2 (partial — see above; leaf-helper convergence still open), P4 where touched |
-| **next** | Phase 15 — DROP reclaim, journal compaction | P4 where touched (uses R's helpers) |
-| then | Phase 16 — multiprocess owner + IPC | P3, P4 where touched (uses R's helpers) |
+| **done** | **Phase 15 — DROP reclaim, rowstore compaction/GC, journal checkpoint** | P4 where touched (uses R's helpers): `htap-catalog/src/model.rs::validate` (already on the P4 list, 702 lines) gained the `pending_reclaim` overlap/duplicate checks and was not split — still open, unchanged severity. No other P4-listed function was touched (`htap-convert`, `htap-sql`'s `bind_create_table`/`bind_select_body` were not part of this diff). |
+| **next** | Phase 16 — multiprocess owner + IPC | P3, P4 where touched (uses R's helpers) |
 | then | Phases 17–18 — TPC-H, TPC-C | — |
+| then | SERIALIZABLE isolation (serializable snapshot isolation) | — |
 | then | Power-loss safety | audits R's single implementation |
 | then | Docker | — |
 
