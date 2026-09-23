@@ -51,6 +51,9 @@ pub enum HtapError {
     #[error("manager is latched pending recovery of txn {blocking_txn}: {reason}")]
     RecoveryRequired { blocking_txn: u64, reason: String },
 
+    #[error("Ambiguous outcome: {0}")]
+    Ambiguous(String),
+
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
@@ -67,6 +70,11 @@ impl HtapError {
     /// Returns true if this error is [`HtapError::RecoveryRequired`].
     pub fn is_recovery_required(&self) -> bool {
         matches!(self, Self::RecoveryRequired { .. })
+    }
+
+    /// Returns true if this error is [`HtapError::Ambiguous`].
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Ambiguous(_))
     }
 
     /// Returns true if this error is [`HtapError::PermissionDenied`].
@@ -134,6 +142,14 @@ mod tests {
         );
         assert!(err_rr.is_recovery_required());
         assert!(!err_rr.is_durable_pending());
+
+        let err_ambiguous = HtapError::Ambiguous("commit outcome unknown".into());
+        assert_eq!(
+            err_ambiguous.to_string(),
+            "Ambiguous outcome: commit outcome unknown"
+        );
+        assert!(err_ambiguous.is_ambiguous());
+        assert!(!err_rr.is_ambiguous());
 
         let err_unsupp = HtapError::Unsupported("feature X".into());
         assert_eq!(err_unsupp.to_string(), "Unsupported: feature X");

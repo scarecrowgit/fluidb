@@ -43,9 +43,9 @@ fn test_session_id_unique_and_monotonic() {
     let dir = TempDir::new().unwrap();
     let server = Arc::new(LocalServer::open(dir.path()).unwrap());
 
-    let s1 = server.open_session();
-    let s2 = server.open_session();
-    let s3 = server.open_session();
+    let s1 = server.open_session().unwrap();
+    let s2 = server.open_session().unwrap();
+    let s3 = server.open_session().unwrap();
 
     assert!(s1.id().get() < s2.id().get());
     assert!(s2.id().get() < s3.id().get());
@@ -64,7 +64,7 @@ fn test_drop_rolls_back_open_transaction() {
         .unwrap();
 
     {
-        let mut session = server.open_session();
+        let mut session = server.open_session().unwrap();
         session.begin().unwrap();
         session
             .execute("UPDATE t SET v = 999 WHERE id = 1;")
@@ -83,7 +83,7 @@ fn test_drop_rolls_back_open_transaction() {
         exec_rows(&server, "SELECT v FROM t WHERE id = 1;"),
         vec![Row::new(vec![Value::Int32(10)])]
     );
-    let mut fresh = server.open_session();
+    let mut fresh = server.open_session().unwrap();
     assert_eq!(
         session_rows(&mut fresh, "SELECT v FROM t WHERE id = 1;"),
         vec![Row::new(vec![Value::Int32(10)])]
@@ -98,7 +98,7 @@ fn test_write_set_payload_cap_enforced_incrementally_per_statement() {
         .execute("CREATE TABLE big (id BIGINT PRIMARY KEY, data VARCHAR);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
 
     // Each row is ~2 MiB; the write set's 16 MiB cap is hit well before 20 of them, so this
@@ -153,7 +153,7 @@ fn test_read_your_own_writes_point_select() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("UPDATE t SET v = 20 WHERE id = 1;")
@@ -196,7 +196,7 @@ fn test_read_your_own_writes_analytic_scan() {
     }
     assert!(server.convert_table_to_column("c").unwrap().is_success());
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     for t in ["r", "c"] {
         session
@@ -262,7 +262,7 @@ fn test_overlay_on_column_partition_excludes_buffered_row_not_matching_pushdown_
         .unwrap();
     assert!(server.convert_table_to_column("c").unwrap().is_success());
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     // Buffered UPDATE: id=2's new value no longer satisfies `v > 15`.
     session.execute("UPDATE c SET v = 5 WHERE id = 2;").unwrap();
@@ -314,7 +314,7 @@ fn test_read_your_own_writes_general_query_join() {
         .execute("INSERT INTO b (id, v) VALUES (1, 100), (2, 200);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO a (id, v) VALUES (3, 30);")
@@ -373,7 +373,7 @@ fn test_read_your_own_writes_nested_join_group() {
         .execute("INSERT INTO c (id, v) VALUES (1, 1000);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO b (id, v) VALUES (2, 200);")
@@ -418,7 +418,7 @@ fn test_double_update_in_one_transaction_composes() {
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("UPDATE t SET v = v + 10 WHERE id = 1;")
@@ -445,7 +445,7 @@ fn test_insert_then_delete_in_one_transaction_nets_to_nothing() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (5, 50);")
@@ -479,7 +479,7 @@ fn test_duplicate_pk_within_one_insert_statement_rejected_in_transaction() {
 
     // An explicit transaction must reject the very same statement, not silently keep the last
     // row, and must not poison the transaction (this is an ordinary statement error).
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     let txn_err = session
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (1, 20);")
@@ -511,7 +511,7 @@ fn test_statement_failure_does_not_pollute_write_set() {
         .execute("INSERT INTO t (id, v) VALUES (1, 1), (2, 2);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
 
     // A successful buffered write before the failing statement.
@@ -554,7 +554,7 @@ fn test_read_your_own_writes_across_partitions() {
         .execute("INSERT INTO sales (id, amount) VALUES (1, 10), (150, 20);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     // One buffered write per partition: an update in p0, an insert in p1.
     session
@@ -611,7 +611,7 @@ fn test_commit_flushes_buffered_writes_as_one_version() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 10);")
@@ -623,9 +623,15 @@ fn test_commit_flushes_buffered_writes_as_one_version() {
         .execute("INSERT INTO t (id, v) VALUES (3, 30);")
         .unwrap();
 
-    let before = server.txn_manager().next_version();
+    let before = server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .next_version();
     session.commit().unwrap();
-    let after = server.txn_manager().next_version();
+    let after = server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .next_version();
     assert_eq!(
         after.get(),
         before.get() + 1,
@@ -653,7 +659,7 @@ fn test_commit_write_write_conflict_returns_clean_conflict_and_poisons_session()
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session.execute("UPDATE t SET v = 2 WHERE id = 1;").unwrap();
 
@@ -693,7 +699,7 @@ fn test_commit_catalog_conflict_on_concurrent_drop_table() {
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session.execute("UPDATE t SET v = 2 WHERE id = 1;").unwrap();
 
@@ -718,7 +724,7 @@ fn test_stale_snapshot_vs_conversion_returns_conflict_and_poisons_session() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
 
     // Advance the visible version past the session's pinned snapshot, then convert to columnar
@@ -767,7 +773,7 @@ fn test_row_column_row_demotion_cycle_during_open_transaction_stays_correct_or_c
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
 
     // Baseline: correct as of the transaction's own snapshot, storage still Row.
@@ -846,7 +852,7 @@ fn test_snapshot_pinned_converting_partition_without_manifest_during_open_transa
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
 
     let catalog_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
@@ -900,7 +906,7 @@ fn test_rollback_after_poison_succeeds() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     server
         .execute("INSERT INTO t (id, v) VALUES (2, 20);")
@@ -938,16 +944,22 @@ fn test_read_only_transaction_commit_skips_2pc() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("START TRANSACTION READ ONLY;").unwrap();
     assert_eq!(
         session_rows(&mut session, "SELECT v FROM t WHERE id = 1;"),
         vec![Row::new(vec![Value::Int32(10)])]
     );
 
-    let before = server.txn_manager().next_version();
+    let before = server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .next_version();
     session.execute("COMMIT;").unwrap();
-    let after = server.txn_manager().next_version();
+    let after = server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .next_version();
     assert_eq!(
         after, before,
         "a read-only transaction's commit must not allocate a version"
@@ -963,17 +975,20 @@ fn test_durable_pending_from_commit_leaves_session_in_outcome_pending_state() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure during commit record append",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure during commit record append",
+            )))
+        });
 
     let err = session.commit().unwrap_err();
     assert!(
@@ -1024,16 +1039,19 @@ fn test_commit_while_manager_latched_by_other_session_keeps_txn_open() {
         .unwrap();
 
     // Session A's commit fails at the journal decision boundary, latching the manager.
-    let mut session_a = server.open_session();
+    let mut session_a = server.open_session().unwrap();
     session_a.begin().unwrap();
     session_a
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure during commit record append",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure during commit record append",
+            )))
+        });
     let err_a = session_a.commit().unwrap_err();
     assert!(
         err_a.is_durable_pending(),
@@ -1043,7 +1061,7 @@ fn test_commit_while_manager_latched_by_other_session_keeps_txn_open() {
     // Session B is unrelated and still has its own open transaction with a buffered write. Its
     // commit must fail with `RecoveryRequired` naming A, never `Conflict` and never A's own
     // `DurablePending`.
-    let mut session_b = server.open_session();
+    let mut session_b = server.open_session().unwrap();
     session_b.begin().unwrap();
     session_b
         .execute("INSERT INTO t (id, v) VALUES (2, 2);")
@@ -1089,7 +1107,7 @@ fn test_commit_of_write_set_exceeding_intent_frame_is_rejected_and_txn_stays_ope
         .execute("CREATE TABLE big (id BIGINT PRIMARY KEY, data VARCHAR);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
 
     // ~4.5 MiB of raw string data: well under the 16 MiB `MAX_PAYLOAD_SIZE`, but its estimated
@@ -1172,7 +1190,7 @@ fn test_autocommit_zero_starts_implicit_transaction() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("SET autocommit = 0;").unwrap();
     assert!(!session.in_transaction());
 
@@ -1206,14 +1224,17 @@ fn test_autocommit_durable_pending_in_session_quarantines_session() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     assert!(!session.in_transaction());
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure during commit record append",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure during commit record append",
+            )))
+        });
 
     let err = session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
@@ -1243,7 +1264,7 @@ fn test_begin_while_active_implicitly_commits_previous() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 10);")
@@ -1286,7 +1307,7 @@ fn test_begin_implicit_commit_failure_does_not_start_new_txn() {
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session.execute("UPDATE t SET v = 2 WHERE id = 1;").unwrap();
 
@@ -1312,17 +1333,20 @@ fn test_begin_api_after_outcome_pending_is_rejected() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure during commit record append",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure during commit record append",
+            )))
+        });
 
     let err = session.commit().unwrap_err();
     assert!(err.is_durable_pending());
@@ -1352,7 +1376,7 @@ fn test_begin_api_twice_implicitly_commits_not_drops() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 10);")
@@ -1387,7 +1411,7 @@ fn test_ddl_rejected_inside_explicit_transaction_and_txn_survives() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
@@ -1422,7 +1446,7 @@ fn test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
@@ -1455,7 +1479,7 @@ fn test_explain_analyze_wrapping_ddl_rejected_inside_open_transaction() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
@@ -1482,7 +1506,7 @@ fn test_explain_analyze_wrapping_insert_rejected_inside_read_only_transaction() 
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("START TRANSACTION READ ONLY;").unwrap();
 
     let err = session
@@ -1505,7 +1529,7 @@ fn catalog_has_no_table(server: &LocalServer, name: &str) -> bool {
 fn test_set_user_variable_and_select_it_back() {
     let dir = TempDir::new().unwrap();
     let server = Arc::new(LocalServer::open(dir.path()).unwrap());
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
 
     session.execute("SET @x = 42;").unwrap();
     assert_eq!(
@@ -1532,7 +1556,7 @@ fn test_set_user_variable_and_select_it_back() {
 fn test_set_autocommit_variable_matches_state() {
     let dir = TempDir::new().unwrap();
     let server = Arc::new(LocalServer::open(dir.path()).unwrap());
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
 
     assert_eq!(
         session_rows(&mut session, "SELECT @@autocommit;"),
@@ -1560,7 +1584,7 @@ fn test_set_autocommit_one_commits_active_transaction() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("SET autocommit = 0;").unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
@@ -1580,7 +1604,7 @@ fn test_set_autocommit_one_commits_active_transaction() {
 fn test_set_transaction_isolation_level_rejects_unsupported_level() {
     let dir = TempDir::new().unwrap();
     let server = Arc::new(LocalServer::open(dir.path()).unwrap());
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
 
     let err = session
         .execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;")
@@ -1609,7 +1633,7 @@ fn test_set_transaction_read_only_rejects_write() {
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("SET TRANSACTION READ ONLY;").unwrap();
     session.execute("BEGIN;").unwrap();
 
@@ -1637,7 +1661,7 @@ fn test_truncate_in_transaction_rollback_restores_rows() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN").unwrap();
     session.execute("TRUNCATE TABLE t").unwrap();
     assert!(session_rows(&mut session, "SELECT id FROM t").is_empty());
@@ -1664,12 +1688,21 @@ fn test_truncate_in_read_only_transaction_is_rejected() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN READ ONLY").unwrap();
-    let before = server.txn_manager().next_version();
+    let before = server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .next_version();
     let error = session.execute("TRUNCATE TABLE t").unwrap_err();
     assert!(matches!(error, HtapError::InvalidArgument(_)));
-    assert_eq!(server.txn_manager().next_version(), before);
+    assert_eq!(
+        server
+            .txn_manager()
+            .expect("transaction manager is available")
+            .next_version(),
+        before
+    );
     assert_eq!(
         session_rows(&mut session, "SELECT id FROM t ORDER BY id"),
         vec![
@@ -1690,7 +1723,7 @@ fn test_delete_by_filter_in_transaction_rollback() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session.execute("DELETE FROM t WHERE v >= 20;").unwrap();
 
@@ -1721,7 +1754,7 @@ fn test_delete_by_filter_reads_own_writes() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (2, 20);")
@@ -1763,7 +1796,7 @@ fn test_delete_by_filter_payload_cap_rejects_atomically() {
             .unwrap();
     }
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
 
     let err = session
@@ -1810,7 +1843,7 @@ fn test_delete_by_filter_rejected_in_read_only_transaction() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN READ ONLY;").unwrap();
 
     let err = session.execute("DELETE FROM t WHERE v >= 10;").unwrap_err();
@@ -1823,9 +1856,18 @@ fn test_delete_by_filter_rejected_in_read_only_transaction() {
         ]
     );
 
-    let before = server.txn_manager().next_version();
+    let before = server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .next_version();
     session.execute("COMMIT;").unwrap();
-    assert_eq!(server.txn_manager().next_version(), before);
+    assert_eq!(
+        server
+            .txn_manager()
+            .expect("transaction manager is available")
+            .next_version(),
+        before
+    );
 }
 
 #[test]
@@ -1839,13 +1881,19 @@ fn test_delete_by_filter_commit_is_one_version() {
         .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30), (4, 40);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session.execute("DELETE FROM t WHERE v >= 20;").unwrap();
 
-    let before = server.txn_manager().next_version();
+    let before = server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .next_version();
     session.execute("COMMIT;").unwrap();
-    let after = server.txn_manager().next_version();
+    let after = server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .next_version();
     assert_eq!(
         after.get(),
         before.get() + 1,
@@ -1863,7 +1911,7 @@ fn test_delete_by_filter_commit_is_one_version() {
 fn test_connector_startup_set_statements_accepted() {
     let dir = TempDir::new().unwrap();
     let server = Arc::new(LocalServer::open(dir.path()).unwrap());
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
 
     for sql in [
         "SET NAMES utf8mb4;",
@@ -1903,8 +1951,8 @@ fn test_execute_and_execute_statement_are_equivalent() {
     let dir_b = TempDir::new().unwrap();
     let server_a = Arc::new(LocalServer::open(dir_a.path()).unwrap());
     let server_b = Arc::new(LocalServer::open(dir_b.path()).unwrap());
-    let mut session_a = server_a.open_session();
-    let mut session_b = server_b.open_session();
+    let mut session_a = server_a.open_session().unwrap();
+    let mut session_b = server_b.open_session().unwrap();
 
     let statements = [
         "CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);",
@@ -1949,17 +1997,20 @@ fn test_execute_statement_respects_commit_outcome_pending() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure during commit record append",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure during commit record append",
+            )))
+        });
     let commit_err = session.commit().unwrap_err();
     assert!(commit_err.is_durable_pending());
 
@@ -1987,7 +2038,7 @@ fn test_reset_clears_state() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("SET @x = 42;").unwrap();
     session.execute("SET autocommit = 0;").unwrap();
     session
@@ -2040,18 +2091,21 @@ fn test_reset_while_outcome_pending_is_rejected_without_mutation() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("SET @x = 7;").unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure during commit record append",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure during commit record append",
+            )))
+        });
     let commit_err = session.commit().unwrap_err();
     assert!(commit_err.is_durable_pending());
 
@@ -2241,7 +2295,7 @@ fn test_change_user_switches_to_authenticated_account() {
         .execute("CREATE USER alice IDENTIFIED BY 'secret';")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     let scramble = b"01234567890123456789";
     let auth_response = scramble_native_password(scramble, "secret");
     session
@@ -2265,7 +2319,7 @@ fn test_change_user_resets_session_state_before_switching_principal() {
         .execute("CREATE USER alice IDENTIFIED BY 'secret';")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("SET @x = 42;").unwrap();
     session.execute("SET autocommit = 0;").unwrap();
     session
@@ -2303,7 +2357,7 @@ fn test_change_user_failure_preserves_existing_principal_and_state() {
         .execute("CREATE USER alice IDENTIFIED BY 'secret';")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
@@ -2354,7 +2408,7 @@ fn test_change_user_can_switch_between_authenticated_accounts() {
 fn test_account_ddl_rejected_inside_open_transaction() {
     let dir = TempDir::new().unwrap();
     let server = Arc::new(LocalServer::open(dir.path()).unwrap());
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
 
     session.execute("BEGIN").unwrap();
     assert!(session.in_transaction());
@@ -2398,7 +2452,7 @@ fn test_insert_select_uncommitted_within_transaction() {
         .execute("CREATE TABLE dst (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO src (id, v) VALUES (1, 10), (2, 20);")
@@ -2440,7 +2494,7 @@ fn test_insert_select_payload_cap_exceeded() {
             .unwrap();
     }
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     let err = session
         .execute("INSERT INTO dst (id, data) SELECT id, data FROM src;")
@@ -2479,7 +2533,7 @@ fn test_insert_select_in_read_only_transaction() {
         .execute("INSERT INTO src (id, v) VALUES (1, 10);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("START TRANSACTION READ ONLY;").unwrap();
     let err = session
         .execute("INSERT INTO dst (id, v) SELECT id, v FROM src;")
@@ -2503,7 +2557,7 @@ fn test_correlated_subquery_sees_uncommitted_session_writes() {
         .execute("INSERT INTO parent (id) VALUES (1), (2), (3);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute(
@@ -2548,7 +2602,7 @@ fn test_recursive_cte_reads_uncommitted_rows_and_rollback_hides_them() {
         ) \
         SELECT node FROM reachable ORDER BY node;";
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO edges (src, dst) VALUES (2, 3), (3, 4);")

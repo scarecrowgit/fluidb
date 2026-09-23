@@ -686,6 +686,7 @@ impl From<AnalyticSelect> for BoundStatement {
 mod tests {
     use super::*;
     use htap_common::types::{ColumnDef, DataType};
+    use serde_json;
 
     #[test]
     fn test_bound_statement_conversions() {
@@ -728,5 +729,53 @@ mod tests {
         );
         let bound_analytic: BoundStatement = analytic.clone().into();
         assert_eq!(bound_analytic, BoundStatement::AnalyticSelect(analytic));
+    }
+
+    #[test]
+    fn test_ast_select_with_placeholders_serialization() {
+        let statement = parse_one("SELECT * FROM users WHERE id = ? AND name = ?").unwrap();
+
+        let json = serde_json::to_string(&statement).unwrap();
+        let deserialized: Statement = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, statement);
+    }
+
+    #[test]
+    fn test_ast_insert_with_binary_literal_serialization() {
+        let statement = parse_one("INSERT INTO binary_values VALUES (0x1234AB)").unwrap();
+
+        let json = serde_json::to_string(&statement).unwrap();
+        let deserialized: Statement = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, statement);
+    }
+
+    #[test]
+    fn test_ast_partition_ddl_serialization() {
+        let statement = parse_one(
+            "CREATE TABLE t (id INT) \
+             PARTITION BY RANGE (id) \
+             (PARTITION p0 VALUES LESS THAN (100))",
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&statement).unwrap();
+        let deserialized: Statement = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, statement);
+    }
+
+    #[test]
+    fn test_ast_nesting_depth_within_limits() {
+        // 8 nested expressions stays well within serde_json's default recursion limit.
+        let depth = 8;
+        let expression = format!("{}1{}", "ABS(".repeat(depth), ")".repeat(depth));
+        let statement = parse_one(&format!("SELECT {expression}")).unwrap();
+
+        let json = serde_json::to_string(&statement).unwrap();
+        let deserialized: Statement = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, statement);
     }
 }

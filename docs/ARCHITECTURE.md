@@ -211,10 +211,56 @@ blocks compaction of every SST that contains or spans it, not just its own rows;
 compaction path (used by `compaction_tick`'s convergence loop) compacts only the first contiguous run per
 `compact_once` call, so a caller may need several calls to fully process one preview's candidate set; and the
 movement/reclaim lease set is intentionally non-durable (see ADR-024's stated precondition).
+Phase 16 has a completed local MVP for concurrent multiprocess use on one machine: opening an
+already-owned root no longer fails outright. Whichever process wins `<root>/LOCK` (unchanged from Phase
+6/`1083fbd`) becomes the owner, exactly as before; every other process that would have received
+`HtapError::Conflict` instead becomes a client and forwards SQL and session work to the owner over a
+length-prefixed JSON protocol on a Unix domain socket at `<root>/htap.sock` (mode `0600`, Unix-only — a
+locked root on a non-Unix target still returns the ordinary `Conflict`, unchanged). See "Process and role
+model" below for the owner/client process model and ADR-025 for the full design, including why an ambiguous
+IPC outcome is a distinct error from `Conflict`/`DurablePending`, the ownership-graph and listener-shutdown
+ordering, and why a bound statement is forwarded as a serialized AST rather than re-rendered SQL text. No
+on-disk format change, no new durability invariant, and no distributed consensus: exactly one process (the
+owner) still holds the one shared WAL and one shared MVCC version domain (ADR-004/008/009 unchanged); the
+socket carries no durable state. `docs/PROBLEMS.md`'s P3 (two independent statement pipelines duplicating the
+privilege check) is fixed as part of this phase's foundation work, ahead of adding the IPC forwarding surface
+itself. See ADR-025, [`PROGRESS.md`](./PROGRESS.md)'s Phase 16 row, and `docs/LIMITATIONS.md`'s matching
+section for the full contract and disclosed gaps (a client session cannot change its authenticated user; a
+client-mode session that loses its connection is terminal and never silently reconnects; a socket path too
+long for a Unix socket, or a non-socket file already at that path, leaves the owner in the pre-existing
+lock-only fallback mode; administrative/data-mover/conversion/compaction/reclaim operations remain owner-only;
+standalone subsystem opens that bypass `LocalServer` remain unsafe for concurrent use, unchanged by this
+phase; a client-mode `LocalServer`'s configuration setters, both the `with_*` builder forms and their `set_*`
+counterparts, are accepted no-ops, since that configuration lives in the owner process). A post-landing storage review plus an external review (batch D) found
+13 defects the passing test suite had missed before this phase's status was set — the clearest were a
+completely broken prepared-statement path for every client-mode session (the owner discarded the
+`CatalogSnapshot` a visibility check needed) and outright process panics on roughly 30 owner-only methods for
+a client-mode handle. 12 of the 13 were fixed; the remaining one (a `change_user` gate-ordering quirk on a
+terminal client-mode session) is recorded as a limitation instead. A second storage re-review (batch E) then
+found 8 more defects, including a security-relevant window (the socket used to be created with the process's
+default umask permissions and tightened a moment later, inside a world-traversable data directory — another
+local user connecting in that window would have gotten an unauthenticated superuser session) and a second
+process-panic path batch D's own "client-mode panics are fixed" claim had missed: `open_session`/
+`authenticate_session` still panicked, in client mode, against a dead or connection-saturated owner. Both are
+fixed: the socket is now created inside a private, owner-only (`0700`) directory, tightened to `0600` there,
+and only then atomically renamed into place, so no window exists at any permission level; `open_session` is
+now fallible end to end, and the wire server reports the failure to the client instead of the process
+unwinding. A third storage re-review (batch F) then found 7 more defects, two of them the same pattern as each
+other: the batch E socket-permission fix and the batch D `open_session`/`authenticate_session` no-panic fix
+had each shipped with a test that could not have caught a regression (one reimplemented the fix's own
+publication logic instead of exercising the real startup path; the other landed with no dedicated test at
+all), and replacing the first of those fake tests with a real one immediately exposed a further defect: the
+private staging directory used to publish the socket was never removed on a successful start, leaking one per
+server run, not only after a crash. Batch F also fixed a post-dispatch response-serialization failure that was
+misreported as bad input instead of an unknown outcome, a failed write that left a connection looking usable
+after bytes had already reached the owner, an owner-gone login that was misreported as bad credentials instead
+of a transport failure, and a handshake read that failed spuriously on an interrupted system call instead of
+retrying against its deadline. See ADR-025's "Post-review fixes (batch D)", "Post-review fixes (batch E)", and
+"Post-review fixes (batch F)" sections and `docs/PROGRESS.md`'s Phase 16 row for the fix-by-fix test evidence.
 
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
-ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent shared-root operation remains unsupported),
+ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent *direct storage access* to a shared root remains unsupported — Phase 16 above adds only local, same-host IPC forwarding for a second process, not a second storage writer),
 remote physical movement, leader handoff, ongoing replication, capacity/rack placement, or live rebalance;
 physical data migration for populated partition reorganization, delete vectors on columnar segments, background compaction folding rowstore deltas into new columnar segments (distinct from the rowstore's own LSM compaction, implemented as of Phase 15 — see above),
 autonomous background conversion scheduling, compound AND pushdown beyond one leaf, != pushdown, vectorized aggregation / operator pipelines,
@@ -226,7 +272,7 @@ detection, and recursive-CTE recursive terms as a permanent optimizer/parallelis
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), semi-join rewrites of IN/EXISTS, broader string/date function coverage,
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
-idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command), IPC/multiprocess access,
+idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),
 Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors; server-side cursors via `COM_STMT_FETCH`, exact DECIMAL, and `TIME`-typed bound parameters also remain deferred — see "Prepared statements and binary protocol (Phase 11)" below);
 note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation of demoted column files remain deferred — this is unrelated to Phase 15's `DROP TABLE` reclaim, which only reclaims a *dropped* table's artifacts, not a demoted table's retained column files).
 See [`PROGRESS.md`](./PROGRESS.md).
@@ -433,6 +479,57 @@ The same `LocalServer` is also reachable over the network via `htapd` and `htap-
 The frontend/backend boundary is preserved as an internal module boundary,
 policed by crate dependencies. Splitting the two into separate processes is
 therefore a **deployment choice, not a rewrite**.
+
+### Concurrent multiprocess use: owner plus IPC (Phase 16)
+
+**Status: `implemented (local MVP)`** (one owner process, any number of local client processes, forwarding
+the SQL/session surface only; see ADR-025 and `docs/PROGRESS.md`'s Phase 16 row).
+
+`LocalServer::open(root)` still races on the same `<root>/LOCK` advisory lock introduced in Phase 6
+(`1083fbd`); nothing about how that race is decided changed. What changed is what happens to the loser: the
+first process to win the lock is the **owner** and behaves exactly as `LocalServer` always has (one
+`OwnedServer` storage core: catalog, engine, transaction manager, data mover). It additionally starts a
+background IPC listener bound to `<root>/htap.sock` (a Unix domain socket, mode `0600`; created inside a
+private, owner-only `0700` directory inside `<root>` (`<root>/.htap-ipc-<pid>-<id>/`, removed again once the
+socket is published — see batch F below), tightened to `0600` there, then atomically renamed
+into place, per batch E — see ADR-025), unless binding fails for a non-fatal reason (socket path too long,
+permission error, or a non-socket file already at that path), in which case it falls back to the pre-Phase-16
+lock-only behavior.
+Every later process that opens the same root and loses the lock race becomes a **client**: it connects to
+`<root>/htap.sock`, completes a version/root-identity handshake, and from then on every SQL/session
+`LocalServer`/`Session` call on that handle (see the exact list below) is forwarded to the owner over a
+length-prefixed JSON frame protocol instead of touching storage directly; every administrative, data-mover,
+conversion, compaction, and reclaim call instead returns `HtapError::Unsupported` locally, without ever
+reaching the wire. `LocalServer::is_owner()`/`is_listener_up()` let a caller distinguish a healthy owner, a
+degraded lock-only owner, and a client.
+
+```mermaid
+flowchart LR
+    subgraph OwnerProcess ["Owner process"]
+        OwnedCore["OwnedServer<br/>(catalog, engine, txn manager, data mover)"]
+        Listener["ipc::owner listener<br/>&lt;root&gt;/htap.sock (mode 0600)"]
+        Listener --> OwnedCore
+    end
+    subgraph ClientProcessA ["Client process A"]
+        ClientLocalServerA["LocalServer (client mode)"]
+    end
+    subgraph ClientProcessB ["Client process B"]
+        ClientLocalServerB["LocalServer (client mode)"]
+    end
+    ClientLocalServerA -->|"handshake, then one persistent<br/>connection per open session"| Listener
+    ClientLocalServerB -->|"handshake, then one persistent<br/>connection per open session"| Listener
+```
+
+One client-side `Session` (from `open_session`/`authenticate_session`) holds exactly one persistent
+connection to the owner for its whole lifetime; the owner's listener constructs one real, owner-side `Session`
+per accepted connection the same way `open_session` would, directly from its own storage-core handle. A
+connection whose session still has an open transaction rolls that transaction back if the connection is lost.
+The forwarding surface is exactly `execute`, `bootstrap_root_account`, `authenticate_session`, `open_session`,
+and every session method reachable from an open session; administrative, data-mover, conversion, compaction,
+and reclaim operations stay owner-only and return `HtapError::Unsupported` in client mode. See ADR-025 for the
+full design (including the `Ambiguous` outcome for a request that may or may not have reached the owner, the
+ownership-graph/listener-shutdown-before-lock-release ordering, and why a bound statement forwards as a
+serialized AST rather than re-rendered SQL text) and `docs/LIMITATIONS.md` for the disclosed gaps.
 
 ---
 

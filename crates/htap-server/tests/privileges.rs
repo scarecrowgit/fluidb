@@ -56,7 +56,7 @@ fn assert_masked(hidden_name: &str, existing: HtapError, missing: HtapError) {
 #[test]
 fn test_superuser_session_unrestricted() {
     let (_dir, server) = setup();
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
 
     session.execute("SELECT v FROM a WHERE id = 1").unwrap();
     session
@@ -558,7 +558,7 @@ fn test_truncate_if_exists_invisible_table_masks_as_missing() {
 #[test]
 fn test_check_statement_visible_masks_invisible_table() {
     let (_dir, server) = setup();
-    let session = user_session(&server);
+    let mut session = user_session(&server);
 
     let hidden = htap_sql::parse_one("SELECT * FROM a").unwrap();
     let missing = htap_sql::parse_one("SELECT * FROM zzz").unwrap();
@@ -573,7 +573,7 @@ fn test_check_statement_visible_masks_invisible_table() {
 fn test_check_statement_visible_allows_placeholders() {
     let (_dir, server) = setup();
     server.execute("GRANT SELECT ON a TO u").unwrap();
-    let session = user_session(&server);
+    let mut session = user_session(&server);
 
     let visible = htap_sql::parse_one("SELECT v FROM a WHERE id = ?").unwrap();
     session.check_statement_visible(&visible).unwrap();

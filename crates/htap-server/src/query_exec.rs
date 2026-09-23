@@ -61,7 +61,7 @@ use htap_sql::result::StatementResult;
 use crate::memory_budget::MemoryBudget;
 use crate::session::WriteSet;
 use crate::spill::{OperatorKind, SpillDir, SpillHeader, SpillKind, SpillReader, SpillWriter};
-use crate::{olap, scan_partition_compact, LocalServer};
+use crate::{olap, scan_partition_compact, OwnedServer};
 
 // Cap concurrent spill writers to limit file descriptors and unbudgeted writer buffers.
 const HASH_JOIN_MAX_SPILL_PARTITIONS: usize = 128;
@@ -83,7 +83,7 @@ thread_local! {
     static LAST_QUERY_OPTIMIZER_INVOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
-impl LocalServer {
+impl OwnedServer {
     /// Returns the largest worker count used by the caller thread's most recent query.
     ///
     /// This is intentionally lightweight execution telemetry for integration tests: it avoids
@@ -197,7 +197,7 @@ fn record_optimizer_invocation() {
 
 /// Per-statement execution context.
 pub(crate) struct ExecContext<'a> {
-    pub server: &'a LocalServer,
+    pub server: &'a OwnedServer,
     pub catalog: &'a CatalogSnapshot,
     pub snapshot: Snapshot,
     /// Open transaction's buffered write set to overlay below relational operators, or `None`
@@ -246,7 +246,7 @@ impl StatsLookup for CatalogStats<'_> {
 /// Inputs required to execute a query with a selected optimization mode.
 pub(crate) struct ExecuteQueryInput<'a> {
     /// Server providing storage access and query configuration.
-    pub server: &'a LocalServer,
+    pub server: &'a OwnedServer,
     /// Bound query plan to execute.
     pub query: &'a BoundQuery,
     /// Catalog snapshot used to resolve table metadata.
@@ -267,7 +267,7 @@ pub(crate) struct ExecuteQueryInput<'a> {
 
 /// Executes a bound query and returns its result set.
 pub(crate) fn execute_query(
-    server: &LocalServer,
+    server: &OwnedServer,
     query: &BoundQuery,
     catalog: &CatalogSnapshot,
     snapshot: Snapshot,
@@ -282,8 +282,8 @@ pub(crate) fn execute_query(
         write_set,
         variables,
         optimization_mode: OptimizationMode::default(),
-        memory_budget: server.query_memory_budget(),
-        parallelism: server.query_parallelism(),
+        memory_budget: server.query_memory_budget.load(Ordering::Relaxed),
+        parallelism: server.query_parallelism.load(Ordering::Relaxed),
     })
 }
 

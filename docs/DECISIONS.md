@@ -3247,3 +3247,500 @@ see `docs/PROGRESS.md`'s Phase 15 row). Cross-references: ADR-004 (the
 single shared MVCC version domain both watermarks and the GC horizon build on), ADR-008/009 (durability
 invariants — every new envelope here follows the same temp-write/fsync/rename/sync-dir + magic/version/CRC32C
 contract), ADR-018 (the manager-wide recovery latch decision 4 reuses verbatim).
+
+---
+
+## ADR-025: Owner plus IPC for concurrent multiprocess use
+
+`Status: Accepted`
+`Date: 2026-09-23`
+
+### Context
+
+Since `1083fbd` (see `docs/LIMITATIONS.md`, `docs/ARCHITECTURE.md`), `LocalServer::open` has enforced
+single-process exclusive ownership of a root directory via a non-blocking advisory `flock` at `<root>/LOCK`: a
+second process opening the same root got `HtapError::Conflict` and nothing else. That is safe — it protects
+the one shared WAL and one shared MVCC version domain (ADR-004) from two independent writers — but it means a
+second local tool, a second embedded-client process, or a restarted `htapd` racing its own predecessor during
+a deploy could never usefully touch an already-open root at all. Phase 16 removes that limitation for the
+narrow local-machine case without touching the durability model: no new on-disk format, no change to
+ADR-004/008/009's one-WAL/one-MVCC-domain/atomic-publish invariants, and no distributed consensus.
+
+### Options considered
+
+1. **Shared-root multi-writer.** Let two processes each open their own `Engine`/`LocalCatalogStore`/
+   `TransactionManager` against the same root directory, coordinating through file locks or optimistic CAS
+   retries at a finer grain than the current root lock. Rejected: the rowstore's WAL, manifest, and commit
+   path assume one in-process `TransactionManager` decides commit order under one lock (ADR-018); making that
+   safe across processes would mean either a cross-process commit protocol (which is what option 2 already is,
+   just implemented badly) or memory-mapped shared state with process-crash-safe locking primitives this
+   workspace has no dependency on and could not add without new `unsafe` code. It would also multiply the
+   surface that needs power-loss/crash-safety proof (`docs/OPERATIONS.md` section 5) by the number of writer
+   processes.
+2. **Distributed consensus (Raft/ZooKeeper).** Already `deferred` in `docs/ARCHITECTURE.md`/
+   `docs/LIMITATIONS.md` for cluster coordination; using it just to arbitrate two processes on one machine
+   sharing one filesystem is disproportionate — it solves cross-node leader election and log replication, a
+   different problem, at a much higher implementation and operational cost, for a same-host, same-OS-user
+   scenario that has no network partition to reason about.
+3. **Owner plus IPC (chosen).** Whichever process wins the existing root-lock race keeps being the one real
+   storage owner, unchanged; every other process that would have gotten `Conflict` instead becomes a client
+   that forwards SQL and session calls to the owner over a local Unix domain socket at `<root>/htap.sock`
+   (mode `0600`, Unix-only). This adds a transport, not a second storage or commit path: the owner still has
+   exactly one `TransactionManager`, one WAL, one MVCC version domain, and every rule in ADR-004/008/009
+   applies unchanged inside that one process. A version-skewed pair (owner and client built from different
+   commits) is possible only because both binaries can be up at once, and is handled by fast, clean failure at
+   decode time (see the wire protocol below), not by a schema-compatibility scheme.
+
+### Decision
+
+`LocalServer::open` still tries `ProcessLock::acquire` first. On success, the process becomes the owner: it
+builds the storage core (`OwnedServer`, formerly the whole of `LocalServer`'s body) and starts a background
+IPC listener (`ipc::owner::start`) bound to `<root>/htap.sock`, handed a clone of the storage-core handle
+directly — never a handle to the outer `LocalServer` wrapper, since the listener only ever needed direct
+storage access, not the wrapper's own mutable-configuration surface. A bind failure (a socket path too long
+for this kind of socket, a permission error, or a non-socket file already at that path) is non-fatal: the
+owner falls back to lock-only mode, exactly like before this phase, and `LocalServer::is_listener_up()`
+reports `false` so a caller can distinguish a healthy owner from a degraded one. `ProcessLock::acquire`
+failing with `Conflict` now triggers `ipc::client::IpcClient::connect`, which retries only the two transient
+connect errors that mean "the owner is still starting" (a missing socket, a refused connection), bounded to a
+low single-digit-second backoff ceiling; a permission error or exhausted retries still return the original
+`Conflict`, with a message that distinguishes "locked but unreachable" from ordinary lock contention. The
+forwarding surface is exactly the SQL/session surface reachable through `LocalServer`/`Session`: `execute`,
+`bootstrap_root_account`, `authenticate_session`, `open_session`, and every session method reachable from an
+open session (including `begin`, present in the public surface even though no in-tree caller uses it
+directly). Every administrative, data-mover, conversion, compaction, and reclaim method (partitioning DDL,
+table conversion, `compaction_tick`/`reclaim_tick`, copy/import/export, tablet clone/verify/repair, job
+load/resume) returns `HtapError::Unsupported` in client mode — those stay owner-only, unchanged from today's
+"standalone subsystem opens are unsafe for concurrent use" boundary, just now also unreachable from a client
+handle by construction rather than merely undocumented.
+
+Because `htap-wire`'s server module and `htap-client` call only `open_session`, `execute`, and the session
+methods it returns, and because `LocalServer::open`'s signature and success-path return type are unchanged
+(still a plain value, not a reference-counted one), `htapd`, `htap-wire`, and `htap-client` needed zero source
+changes for batches A-C: a second `htapd` (or embedded client) on an already-owned root transparently becomes
+an IPC front end. This stopped being true once `open_session` itself became fallible (batch E's E1, below):
+`htap-wire`'s `authenticate` and `htap-client::EmbeddedClient::open_session` both needed a small source change
+to handle the new `Result`, since a client-mode `open_session`/`authenticate_session` call can now return an
+error instead of panicking.
+
+**Wire protocol.** Length-prefixed frames (a four-byte big-endian length, then a JSON body) in both
+directions, symmetrically capped at 16 MiB before any allocation on either side — an oversize declared length
+is rejected before the body buffer is allocated, for both a request frame on the owner side and a response
+frame on the client side. JSON, not a byte-oriented binary encoding, because the payload already needs to
+carry the parsed statement AST (see below) and the existing catalog envelope's own serialization already goes
+through `serde`; reusing that removes a second encoding scheme from this phase's scope. A hand-bumped
+`IPC_PROTOCOL_VERSION` constant (currently `1`), checked at handshake alongside the canonicalized root path, is
+the actual compatibility gate — not a derived schema hash — because a decode failure on either side, at any
+point in the protocol, already closes the connection cleanly with a diagnostic rather than panicking or
+misinterpreting bytes; a schema hash would only add process, not safety, for this MVP's single-repository,
+single-binary deployment model. Every session-scoped response, success or failure alike, carries a small
+session-status snapshot (`autocommit`, `in_transaction`, `principal`) — an error can still change session
+state (a poisoned commit still clears the transaction), so the client-side session resyncs its cached status
+even on a failed call rather than only on success.
+
+**Why forward the statement AST directly instead of a text round trip.** `Session::execute_statement` takes an
+already-parsed statement, not raw SQL text, and is the entry point `htap-wire`'s prepared-statement path uses
+after its placeholder-substitution helper has already turned every `?` into a literal value node — including
+binary blobs (ADR-019) and non-finite-float rejection concerns already present on the row-mutation path.
+Rendering that already-substituted AST back to SQL text on the client and re-parsing it on the owner would be
+exactly the lossy, dialect-fragile bridge CLAUDE.md's durability caution warns against: a binary literal with
+embedded zero bytes has no safe unambiguous SQL-text spelling in general, and a round trip through text is one
+more place a corner case (non-finite floats, deeply nested expressions, unusual escaping) could silently
+diverge between what the client meant and what the owner executes. The vendored parser fork's statement type,
+and every fork-added typed-partition-DDL type in its DDL module, already carry a conditional `serde` derive
+behind a cargo feature the fork's manifest already declares (unused by any workspace member before this
+phase); turning it on needed only two additive one-line feature-list entries in `htap-sql`'s and
+`htap-server`'s own manifests, not a change to any file inside the vendored fork's source tree, so CLAUDE.md's
+"change the vendored fork only when unavoidable" rule does not apply. `IpcRequest::ExecuteBound` therefore
+carries `sqlparser::ast::Statement` directly, and `IpcRequest::VisibilityCheck` carries a statement AST the
+same way; the plain-text `IpcRequest::Execute` path — the common case for the embedded client, a remote
+client's ordinary query, and `htap-wire`'s ordinary `COM_QUERY` handling — still forwards as SQL text, since
+that path already works and has no substituted-literal problem to solve. This does tie the wire format to the
+exact AST shape of whichever build produced it (see Consequences), which is why the manually bumped protocol
+version, not the AST's own shape, is the actual compatibility gate.
+
+**A new `Ambiguous` error variant, distinct from `Conflict` and `DurablePending`.** A non-read-only IPC
+request (anything except the statically-read-only catalog-snapshot and visibility-check requests) can fail
+after some or all of its request bytes have already reached the owner — the owner may have applied it, or may
+not have, and the client cannot tell which from a write or read failure alone, because the standard
+all-or-nothing write call's error contract does not expose "how many bytes actually reached the peer." The
+classification rule (`ipc::client::classify_transport_failure`) is: zero bytes of the request handed to the OS
+before the failure, or the request being one of the two statically-read-only kinds, is safely retryable
+(`Conflict`); anything else is `Ambiguous`, and never auto-retried. `Ambiguous` was consulted on with the
+architect (heavy tier) specifically, after two earlier consultation attempts on this same decision hit a
+transient service error before one succeeded; architect recommended the same choice this design already
+favored — a new sibling variant, not a reuse of an existing one:
+- **Not `Conflict`.** `Conflict` already means "safe to retry, nothing changed" throughout the codebase (lock
+  contention, first-writer-wins); reusing it for an outcome that might have mutated durable state would imply
+  a false safety guarantee to every caller that already treats `Conflict` as retryable.
+- **Not `DurablePending`.** `DurablePending`'s two identifying fields (`txn_id`, `version`) are load-bearing
+  and pattern-matched verbatim at several call sites as "this specific transaction's outcome must be resolved
+  by inspecting durable state at this version." An ambiguous IPC failure usually has no such identifying values
+  at all — the request might have been a plain autocommit statement, a bootstrap call, or a commit with no
+  transaction identifier the client ever learned — so retrofitting it onto `DurablePending` would either
+  fabricate values that do not exist or silently break every exhaustive match that already relies on those
+  two fields meaning something specific.
+- **Not the generic `Internal` outcome.** That would defeat the actual point of this feature: a session
+  quarantine that survives exactly as long as the existing `DurablePending`/`RecoveryRequired` quarantine does,
+  never silently cleared, never transparently retried.
+
+Architect also flagged and this plan addressed: exhaustiveness (the shared error enum stays closed, not marked
+open-ended for future growth, since the workspace's existing lint gate already forces every match site to
+handle a new variant — a separate dispatch-predicate abstraction was judged unnecessary on top of that); the
+wire-mapping risk (`docs/DECISIONS.md`'s own error-mapping test, extended in Task A2, pins `Ambiguous`'s mapped
+MySQL code away from any driver-auto-retry code, the same protection `DurablePending` already has); and
+reversibility (judged moderately reversible now, since it is purely additive, but costly to unwind once
+client and session code depends on it — not treated as a reason to defer, since retrofitting `DurablePending`
+instead was judged strictly worse to reverse later).
+
+An `Ambiguous` outcome quarantines a session exactly like `DurablePending` does today: every call site that
+already re-raises a stored `DurablePending` error also re-raises a stored `Ambiguous` one (including the
+`reset` method's own quarantine gate), and neither state is ever exited by silently reconnecting — a session
+whose connection is confirmed dead before a call even starts instead enters a second, distinct terminal
+`RemoteDisconnected` state carrying the ordinary `Conflict` error, since "this session's connection is gone,
+open a new one" is a different, safe-to-retry-with-a-fresh-session fact from "this specific outcome is
+unknown."
+
+**Ownership graph and teardown order.** Two problems made "add a socket field to the existing struct" unsound
+rather than merely inelegant, both found during design review (see Consequences below for how they were
+found): first, `open_session` requires a reference-counted handle to the outer server value that only the
+*caller* constructs after `open` returns, so the IPC listener — which must mint one real session per
+connection the same way — cannot go through `open_session` without either changing `open`'s return type
+(touching roughly 354 existing call sites, several of which use `LocalServer`'s exclusive-reference
+configuration setters that stop being callable once shared through a reference-counted wrapper) or being given
+a narrower way to mint sessions that does not depend on the caller's wrapper at all. Second, an optional
+socket field bolted onto the existing session/server structs would leave invalid state combinations reachable
+(a "local" session with a live socket, a "client" server that still thinks it has direct storage access) and
+would not solve the first problem regardless.
+
+The fix is an explicit ownership graph, not a field: `OwnedServer` is the renamed storage core (unchanged
+body); `ServerMode` is a two-case enum (`Owner(OwnerRuntime)` or, Unix-only, `Client { client: IpcClient }`)
+that `LocalServer` wraps; `OwnerRuntime` pairs a reference-counted `OwnedServer` handle with the optional
+running `IpcListener`, by value, not behind its own extra reference count, since exactly one `OwnerRuntime`
+exists per owning process — the caller's own wrapper (`Arc<LocalServer>` in `htapd`, `EmbeddedClient`, every
+test) is the only sharing layer needed above it. The IPC listener is started by handing it a direct clone of
+the `OwnedServer` handle, bypassing `open_session` and the outer wrapper entirely, which sidesteps the
+chicken-and-egg problem: the listener never needed anything but direct storage access. `Session`'s own private
+storage-access field became the same kind of two-case split (`SessionBackend::Owner(Arc<OwnedServer>)` or,
+Unix-only, `SessionBackend::Remote { connection, status }`), so an owner-side session (used both by
+`open_session` and by each IPC connection's server-side handler) and a client-side session are structurally
+distinct, not one struct with an optional field.
+
+Teardown order is the second half of the same problem: dropping the caller-facing `LocalServer` handle must
+not release `<root>/LOCK` while the listener's own accept thread or a connection-handler thread might still be
+touching storage through its own clone of the `OwnedServer` handle — Rust's ordinary field-declaration drop
+order cannot express "shut the listener down, *then* release the lock" across a reference count, because
+`OwnedServer`'s own `Drop` (which releases `ProcessLock`) only runs once the *last* clone of it is dropped, and
+a listener thread's clone is not necessarily the caller's. `OwnerRuntime`'s `Drop` is hand-written, not
+derived, specifically to sequence this: it takes and drops its `IpcListener` first, whose own `Drop`
+(`ipc::owner::IpcListener`) sets a stop flag, force-closes every live connection (interrupting any blocked
+read), then joins the accept thread and every connection thread with a real, unbounded join — not a bounded
+wait that gives up and proceeds anyway, matching `htap-wire`'s own existing shutdown precedent, at the accepted
+cost that one stuck in-flight statement can delay shutdown. Only once that join has returned — guaranteeing
+every listener-held clone of the `OwnedServer` handle is gone — does `OwnerRuntime`'s own `OwnedServer` handle
+clone drop normally, which is now deterministically the last one, releasing `<root>/LOCK` only after the
+socket is already gone. This ordering is exercised by
+`crates/htap-server/tests/ipc_owner_shutdown_bounded.rs::dropping_owner_with_idle_client_is_bounded_and_releases_lock`
+and the disconnect-mid-transaction rollback test
+(`crates/htap-server/tests/ipc_owner_disconnect_mid_txn.rs::disconnect_rolls_back_open_transaction`), which
+also confirms a connection whose session still has an open transaction gets that transaction rolled back
+before the session is dropped, matching `htap-wire`'s own dropped-connection behavior.
+
+### Consequences
+
+- **Positive.** A second local process on an already-owned root now gets a working, if narrower, connection
+  instead of an unconditional failure; `htapd`, `htap-wire`, and `htap-client` needed no source changes to gain
+  this for batches A-C (batch E's `open_session` fallibility fix later required a small change to each of
+  `htap-wire` and `htap-client`, see above). No new on-disk format, no change to the durability invariants in
+  ADR-004/008/009. The trust model
+  matches the existing root-lock file exactly: same-OS-user, not a security boundary (see Decision #6 in the
+  Phase 16 plan). The socket is published mode `0600`; as of batch E, it is created inside a private,
+  owner-only (`0700`) directory and tightened there before being atomically renamed into place, so there is no
+  window during creation where a different local user could reach it (see "Post-review fixes (batch E)"
+  below — the original bind-then-chmod sequence directly at the published path did have such a window, found
+  by a second storage re-review). That private directory is itself removed immediately after the rename
+  publishes the socket, and any left behind by a crashed prior owner are swept up at startup (batch F, F2
+  below) — the directory never accumulates on a normal run, only ever a real crash leaves one to clean up.
+- **Negative / disclosed gaps.** A client-mode session cannot change its authenticated user: `change_user`
+  returns `Unsupported` in client mode, a narrower surface than the owner side, disclosed in
+  `docs/LIMITATIONS.md`. A client-mode `LocalServer`'s configuration setters — both the `with_*` builder forms
+  and their mutable `set_*` counterparts (scan workers, query parallelism, query memory budget, the
+  `ANALYZE TABLE` distinct-value limit, GC horizon retention slack) — are accepted no-ops, and their getters
+  report the compiled-in defaults rather than the owner's actual
+  configuration, because that configuration lives entirely in the owner process's `OwnedServer` and is not
+  itself forwarded over the wire protocol (found during the batch D review as one symptom of the same
+  `Deref`-panic defect, fixed as a safe no-op rather than as forwarding, since none of `htapd`/`htap-wire`/
+  `htap-client` ever call these setters on anything but the one process that opens the root). Every
+  administrative/data-mover/conversion/compaction/reclaim method is owner-only. A client session that is
+  confirmed disconnected is terminal — it never
+  transparently reconnects and continues the same transaction, matching the review finding that a broken
+  session silently resuming would be unsafe. A socket path too long for a Unix domain socket, or a non-socket
+  file already occupying `<root>/htap.sock`, leaves the owner in the same lock-only mode this workspace has
+  always had as its fallback: a second opener in that case still gets the ordinary `Conflict`, not IPC
+  forwarding. The wire format is tied to the exact AST shape of the build that produced it; a version-skewed
+  owner/client pair (e.g. an unrestarted process after an in-place binary upgrade) fails cleanly at decode
+  time rather than silently misinterpreting bytes, but there is no schema-compatibility scheme beyond the
+  hand-bumped protocol-version constant. Standalone subsystem opens that bypass `LocalServer`
+  (`Engine::open`, `LocalCatalogStore::open`, `LocalDataMover::new`) remain unsafe for concurrent use, exactly
+  as before this phase — this decision does not touch that gap.
+- **Design review.** An initial draft of the owner/client split assumed a single shared "run one statement"
+  function and an optional socket field bolted onto the existing session struct; a review panel (`reasoner` and
+  `cx/gpt-5.5`) found both unsound — the shared function would have silently reordered session-specific
+  decisions (implicit-transaction timing relative to a bind/privilege failure, DDL-in-transaction rejection,
+  poison/read-only checks), and the optional field left invalid state combinations reachable while not
+  actually solving the `open_session`/reference-counting problem described above. The narrower
+  prepare-then-dispatch split (a new `prepare_statement` helper shared by `LocalServer::execute` and
+  `Session::execute_statement`, fixing `docs/PROBLEMS.md` P3 as a side effect) and the explicit ownership-graph
+  types described above are the adopted fixes.
+
+### Post-review fixes (batch D)
+
+A storage review of the Batch A-C2 diff (verdict: fix-first) plus an external review found 13 defects the
+passing test suite had not caught, two of them serious enough to undermine the design's own stated
+guarantees: prepared statements were completely broken for every client-mode session, because the owner's
+`VisibilityCheck` handler discarded the `CatalogSnapshot` the client needed and returned an empty one instead
+(D4); and roughly 30 owner-only `LocalServer` methods, plus `Debug` formatting and the five mutable
+configuration setters, panicked the whole process on a client-mode handle, because they reached the storage
+core through a blanket `Deref` impl that assumed local storage access unconditionally (D3). Neither had a
+dedicated test before this batch — the existing suite only ever exercised these paths in owner mode. Twelve of
+the thirteen (D1-D12) were fixed, each verified against the code before landing; the last (D13) was left
+unfixed and is instead recorded as a limitation:
+
+- **D1 (durable-pending downgrade).** A `DurablePending` error received over IPC is now latched into
+  `SessionState::CommitOutcomePending` at the point `Session::remote_request` receives it, before it is ever
+  returned to the caller, so a later disconnect can never downgrade it to a retryable `Conflict` — the same
+  "never silently downgraded" invariant the local-backend path already had.
+  Test: `crates/htap-server/tests/ipc_client_session_durable_pending_latch.rs::remote_session_latches_durable_pending_commit_outcome`.
+- **D2 (stale status on error).** `IpcConnection::request` now returns the response's `SessionStatus`
+  alongside both the success and the error case, instead of discarding it on error, so `Session::in_transaction()`
+  cannot report a stale "still in a transaction" answer after a transaction-ending failure.
+  Test: `ipc_client_session_status_after_error.rs::remote_session_applies_status_from_failed_commit_response`.
+- **D3 (client-mode panics).** The blanket `Deref` to the storage core is gone. Every owner-only method
+  (`compaction_tick`, `reclaim_tick`, `data_mover`, `txn_manager`, `colstore_dir`, `convert_table`,
+  `convert_table_to_column`, `convert_table_to_row`, `conversion_tick`, `tick`, `load_job`, `resume_job`, and
+  the rest of the administrative surface) returns `HtapError::Unsupported` instead of panicking on a
+  client-mode `LocalServer`; `Debug` formatting and the five configuration knobs (scan workers, query
+  parallelism, query memory budget, the `ANALYZE TABLE` distinct-value limit, and GC horizon retention
+  slack) — both their `with_*` builder forms and their mutable `set_*` counterparts — are safe no-ops in
+  client mode, with their getters reporting the compiled-in defaults rather than reading through to storage
+  that does not exist in this process. Recorded
+  as a limitation, not further fixed: this makes client-mode configuration cosmetic, not forwarded to the
+  owner (see Consequences below).
+  Test: `ipc_client_mode_unsupported_methods.rs::ipc_client_mode_owner_only_methods_return_unsupported_without_panicking`.
+- **D4 (broken prepared statements).** The owner's `VisibilityCheck` handler now returns the real
+  `CatalogSnapshot` it just checked against instead of an empty one, fixing prepared statements for
+  client-mode sessions end to end.
+  Test: `ipc_client_session_visibility_check.rs::remote_session_forwards_statement_visibility_check`.
+- **D5 (reclaim/listener race).** `LocalServer::open` now runs `reclaim_tick_locked(true)` under
+  `execution_lock` and only starts the IPC listener afterward, so a client can never execute a statement
+  while startup reclaim is deleting a dropped table's tablet directories. Verified by read-through of
+  `crates/htap-server/src/lib.rs::open` (the reclaim call is now sequenced, still under the lock, strictly
+  before `ipc::start`); no new dedicated regression test, since the existing reclaim suite staying green after
+  the reorder was the actual check.
+- **D6 (silent close on an undecodable frame).** A fully received but undecodable request frame on the owner
+  side now gets a definite `InvalidArgument` error reply before the connection is closed, instead of a bare
+  disconnect, so a client never reports an unknown outcome for a statement that provably never ran.
+  Test: `ipc_owner_undecodable_frame.rs::undecodable_frame_returns_error_then_closes`.
+- **D7/D8 (local failure misclassified as terminal).** A purely local, pre-send failure — the concrete case
+  is an oversize request rejected by `MAX_FRAME_SIZE` before any byte is written to the socket — is now
+  classified as `HtapError::InvalidArgument` ahead of the write-boundary rule in `classify_transport_failure`,
+  rather than falling through to the ordinary `Conflict`/`Ambiguous` path and latching the session terminal;
+  the session stays usable for the next statement. The `set_max_allowed_packet` remote path was fixed the
+  same way in passing: it now checks the terminal-state (quarantine/disconnected) gate up front like every
+  other remote call, and no longer swallows a transport error.
+  Test: `ipc_client_session_oversize_request.rs::oversized_request_is_rejected_locally_without_poisoning_session`.
+- **D9 (unbounded handshake, blocking rollback on drop).** The owner now bounds its handshake read to a fixed
+  5-second timeout, so a connection that sends nothing after connecting cannot hold a connection slot forever.
+  Dropping a `Session` whose backend is `SessionBackend::Remote` no longer issues a blocking rollback request
+  over the socket (`impl Drop for Session` returns immediately for the remote case; only a local-backend
+  session's `Drop` still calls `rollback()`), matching the terminal-state contract that a lost or disconnecting
+  remote session must not block teardown.
+  Test: `ipc_owner_handshake_timeout.rs::silent_handshake_times_out_and_releases_connection_slot`.
+- **D10 (fabricated bootstrap report).** A client-mode `bootstrap_root_account` now returns the owner's real
+  `BootstrapReport` from the IPC response instead of fabricating one locally.
+- **D11 (non-fatal paths treated as fatal).** `ipc::owner::start` now treats a root-canonicalize failure, a
+  stale-socket removal failure, and a bind failure identically: log a warning and return `Ok(None)` (lock-only
+  fallback), never propagate an error that would fail `LocalServer::open` itself.
+- **D12 (string-based disconnect classification).** Disconnect classification is now a structural match on
+  the `WireError` enum (`WireError::OwnerUnreachable` vs. `WireError::Ambiguous`, a new dedicated wire-error
+  variant) rather than a string-prefix check on an error message.
+- **D13 (not fixed — recorded as a limitation).** `Session::change_user` still checks "this is a client-mode
+  session" before checking the terminal-state (quarantine/disconnected) gate, so a client-mode session in
+  `AmbiguousOutcomePending` or `RemoteDisconnected` gets `HtapError::Unsupported` for a `change_user` call
+  instead of the stored terminal error. This is disclosed in `docs/LIMITATIONS.md` rather than fixed in this
+  batch, since `change_user` is already `Unsupported` for every client-mode session regardless of state — the
+  gate ordering changes which specific error a caller sees, not whether the call succeeds.
+
+`docs/PROGRESS.md`'s Phase 16 row states plainly that both reviews found defects the passing suite had missed;
+see it for the complete test-evidence map.
+
+### Post-review fixes (batch E)
+
+A second storage re-review of the batch D diff (verdict: fix-first) found 8 more defects, two of them serious
+enough that this ADR's own "Post-review fixes (batch D)" section had overclaimed: D3's "client-mode panics are
+fixed" was incomplete (`open_session`/`authenticate_session` still panicked in 3 places D3 never reached), and
+this ADR's own trust-model claim about the socket's creation window understated the actual exposure (the root
+directory is world-traversable, so the window was a real unauthenticated-superuser path, not merely a
+theoretical race). Both are fixed here, along with the six other findings:
+
+- **E1 (client-mode `open_session` still panicked — HIGH).** `open_session` had 3 remaining panic sites in
+  client mode, and `authenticate_session` inherited them; a dead owner or the 64-connection cap crashed the
+  calling process instead of returning an error, and `htap-wire` hit this once per incoming connection.
+  `LocalServer::open_session` is now `Result`-returning end to end (`OwnedServer::open_session` stays
+  infallible, since the owner-side path cannot fail this way); `authenticate_session` propagates the error;
+  `htap-wire`'s server module reports it to the client (`ER_UNKNOWN`) instead of unwinding. This is a
+  behavioral, not merely internal, change: `LocalServer::open_session`'s public signature is now
+  `fn open_session(self: &Arc<Self>) -> Result<Session>`, and every one of the roughly 83 existing call sites
+  across `crates/htap-server/tests/*.rs` was updated mechanically (`.unwrap()`) to match. No dedicated
+  regression test reproduces the dead-owner/connection-cap failure itself at the `LocalServer`/wire-server
+  level (unlike D3's own dedicated panic test); the fix is verified by code inspection (no remaining
+  `unwrap`/`expect`/`panic` on this path) and by every existing session-opening test continuing to pass against
+  the new fallible signature.
+- **E2 (a read-side failure bypassed the write-boundary rule — MED).** An undecodable or oversize response used
+  to be classified `HtapError::InvalidArgument` ("bad input"), even for a mutation whose request bytes had
+  already fully reached the owner — reporting a write that may have been applied as a client-side input error,
+  the wrong side of the write-boundary rule entirely. An oversize declared length also left unread bytes on
+  the wire, desynchronizing the connection for whatever request came next. Fixed: only a genuinely local,
+  pre-write failure (never handed to the OS) still gets `InvalidArgument`; every `read_frame` failure is now
+  `Ambiguous` for a non-read-only request or `OwnerUnreachable` for one of the two statically-read-only
+  requests, and the connection is marked dead after any framing failure so nothing later reads stale bytes.
+  Test: `crates/htap-server/src/ipc/client.rs::ipc::client::tests::malformed_or_oversized_response_marks_connection_dead_and_preserves_outcome_classification`.
+- **E3 (socket creation-window is an unauthenticated-superuser path — MED, security).** See "Positive" above
+  and the new decision text there: the socket is now bound inside a private `0700` directory, tightened to
+  `0600` there, then atomically renamed to `<root>/htap.sock`.
+  Test at the time: `ipc::owner::tests::published_socket_is_owner_only` — batch F (F1, below) found this test
+  reimplemented the publication sequence itself instead of calling the real startup path and would have passed
+  even against a reverted fix; it was deleted and replaced by
+  `crates/htap-server/tests/ipc_owner_socket_permissions.rs::startup_publishes_owner_only_socket_and_cleans_up_staging_directory`.
+- **E4 (handshake deadline reset on every byte — LOW-MED).** The handshake bound was a per-read socket
+  timeout, not an absolute deadline, so a peer trickling one byte at a time could hold a connection thread
+  forever; enough such connections made the owner unreachable for everyone. Fixed: a single absolute deadline
+  now covers the whole frame read on both the owner's handshake-accept path and the client's connect path.
+  Established sessions (past the handshake) are never cut off — a long-running statement or an idle session
+  has no deadline at all.
+  Test: `crates/htap-server/src/ipc/protocol.rs::ipc::protocol::tests::handshake_frame_deadline_is_absolute_when_peer_trickles`.
+- **E5 (non-Unix build broken — LOW, a batch-D/C2 regression).** `Session`'s `remote_request` helper was
+  missing `#[cfg(unix)]`, breaking the non-Unix build C2 had otherwise gated correctly. Restored. Verified by
+  read-through only, matching C2's own precedent (this workspace's CI runs Linux exclusively).
+- **E6 (owner-backed sessions skipped the quarantine gate the remote arms already had — LOW).**
+  `catalog_snapshot`, `check_statement_visible`, and `set_max_allowed_packet` checked the
+  `AmbiguousOutcomePending`/`CommitOutcomePending`/`RemoteDisconnected` terminal-state gate only on the remote
+  branch; an owner-backed (local) session could call them past quarantine. The gate now runs once, ahead of
+  the owner/remote split, so both modes agree. (D13's `change_user` gate-ordering quirk is unrelated and
+  unchanged — see "Post-review fixes (batch D)" above and `docs/LIMITATIONS.md`.) No dedicated regression test
+  was added for this specific symmetry; verified by code read-through (the gate check now precedes the
+  `#[cfg(unix)]` remote-branch check in each of the three methods) and by the existing owner-mode quarantine
+  tests in `crates/htap-server/tests/session.rs` continuing to pass unchanged.
+- **E7 (client-mode getters fabricate values — LOW, documentation).** The `last_query_*` diagnostic getters
+  (parallel workers, spill flags, optimizer invocation count) return fixed defaults (`1`/`false`/`0`) in client
+  mode rather than reading the owner's actual last-query state, which they cannot see; the configuration
+  setters (`with_*`/`set_*`) were already correct as no-ops (configuration is process-global, owner-only), but
+  this was previously undocumented. Documented in `docs/LIMITATIONS.md`; no behavior change.
+- **E8 (protocol version doesn't cover the payload types it actually gates — LOW).** `IPC_PROTOCOL_VERSION`'s
+  doc comment now states plainly which payload types force a manual bump (`IpcRequest`, `IpcResponse`,
+  `SessionStatus`, any of their variants, `sqlparser::ast::Statement`, or any nested payload type they carry) —
+  this is what makes E2's read-side classification fix meaningful: two builds with a mismatched serde layout
+  for one of those types could otherwise complete a handshake (which only checks the numeric constant) and
+  then fail at frame decode, which used to surface as a misclassified `InvalidArgument`.
+
+`docs/PROGRESS.md`'s Phase 16 row states plainly that this second review found a security-relevant window and
+another panic path, and that batch D's own claim to have removed client-mode panics was incomplete.
+
+### Post-review fixes (batch F)
+
+A third storage re-review of the batch E diff (verdict: fix-first) found 7 more defects, two of them a repeat
+of the same pattern the "batch F" heading itself exists to name: a regression test for a real fix that was
+written to pass regardless of whether the fix held, and, once one of those was replaced with a test that
+actually exercised the real code path, that new test immediately found a further defect the review itself had
+only partly identified.
+
+- **F1 (E3's own regression test could not fail — the test-quality defect this batch is named for).**
+  `ipc::owner::tests::published_socket_is_owner_only` reimplemented the private-directory-then-rename
+  publication sequence itself, inline in the test, instead of calling `LocalServer::open`'s real startup path;
+  it would have kept passing even if E3's fix (see above) were reverted back to a bind-then-chmod sequence at
+  the published path. It is deleted and replaced by
+  `crates/htap-server/tests/ipc_owner_socket_permissions.rs::startup_publishes_owner_only_socket_and_cleans_up_staging_directory`,
+  which opens a real `LocalServer` and asserts the actually-published `<root>/htap.sock` is a socket, mode
+  `0600`.
+- **F2 (the staging-directory leak F1's new test then found).** The private `.htap-ipc-<pid>-<id>` directory
+  `ipc::owner::start` creates before binding, tightening, and renaming the socket into place was never removed
+  on the successful path — only the socket itself was ever cleaned up. Every server that ever started left one
+  of these directories behind in `<root>`, forever, not merely after a crash. Fixed: the directory is now
+  removed immediately after the rename publishes the socket, and a new `cleanup_stale_private_directories`
+  scans `<root>` for any left by a crashed prior owner and removes them at the start of `ipc::owner::start`,
+  before a new private directory is created. This is the specific claim in `docs/OPERATIONS.md`'s and
+  `docs/LIMITATIONS.md`'s batch E text that read as though the private directory were only ever a transient
+  bind target with no cleanup story of its own — both now describe the successful-path removal and the
+  startup sweep explicitly. Test: the same
+  `startup_publishes_owner_only_socket_and_cleans_up_staging_directory` above also asserts no `.htap-ipc-*`
+  directory remains in `<root>` after a normal, non-crashing `LocalServer::open`/drop cycle.
+- **F3 (E1's own no-panic fix had no test either).** E1 made `open_session`/`authenticate_session` fallible
+  instead of panicking in client mode, but landed with no test reproducing the dead-owner scenario itself
+  (verification at the time was code inspection plus the existing suite passing against the new signature).
+  `crates/htap-server/tests/ipc_client_open_session_owner_gone.rs::ipc_client_session_operations_error_when_owner_has_gone_away`
+  now proves it directly: with the owner process dropped, both `open_session` and `authenticate_session` on a
+  client-mode handle return `Err` within a bounded one-second deadline, never panicking and never hanging.
+- **F4 (a post-dispatch response-framing failure was reported as bad input, not as unknown).** If a response
+  failed to serialize *after* its statement had already run against the owner's real storage,
+  `ipc::owner::write_response`'s fallback reported `HtapError::InvalidArgument` ("bad input") — the wrong side
+  of the same write-boundary rule E2 fixed for the read side, and a classification that could have invited a
+  caller to retry a mutation that had already happened. It now reports `HtapError::Ambiguous` (unknown
+  outcome) whenever the original dispatch had already run, keeping the safe-to-retry `InvalidArgument`
+  classification only for a request that failed to decode before anything executed. This is latent today —
+  no write path in this phase returns rows through this response frame — but would have gone live the moment
+  one did, e.g. an `INSERT ... RETURNING`-shaped future statement. Test:
+  `ipc::owner::tests::post_dispatch_serialization_failure_returns_ambiguous_outcome`, which replaces B3's
+  original `serialization_failure_is_returned_as_a_normal_error_frame` (that name asserted the now-fixed
+  `InvalidArgument` behavior and no longer exists).
+- **F5 (a failed write with bytes already on the wire did not mark the connection dead).** `IpcConnection`'s
+  write path counted bytes actually handed to the OS (via `CountingWriter`) to classify a write failure as
+  `Conflict` or `Ambiguous`, but did not also set the connection's `dead` flag the way the read path already
+  does on any framing failure (E2) — a partially written, desynchronizing request left the connection object
+  itself still marked usable, so an out-of-tree caller holding it could send a next request onto a connection
+  the owner had already given up on. `request` now sets `dead = true` whenever any request bytes were written
+  before the failure, matching the read side exactly. Test:
+  `crates/htap-server/src/ipc/client.rs::ipc::client::tests::partial_request_write_marks_connection_dead`.
+- **F6 (owner-gone login misreported as bad credentials).** With the owner unreachable, `htap-wire`'s
+  `authenticate` (initial login) and `respond_change_user` (`COM_CHANGE_USER`'s re-authentication) both fell
+  through to their generic `Err(_)` arm and reported `ER_ACCESS_DENIED`/"Access denied for user '...'" —
+  indistinguishable from an actual bad password, which would send an operator chasing a credentials problem
+  that did not exist. Both call sites now match `HtapError::Conflict` ahead of the generic arm and report the
+  real transport failure via `ER_UNKNOWN` instead. Verified by code read-through only, matching the
+  read-through-only precedent already set by D5/D10/D11/D12/E1/E5/E6 above; no dedicated wire-level
+  integration test names this exact scenario.
+- **F7 (an interrupted system call during the handshake failed spuriously).** `read_exact_until` — used only
+  for the bounded handshake read on both the owner's accept side and the client's connect side (E4) — treated
+  `io::ErrorKind::Interrupted` as an ordinary hard failure and returned it straight to the caller instead of
+  retrying the read, so a single `EINTR` arriving mid-syscall (e.g. from an unrelated signal) could fail an
+  otherwise-healthy handshake for a reason that has nothing to do with the peer. It now retries the same read
+  against the same absolute deadline on `Interrupted`, matching how the ordinary (non-handshake) `read_frame`
+  path already behaves via the standard library's own `read_exact` retry semantics. Verified by code
+  read-through only; this crate has no seam to inject a real `EINTR` in a test.
+
+`docs/PROGRESS.md`'s Phase 16 row states plainly that this third round found that two earlier fixes (E3's
+socket-permission test and E1's no-panic test) had shipped with tests that could not have caught a regression,
+and that replacing one of those fake tests with a real one immediately exposed a further defect (the
+staging-directory leak, F2) the review itself had only partly identified.
+
+### Reversal path
+
+Every new type here is additive: `ServerMode`, `OwnerRuntime`, `SessionBackend::Remote`, the `ipc` module, and
+the `Ambiguous` error variant can all be deleted without touching the durable format, since none of them are
+ever persisted — the socket handshake and every frame are transient, in-memory-only protocol state. Reverting
+to lock-only behavior means: make `LocalServer::open`'s `Conflict` branch return the error unchanged again
+(dropping the `IpcClient::connect` attempt), stop constructing `OwnerRuntime`'s listener, and remove the
+`ipc`-only session/error variants — the exhaustive-match discipline the workspace already relies on (Decision
+#5 above) means the compiler enumerates every call site that would need to change. No stored data or catalog
+format depends on any of this, so a reversal carries no migration.
+
+### Verification
+
+`cargo test --workspace --no-fail-fast` (re-measured after the batch F fixes above): 1535 passed, 0 failed, 1
+ignored; `cargo clippy --workspace --all-targets -- -D warnings` clean. See `docs/PROGRESS.md`'s Phase 16 row
+for the full test-name evidence map, including the 28 dedicated `ipc_*` integration test files
+(`crates/htap-server/tests/ipc_owner_*.rs`, `ipc_client_*.rs`, `ipc_multiprocess.rs`) and the protocol/owner/
+client unit tests inside `crates/htap-server/src/ipc/{protocol,owner,client}.rs`. Cross-references: ADR-004
+(the single shared MVCC version domain and WAL the owner alone still writes to), ADR-008/009 (durability
+invariants, unchanged — the socket carries no durable state), ADR-018 (the `DurablePending`/`RecoveryRequired`
+quarantine pattern `Ambiguous` and `RemoteDisconnected` extend), ADR-019 (binary-blob literal substitution,
+the concrete case the AST-serialization decision above protects).

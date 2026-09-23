@@ -85,13 +85,28 @@ binders. What Phase 14 actually converged, and what is still open:
 warnings` pass with the join-evaluator and `EvalContext` unifications in place; see `docs/PROGRESS.md`'s
 Phase 14 row and ADR-023 for the full record, including exactly what was not delivered.
 
-## P3 — Two statement pipelines in the server (fix in Phase 16)
+## P3 — Two statement pipelines in the server (fixed in Phase 16)
 
 `LocalServer::execute` / `dispatch_bound` (`htap-server/src/lib.rs`) and `Session::execute` /
-`execute_statement` (`htap-server/src/session.rs`) each parse, check visibility, bind, check privileges and
-dispatch. Phase 16 IPC forwarding would add a third entry point.
+`execute_statement` (`htap-server/src/session.rs`) each parsed, checked visibility, bound, checked privileges,
+and dispatched independently, so the privilege check ran twice per session-driven statement.
 
-**Fix.** Build one statement pipeline that all three entry points call, as part of Phase 16.
+**Fix.** A new narrow helper, `LocalServer::prepare_statement` (`crates/htap-server/src/lib.rs`), does exactly
+catalog load, statement-visibility check, bind, and privilege check, and hands back the bound statement
+together with the catalog snapshot it was bound against. `dispatch_bound` had its own now-redundant privilege
+check removed. `LocalServer::execute` calls `prepare_statement` then dispatches immediately;
+`Session::execute_statement`'s ordinary-statement branch calls the same helper and keeps every one of its own
+session-state decisions (implicit-transaction timing, DDL-in-transaction rejection, poison/read-only checks,
+post-dispatch quarantine) unchanged, operating on the bound statement `prepare_statement` returns instead of
+computing it inline. This also gave Phase 16's owner-side IPC listener (a third entry point, `ipc::owner`) the
+same one pipeline for free — it dispatches through the same `Session`/`LocalServer` methods, adding no
+statement-dispatch logic of its own.
+
+**Evidence.** `crates/htap-server/src/session.rs::session::tests::session_statement_checks_privileges_once`
+proves the privilege-check function runs exactly once for a representative session-driven statement (shown to
+fail against the pre-fix double-call code before the fix landed, per the Phase 15 regression-test lesson); the
+full `htap-server` and `htap-wire` test suites pass unchanged, confirming this was a pure refactor with
+identical behavior, errors, and ordering. See ADR-025 and `docs/PROGRESS.md`'s Phase 16 row.
 
 ## P4 — Very long functions (fix when touched)
 
@@ -125,8 +140,8 @@ dedicated stage.
 | **done** | **Stage R — shared durability primitives** | P1 |
 | **done** | **Phase 14 — CBO, spill, parallelism** | P2 (partial — see above; leaf-helper convergence still open), P4 where touched |
 | **done** | **Phase 15 — DROP reclaim, rowstore compaction/GC, journal checkpoint** | P4 where touched (uses R's helpers): `htap-catalog/src/model.rs::validate` (already on the P4 list, 702 lines) gained the `pending_reclaim` overlap/duplicate checks and was not split — still open, unchanged severity. No other P4-listed function was touched (`htap-convert`, `htap-sql`'s `bind_create_table`/`bind_select_body` were not part of this diff). |
-| **next** | Phase 16 — multiprocess owner + IPC | P3, P4 where touched (uses R's helpers) |
-| then | Phases 17–18 — TPC-H, TPC-C | — |
+| **done** | **Phase 16 — multiprocess owner + IPC** | P3 (fixed, see above). No P4-listed function was touched by this diff. |
+| **next** | Phases 17–18 — TPC-H, TPC-C | — |
 | then | SERIALIZABLE isolation (serializable snapshot isolation) | — |
 | then | Power-loss safety | audits R's single implementation |
 | then | Docker | — |

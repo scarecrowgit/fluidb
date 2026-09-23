@@ -9,6 +9,8 @@
 
 mod analyze;
 mod explain;
+#[cfg(unix)]
+pub mod ipc;
 mod memory_budget;
 pub mod olap;
 mod privilege;
@@ -17,7 +19,7 @@ mod session;
 mod spill;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use htap_catalog::local::LocalCatalogStore;
@@ -134,7 +136,7 @@ pub const DEFAULT_QUERY_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_ANALYZE_DISTINCT_LIMIT: usize = 200_000;
 
 /// Result of [`LocalServer::bootstrap_root_account`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BootstrapReport {
     /// Whether this invocation created the root account.
     pub created_root: bool,
@@ -187,7 +189,7 @@ pub struct CompactionTickReport {
 ///
 /// Encapsulates catalog metadata management, transactional write logging,
 /// LSM-based rowstore persistence, and data movement within a single local directory.
-pub struct LocalServer {
+pub struct OwnedServer {
     _lock: ProcessLock,
     catalog: Arc<LocalCatalogStore>,
     engine: Arc<Engine>,
@@ -197,23 +199,80 @@ pub struct LocalServer {
     pinned_snapshots: Mutex<std::collections::BTreeMap<SessionId, Version>>,
     colstore_dir: PathBuf,
     data_root: PathBuf,
-    scan_workers: usize,
-    query_parallelism: usize,
-    query_memory_budget: usize,
-    analyze_distinct_limit: usize,
-    gc_horizon_retention_slack: u64,
+    scan_workers: AtomicUsize,
+    query_parallelism: AtomicUsize,
+    query_memory_budget: AtomicUsize,
+    analyze_distinct_limit: AtomicUsize,
+    gc_horizon_retention_slack: AtomicU64,
     next_session_id: AtomicU64,
+}
+
+/// Public server handle.
+pub struct LocalServer {
+    mode: ServerMode,
+}
+
+/// Server runtime mode.
+///
+/// Outside Unix, a locked root still returns the ordinary lock-contention conflict error. IPC
+/// forwarding and client mode do not apply there.
+pub(crate) enum ServerMode {
+    /// The local process owns the storage runtime.
+    Owner(OwnerRuntime),
+    /// The local process forwards work to an owner process through IPC.
+    #[cfg(unix)]
+    Client {
+        /// Connector for the owner holding the root lock.
+        client: ipc::IpcClient,
+    },
+}
+
+/// Resources owned by an in-process storage server.
+pub(crate) struct OwnerRuntime {
+    server: Arc<OwnedServer>,
+    #[cfg(unix)]
+    listener: Option<ipc::IpcListener>,
+}
+
+impl Drop for OwnerRuntime {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // Drop the listener before the owned storage runtime and its root lock.
+            self.listener.take();
+        }
+    }
 }
 
 impl std::fmt::Debug for LocalServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalServer")
-            .field("colstore_dir", &self.colstore_dir)
-            .field("scan_workers", &self.scan_workers)
-            .field("query_parallelism", &self.query_parallelism)
-            .field("query_memory_budget", &self.query_memory_budget)
-            .field("analyze_distinct_limit", &self.analyze_distinct_limit)
-            .finish()
+        let mut debug = f.debug_struct("LocalServer");
+        match &self.mode {
+            ServerMode::Owner(runtime) => {
+                let server = runtime.server.as_ref();
+                debug
+                    .field("mode", &"owner")
+                    .field("colstore_dir", &server.colstore_dir)
+                    .field("scan_workers", &server.scan_workers.load(Ordering::Relaxed))
+                    .field(
+                        "query_parallelism",
+                        &server.query_parallelism.load(Ordering::Relaxed),
+                    )
+                    .field(
+                        "query_memory_budget",
+                        &server.query_memory_budget.load(Ordering::Relaxed),
+                    )
+                    .field(
+                        "analyze_distinct_limit",
+                        &server.analyze_distinct_limit.load(Ordering::Relaxed),
+                    );
+            }
+            #[cfg(unix)]
+            ServerMode::Client { .. } => {
+                debug.field("mode", &"client");
+            }
+        }
+        debug.finish()
     }
 }
 
@@ -241,7 +300,7 @@ impl ExecMode<'_> {
     /// Read-side view: the MVCC snapshot to read at, and the write set to overlay below
     /// relational operators (`None` in autocommit mode, which is byte-for-byte the pre-Phase-10
     /// read path).
-    fn read_view(&self, server: &LocalServer) -> (Snapshot, Option<&WriteSet>) {
+    fn read_view(&self, server: &OwnedServer) -> (Snapshot, Option<&WriteSet>) {
         match self {
             ExecMode::Autocommit => (Snapshot::new(server.txn_manager.visible_version()), None),
             ExecMode::Txn {
@@ -275,6 +334,29 @@ fn reject_duplicate_mutation_keys(mutations: &[Mutation]) -> Result<()> {
 }
 
 impl LocalServer {
+    /// Returns whether this server owns its storage runtime.
+    pub fn is_owner(&self) -> bool {
+        matches!(self.mode, ServerMode::Owner(_))
+    }
+
+    /// Returns whether the owner-mode listener is running.
+    #[cfg(unix)]
+    pub fn is_listener_up(&self) -> bool {
+        matches!(
+            &self.mode,
+            ServerMode::Owner(OwnerRuntime {
+                listener: Some(_),
+                ..
+            })
+        )
+    }
+
+    /// Returns whether the owner-mode listener is running.
+    #[cfg(not(unix))]
+    pub fn is_listener_up(&self) -> bool {
+        false
+    }
+
     /// Opens or recovers a local server instance rooted at `root`.
     ///
     /// Canonicalizes/creates `root` and acquires an exclusive non-blocking advisory
@@ -300,7 +382,19 @@ impl LocalServer {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         let canonical_root = root.canonicalize()?;
-        let lock_guard = ProcessLock::acquire(&canonical_root)?;
+        let lock_guard = match ProcessLock::acquire(&canonical_root) {
+            Ok(lock_guard) => lock_guard,
+            #[cfg(unix)]
+            Err(HtapError::Conflict(_)) => {
+                let client = ipc::IpcClient::connect(&canonical_root)?;
+                return Ok(Self {
+                    mode: ServerMode::Client { client },
+                });
+            }
+            #[cfg(not(unix))]
+            Err(error @ HtapError::Conflict(_)) => return Err(error),
+            Err(error) => return Err(error),
+        };
 
         let spill_dir = canonical_root.join("spill");
         if let Err(error) = std::fs::remove_dir_all(&spill_dir) {
@@ -336,10 +430,10 @@ impl LocalServer {
         let colstore_dir = canonical_root.join("colstore");
         std::fs::create_dir_all(&colstore_dir)?;
 
-        Self::validate_storage_state_on_open(&catalog, &colstore_dir)?;
-        Self::migrate_legacy_id_high_water(&catalog, &colstore_dir)?;
+        OwnedServer::validate_storage_state_on_open(&catalog, &colstore_dir)?;
+        OwnedServer::migrate_legacy_id_high_water(&catalog, &colstore_dir)?;
 
-        let server = Self {
+        let owned_server = Arc::new(OwnedServer {
             _lock: lock_guard,
             catalog,
             engine,
@@ -348,20 +442,721 @@ impl LocalServer {
             execution_lock: Mutex::new(()),
             pinned_snapshots: Mutex::new(std::collections::BTreeMap::new()),
             colstore_dir,
-            data_root: canonical_root,
-            scan_workers: DEFAULT_SCAN_WORKERS,
-            query_parallelism: default_query_parallelism(),
-            query_memory_budget: DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
-            analyze_distinct_limit: DEFAULT_ANALYZE_DISTINCT_LIMIT,
-            gc_horizon_retention_slack: 0,
+            data_root: canonical_root.clone(),
+            scan_workers: AtomicUsize::new(DEFAULT_SCAN_WORKERS),
+            query_parallelism: AtomicUsize::new(default_query_parallelism()),
+            query_memory_budget: AtomicUsize::new(DEFAULT_QUERY_MEMORY_BUDGET_BYTES),
+            analyze_distinct_limit: AtomicUsize::new(DEFAULT_ANALYZE_DISTINCT_LIMIT),
+            gc_horizon_retention_slack: AtomicU64::new(0),
             next_session_id: AtomicU64::new(1),
-        };
-        if let Err(error) = server.reclaim_tick_locked(true) {
-            eprintln!("failed to reclaim dropped table artifacts on open: {error}");
+        });
+        {
+            let _guard = owned_server.execution_lock.lock();
+            if let Err(error) = owned_server.reclaim_tick_locked(true) {
+                eprintln!("failed to reclaim dropped table artifacts on open: {error}");
+            }
         }
-        Ok(server)
+
+        #[cfg(unix)]
+        let listener = ipc::start(&canonical_root, Arc::clone(&owned_server), 64)?;
+        Ok(Self {
+            mode: ServerMode::Owner(OwnerRuntime {
+                server: owned_server,
+                #[cfg(unix)]
+                listener,
+            }),
+        })
     }
 
+    /// Initializes the root superuser account once.
+    ///
+    /// When accounts have already been initialized, this does not change the catalog. If
+    /// `password` is supplied, the report indicates whether it matches the persisted root
+    /// password so callers can warn about configuration drift.
+    pub fn bootstrap_root_account(&self, password: Option<&str>) -> Result<BootstrapReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.bootstrap_root_account(password),
+            #[cfg(unix)]
+            ServerMode::Client { client } => {
+                let (_, payload) = client.bootstrap_root_account(password)?;
+                match payload {
+                    ipc::ResponsePayload::BootstrapReport(report) => Ok(report),
+                    _ => Err(HtapError::Internal(
+                        "client bootstrap_root_account returned an unexpected response payload"
+                            .into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Configures the maximum number of worker threads used for concurrent partition scans.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn with_scan_workers(self, scan_workers: usize) -> Self {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .scan_workers
+                .store(scan_workers.max(1), Ordering::Relaxed);
+        }
+        self
+    }
+
+    /// Sets the maximum number of worker threads used for concurrent partition scans.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn set_scan_workers(&mut self, scan_workers: usize) {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .scan_workers
+                .store(scan_workers.max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the configured scan worker thread count.
+    pub fn scan_workers(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.scan_workers.load(Ordering::Relaxed),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => DEFAULT_SCAN_WORKERS,
+        }
+    }
+
+    /// Configures the degree of parallelism used by general query execution.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn with_query_parallelism(self, parallelism: usize) -> Self {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .query_parallelism
+                .store(parallelism.max(1), Ordering::Relaxed);
+        }
+        self
+    }
+
+    /// Sets the degree of parallelism used by general query execution.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn set_query_parallelism(&mut self, parallelism: usize) {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .query_parallelism
+                .store(parallelism.max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the configured degree of parallelism for general query execution.
+    pub fn query_parallelism(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.query_parallelism.load(Ordering::Relaxed),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => default_query_parallelism(),
+        }
+    }
+
+    /// Configures the per-query memory budget in bytes.
+    pub fn with_query_memory_budget(self, limit: usize) -> Self {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .query_memory_budget
+                .store(limit, Ordering::Relaxed);
+        }
+        self
+    }
+
+    /// Sets the per-query memory budget in bytes.
+    pub fn set_query_memory_budget(&mut self, limit: usize) {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .query_memory_budget
+                .store(limit, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the configured per-query memory budget in bytes.
+    pub fn query_memory_budget(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => {
+                runtime.server.query_memory_budget.load(Ordering::Relaxed)
+            }
+            #[cfg(unix)]
+            ServerMode::Client { .. } => DEFAULT_QUERY_MEMORY_BUDGET_BYTES,
+        }
+    }
+
+    /// Configures the maximum exact distinct values retained per column by `ANALYZE TABLE`.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn with_analyze_distinct_limit(self, distinct_limit: usize) -> Self {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .analyze_distinct_limit
+                .store(distinct_limit.max(1), Ordering::Relaxed);
+        }
+        self
+    }
+
+    /// Sets the maximum exact distinct values retained per column by `ANALYZE TABLE`.
+    ///
+    /// Must be at least 1; values less than 1 are clamped to 1.
+    pub fn set_analyze_distinct_limit(&mut self, distinct_limit: usize) {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .analyze_distinct_limit
+                .store(distinct_limit.max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the configured exact-distinct limit used by `ANALYZE TABLE`.
+    pub fn analyze_distinct_limit(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .analyze_distinct_limit
+                .load(Ordering::Relaxed),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => DEFAULT_ANALYZE_DISTINCT_LIMIT,
+        }
+    }
+
+    /// Configures the number of recent MVCC versions retained behind the oldest active horizon.
+    pub fn with_gc_horizon_retention_slack(self, slack: u64) -> Self {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .gc_horizon_retention_slack
+                .store(slack, Ordering::Relaxed);
+        }
+        self
+    }
+
+    /// Sets the number of recent MVCC versions retained behind the oldest active horizon.
+    pub fn set_gc_horizon_retention_slack(&mut self, slack: u64) {
+        if let ServerMode::Owner(runtime) = &self.mode {
+            runtime
+                .server
+                .gc_horizon_retention_slack
+                .store(slack, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the configured compaction GC-horizon retention slack.
+    pub fn gc_horizon_retention_slack(&self) -> u64 {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .gc_horizon_retention_slack
+                .load(Ordering::Relaxed),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => 0,
+        }
+    }
+
+    /// Synchronously executes a single SQL statement against the local database.
+    ///
+    /// In client mode, forwards the request to the process that owns the storage runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] when statement execution or IPC forwarding fails.
+    pub fn execute(&self, sql: &str) -> Result<StatementResult> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.execute(sql),
+            #[cfg(unix)]
+            ServerMode::Client { client } => {
+                let (_, payload) = client.execute(sql)?;
+                match payload {
+                    ipc::ResponsePayload::StatementResult(result) => Ok(result),
+                    _ => Err(HtapError::Internal(
+                        "client execute returned an unexpected response payload".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Executes a general query with explicit optimizer, memory-budget, and parallelism settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtapError`] when query execution fails or client mode is active.
+    pub fn execute_query_with_options(
+        &self,
+        sql: &str,
+        optimization_mode: OptimizationMode,
+        memory_budget: usize,
+        parallelism: usize,
+    ) -> Result<StatementResult> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.execute_query_with_options(
+                sql,
+                optimization_mode,
+                memory_budget,
+                parallelism,
+            ),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "execute_query_with_options is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Returns the worker count used by the most recently executed general query.
+    pub fn last_query_parallel_workers(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_parallel_workers(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => 1,
+        }
+    }
+
+    /// Returns whether the most recently executed general query spilled a hash join.
+    pub fn last_query_hash_join_spilled(&self) -> bool {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_hash_join_spilled(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => false,
+        }
+    }
+
+    /// Returns whether the most recently executed general query spilled a group-by operation.
+    pub fn last_query_group_by_spilled(&self) -> bool {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_group_by_spilled(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => false,
+        }
+    }
+
+    /// Returns whether the most recently executed general query spilled a sort operation.
+    pub fn last_query_sort_spilled(&self) -> bool {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_sort_spilled(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => false,
+        }
+    }
+
+    /// Returns whether the most recently executed general query spilled a distinct operation.
+    pub fn last_query_distinct_spilled(&self) -> bool {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_distinct_spilled(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => false,
+        }
+    }
+
+    /// Returns whether the most recently executed general query spilled a set operation.
+    pub fn last_query_set_operation_spilled(&self) -> bool {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_set_operation_spilled(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => false,
+        }
+    }
+
+    /// Returns whether the most recently executed general query spilled a window operation.
+    pub fn last_query_window_spilled(&self) -> bool {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_window_spilled(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => false,
+        }
+    }
+
+    /// Returns the optimizer invocation count for the most recently executed general query.
+    pub fn last_query_optimizer_invocations(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_optimizer_invocations(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => 0,
+        }
+    }
+
+    /// Reclaims deferred artifacts from dropped tables.
+    pub fn reclaim_tick(&self) -> Result<ReclaimReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.reclaim_tick(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "reclaim_tick is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Runs one bounded rowstore compaction and reclamation maintenance tick.
+    pub fn compaction_tick(&self) -> Result<CompactionTickReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.compaction_tick(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "compaction_tick is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Returns a borrowing facade for server-integrated data movement operations.
+    pub fn data_mover(&self) -> Result<LocalServerDataMover<'_>> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => Ok(runtime.server.data_mover()),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "data_mover is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Returns the server transaction manager.
+    pub fn txn_manager(&self) -> Result<&TransactionManager> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => Ok(runtime.server.txn_manager()),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "txn_manager is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Returns the columnar storage root directory.
+    pub fn colstore_dir(&self) -> Result<&Path> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => Ok(runtime.server.colstore_dir()),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "colstore_dir is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Creates a new partitioned table according to the provided definition.
+    pub fn create_partitioned_table(
+        &self,
+        definition: PartitionedTableDefinition,
+    ) -> Result<StatementResult> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.create_partitioned_table(definition),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "create_partitioned_table is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Alters partition topology of an existing partitioned table.
+    pub fn alter_partitions(
+        &self,
+        table_name: &str,
+        alteration: impl Into<PartitionAlteration>,
+    ) -> Result<StatementResult> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.alter_partitions(table_name, alteration),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "alter_partitions is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Converts a single-partition table from row to column format.
+    pub fn convert_table(&self, table_name: &str) -> Result<htap_convert::TabletColumnManifest> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.convert_table(table_name),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "convert_table is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Converts all partitions of a table to columnar format.
+    pub fn convert_table_to_column(&self, table_name: &str) -> Result<TableConversionReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.convert_table_to_column(table_name),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "convert_table_to_column is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Demotes all partitions of a table back to row storage.
+    pub fn convert_table_to_row(&self, table_name: &str) -> Result<TableConversionReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.convert_table_to_row(table_name),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "convert_table_to_row is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Executes a conversion tick according to the given policy.
+    pub fn conversion_tick(&self, policy: ConversionPolicy) -> Result<ConversionTickReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.conversion_tick(policy),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "conversion_tick is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Executes a conversion tick using the default manual policy.
+    pub fn tick(&self) -> Result<ConversionTickReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.tick(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "tick is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Imports records from a CSV file.
+    pub fn copy_from_csv(&self, options: &CopyOptions) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().copy_from_csv(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "copy_from_csv is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Imports records from a JSONLines file.
+    pub fn copy_from_jsonl(&self, options: &CopyOptions) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().copy_from_jsonl(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "copy_from_jsonl is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Imports records from a generic CSV reader.
+    pub fn copy_from_csv_reader<R: std::io::Read>(
+        &self,
+        options: &CopyOptions,
+        reader: R,
+    ) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .data_mover()
+                .copy_from_csv_reader(options, reader),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "copy_from_csv_reader is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Imports records from a generic JSONLines reader.
+    pub fn copy_from_jsonl_reader<R: std::io::Read>(
+        &self,
+        options: &CopyOptions,
+        reader: R,
+    ) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .data_mover()
+                .copy_from_jsonl_reader(options, reader),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "copy_from_jsonl_reader is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Imports records according to the configured file format.
+    pub fn import(&self, options: &CopyOptions) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().import(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "import is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Exports records to a CSV file.
+    pub fn copy_to_csv(&self, options: &CopyOptions) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().copy_to_csv(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "copy_to_csv is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Exports records to a JSONLines file.
+    pub fn copy_to_jsonl(&self, options: &CopyOptions) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().copy_to_jsonl(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "copy_to_jsonl is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Exports records to a generic CSV writer.
+    pub fn copy_to_csv_writer<W: std::io::Write>(
+        &self,
+        options: &CopyOptions,
+        writer: W,
+    ) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .data_mover()
+                .copy_to_csv_writer(options, writer),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "copy_to_csv_writer is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Exports records to a generic JSONLines writer.
+    pub fn copy_to_jsonl_writer<W: std::io::Write>(
+        &self,
+        options: &CopyOptions,
+        writer: W,
+    ) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .data_mover()
+                .copy_to_jsonl_writer(options, writer),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "copy_to_jsonl_writer is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Exports records according to the configured file format.
+    pub fn export(&self, options: &CopyOptions) -> Result<CopyReport> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().export(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "export is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Clones a source tablet partition snapshot into a durable logical package.
+    pub fn clone_tablet(&self, options: &TabletCloneOptions) -> Result<TabletPackageManifest> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().clone_tablet(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "clone_tablet is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Verifies the integrity and consistency of a tablet clone package.
+    pub fn verify_package(&self, options: &TabletCloneOptions) -> Result<TabletPackageManifest> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().verify_package(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "verify_package is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Reconciles and repairs an unhealthy replica.
+    pub fn repair_tablet(&self, options: &TabletCloneOptions) -> Result<ReplicaDescriptor> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().repair_tablet(options),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "repair_tablet is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Loads an existing movement job by ID.
+    pub fn load_job(&self, job_id: &str) -> Result<Option<MovementJob>> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().load_job(job_id),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "load_job is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Resumes an existing movement job by ID.
+    pub fn resume_job(&self, job_id: &str) -> Result<MovementJob> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.data_mover().resume_job(job_id),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "resume_job is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Returns the underlying local data mover.
+    pub fn mover(&self) -> Result<&LocalDataMover> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => Ok(&runtime.server.data_mover),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => Err(HtapError::Unsupported(
+                "mover is unavailable in client mode".into(),
+            )),
+        }
+    }
+
+    /// Authenticates a catalog account and opens a session bound to that account principal.
+    ///
+    /// Authentication failures deliberately use one generic permission-denied response so callers
+    /// cannot distinguish unknown, locked, and incorrectly authenticated accounts.
+    pub fn authenticate_session(
+        self: &Arc<Self>,
+        username: &str,
+        scramble: &[u8],
+        auth_response: &[u8],
+    ) -> Result<Session> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => {
+                let principal = session::authenticate_principal(
+                    &runtime.server,
+                    username,
+                    scramble,
+                    auth_response,
+                )?;
+                let mut session = self.open_session()?;
+                session.set_principal(principal);
+                Ok(session)
+            }
+            #[cfg(unix)]
+            ServerMode::Client { .. } => {
+                let mut session = self.open_session()?;
+                session.authenticate_remote(username, scramble, auth_response)?;
+                Ok(session)
+            }
+        }
+    }
+}
+
+impl OwnedServer {
     /// Initializes the root superuser account once.
     ///
     /// When accounts have already been initialized, this does not change the catalog. If
@@ -433,98 +1228,6 @@ impl LocalServer {
         })
     }
 
-    /// Configures the maximum number of worker threads used for concurrent partition scans.
-    ///
-    /// Must be at least 1; values less than 1 are clamped to 1.
-    pub fn with_scan_workers(mut self, scan_workers: usize) -> Self {
-        self.scan_workers = scan_workers.max(1);
-        self
-    }
-
-    /// Sets the maximum number of worker threads used for concurrent partition scans.
-    ///
-    /// Must be at least 1; values less than 1 are clamped to 1.
-    pub fn set_scan_workers(&mut self, scan_workers: usize) {
-        self.scan_workers = scan_workers.max(1);
-    }
-
-    /// Returns the configured scan worker thread count.
-    pub fn scan_workers(&self) -> usize {
-        self.scan_workers
-    }
-
-    /// Configures the degree of parallelism used by general query execution.
-    ///
-    /// Must be at least 1; values less than 1 are clamped to 1.
-    pub fn with_query_parallelism(mut self, parallelism: usize) -> Self {
-        self.query_parallelism = parallelism.max(1);
-        self
-    }
-
-    /// Sets the degree of parallelism used by general query execution.
-    ///
-    /// Must be at least 1; values less than 1 are clamped to 1.
-    pub fn set_query_parallelism(&mut self, parallelism: usize) {
-        self.query_parallelism = parallelism.max(1);
-    }
-
-    /// Returns the configured degree of parallelism for general query execution.
-    pub fn query_parallelism(&self) -> usize {
-        self.query_parallelism
-    }
-
-    /// Configures the per-query memory budget in bytes.
-    pub fn with_query_memory_budget(mut self, limit: usize) -> Self {
-        self.query_memory_budget = limit;
-        self
-    }
-
-    /// Sets the per-query memory budget in bytes.
-    pub fn set_query_memory_budget(&mut self, limit: usize) {
-        self.query_memory_budget = limit;
-    }
-
-    /// Returns the configured per-query memory budget in bytes.
-    pub fn query_memory_budget(&self) -> usize {
-        self.query_memory_budget
-    }
-
-    /// Configures the maximum exact distinct values retained per column by `ANALYZE TABLE`.
-    ///
-    /// Must be at least 1; values less than 1 are clamped to 1.
-    pub fn with_analyze_distinct_limit(mut self, distinct_limit: usize) -> Self {
-        self.analyze_distinct_limit = distinct_limit.max(1);
-        self
-    }
-
-    /// Sets the maximum exact distinct values retained per column by `ANALYZE TABLE`.
-    ///
-    /// Must be at least 1; values less than 1 are clamped to 1.
-    pub fn set_analyze_distinct_limit(&mut self, distinct_limit: usize) {
-        self.analyze_distinct_limit = distinct_limit.max(1);
-    }
-
-    /// Returns the configured exact-distinct limit used by `ANALYZE TABLE`.
-    pub fn analyze_distinct_limit(&self) -> usize {
-        self.analyze_distinct_limit
-    }
-
-    /// Configures the number of recent MVCC versions retained behind the oldest active horizon.
-    pub fn with_gc_horizon_retention_slack(mut self, slack: u64) -> Self {
-        self.gc_horizon_retention_slack = slack;
-        self
-    }
-
-    /// Sets the number of recent MVCC versions retained behind the oldest active horizon.
-    pub fn set_gc_horizon_retention_slack(&mut self, slack: u64) {
-        self.gc_horizon_retention_slack = slack;
-    }
-
-    /// Returns the configured compaction GC-horizon retention slack.
-    pub fn gc_horizon_retention_slack(&self) -> u64 {
-        self.gc_horizon_retention_slack
-    }
-
     /// Registers the MVCC version pinned by an open session transaction.
     pub(crate) fn register_pinned_snapshot(&self, session_id: SessionId, version: Version) {
         self.pinned_snapshots.lock().insert(session_id, version);
@@ -537,7 +1240,9 @@ impl LocalServer {
     pub(crate) fn unregister_pinned_snapshot(&self, session_id: SessionId) {
         self.pinned_snapshots.lock().remove(&session_id);
     }
+}
 
+impl OwnedServer {
     /// Returns the oldest MVCC version pinned by an open session transaction.
     fn oldest_pinned_snapshot(&self) -> Option<(SessionId, Version)> {
         self.pinned_snapshots
@@ -724,7 +1429,7 @@ impl LocalServer {
         let gc_horizon = Version::new(
             limiting_version
                 .get()
-                .saturating_sub(self.gc_horizon_retention_slack),
+                .saturating_sub(self.gc_horizon_retention_slack.load(Ordering::Relaxed)),
         );
 
         let mut dropped_partition_ids = std::collections::HashSet::new();
@@ -955,8 +1660,7 @@ impl LocalServer {
         let _guard = self.execution_lock.lock();
 
         let statement = htap_sql::parse_one(sql)?;
-        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
-        let bound = htap_sql::bind(&statement, &catalog)?;
+        let (bound, catalog) = self.prepare_statement(&statement, &Principal::Superuser)?;
 
         self.dispatch_bound(
             bound,
@@ -965,6 +1669,21 @@ impl LocalServer {
             &DefaultVariables,
             &Principal::Superuser,
         )
+    }
+
+    /// Loads the catalog, checks statement visibility and privileges, and binds a parsed statement.
+    ///
+    /// The returned catalog snapshot is the same snapshot used for binding and authorization.
+    pub(crate) fn prepare_statement(
+        &self,
+        statement: &sqlparser::ast::Statement,
+        principal: &Principal,
+    ) -> Result<(BoundStatement, CatalogSnapshot)> {
+        let catalog = self.catalog.load()?.unwrap_or_else(CatalogSnapshot::empty);
+        privilege::check_statement_visible(principal, statement, &catalog)?;
+        let bound = htap_sql::bind(statement, &catalog)?;
+        privilege::check_privileges(principal, &bound, &catalog)?;
+        Ok((bound, catalog))
     }
 
     /// Executes a query with explicit optimizer, memory-budget, and parallelism settings.
@@ -1007,22 +1726,6 @@ impl LocalServer {
         })
     }
 
-    /// Authenticates a catalog account and opens a session bound to that account principal.
-    ///
-    /// Authentication failures deliberately use one generic permission-denied response so callers
-    /// cannot distinguish unknown, locked, and incorrectly authenticated accounts.
-    pub fn authenticate_session(
-        self: &Arc<Self>,
-        username: &str,
-        scramble: &[u8],
-        auth_response: &[u8],
-    ) -> Result<Session> {
-        let principal = session::authenticate_principal(self, username, scramble, auth_response)?;
-        let mut session = self.open_session();
-        session.set_principal(principal);
-        Ok(session)
-    }
-
     /// Returns the server's transaction manager.
     ///
     /// Exposed for tests that need to inject commit-path failures via
@@ -1044,10 +1747,12 @@ impl LocalServer {
         let table_id = table.id;
         let snapshot = Snapshot::new(self.txn_manager.visible_version());
         let source_columns: Vec<usize> = (0..table.schema.len()).collect();
-        let memory_budget = Arc::new(memory_budget::MemoryBudget::new(self.query_memory_budget));
+        let memory_budget = Arc::new(memory_budget::MemoryBudget::new(
+            self.query_memory_budget.load(Ordering::Relaxed),
+        ));
         let mut accumulator = analyze::AnalyzeAccumulator::new(
             table.schema.len(),
-            self.analyze_distinct_limit,
+            self.analyze_distinct_limit.load(Ordering::Relaxed),
             Arc::clone(&memory_budget),
         );
 
@@ -1139,8 +1844,6 @@ impl LocalServer {
         variables: &dyn VariableLookup,
         principal: &Principal,
     ) -> Result<StatementResult> {
-        privilege::check_privileges(principal, &bound, catalog)?;
-
         match bound {
             BoundStatement::CreateTable(create) => {
                 let _route = classify_route(
@@ -2293,9 +2996,11 @@ impl LocalServer {
             variables: Some(variables),
             working_rows: None,
             working_width: 0,
-            memory_budget: Arc::new(memory_budget::MemoryBudget::new(self.query_memory_budget)),
+            memory_budget: Arc::new(memory_budget::MemoryBudget::new(
+                self.query_memory_budget.load(Ordering::Relaxed),
+            )),
             spill_root: self.data_root(),
-            parallelism: self.query_parallelism,
+            parallelism: self.query_parallelism.load(Ordering::Relaxed),
             optimization_mode: query_exec::OptimizationMode::Enabled,
         };
         let all_columns: std::collections::BTreeSet<usize> = (0..table_desc.schema.len()).collect();
@@ -2705,9 +3410,11 @@ impl LocalServer {
             variables: Some(variables),
             working_rows: None,
             working_width: 0,
-            memory_budget: Arc::new(memory_budget::MemoryBudget::new(self.query_memory_budget)),
+            memory_budget: Arc::new(memory_budget::MemoryBudget::new(
+                self.query_memory_budget.load(Ordering::Relaxed),
+            )),
             spill_root: self.data_root(),
-            parallelism: self.query_parallelism,
+            parallelism: self.query_parallelism.load(Ordering::Relaxed),
             optimization_mode: query_exec::OptimizationMode::Enabled,
         };
         let all_columns: std::collections::BTreeSet<usize> = (0..table_desc.schema.len()).collect();
@@ -2809,7 +3516,11 @@ impl LocalServer {
         let pushdown_predicate = olap::select_pushdown_predicate(select.filter.as_ref());
 
         let n_parts = selected_partitions.len();
-        let num_workers = self.scan_workers.max(1).min(n_parts.max(1));
+        let num_workers = self
+            .scan_workers
+            .load(Ordering::Relaxed)
+            .max(1)
+            .min(n_parts.max(1));
 
         // 2. Concurrently execute partition scans with bounded workers
         let partition_results: Vec<Result<Vec<Row>>> = if n_parts <= 1 || num_workers <= 1 {
@@ -3089,7 +3800,7 @@ pub(crate) fn scan_partition_compact(
     }
 }
 
-impl LocalServer {
+impl OwnedServer {
     /// Returns the canonical data root directory for this local server.
     pub(crate) fn data_root(&self) -> &Path {
         &self.data_root

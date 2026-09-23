@@ -62,7 +62,7 @@ components are **deliberately not implemented** and are out of scope for this lo
   reclaim-leased (busy) partition blocks compaction of every SST that contains or spans it (the rowstore is
   one shared keyspace, so protection is per SST, not per row). Folding accumulated rowstore deltas forward
   into new columnar segments, and delete vectors on columnar segments, remain deferred.
-- **Exclusive Process Ownership (No Concurrent Multiprocess Operation):** `LocalServer` and `LocalCoordinator` enforce exclusive ownership of their root directory using an OS-level advisory lock (`<root>/LOCK` via `flock`). Concurrent access or duplicate opens by multiple processes against the same root directory (or its symlink aliases) are strictly rejected with `HtapError::Conflict`. This is single-process exclusive ownership, not concurrent shared-root operation; concurrent multiprocess writers are not supported. Low-level standalone subsystem instances (`htap_rowstore::Engine::open`, `htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) do not acquire this lock and remain unsafe for concurrent shared-root use.
+- **Exclusive Storage Ownership, Now With IPC Forwarding for a Second Process (Phase 16):** `LocalServer` and `LocalCoordinator` still enforce exclusive ownership of their root directory using an OS-level advisory lock (`<root>/LOCK` via `flock`); exactly one process ever touches storage directly, and this is still not concurrent shared-root writers. What changed: a second (or later) process opening the same root is no longer just rejected with `HtapError::Conflict` — it becomes an IPC client and forwards SQL/session calls to the owner over a Unix domain socket at `<root>/htap.sock` (mode `0600`, Unix-only; non-Unix targets keep the unconditional `Conflict`). Three rounds of post-landing storage re-review (ADR-025's "batch D/E/F") found 28 defects the passing test suite alone had not caught and fixed 27 of them (one, a `change_user` gate-ordering quirk, is recorded as a limitation instead), including two client-mode panic paths, a socket-permission window, and — found only once a fake regression test was replaced with a real one — a private-staging-directory leak on every server start; see "Concurrent multiprocess use: owner plus IPC (Phase 16)" in `docs/ARCHITECTURE.md` and ADR-025 in `docs/DECISIONS.md` for the full design, and `docs/LIMITATIONS.md` for the disclosed gaps (client sessions cannot change users, a client-mode handle's configuration setters (both `with_*` builder and `set_*` mutable forms) are accepted no-ops, administrative/data-mover/conversion/compaction operations stay owner-only, a lost client connection is terminal, and a socket bind failure falls back to the pre-Phase-16 lock-only mode). Low-level standalone subsystem instances (`htap_rowstore::Engine::open`, `htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) still do not participate in this and remain unsafe for concurrent shared-root use.
 
 ---
 
@@ -70,7 +70,7 @@ components are **deliberately not implemented** and are out of scope for this lo
 
 The `htap-client` crate provides [`EmbeddedClient`], an ergonomic synchronous in-process façade over `LocalServer`:
 
-- **`EmbeddedClient::open(root)`:** Opens or recovers the local database rooted at `root`, acquiring `<root>/LOCK`, loading catalog metadata, recovering committed rowstore transactions, and initializing data movement.
+- **`EmbeddedClient::open(root)`:** Opens or recovers the local database rooted at `root`, acquiring `<root>/LOCK`, loading catalog metadata, recovering committed rowstore transactions, and initializing data movement. If another process already holds `<root>/LOCK`, this instead becomes an IPC client that forwards SQL/session calls to that owner over `<root>/htap.sock` (Phase 16, ADR-025) — it does none of the local storage-opening steps above in that case, and `EmbeddedClient::execute`/`open_session` behave identically either way from the caller's perspective. See "Concurrent multiprocess use: owner plus IPC (Phase 16)" in `docs/ARCHITECTURE.md`.
 - **`client.execute(sql)`:** Synchronously executes a single SQL statement against the embedded engine, returning a [`StatementResult`].
 - **Re-exported Result Types:**
   - [`StatementResult`]: `StatementResult::Command(CommandResult)` or `StatementResult::Query(QueryResult)`.
@@ -327,7 +327,7 @@ fn main() -> Result<()> {
     client.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance INT);")?;
     client.execute("INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 0);")?;
 
-    let mut session = client.open_session();
+    let mut session = client.open_session()?;
     session.begin()?;
     session.execute("UPDATE accounts SET balance = balance - 50 WHERE id = 1;")?;
     session.execute("UPDATE accounts SET balance = balance + 50 WHERE id = 2;")?;

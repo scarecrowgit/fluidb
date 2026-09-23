@@ -660,7 +660,9 @@ fn handle_connection(stream: TcpStream, connection_id: u32, shared: &Shared) -> 
     // whole lifetime. One `PreparedStatementRegistry` per connection too (Phase 11 plan task 4):
     // unlike `htap_server::Session`, prepared statements have no counterpart inside `htap-server`
     // at all, since they are a wire-protocol concept.
-    server_session.set_max_allowed_packet(shared.max_allowed_packet as u64);
+    if let Err(error) = server_session.set_max_allowed_packet(shared.max_allowed_packet as u64) {
+        tracing::warn!(connection_id, error = %error, "failed to set session max_allowed_packet");
+    }
     let mut registry =
         PreparedStatementRegistry::new(MAX_PREPARED_STATEMENTS, shared.max_allowed_packet);
     let result = run_commands(
@@ -967,6 +969,11 @@ fn authenticate(
             .authenticate_session(&response.username, &scramble, &auth_response)
         {
             Ok(session) => session,
+            Err(HtapError::Conflict(message)) => {
+                tracing::warn!(connection_id, user = %response.username, error = %message, "owner unavailable during authentication");
+                send_err(stream, &mut seq, ER_UNKNOWN, &message)?;
+                return Ok(None);
+            }
             Err(_) => {
                 tracing::warn!(connection_id, user = %response.username, "access denied");
                 send_err(
@@ -1004,7 +1011,14 @@ fn authenticate(
             )?;
             return Ok(None);
         }
-        shared.server.open_session()
+        match shared.server.open_session() {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(connection_id, error = %error, "failed to open session");
+                send_err(stream, &mut seq, ER_UNKNOWN, &error.to_string())?;
+                return Ok(None);
+            }
+        }
     };
 
     if let Some(db) = response.database.as_deref() {
@@ -1748,6 +1762,10 @@ fn respond_change_user(
             Ok(()) => {}
             Err(HtapError::DurablePending { .. }) => {
                 send_err(stream, seq, ER_UNKNOWN, "resource busy")?;
+                return Ok(true);
+            }
+            Err(error @ HtapError::Conflict(_)) => {
+                send_err(stream, seq, ER_UNKNOWN, &error.to_string())?;
                 return Ok(true);
             }
             Err(_) => {

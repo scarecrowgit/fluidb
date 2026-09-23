@@ -36,7 +36,45 @@ The following operational facilities and production features are **explicitly no
   is trusted.
 - **Narrow OLAP SQL path, plus a separate general query executor:** `LocalServer` executes narrow single-table analytical scans (`Route::OlapScan`: plain projections, AND-only typed filters, `COUNT(*)`, `COUNT(col)`, `SUM(Int32/Int64/Float64)`, `MIN/MAX`, deterministic `GROUP BY` with SQL NULL grouping, and simple unqualified source/projected column `ORDER BY` with ASC/DESC and NULLS FIRST/LAST/default policy, global deterministic tie-break) over logical rowstore and base-plus-delta rows using server-root `<root>/colstore` for materialized `Column`/`Converting` partitions. For `Column` and `Converting` partitions, `LocalServer` executes projection-aware compact reads (PK + requested column union), safely pushing down one eligible predicate leaf directly into `SegmentReader::scan`, suppressing stale base rows via post-base rowstore deltas, and evaluating residual SQL logic. ScanStats/pruning is available as internal execution evidence, but SQL still uses materialized logical rows and vectorized aggregation is not implemented. Complete-PK `RowstorePointRead` remains separate and unchanged. This narrow path itself has no joins, CTEs, windows, expressions beyond a plain column, or `HAVING`/`OR`/arithmetic — those are handled instead by the separate general query executor (`Route::Query`, `htap-server::query_exec`), which implements joins (including `FULL OUTER`/`NATURAL`/`USING` and nested join trees), CTEs (including `WITH RECURSIVE`), expressions, aliases, full `ORDER BY`/`GROUP BY` (including ordinals), `LIMIT`/`OFFSET`, `HAVING`, `OR`/`NOT`/arithmetic/casts, `AVG`/`DISTINCT` aggregates, window functions, correlated subqueries (one level deep), `UNION`/`EXCEPT`/`INTERSECT`, `DELETE` by filter, `TRUNCATE`, and `INSERT ... SELECT` — see `docs/ARCHITECTURE.md`'s Phase 9/13 paragraphs and `docs/LIMITATIONS.md`'s "General query executor scope and deferred features" for the full contract. Direct `SegmentReader` pushdown optimization is implemented for the compact base path. As of Phase 14, the general `Route::Query` executor also has `ANALYZE TABLE` statistics, a statistics-driven cost-based optimizer (`htap_sql::optimize`, enabled by default), `EXPLAIN`/`EXPLAIN ANALYZE`, a per-statement memory budget with disk spilling, and bounded parallelism for `GROUP BY`/`INNER`/`CROSS` hash joins — see "Cost-based optimization, `EXPLAIN`, spilling, and parallelism (Phase 14)" in `README.md` and ADR-023 in `docs/DECISIONS.md`. Compound `AND` pushdown beyond one leaf, `!=` pushdown, vectorized operator pipelines, worker-pool parallelism above the per-slot scan for `LEFT`/`RIGHT`/`FULL` joins (their equi-hash spilling is not itself kind-restricted in code, but is exercised by a test only for `INNER` joins), memory-bounded spilling for non-equi/`CROSS` joins (a genuine gap — evaluated by an in-memory nested loop with no budget check at all), multi-tablet/distributed scans, resource quotas/cancellation, DataFusion/Arrow, and full MySQL breadth remain unsupported on every path.
 - **No High Availability (HA) or Distributed Consensus:** No Raft (`openraft`), ZooKeeper ensemble backend, network heartbeats, ephemeral sessions, remote RPC replica serving, or active failover exists.
-- **One-Owner Multiprocess-Exclusive Mode (Not Concurrent Shared-Root Writers):** Root locking (`<root>/LOCK`) enforces that only one operating system process may open a server or coordinator root. Concurrent multiprocess shared-root operations and concurrent writers are strictly unsupported. Standalone subsystem opens (`Engine::open`, `LocalCatalogStore::open`, `LocalDataMover::new`) do not acquire this lock and remain unsafe for direct concurrent use.
+- **One-Owner Multiprocess-Exclusive Mode, Now With IPC Forwarding for Later Processes (Phase 16, ADR-025):**
+  Root locking (`<root>/LOCK`) still enforces that only one operating system process ever touches a server
+  root's storage directly — concurrent shared-root writers or readers at the storage layer are still strictly
+  unsupported, unchanged. What changed: the process that wins that lock (the **owner**) also starts a
+  background IPC listener bound to `<root>/htap.sock` (a Unix domain socket, Unix-only), and a later process
+  that loses the lock race no longer just fails — it becomes an IPC **client** and forwards SQL and session
+  calls to the owner over that socket instead of touching storage itself. `LocalServer::is_owner()` reports
+  which mode a given handle is in, and `LocalServer::is_listener_up()` reports whether the owner's listener is
+  actually accepting connections (a healthy owner) or has fallen back to lock-only mode (a degraded owner —
+  see below); a client-mode `LocalServer` reports `is_listener_up() == false` as well, since the query is
+  about *this* handle's own listener, not the remote owner's.
+  - **Trust boundary.** The published socket is mode `0600` (owner read/write only), matching the same
+    same-OS-user trust model already documented for `<root>/LOCK` — this is not a security boundary against
+    another local user with filesystem access to the whole root, only against accidental cross-process
+    interference. A storage re-review (batch E) found that the original implementation bound the socket
+    directly at `<root>/htap.sock` with the process's default file-creation mask and only tightened it to
+    `0600` a moment later; since the root directory is itself world-traversable, another local user who
+    connected in that window would have gotten an unauthenticated superuser session. The socket is now
+    created inside a private, owner-only (`0700`) directory, tightened there, and atomically renamed into
+    place, closing the window entirely — no peer-credential checking is needed to fix this specific gap (see
+    ADR-025's "Post-review fixes (batch E)" section). That private directory itself is removed right after the
+    rename publishes the socket, and any left behind by a crashed prior owner are cleaned up at the start of
+    the next `LocalServer::open` on that root — a batch F storage re-review found the successful-path removal
+    was missing, so every server that ever started, not only a crashed one, leaked one of these directories
+    into `<root>` until this fix (see ADR-025's "Post-review fixes (batch F)" section).
+  - **Long-socket-path fallback.** If `<root>/htap.sock`'s absolute path is too long for this kind of Unix
+    domain socket, or a non-socket file already occupies that path, the owner logs a warning and falls back to
+    the pre-Phase-16 lock-only mode: it keeps working normally for itself, but a second opener on that root
+    gets the ordinary `HtapError::Conflict` (lock contention), not IPC forwarding, exactly as it would have
+    before this phase. `is_listener_up()` reports `false` in this case.
+  - **Listener-health query.** Use `server.is_owner()` and `server.is_listener_up()` together to distinguish a
+    healthy owner (`true`, `true`) from a degraded, lock-only owner (`true`, `false`) from a client
+    (`false`, `false`) — a monitoring or diagnostic caller should treat `(true, false)` as "storage is fine,
+    but a second process on this root will get `Conflict` instead of forwarding," not as an error.
+  - Standalone subsystem opens (`Engine::open`, `LocalCatalogStore::open`, `LocalDataMover::new`) do not
+    acquire this lock, do not participate in the owner/client split, and remain unsafe for direct concurrent
+    use — unchanged by this phase. See "Concurrent multiprocess use: owner plus IPC (Phase 16)" in
+    `docs/ARCHITECTURE.md`, ADR-025, and `docs/LIMITATIONS.md`'s "Owner plus IPC (Phase 16) scope and deferred
+    features" for the full contract.
 - **`txn.journal` Is Checkpointed (Phase 15); the `MANIFEST` v2 External-Apply Ledger's Hard Cap Is Separate and Unaddressed:** `TransactionManager::checkpoint()` compacts `txn.journal` by dropping resolved `Intent`/`Commit`/`Abort` records past a durable baseline (`txn.checkpoint`, `HTAPTXC1`) — see section 3 below for the full contract. The rowstore `MANIFEST` v2 external-apply ledger has no compaction or coordinated retention and still enforces a hard cap (`MAX_APPLIED_EXTERNAL_TXNS = 1_000_000`). Once full, new external applies fail with `HtapError::InvalidArgument` (there is no `HtapError::CapacityExceeded` variant); a Phase 10 fix pass moved this check into `Engine::prepare` as well, so a real 2PC/direct-commit transaction is rejected before any journal write rather than only at apply time. Do not conflate the two — checkpointing the journal does not touch the ledger's cap.
 - **Possible Later Flush-Boundary Duplicate SST Publication After Crash:** Crashes occurring after an SST is written but before reader registration, manifest update, or checkpoint advance can cause duplicate SST publication on subsequent cycles, requiring future staged flush recovery.
 - **No Power-Loss Proof:** Integration crash tests prove recovery across process `SIGKILL` termination, not physical machine power loss, host kernel panics, or write cache invalidation.
@@ -96,8 +134,8 @@ When opening or recovering a database instance at a given `root` path, `LocalSer
 flowchart TD
     Start["LocalServer::open(root)"] --> Mkdir["Create root directory if missing<br/>std::fs::create_dir_all(&amp;root)"]
     Mkdir --> Canon["Canonicalize root path<br/>root.canonicalize()"]
-    Canon --> Lock["Acquire ProcessLock on &lt;canonical_root&gt;/LOCK<br/>(OS flock exclusive, non-blocking)"]
-    Lock --> Catalog["Open LocalCatalogStore at &lt;canonical_root&gt;/catalog<br/>catalog/{CATALOG, CATALOG.tmp}"]
+    Canon --> Lock["Attempt ProcessLock on &lt;canonical_root&gt;/LOCK<br/>(OS flock exclusive, non-blocking)"]
+    Lock -->|"lock acquired: this process becomes the owner"| Catalog["Open LocalCatalogStore at &lt;canonical_root&gt;/catalog<br/>catalog/{CATALOG, CATALOG.tmp}"]
     Catalog --> Rowstore["Open Rowstore Engine at &lt;canonical_root&gt;/rowstore<br/>wal/{20-digit}.wal, sst/{id}.sst, MANIFEST, VISIBLE"]
     Rowstore --> TxnJourn["Open TransactionManager at &lt;canonical_root&gt;/txn.journal"]
     TxnJourn --> Part1["Register RowstoreParticipant<br/>(ParticipantId(1) wrapping Engine)"]
@@ -105,7 +143,12 @@ flowchart TD
     Recov --> Move["Initialize LocalDataMover at &lt;canonical_root&gt;/movement<br/>movement/jobs, movement/tablets"]
     Move --> Colstore["Initialize Columnar Storage Root at &lt;canonical_root&gt;/colstore<br/>std::fs::create_dir_all(&amp;colstore_dir)"]
     Colstore --> ValStor["Validate Storage State on Open<br/>validate_storage_state_on_open (fail-closed catalog/colstore check)"]
-    ValStor --> Ready["Return ready LocalServer instance"]
+    ValStor --> Reclaim["Startup reclaim under execution_lock<br/>reclaim_tick_locked(true) (Phase 15; sequenced<br/>before the listener starts, batch D fix)"]
+    Reclaim --> Listen["Start IPC listener at &lt;canonical_root&gt;/htap.sock<br/>(Phase 16, ADR-025; non-fatal fallback to lock-only on bind failure)"]
+    Listen --> Ready["Return ready LocalServer instance (owner mode)"]
+    Lock -->|"lock already held (Unix only)"| IpcConnect["ipc::IpcClient::connect(&lt;canonical_root&gt;)<br/>(Phase 16, ADR-025; bounded startup-race retry)"]
+    IpcConnect -->|"handshake succeeds"| ReadyClient["Return ready LocalServer instance (client mode)<br/>no local storage opened in this process"]
+    IpcConnect -->|"handshake fails, or non-Unix target"| ConflictErr["Return HtapError::Conflict<br/>(pre-Phase-16 behavior, unchanged)"]
 ```
 
 ### Filesystem Layout
@@ -115,6 +158,7 @@ flowchart TD
 ```text
 <root>/
 ├── LOCK                                      # Exclusive process advisory lock and diagnostic PID/start-time (1083fbd)
+├── htap.sock                                 # Owner-only IPC listener socket, mode 0600, Unix-only (Phase 16, ADR-025)
 ├── catalog/
 │   ├── CATALOG                               # Durable catalog snapshot state (bounded envelope b7ff200)
 │   └── CATALOG.tmp                           # Staging file for atomic replacement
@@ -149,9 +193,35 @@ flowchart TD
 
 0. **`LOCK` (`ProcessLock` — `1083fbd`):**
    - **Lock Lifetime:** Acquired during `LocalServer::open(root)` (and `LocalCoordinator::open`) and held continuously by the `ProcessLock` instance for the lifetime of the server. Dropping the server instance releases the OS-level file lock (`flock unlock`).
-   - **Contention Behavior:** The lock is acquired non-blockingly (`try_lock_exclusive`). If another process or thread holds an exclusive lock on the file, `open` fails immediately with `HtapError::Conflict`. The error message includes diagnostic metadata read from `<root>/LOCK` (`pid=<pid>;start_time=<epoch_secs>`).
+   - **Contention Behavior:** The lock is acquired non-blockingly (`try_lock_exclusive`). `LocalCoordinator::open` still fails immediately with `HtapError::Conflict` if another process or thread holds the lock, with diagnostic metadata read from `<root>/LOCK` (`pid=<pid>;start_time=<epoch_secs>`). As of Phase 16 (ADR-025), `LocalServer::open` instead attempts to become an IPC client of the current owner when the lock is already held (see the `htap.sock` bullet below); it falls back to the same immediate `HtapError::Conflict` only when IPC forwarding itself is unavailable (no listener, a degraded lock-only owner, a non-Unix target, or a handshake failure).
    - **Symlink Aliases:** `ProcessLock::acquire` operates on the canonicalized root path (`root.canonicalize()`). Accessing the same root via symlink aliases resolves to the exact same physical lock file, preventing multi-process lock bypass.
    - **Low-Level Subsystem APIs Do Not Acquire the Root Lock:** Standalone subsystem instances (`htap_catalog::LocalCatalogStore::open`, `htap_movement::LocalDataMover::new`) do **not** acquire `<root>/LOCK`. They remain unsafe for direct concurrent shared-root use. As of Phase 15, `htap_rowstore::Engine::open` acquires its *own*, separate exclusive lock at `<rowstore>/LOCK` for the engine's lifetime — a second `Engine::open` against the same rowstore directory (in or out of process) fails — but this is a rowstore-directory-only lock, not a substitute for the server's root lock; `LocalServer` always acquires `<root>/LOCK` first, so the two cannot form an ordering cycle.
+   - **`htap.sock` (Phase 16, ADR-025, Unix-only):** After winning `<root>/LOCK`, opening every subsystem, and
+     running startup reclaim (`reclaim_tick_locked(true)`, still under `execution_lock`), `LocalServer::open`
+     starts a background IPC listener bound to `<root>/htap.sock` — this ordering (reclaim before the listener
+     accepts connections, fixed in the batch D storage-review pass; see ADR-025) means a client can never
+     execute a statement while startup reclaim is still deleting a dropped table's tablet directories. It
+     removes a stale socket file left by a provably-dead previous owner (found already-a-socket at that
+     path — safe, since this process just won the exclusive lock) before binding. As of batch E (a storage
+     re-review finding), the socket is bound inside a private, owner-only (`0700`) directory (`<root>/.htap-ipc-<pid>-<id>/`),
+     tightened to `0600` there, and only then atomically renamed to `<root>/htap.sock` — no window
+     exists at any permission level where another local user could reach an unauthenticated socket, unlike
+     the original bind-then-chmod sequence directly at the published path. The private staging directory
+     itself is removed right after the rename publishes the socket — on every successful start, not only after
+     a crash — and `LocalServer::open` also sweeps `<root>` for any private directories left by a crashed
+     prior owner and removes them before creating a new one (fixed as of batch F: the successful-path removal
+     was missing before this, so every server that ever started, not only a crashed one, leaked one of these
+     directories; see ADR-025's "Post-review fixes (batch F)" section). A bind failure for any other
+     reason (a canonicalize failure, a stale-socket removal failure, a permission error, a path too long for
+     this kind of socket, or a non-socket file already at that path) is non-fatal: the owner falls back to
+     lock-only mode, exactly as it always has, with a warning log. The listener is torn down — stop flag,
+     force-close every live connection, unbounded join of the accept and every connection thread, then
+     socket-file removal — before `<root>/LOCK` is released, so a stale socket never outlives its owner's
+     lock. The owner also bounds its handshake read to a single absolute 5-second deadline across the whole
+     frame (also true on the client's connect path) — as of batch E, a peer trickling bytes one at a time can
+     no longer reset that deadline on every byte received and hold a connection thread indefinitely; an
+     established session (past the handshake) has no deadline at all, so a long-running statement or an idle
+     session is never cut off.
 
 1. **`catalog/` (`LocalCatalogStore` — `b7ff200`):**
    - Tracks table definitions, schema, partition descriptors, tablets, and replica topologies.
@@ -500,10 +570,19 @@ prepared statement's buffered `COM_STMT_SEND_LONG_DATA` bytes — and can also b
    `tracing`, controlled by `RUST_LOG`), and parks the main thread until the process is killed. There is no
    signal handler; Ctrl-C or SIGTERM stops the
    process unconditionally.
-2. **Root lock is exclusive:** `LocalServer::open` acquires the same `<root>/LOCK` advisory lock as any other
-   caller (section 3.0 above). A second `htapd` (or `EmbeddedClient`) pointed at the same root fails to start
-   with `HtapError::Conflict` — this is the existing one-owner-per-root invariant, not a network-specific
-   one.
+2. **Root lock is exclusive, but a second process is no longer just rejected (Phase 16, ADR-025):**
+   `LocalServer::open` acquires the same `<root>/LOCK` advisory lock as any other caller (section 3.0 above);
+   exactly one process ever touches storage directly. A second `htapd` (bound to a different `--listen`
+   address, since the first `htapd`'s socket already owns its own) or `EmbeddedClient` pointed at the same root
+   no longer fails outright: `LocalServer::open` transparently becomes an IPC client and forwards SQL/session
+   calls (including the `bootstrap_root_account` call `WireServer::start` makes) to the first `htapd` over
+   `<root>/htap.sock` — no source change to the `htapd` binary itself was needed for this (batches A-C).
+   `htap-wire` and `htap-client` did later need small changes once `open_session`/`authenticate_session` became
+   fallible in client mode instead of panicking (batch E) and once an owner-gone login was distinguished from a
+   real credential failure (batch F) — see ADR-025's "Post-review fixes (batch E)" and "(batch F)" sections. The
+   second `htapd` still fails to start with `HtapError::Conflict` only when IPC forwarding itself is
+   unavailable (no listener, a degraded lock-only owner, a non-Unix target, or a handshake failure), or with a
+   plain bind error if it reuses the same `--listen` address as the first.
 3. **Shutdown:** There is no graceful drain API exposed by the binary itself. Stop the process (Ctrl-C /
    SIGTERM); in-flight statements are not drained, but storage is crash-safe by construction
    (ADR-004/008/009), so committed state is recovered on the next start exactly as after a `SIGKILL` of any
@@ -542,8 +621,13 @@ prepared statement's buffered `COM_STMT_SEND_LONG_DATA` bytes — and can also b
   `LocalServer::open(root)` and calls `.execute("ALTER USER root IDENTIFIED BY '...'")` or
   `.execute("CREATE USER ...")` as needed) — this path is always an implicit, unchecked superuser and has no
   `check_privileges` gate, analogous to MySQL's `--skip-grant-tables`. It requires filesystem access to the
-  root directory and cannot be done from a running `htapd` process at the same time (the root lock is
-  exclusive — stop `htapd` first).
+  root directory. As of Phase 16 (ADR-025), this **no longer requires stopping `htapd` first**: opening the
+  same root while `htapd` is running returns a client-mode `LocalServer` that forwards `.execute(...)` over
+  `<root>/htap.sock` to the running owner, where each call still runs as an unchecked superuser (the owner's
+  per-connection session for a plain `execute` call defaults to `Principal::Superuser`, exactly like the
+  in-process case) — so this recovery path works identically whether or not `htapd` is currently running,
+  as long as IPC forwarding is reachable. If forwarding is unavailable (see the "Root lock is exclusive"
+  bullet above), stopping `htapd` first and reopening the root directly still works, as it always has.
 - **Catalog file permissions:** the catalog file now carries password hashes; `CATALOG`/`CATALOG.tmp` are
   created with Unix mode `0600`. This does not substitute for restricting access to the whole root directory
   (the process's own working data), which should remain readable only by the account `htapd` runs as.

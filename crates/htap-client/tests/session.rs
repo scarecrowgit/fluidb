@@ -21,7 +21,7 @@ fn test_embedded_session_begin_commit_rollback() {
         .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
         .unwrap();
 
-    let mut session = client.open_session();
+    let mut session = client.open_session().unwrap();
     session.begin().unwrap();
     session
         .execute("INSERT INTO t (id, v) VALUES (1, 10);")
@@ -65,7 +65,7 @@ fn test_embedded_autocommit_execute_unaffected_by_open_session_on_same_server() 
         .execute("INSERT INTO t (id, v) VALUES (1, 1);")
         .unwrap();
 
-    let mut session = client.open_session();
+    let mut session = client.open_session().unwrap();
     session.begin().unwrap();
     session.execute("UPDATE t SET v = 2 WHERE id = 1;").unwrap();
 

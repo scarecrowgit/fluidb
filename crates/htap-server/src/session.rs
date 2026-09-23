@@ -72,19 +72,75 @@ use htap_txn::{
     intent_frame_size_bound, ParticipantId, ParticipantWork, RowstoreParticipant, Transaction,
     TransactionRequest, MAX_PAYLOAD_SIZE,
 };
+use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     ContextModifier, Expr as SqlExpr, ObjectName, ObjectNamePart, Set, Statement as SqlStatement,
     TransactionAccessMode, TransactionMode,
 };
 
+#[cfg(unix)]
+use crate::ipc::WireError;
+#[cfg(unix)]
+use crate::ipc::{IpcConnection, IpcRequest, ResponsePayload, SessionStatus};
 use crate::{
-    privilege::{check_privileges, check_statement_visible},
-    CatalogSnapshot, ExecMode, LocalServer, PartitionId, TableId,
+    privilege::check_statement_visible, CatalogSnapshot, ExecMode, LocalServer, OwnedServer,
+    PartitionId, ServerMode, TableId,
 };
 use htap_catalog::AccountId;
 
+/// Storage backend used by a server session.
+///
+/// A session is bound to an owned local server runtime for its entire lifetime.
+pub(crate) enum SessionBackend {
+    /// The session executes against an in-process owned server runtime.
+    Owner(Arc<OwnedServer>),
+    /// The session executes through a persistent IPC connection to the owner process.
+    #[cfg(unix)]
+    Remote {
+        connection: IpcConnection,
+        status: SessionStatus,
+    },
+}
+
+impl SessionBackend {
+    /// Returns the owned server runtime backing a local session.
+    ///
+    /// Remote sessions must forward requests through their IPC connection instead.
+    fn server(&self) -> &Arc<OwnedServer> {
+        match self {
+            Self::Owner(server) => server,
+            #[cfg(unix)]
+            Self::Remote { .. } => {
+                panic!("remote sessions do not have an in-process owned server runtime")
+            }
+        }
+    }
+
+    /// Returns the latest owner-reported status for a remote session.
+    #[cfg(unix)]
+    fn remote_status(&self) -> Option<&SessionStatus> {
+        match self {
+            Self::Owner(_) => None,
+            Self::Remote { status, .. } => Some(status),
+        }
+    }
+
+    #[cfg(unix)]
+    fn remote_request(
+        &mut self,
+        request: IpcRequest,
+    ) -> std::result::Result<ResponsePayload, WireError> {
+        let Self::Remote { connection, status } = self else {
+            unreachable!("remote_request called for an owner-backed session");
+        };
+        let (new_status, result) = connection.request(request)?;
+        *status = new_status;
+        result
+    }
+}
+
 /// Authenticated identity associated with a server session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Principal {
     /// The embedded/default session identity, which retains existing unrestricted behavior.
     Superuser,
@@ -101,7 +157,7 @@ pub enum Principal {
 ///
 /// Allocated from [`LocalServer`]'s internal counter; never reused within a process lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionId(u64);
+pub struct SessionId(pub u64);
 
 impl SessionId {
     /// Returns the inner identifier value.
@@ -410,6 +466,18 @@ pub(crate) enum SessionState {
     Idle,
     /// A transaction is open and accumulating a write set.
     InTxn(OpenTxn),
+    /// A request may have reached the remote owner, but its response was lost. No further
+    /// requests are safe because retrying the request could duplicate its effects.
+    AmbiguousOutcomePending {
+        /// Original ambiguous-outcome reason.
+        reason: String,
+    },
+    /// The remote owner was safely unreachable before a request was started. The connection is
+    /// no longer usable, but no operation outcome is ambiguous.
+    RemoteDisconnected {
+        /// Original safe-disconnect reason.
+        reason: String,
+    },
     /// A prior `COMMIT` returned `DurablePending` (fsync ambiguity after the commit record was
     /// durable): the outcome cannot be trusted either way from this process, so every further
     /// statement, including `ROLLBACK`, is rejected until server recovery resolves it. The
@@ -433,6 +501,7 @@ pub(crate) enum SessionState {
 /// that with `matches!`.
 fn outcome_pending_error(state: &SessionState) -> HtapError {
     match state {
+        SessionState::AmbiguousOutcomePending { reason } => HtapError::Ambiguous(reason.clone()),
         SessionState::CommitOutcomePending {
             txn_id,
             version,
@@ -442,7 +511,14 @@ fn outcome_pending_error(state: &SessionState) -> HtapError {
             version: *version,
             reason: reason.clone(),
         },
-        _ => unreachable!("outcome_pending_error called on a non-CommitOutcomePending state"),
+        _ => unreachable!("outcome_pending_error called on a non-pending state"),
+    }
+}
+
+fn remote_disconnected_error(state: &SessionState) -> HtapError {
+    match state {
+        SessionState::RemoteDisconnected { reason } => HtapError::Conflict(reason.clone()),
+        _ => unreachable!("remote_disconnected_error called on a connected session"),
     }
 }
 
@@ -491,7 +567,7 @@ fn access_denied(username: &str) -> HtapError {
 
 /// Authenticates a catalog account and returns its session principal.
 pub(crate) fn authenticate_principal(
-    server: &LocalServer,
+    server: &OwnedServer,
     username: &str,
     scramble: &[u8],
     auth_response: &[u8],
@@ -544,7 +620,7 @@ pub(crate) fn authenticate_principal(
 /// undone).
 pub struct Session {
     id: SessionId,
-    server: Arc<LocalServer>,
+    backend: SessionBackend,
     principal: Principal,
     state: SessionState,
     /// `@name` user variables set by `SET @name = expr`, scoped to this session for its
@@ -566,6 +642,82 @@ pub struct Session {
 }
 
 impl Session {
+    /// Constructs a session backed by an already-open persistent IPC connection.
+    #[cfg(unix)]
+    pub fn open_remote(id: SessionId, connection: IpcConnection, status: SessionStatus) -> Self {
+        Self {
+            id,
+            backend: SessionBackend::Remote { connection, status },
+            principal: Principal::Superuser,
+            state: SessionState::Idle,
+            user_vars: BTreeMap::new(),
+            autocommit: true,
+            next_txn_read_only: None,
+            max_allowed_packet: DEFAULT_MAX_ALLOWED_PACKET,
+        }
+    }
+
+    /// Forwards a request to the owner and preserves terminal outcomes locally.
+    #[cfg(unix)]
+    fn remote_request(&mut self, request: IpcRequest) -> Result<ResponsePayload> {
+        match self.backend.remote_request(request) {
+            Ok(payload) => Ok(payload),
+            Err(WireError::OwnerUnreachable(reason)) => {
+                self.state = SessionState::RemoteDisconnected {
+                    reason: reason.clone(),
+                };
+                Err(HtapError::Conflict(reason))
+            }
+            Err(WireError::Ambiguous(reason)) => {
+                self.state = SessionState::AmbiguousOutcomePending {
+                    reason: reason.clone(),
+                };
+                Err(HtapError::Ambiguous(reason))
+            }
+            Err(error) => {
+                let error = HtapError::from(error);
+                if let HtapError::DurablePending {
+                    txn_id,
+                    version,
+                    reason,
+                } = &error
+                {
+                    self.state = SessionState::CommitOutcomePending {
+                        txn_id: *txn_id,
+                        version: *version,
+                        reason: reason.clone(),
+                    };
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Sends an execution request to the remote owner, preserving terminal session outcomes
+    /// locally when the transport cannot safely continue.
+    #[cfg(unix)]
+    fn execute_remote_statement(&mut self, request: IpcRequest) -> Result<StatementResult> {
+        match &self.state {
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. } => {
+                return Err(outcome_pending_error(&self.state));
+            }
+            SessionState::RemoteDisconnected { .. } => {
+                return Err(remote_disconnected_error(&self.state));
+            }
+            SessionState::Idle | SessionState::InTxn(_) => {}
+        }
+
+        let outcome = self.remote_request(request);
+        match outcome {
+            Ok(ResponsePayload::StatementResult(result)) => Ok(result),
+            Ok(payload) => Err(HtapError::Internal(format!(
+                "remote execute returned unexpected response payload: {payload:?}"
+            ))),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Returns this session's unique identifier.
     pub fn id(&self) -> SessionId {
         self.id
@@ -573,6 +725,13 @@ impl Session {
 
     /// Returns the identity authenticated for this session.
     pub fn principal(&self) -> &Principal {
+        #[cfg(unix)]
+        {
+            if let Some(status) = self.backend.remote_status() {
+                return &status.principal;
+            }
+        }
+
         &self.principal
     }
 
@@ -592,7 +751,15 @@ impl Session {
         scramble: &[u8],
         auth_response: &[u8],
     ) -> Result<()> {
-        let principal = authenticate_principal(&self.server, username, scramble, auth_response)?;
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            return Err(HtapError::Unsupported(
+                "changing users through a remote session is not supported".into(),
+            ));
+        }
+
+        let principal =
+            authenticate_principal(self.backend.server(), username, scramble, auth_response)?;
         self.reset()?;
         self.principal = principal;
         Ok(())
@@ -600,12 +767,30 @@ impl Session {
 
     /// Returns `true` if a transaction is currently open.
     pub fn in_transaction(&self) -> bool {
-        matches!(self.state, SessionState::InTxn(_))
+        match &self.backend {
+            SessionBackend::Owner(_) => matches!(self.state, SessionState::InTxn(_)),
+            #[cfg(unix)]
+            SessionBackend::Remote { status, .. } => status.in_transaction,
+        }
+    }
+
+    /// Returns `true` if a transaction is currently open.
+    ///
+    /// Alias retained for callers that use the status-oriented session API.
+    pub fn is_in_transaction(&self) -> bool {
+        self.in_transaction()
     }
 
     /// Returns `true` if autocommit is currently enabled (MySQL-compatible default: on). Used by
     /// `htap-wire` to report `SERVER_STATUS_AUTOCOMMIT` accurately instead of hardcoding it.
     pub fn autocommit(&self) -> bool {
+        #[cfg(unix)]
+        {
+            if let Some(status) = self.backend.remote_status() {
+                return status.autocommit;
+            }
+        }
+
         self.autocommit
     }
 
@@ -620,9 +805,45 @@ impl Session {
     /// # Errors
     ///
     /// Returns [`HtapError`] on a catalog load I/O failure.
-    pub fn catalog_snapshot(&self) -> Result<CatalogSnapshot> {
+    pub fn catalog_snapshot(&mut self) -> Result<CatalogSnapshot> {
+        match &self.state {
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. } => {
+                return Err(outcome_pending_error(&self.state));
+            }
+            SessionState::RemoteDisconnected { .. } => {
+                return Err(remote_disconnected_error(&self.state));
+            }
+            SessionState::Idle | SessionState::InTxn(_) => {}
+        }
+
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            match &self.state {
+                SessionState::AmbiguousOutcomePending { .. }
+                | SessionState::CommitOutcomePending { .. } => {
+                    return Err(outcome_pending_error(&self.state));
+                }
+                SessionState::RemoteDisconnected { .. } => {
+                    return Err(remote_disconnected_error(&self.state));
+                }
+                SessionState::Idle | SessionState::InTxn(_) => {}
+            }
+
+            return match self.remote_request(IpcRequest::CatalogSnapshot {
+                session_id: self.id.get(),
+            }) {
+                Ok(ResponsePayload::CatalogSnapshot(catalog)) => Ok(catalog),
+                Ok(payload) => Err(HtapError::Internal(format!(
+                    "remote catalog snapshot returned unexpected response payload: {payload:?}"
+                ))),
+                Err(error) => Err(error),
+            };
+        }
+
         Ok(self
-            .server
+            .backend
+            .server()
             .catalog
             .load()?
             .unwrap_or_else(CatalogSnapshot::empty))
@@ -634,9 +855,46 @@ impl Session {
     /// visibility and schema information cannot be resolved against different catalog versions.
     /// This deliberately does not bind: a prepared statement still contains `?` placeholders.
     /// Execution performs the authoritative bound-statement privilege check after substitution.
-    pub fn check_statement_visible(&self, statement: &SqlStatement) -> Result<CatalogSnapshot> {
+    pub fn check_statement_visible(&mut self, statement: &SqlStatement) -> Result<CatalogSnapshot> {
+        match &self.state {
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. } => {
+                return Err(outcome_pending_error(&self.state));
+            }
+            SessionState::RemoteDisconnected { .. } => {
+                return Err(remote_disconnected_error(&self.state));
+            }
+            SessionState::Idle | SessionState::InTxn(_) => {}
+        }
+
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            match &self.state {
+                SessionState::AmbiguousOutcomePending { .. }
+                | SessionState::CommitOutcomePending { .. } => {
+                    return Err(outcome_pending_error(&self.state));
+                }
+                SessionState::RemoteDisconnected { .. } => {
+                    return Err(remote_disconnected_error(&self.state));
+                }
+                SessionState::Idle | SessionState::InTxn(_) => {}
+            }
+
+            return match self.remote_request(IpcRequest::VisibilityCheck {
+                session_id: self.id.get(),
+                statement: statement.clone(),
+            }) {
+                Ok(ResponsePayload::CatalogSnapshot(catalog)) => Ok(catalog),
+                Ok(payload) => Err(HtapError::Internal(format!(
+                    "remote visibility check returned unexpected response payload: {payload:?}"
+                ))),
+                Err(error) => Err(error),
+            };
+        }
+
         let catalog = self
-            .server
+            .backend
+            .server()
             .catalog
             .load()?
             .unwrap_or_else(CatalogSnapshot::empty);
@@ -653,14 +911,84 @@ impl Session {
     /// never affects any in-flight or future statement's own execution limits (e.g. the rowstore
     /// commit payload cap): it is purely the value this session reports back to `SELECT
     /// @@max_allowed_packet`.
-    pub fn set_max_allowed_packet(&mut self, max_allowed_packet: u64) {
+    pub fn set_max_allowed_packet(&mut self, max_allowed_packet: u64) -> Result<()> {
+        match &self.state {
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. } => {
+                return Err(outcome_pending_error(&self.state));
+            }
+            SessionState::RemoteDisconnected { .. } => {
+                return Err(remote_disconnected_error(&self.state));
+            }
+            SessionState::Idle | SessionState::InTxn(_) => {}
+        }
+
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            match &self.state {
+                SessionState::AmbiguousOutcomePending { .. }
+                | SessionState::CommitOutcomePending { .. } => {
+                    return Err(outcome_pending_error(&self.state));
+                }
+                SessionState::RemoteDisconnected { .. } => {
+                    return Err(remote_disconnected_error(&self.state));
+                }
+                SessionState::Idle | SessionState::InTxn(_) => {}
+            }
+
+            match self.remote_request(IpcRequest::SetMaxAllowedPacket {
+                session_id: self.id.get(),
+                max_allowed_packet,
+            })? {
+                ResponsePayload::Empty => {
+                    self.max_allowed_packet = max_allowed_packet;
+                    return Ok(());
+                }
+                payload => {
+                    return Err(HtapError::Internal(format!(
+                        "remote max_allowed_packet update returned unexpected response payload: \
+                         {payload:?}"
+                    )));
+                }
+            }
+        }
+
         self.max_allowed_packet = max_allowed_packet;
+        Ok(())
+    }
+
+    /// Authenticates this remote session against the owner process.
+    #[cfg(unix)]
+    pub(crate) fn authenticate_remote(
+        &mut self,
+        username: &str,
+        scramble: &[u8],
+        auth_response: &[u8],
+    ) -> Result<()> {
+        if !matches!(self.backend, SessionBackend::Remote { .. }) {
+            return Err(HtapError::Unsupported(
+                "authenticate_remote requires a remote session".into(),
+            ));
+        }
+
+        match self.remote_request(IpcRequest::AuthenticateSession {
+            session_id: self.id.get(),
+            username: username.to_string(),
+            scramble: scramble.to_vec(),
+            auth_response: auth_response.to_vec(),
+        })? {
+            ResponsePayload::Empty => Ok(()),
+            payload => Err(HtapError::Internal(format!(
+                "remote authentication returned unexpected response payload: {payload:?}"
+            ))),
+        }
     }
 
     /// Opens a new [`OpenTxn`] pinning the current visible MVCC version as the read snapshot.
     fn open_new_txn(&mut self, read_only: bool) {
-        let snapshot = Snapshot::new(self.server.txn_manager.visible_version());
-        self.server
+        let snapshot = Snapshot::new(self.backend.server().txn_manager.visible_version());
+        self.backend
+            .server()
             .register_pinned_snapshot(self.id, snapshot.version);
         self.state = SessionState::InTxn(OpenTxn {
             snapshot,
@@ -692,6 +1020,30 @@ impl Session {
     /// whatever [`Session::commit`] returns if an already-open transaction's implicit commit
     /// fails (in which case no new transaction is started).
     pub fn begin(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            match &self.state {
+                SessionState::AmbiguousOutcomePending { .. }
+                | SessionState::CommitOutcomePending { .. } => {
+                    return Err(outcome_pending_error(&self.state));
+                }
+                SessionState::RemoteDisconnected { .. } => {
+                    return Err(remote_disconnected_error(&self.state));
+                }
+                SessionState::Idle | SessionState::InTxn(_) => {}
+            }
+
+            return match self.remote_request(IpcRequest::Begin {
+                session_id: self.id.get(),
+            }) {
+                Ok(ResponsePayload::Empty) => Ok(()),
+                Ok(payload) => Err(HtapError::Internal(format!(
+                    "remote BEGIN returned unexpected response payload: {payload:?}"
+                ))),
+                Err(error) => Err(error),
+            };
+        }
+
         self.begin_guarded_prelude()?;
         self.pin_new_txn_locked(false);
         Ok(())
@@ -702,8 +1054,15 @@ impl Session {
     /// [`Session::handle_start_transaction`] (F2): every path that can open a new transaction
     /// goes through this same guard before doing so.
     fn begin_guarded_prelude(&mut self) -> Result<()> {
-        if matches!(self.state, SessionState::CommitOutcomePending { .. }) {
-            return Err(outcome_pending_error(&self.state));
+        match &self.state {
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. } => {
+                return Err(outcome_pending_error(&self.state));
+            }
+            SessionState::RemoteDisconnected { .. } => {
+                return Err(remote_disconnected_error(&self.state));
+            }
+            SessionState::Idle | SessionState::InTxn(_) => {}
         }
         if self.in_transaction() {
             self.commit()?;
@@ -715,7 +1074,7 @@ impl Session {
     /// other snapshot read in this server, via a cloned `Arc<LocalServer>` handle so the guard
     /// does not borrow `self`.
     fn pin_new_txn_locked(&mut self, read_only: bool) {
-        let server = Arc::clone(&self.server);
+        let server = Arc::clone(self.backend.server());
         let _guard = server.execution_lock.lock();
         self.open_new_txn(read_only);
     }
@@ -734,6 +1093,13 @@ impl Session {
     /// Returns [`HtapError`] on parse failure, or whatever [`Session::execute_statement`] returns
     /// for the parsed statement.
     pub fn execute(&mut self, sql: &str) -> Result<StatementResult> {
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            return self.execute_remote_statement(IpcRequest::Execute {
+                sql: sql.to_string(),
+            });
+        }
+
         let statement = htap_sql::parse_one(sql)?;
         self.execute_statement(statement)
     }
@@ -770,8 +1136,20 @@ impl Session {
     /// [`LocalServer::execute`] — never re-locked while already held, which would deadlock
     /// against `parking_lot::Mutex`'s non-reentrant lock.
     pub fn execute_statement(&mut self, statement: SqlStatement) -> Result<StatementResult> {
-        if matches!(self.state, SessionState::CommitOutcomePending { .. }) {
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            return self.execute_remote_statement(IpcRequest::ExecuteBound { statement });
+        }
+
+        if matches!(
+            self.state,
+            SessionState::AmbiguousOutcomePending { .. }
+                | SessionState::CommitOutcomePending { .. }
+        ) {
             return Err(outcome_pending_error(&self.state));
+        }
+        if matches!(self.state, SessionState::RemoteDisconnected { .. }) {
+            return Err(remote_disconnected_error(&self.state));
         }
 
         match &statement {
@@ -827,17 +1205,13 @@ impl Session {
         // cloned `Arc<LocalServer>` handle (rather than `self.server` directly) means the guard
         // does not borrow `self`, so the `&mut self` calls below (`begin_implicit`,
         // `dispatch_bound` via `&mut self.state`) are not blocked by it.
-        let server = Arc::clone(&self.server);
+        let server = Arc::clone(self.backend.server());
         let _guard = server.execution_lock.lock();
 
-        let catalog = self
-            .server
-            .catalog
-            .load()?
-            .unwrap_or_else(CatalogSnapshot::empty);
-        check_statement_visible(&self.principal, &statement, &catalog)?;
-        let bound = htap_sql::bind(&statement, &catalog)?;
-        check_privileges(&self.principal, &bound, &catalog)?;
+        let (bound, catalog) = self
+            .backend
+            .server()
+            .prepare_statement(&statement, &self.principal)?;
 
         // DDL is rejected inside any open transaction, explicit or implicit (autocommit off);
         // the transaction, if any, survives untouched (not poisoned).
@@ -862,7 +1236,7 @@ impl Session {
         };
 
         let outcome = match &mut self.state {
-            SessionState::Idle => self.server.dispatch_bound(
+            SessionState::Idle => self.backend.server().dispatch_bound(
                 bound,
                 &catalog,
                 ExecMode::Autocommit,
@@ -884,11 +1258,14 @@ impl Session {
                     snapshot: open_txn.snapshot,
                     write_set: &mut open_txn.write_set,
                 };
-                self.server
+                self.backend
+                    .server()
                     .dispatch_bound(bound, &catalog, mode, &vars, &self.principal)
             }
-            SessionState::CommitOutcomePending { .. } => {
-                unreachable!("checked and rejected at the top of `execute` before parsing")
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. }
+            | SessionState::RemoteDisconnected { .. } => {
+                unreachable!("terminal states were rejected at the top of `execute_statement`")
             }
         };
 
@@ -1096,12 +1473,13 @@ impl Session {
     /// evaluates the single projected value with this session as the [`VariableLookup`], so `SET
     /// @b = @a + 1` reads `@a` back from this same session.
     fn eval_scalar_expr(&self, expr: &SqlExpr) -> Result<Value> {
-        let server = Arc::clone(&self.server);
+        let server = Arc::clone(self.backend.server());
         let _guard = server.execution_lock.lock();
         let sql = format!("SELECT {expr}");
         let statement = htap_sql::parse_one(&sql)?;
         let catalog = self
-            .server
+            .backend
+            .server()
             .catalog
             .load()?
             .unwrap_or_else(CatalogSnapshot::empty);
@@ -1188,7 +1566,32 @@ impl Session {
     /// Returns [`HtapError`] if the transaction was poisoned, if commit-time catalog
     /// revalidation fails, or if the underlying 2PC commit fails.
     pub fn commit(&mut self) -> Result<()> {
-        let server = Arc::clone(&self.server);
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            match &self.state {
+                SessionState::AmbiguousOutcomePending { .. }
+                | SessionState::CommitOutcomePending { .. } => {
+                    return Err(outcome_pending_error(&self.state));
+                }
+                SessionState::RemoteDisconnected { .. } => {
+                    return Err(remote_disconnected_error(&self.state));
+                }
+                SessionState::Idle | SessionState::InTxn(_) => {}
+            }
+
+            let outcome = self.remote_request(IpcRequest::Commit {
+                session_id: self.id.get(),
+            });
+            return match outcome {
+                Ok(ResponsePayload::Empty) => Ok(()),
+                Ok(payload) => Err(HtapError::Internal(format!(
+                    "remote COMMIT returned unexpected response payload: {payload:?}"
+                ))),
+                Err(error) => Err(error),
+            };
+        }
+
+        let server = Arc::clone(self.backend.server());
         let _guard = server.execution_lock.lock();
         self.commit_locked()
     }
@@ -1207,27 +1610,36 @@ impl Session {
     /// catalog revalidation is a genuine, intentional abort (task 6b), not an infrastructure
     /// failure, so it does take the transaction out of session state.
     fn commit_locked(&mut self) -> Result<()> {
-        if matches!(self.state, SessionState::CommitOutcomePending { .. }) {
-            return Err(outcome_pending_error(&self.state));
+        match &self.state {
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. } => {
+                return Err(outcome_pending_error(&self.state));
+            }
+            SessionState::RemoteDisconnected { .. } => {
+                return Err(remote_disconnected_error(&self.state));
+            }
+            SessionState::Idle | SessionState::InTxn(_) => {}
         }
 
         let open_txn = match &mut self.state {
             SessionState::InTxn(open_txn) => open_txn,
             SessionState::Idle => return Ok(()),
-            SessionState::CommitOutcomePending { .. } => {
-                unreachable!("checked and rejected above")
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. }
+            | SessionState::RemoteDisconnected { .. } => {
+                unreachable!("terminal states were rejected above")
             }
         };
 
         if let Some(reason) = open_txn.poisoned.clone() {
             self.state = SessionState::Idle;
-            self.server.unregister_pinned_snapshot(self.id);
+            self.backend.server().unregister_pinned_snapshot(self.id);
             return Err(HtapError::Conflict(reason));
         }
 
         if open_txn.read_only || open_txn.write_set.is_empty() {
             self.state = SessionState::Idle;
-            self.server.unregister_pinned_snapshot(self.id);
+            self.backend.server().unregister_pinned_snapshot(self.id);
             return Ok(());
         }
 
@@ -1235,7 +1647,8 @@ impl Session {
         // must still belong to the same table. A `Catalog::load` I/O failure here is
         // infrastructure, not a decision: propagate it with the transaction left open (F7).
         let catalog = self
-            .server
+            .backend
+            .server()
             .catalog
             .load()?
             .unwrap_or_else(CatalogSnapshot::empty);
@@ -1246,7 +1659,7 @@ impl Session {
             if !still_valid {
                 // A genuine conflict, not an infrastructure failure: the transaction is aborted.
                 self.state = SessionState::Idle;
-                self.server.unregister_pinned_snapshot(self.id);
+                self.backend.server().unregister_pinned_snapshot(self.id);
                 return Err(HtapError::Conflict(format!(
                     "table dropped or partition altered during transaction (partition {partition_id})"
                 )));
@@ -1266,7 +1679,7 @@ impl Session {
         // oversize commit leaves the transaction open (F7) instead of silently discarding its
         // write set. Fix-pass round 3, item 3(d): use this manager's own configured
         // `max_frame_size` rather than assuming `DEFAULT_MAX_FRAME_SIZE`.
-        let max_frame_size = self.server.txn_manager.max_frame_size();
+        let max_frame_size = self.backend.server().txn_manager.max_frame_size();
         let intent_bound = intent_frame_size_bound(payload.len(), 1);
         if intent_bound > max_frame_size {
             return Err(HtapError::InvalidArgument(format!(
@@ -1279,7 +1692,7 @@ impl Session {
 
         let work = ParticipantWork::new(ParticipantId::new(1), payload);
         let request = TransactionRequest::new(vec![work])?;
-        let txn_id = self.server.txn_manager.next_txn_id()?;
+        let txn_id = self.backend.server().txn_manager.next_txn_id()?;
 
         // Decision point: every pre-decision step above succeeded, so the open transaction is
         // now committed to this one attempt and removed from session state.
@@ -1292,9 +1705,9 @@ impl Session {
 
         let mut txn = Transaction::new(txn_id, open_txn.snapshot.version);
         txn.set_request(request);
-        match self.server.txn_manager.commit(&mut txn) {
+        match self.backend.server().txn_manager.commit(&mut txn) {
             Ok(_) => {
-                self.server.unregister_pinned_snapshot(self.id);
+                self.backend.server().unregister_pinned_snapshot(self.id);
                 Ok(())
             }
             Err(HtapError::DurablePending {
@@ -1302,7 +1715,7 @@ impl Session {
                 version,
                 reason,
             }) => {
-                self.server.unregister_pinned_snapshot(self.id);
+                self.backend.server().unregister_pinned_snapshot(self.id);
                 self.state = SessionState::CommitOutcomePending {
                     txn_id,
                     version,
@@ -1334,7 +1747,7 @@ impl Session {
             }
             // `self.state` is already `Idle` (aborted) from the `mem::replace` above.
             Err(err) => {
-                self.server.unregister_pinned_snapshot(self.id);
+                self.backend.server().unregister_pinned_snapshot(self.id);
                 Err(err)
             }
         }
@@ -1352,11 +1765,43 @@ impl Session {
     /// Returns the original stored `DurablePending` error if the session's last commit left it in
     /// the `CommitOutcomePending` state (never `HtapError::Conflict`; see [`outcome_pending_error`]).
     pub fn rollback(&mut self) -> Result<()> {
-        if matches!(self.state, SessionState::CommitOutcomePending { .. }) {
-            return Err(outcome_pending_error(&self.state));
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            match &self.state {
+                SessionState::AmbiguousOutcomePending { .. }
+                | SessionState::CommitOutcomePending { .. } => {
+                    return Err(outcome_pending_error(&self.state));
+                }
+                SessionState::RemoteDisconnected { .. } => {
+                    return Err(remote_disconnected_error(&self.state));
+                }
+                SessionState::Idle | SessionState::InTxn(_) => {}
+            }
+
+            let outcome = self.remote_request(IpcRequest::Rollback {
+                session_id: self.id.get(),
+            });
+            return match outcome {
+                Ok(ResponsePayload::Empty) => Ok(()),
+                Ok(payload) => Err(HtapError::Internal(format!(
+                    "remote ROLLBACK returned unexpected response payload: {payload:?}"
+                ))),
+                Err(error) => Err(error),
+            };
+        }
+
+        match &self.state {
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. } => {
+                return Err(outcome_pending_error(&self.state));
+            }
+            SessionState::RemoteDisconnected { .. } => {
+                return Err(remote_disconnected_error(&self.state));
+            }
+            SessionState::Idle | SessionState::InTxn(_) => {}
         }
         if matches!(self.state, SessionState::InTxn(_)) {
-            self.server.unregister_pinned_snapshot(self.id);
+            self.backend.server().unregister_pinned_snapshot(self.id);
         }
         self.state = SessionState::Idle;
         Ok(())
@@ -1378,8 +1823,40 @@ impl Session {
     /// Returns the stored `DurablePending` error if the session is `CommitOutcomePending`;
     /// otherwise never fails.
     pub fn reset(&mut self) -> Result<()> {
-        if matches!(self.state, SessionState::CommitOutcomePending { .. }) {
-            return Err(outcome_pending_error(&self.state));
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            match &self.state {
+                SessionState::AmbiguousOutcomePending { .. }
+                | SessionState::CommitOutcomePending { .. } => {
+                    return Err(outcome_pending_error(&self.state));
+                }
+                SessionState::RemoteDisconnected { .. } => {
+                    return Err(remote_disconnected_error(&self.state));
+                }
+                SessionState::Idle | SessionState::InTxn(_) => {}
+            }
+
+            let outcome = self.remote_request(IpcRequest::Reset {
+                session_id: self.id.get(),
+            });
+            return match outcome {
+                Ok(ResponsePayload::Empty) => Ok(()),
+                Ok(payload) => Err(HtapError::Internal(format!(
+                    "remote RESET returned unexpected response payload: {payload:?}"
+                ))),
+                Err(error) => Err(error),
+            };
+        }
+
+        match &self.state {
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. } => {
+                return Err(outcome_pending_error(&self.state));
+            }
+            SessionState::RemoteDisconnected { .. } => {
+                return Err(remote_disconnected_error(&self.state));
+            }
+            SessionState::Idle | SessionState::InTxn(_) => {}
         }
         self.rollback()?;
         self.user_vars.clear();
@@ -1391,7 +1868,12 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if matches!(self.state, SessionState::InTxn(_)) {
+        #[cfg(unix)]
+        if matches!(self.backend, SessionBackend::Remote { .. }) {
+            return;
+        }
+
+        if self.in_transaction() {
             let _ = self.rollback();
         }
     }
@@ -1565,11 +2047,36 @@ impl LocalServer {
     ///
     /// Each session has a unique, monotonically increasing [`SessionId`] for the lifetime of the
     /// process. Autocommit defaults on, matching MySQL.
+    pub fn open_session(self: &Arc<Self>) -> Result<Session> {
+        match &self.mode {
+            ServerMode::Owner(runtime) => Ok(runtime.server.open_session()),
+            #[cfg(unix)]
+            ServerMode::Client { client } => {
+                let mut connection = client.open_connection()?;
+                let (status, payload) = connection.request(IpcRequest::OpenSession)?;
+                match payload? {
+                    ResponsePayload::SessionId(id) => {
+                        Ok(Session::open_remote(SessionId(id), connection, status))
+                    }
+                    payload => Err(HtapError::Internal(format!(
+                        "remote OpenSession returned an unexpected response payload: {payload:?}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+impl OwnedServer {
+    /// Opens a new session directly against this owned server runtime.
+    ///
+    /// Each session receives a unique, monotonically increasing [`SessionId`] for the lifetime of
+    /// the process.
     pub fn open_session(self: &Arc<Self>) -> Session {
         let id = SessionId(self.next_session_id.fetch_add(1, Ordering::SeqCst));
         Session {
             id,
-            server: Arc::clone(self),
+            backend: SessionBackend::Owner(Arc::clone(self)),
             principal: Principal::Superuser,
             state: SessionState::Idle,
             user_vars: BTreeMap::new(),
@@ -1577,5 +2084,60 @@ impl LocalServer {
             next_txn_read_only: None,
             max_allowed_packet: DEFAULT_MAX_ALLOWED_PACKET,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::{privilege, LocalServer, Principal};
+    use htap_catalog::AccountId;
+    #[test]
+    fn session_statement_checks_privileges_once() {
+        let root = std::env::temp_dir().join(format!(
+            "htap-server-session-privilege-count-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time must be after the Unix epoch")
+                .as_nanos()
+        ));
+
+        privilege::reset_privilege_check_call_count();
+        {
+            let server = Arc::new(LocalServer::open(&root).expect("server opens"));
+            let mut session = server.open_session().expect("session opens");
+            session.execute("SELECT 1").expect("statement executes");
+        }
+        assert_eq!(privilege::privilege_check_call_count(), 1);
+
+        std::fs::remove_dir_all(root).expect("test server directory is removed");
+    }
+
+    #[test]
+    fn test_principal_superuser_serialization() {
+        let principal = Principal::Superuser;
+
+        let serialized = serde_json::to_string(&principal).expect("principal serializes");
+        let deserialized: Principal =
+            serde_json::from_str(&serialized).expect("principal deserializes");
+
+        assert_eq!(deserialized, principal);
+    }
+
+    #[test]
+    fn test_principal_account_serialization() {
+        let principal = Principal::Account {
+            id: AccountId::new(42),
+            username: "test_user".to_string(),
+        };
+
+        let serialized = serde_json::to_string(&principal).expect("principal serializes");
+        let deserialized: Principal =
+            serde_json::from_str(&serialized).expect("principal deserializes");
+
+        assert_eq!(deserialized, principal);
     }
 }

@@ -38,6 +38,7 @@ fn test_dropped_table_reclaim_deletes_movement_package_and_job_artifacts() {
     let job_id = "movement-reclaim-import";
     server
         .data_mover()
+        .expect("data mover must be available")
         .copy_from_csv(&CopyOptions::new(
             job_id,
             table.id,
@@ -78,8 +79,18 @@ fn test_dropped_table_reclaim_deletes_movement_package_and_job_artifacts() {
     let package_job_id = "movement-reclaim-package";
     let package_options = TabletCloneOptions::new(package_job_id, tablet_id, follower_replica_id)
         .with_table_id(table.id)
-        .with_pinned_version(Version::new(server.txn_manager().visible_version().get()));
-    server.data_mover().clone_tablet(&package_options).unwrap();
+        .with_pinned_version(Version::new(
+            server
+                .txn_manager()
+                .expect("transaction manager is available")
+                .visible_version()
+                .get(),
+        ));
+    server
+        .data_mover()
+        .expect("data mover must be available")
+        .clone_tablet(&package_options)
+        .unwrap();
 
     let movement_dir = temp.path().join("movement");
     let tablet_artifacts_dir = movement_dir

@@ -44,7 +44,12 @@ fn table_id(root: &std::path::Path, table_name: &str) -> htap_catalog::TableId {
 }
 
 fn tablet_dir(server: &LocalServer, tablet_id: TabletId) -> std::path::PathBuf {
-    convert_tablet_dir(server.colstore_dir(), tablet_id)
+    convert_tablet_dir(
+        server
+            .colstore_dir()
+            .expect("colstore directory must be available"),
+        tablet_id,
+    )
 }
 
 struct BlockingReader {
@@ -123,7 +128,7 @@ fn test_drop_then_create_same_name_isolates_new_artifacts_and_reclaims_old_after
     // Recreating the table must allocate a fresh tablet ID.
     let old_tablet = tablet_id(temp.path(), "reused_table");
     let old_dir = tablet_dir(&server, old_tablet);
-    let data_mover = server.data_mover();
+    let data_mover = server.data_mover().expect("data mover must be available");
     let reclaim_lease = data_mover
         .try_acquire_reclaim_lease(&[old_tablet])
         .expect("old tablet reclaim lease should be acquired");
@@ -183,20 +188,23 @@ fn test_drop_while_movement_job_holds_tablet_lease_stays_pending() {
     let (data_tx, data_rx) = mpsc::channel();
     let mover_server = std::sync::Arc::clone(&server);
     let copy_thread = thread::spawn(move || {
-        mover_server.data_mover().copy_from_csv_reader(
-            &CopyOptions::new(
-                "drop_while_moving",
-                table,
-                tablet,
-                DataFormat::Csv,
-                "/unused/moving.csv",
-            ),
-            BlockingReader {
-                started: started_tx,
-                data: data_rx,
-                buffer: None,
-            },
-        )
+        mover_server
+            .data_mover()
+            .expect("data mover must be available")
+            .copy_from_csv_reader(
+                &CopyOptions::new(
+                    "drop_while_moving",
+                    table,
+                    tablet,
+                    DataFormat::Csv,
+                    "/unused/moving.csv",
+                ),
+                BlockingReader {
+                    started: started_tx,
+                    data: data_rx,
+                    buffer: None,
+                },
+            )
     });
 
     started_rx.recv().unwrap();
@@ -249,16 +257,19 @@ fn test_crash_orphaned_running_job_is_failed_and_reclaimed_at_open() {
                 .unwrap(),
         );
         let server = LocalServer::open(root).unwrap();
-        let result = server.data_mover().copy_from_csv_reader(
-            &CopyOptions::new(
-                "crash_orphaned_job",
-                table,
-                tablet,
-                DataFormat::Csv,
-                "/unused/crash.csv",
-            ),
-            CrashReader,
-        );
+        let result = server
+            .data_mover()
+            .expect("data mover must be available")
+            .copy_from_csv_reader(
+                &CopyOptions::new(
+                    "crash_orphaned_job",
+                    table,
+                    tablet,
+                    DataFormat::Csv,
+                    "/unused/crash.csv",
+                ),
+                CrashReader,
+            );
         panic!("CrashReader copy result: {result:?}");
     }
 
@@ -297,13 +308,18 @@ fn test_crash_orphaned_running_job_is_failed_and_reclaimed_at_open() {
     let server = LocalServer::open(temp.path()).unwrap();
     let job = server
         .data_mover()
+        .expect("data mover must be available")
         .load_job("crash_orphaned_job")
         .unwrap()
         .expect("crashed movement job must exist before reclaim");
     assert!(job.is_running());
     let colstore = tablet_dir(&server, tablet);
     assert!(colstore.join("MANIFEST").is_file());
-    let job_dir = server.data_mover().job_dir("crash_orphaned_job").unwrap();
+    let job_dir = server
+        .data_mover()
+        .expect("data mover must be available")
+        .job_dir("crash_orphaned_job")
+        .unwrap();
 
     server.execute("DROP TABLE crashed_table").unwrap();
     drop(server);
@@ -313,6 +329,7 @@ fn test_crash_orphaned_running_job_is_failed_and_reclaimed_at_open() {
     assert!(
         server
             .data_mover()
+            .expect("data mover must be available")
             .load_job("crash_orphaned_job")
             .unwrap()
             .is_none(),
@@ -377,7 +394,14 @@ fn test_open_finalizes_and_compacts_oversized_transaction_journal() {
         "finalize_open must compact below the configured journal limit; before={before}, after={after}"
     );
     assert!(temp.path().join("txn.checkpoint").is_file());
-    assert_eq!(server.txn_manager().visible_version().get(), 601);
+    assert_eq!(
+        server
+            .txn_manager()
+            .expect("transaction manager must be available")
+            .visible_version()
+            .get(),
+        601
+    );
 }
 
 #[test]
@@ -398,7 +422,7 @@ fn test_open_time_reclaim_failure_does_not_fail_open() {
     let artifact_dir = tablet_dir(&server, tablet);
     assert!(artifact_dir.join("MANIFEST").is_file());
 
-    let data_mover = server.data_mover();
+    let data_mover = server.data_mover().expect("data mover must be available");
     let lease = data_mover
         .try_acquire_reclaim_lease(&[tablet])
         .expect("lease must block reclamation");

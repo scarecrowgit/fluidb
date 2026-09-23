@@ -110,9 +110,9 @@ fn horizon_protects_an_open_transaction_snapshot() {
         .execute("INSERT INTO protected_rows (id, value) VALUES (1, 'before')")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
-    let pinned_version = server.txn_manager().visible_version();
+    let pinned_version = server.txn_manager().unwrap().visible_version();
     assert_eq!(
         query_value(
             &mut session,
@@ -172,9 +172,9 @@ fn commit_and_rollback_unregister_snapshot_and_allow_versions_to_collapse() {
     }
 
     let server = std::sync::Arc::new(server);
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
-    let pinned_version = server.txn_manager().visible_version();
+    let pinned_version = server.txn_manager().unwrap().visible_version();
 
     session.commit().unwrap();
     drop(session);
@@ -217,9 +217,9 @@ fn commit_and_rollback_unregister_snapshot_and_allow_versions_to_collapse() {
     server = flush_rowstore(root, server);
 
     let server = std::sync::Arc::new(server);
-    let mut rollback_session = server.open_session();
+    let mut rollback_session = server.open_session().unwrap();
     rollback_session.begin().unwrap();
-    let rollback_pin = server.txn_manager().visible_version();
+    let rollback_pin = server.txn_manager().unwrap().visible_version();
 
     server
         .execute("UPDATE versioned_rows SET value = 'v11' WHERE id = 1")
@@ -370,7 +370,7 @@ fn movement_lease_blocks_compaction_rewrite_of_busy_tablet() {
     let (data_tx, data_rx) = mpsc::channel();
     let mover_server = std::sync::Arc::clone(&server);
     let worker = thread::spawn(move || {
-        mover_server.data_mover().copy_from_csv_reader(
+        mover_server.data_mover().unwrap().copy_from_csv_reader(
             &CopyOptions::new(
                 "compaction_busy_tablet",
                 moving_table,
@@ -492,7 +492,7 @@ fn best_effort_compaction_runs_bounded_iterations_with_busy_tablet() {
     let (other_table, _, other_tablet) = table_and_partition(root, "other_rows");
     assert_ne!(busy_tablet, other_tablet);
 
-    let data_mover = server.data_mover();
+    let data_mover = server.data_mover().unwrap();
     let lease = data_mover
         .try_acquire_reclaim_lease(&[other_tablet])
         .expect("failed to acquire reclaim lease for protected tablet");
@@ -573,7 +573,7 @@ fn compaction_tick_refuses_while_transaction_recovery_is_required() {
         .execute("CREATE TABLE recovery_rows (id INT PRIMARY KEY, value TEXT)")
         .unwrap();
 
-    server.txn_manager().set_commit_sync_hook(|_| {
+    server.txn_manager().unwrap().set_commit_sync_hook(|_| {
         Err(htap_common::HtapError::DurablePending {
             txn_id: 999,
             version: htap_common::Version::new(999),

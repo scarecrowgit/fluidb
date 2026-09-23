@@ -1430,11 +1430,14 @@ fn test_prepared_statement_in_transaction_and_commit_outcome_pending() {
     let resp = raw_execute(&mut stream, &payload);
     assert_eq!(resp[0], OK_HEADER, "{resp:?}");
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure during commit record append",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure during commit record append",
+            )))
+        });
     raw_send_command(&mut stream, COM_QUERY, b"COMMIT");
     let (_, resp) = read_packet(&mut stream).unwrap();
     assert_eq!(resp[0], ERR_HEADER);
@@ -1752,11 +1755,14 @@ fn test_wire_reset_connection_while_commit_outcome_pending_stays_quarantined() {
     );
     read_packet(&mut stream).unwrap();
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure",
+            )))
+        });
     raw_send_command(&mut stream, COM_QUERY, b"COMMIT");
     let (_, resp) = read_packet(&mut stream).unwrap();
     assert_eq!(resp[0], ERR_HEADER);
@@ -1797,11 +1803,14 @@ fn test_wire_quit_allowed_while_commit_outcome_pending() {
     );
     read_packet(&mut stream).unwrap();
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure",
+            )))
+        });
     raw_send_command(&mut stream, COM_QUERY, b"COMMIT");
     let (_, resp) = read_packet(&mut stream).unwrap();
     assert_eq!(resp[0], ERR_HEADER);
@@ -1993,11 +2002,14 @@ fn test_wire_change_user_while_commit_outcome_pending_stays_quarantined() {
     );
     read_packet(&mut stream).unwrap();
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure",
+            )))
+        });
     raw_send_command(&mut stream, COM_QUERY, b"COMMIT");
     let (_, resp) = read_packet(&mut stream).unwrap();
     assert_eq!(resp[0], ERR_HEADER);
@@ -2502,11 +2514,14 @@ fn test_wire_multi_statements_stops_on_durable_pending() {
     )
     .unwrap();
 
-    server.txn_manager().set_commit_append_hook(|_journal| {
-        Err(HtapError::Io(std::io::Error::other(
-            "simulated disk failure during commit record append",
-        )))
-    });
+    server
+        .txn_manager()
+        .expect("transaction manager is available")
+        .set_commit_append_hook(|_journal| {
+            Err(HtapError::Io(std::io::Error::other(
+                "simulated disk failure during commit record append",
+            )))
+        });
 
     let outcome = client
         .query_multi(

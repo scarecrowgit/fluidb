@@ -523,7 +523,12 @@ Partition state is persistent and crash-safe across server restarts, qualified a
 ### Server Reopen Lifecycle (`LocalServer::open`)
 
 When `LocalServer::open(root)` is called:
-1. **OS Process Lock:** Acquires non-blocking exclusive advisory lock on `<root>/LOCK` (`ProcessLock`).
+1. **OS Process Lock:** Acquires non-blocking exclusive advisory lock on `<root>/LOCK` (`ProcessLock`). On
+   success this process becomes the storage owner and the steps below run against local storage, as
+   described. If the lock is already held, `LocalServer::open` instead attempts to become an IPC client of
+   the current owner (Phase 16, ADR-025) — see `docs/ARCHITECTURE.md`'s "Concurrent multiprocess use: owner
+   plus IPC" section — and none of steps 2-5 below run in that process; only `HtapError::Conflict` on
+   forwarding failure falls back to the pre-Phase-16 behavior.
 2. **Catalog Recovery:** Opens `LocalCatalogStore` at `<root>/catalog`. Reads durable snapshot from `<root>/catalog/CATALOG`, verifying integrity and deserializing partition metadata. Calls `CatalogSnapshot::validate()` to ensure no corrupted or orphaned entities exist.
 3. **Rowstore Recovery:** Opens `htap_rowstore::Engine` at `<root>/rowstore`. Replays WAL segments (`wal/*.wal`), mounts immutable SSTs (`sst/*.sst`), and reads visible version watermark.
 4. **Transaction Journal Recovery:** Opens `TransactionManager` at `<root>/txn.journal`. Re-registers `RowstoreParticipant` (wrapping `Engine`), recovers 2PC transaction states, and republishes committed versions.

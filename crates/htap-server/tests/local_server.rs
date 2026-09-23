@@ -618,7 +618,11 @@ fn test_server_data_mover_integration() {
         DataFormat::Csv,
         &csv_path,
     );
-    let report = server.data_mover().copy_from_csv(&copy_opts).unwrap();
+    let report = server
+        .data_mover()
+        .expect("data mover must be available")
+        .copy_from_csv(&copy_opts)
+        .unwrap();
     assert_eq!(report.records_read, 2);
     assert_eq!(report.records_committed, 2);
     assert_eq!(report.rows_written, 2);
@@ -663,6 +667,7 @@ fn test_server_data_mover_integration() {
 
     let job = server
         .data_mover()
+        .expect("data mover must be available")
         .load_job("import_users_1")
         .unwrap()
         .expect("job must be loadable via server data_mover");
@@ -698,6 +703,7 @@ fn test_server_data_mover_integration() {
     // Verify job persistence via reopened server data_mover
     let job_reopened = reopened
         .data_mover()
+        .expect("data mover must be available")
         .load_job("import_users_1")
         .unwrap()
         .expect("movement job must persist across reopen");
@@ -732,7 +738,11 @@ fn test_server_data_mover_integration() {
         DataFormat::Csv,
         &export_csv_path,
     );
-    let exp_report = reopened.data_mover().copy_to_csv(&export_opts).unwrap();
+    let exp_report = reopened
+        .data_mover()
+        .expect("data mover must be available")
+        .copy_to_csv(&export_opts)
+        .unwrap();
     assert_eq!(exp_report.records_read, 3);
     assert_eq!(exp_report.rows_written, 3);
 
@@ -752,6 +762,7 @@ fn test_server_data_mover_integration() {
     );
     let jsonl_report = reopened
         .data_mover()
+        .expect("data mover must be available")
         .copy_from_jsonl_reader(&jsonl_opts, jsonl_data.as_bytes())
         .unwrap();
     assert_eq!(jsonl_report.records_read, 1);
@@ -806,19 +817,31 @@ fn test_server_data_mover_clone_verify_repair() {
     let clone_opts = TabletCloneOptions::new("clone_docs_1", TabletId::new(1), follower_rep_id);
 
     // 1. Clone tablet via server data_mover
-    let manifest = server.data_mover().clone_tablet(&clone_opts).unwrap();
+    let manifest = server
+        .data_mover()
+        .expect("data mover must be available")
+        .clone_tablet(&clone_opts)
+        .unwrap();
     assert_eq!(manifest.job_id, "clone_docs_1");
     assert_eq!(manifest.source_tablet_id, TabletId::new(1));
     assert_eq!(manifest.target_replica_id, follower_rep_id);
     assert_eq!(manifest.row_count, 2);
 
     // 2. Verify clone package via server data_mover
-    let verified = server.data_mover().verify_package(&clone_opts).unwrap();
+    let verified = server
+        .data_mover()
+        .expect("data mover must be available")
+        .verify_package(&clone_opts)
+        .unwrap();
     assert_eq!(verified.row_count, 2);
     assert_eq!(verified.payload_checksum, manifest.payload_checksum);
 
     // 3. Repair replica via server data_mover
-    let repaired = server.data_mover().repair_tablet(&clone_opts).unwrap();
+    let repaired = server
+        .data_mover()
+        .expect("data mover must be available")
+        .repair_tablet(&clone_opts)
+        .unwrap();
     assert_eq!(repaired.id, follower_rep_id);
     assert!(repaired.healthy);
 
@@ -874,70 +897,46 @@ fn test_subprocess_exclusive_lock_contention_and_symlink() {
     reader.read_line(&mut line).expect("read from child");
     assert_eq!(line.trim(), "LOCKED");
 
-    // 2. Child is holding lock. Opening from parent process must fail with Conflict.
-    let err = match LocalServer::open(root) {
-        Err(e) => e,
-        Ok(_) => panic!("expected LocalServer::open to fail with Conflict"),
-    };
+    // 2. Child owns the lock. Opening from parent process connects as an IPC client.
+    let client = LocalServer::open(root).expect("open should connect to lock owner");
     assert!(
-        matches!(err, HtapError::Conflict(_)),
-        "expected Conflict error, got {err:?}"
-    );
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("exclusive root lock contention"),
-        "error message did not mention contention: {err_msg}"
-    );
-    assert!(
-        err_msg.contains(&format!("pid={}", child.id())),
-        "error message should contain child pid: {err_msg}"
+        !client.is_owner(),
+        "server opened while another process owns the root must be a client"
     );
 
-    // 3. Symlink alias test where supported: opening via symlink must also fail with Conflict
+    // 3. Symlink alias also resolves to the same owner and connects as a client.
     #[cfg(unix)]
     {
         let symlink_parent = TempDir::new().unwrap();
         let symlink_path = symlink_parent.path().join("server_symlink_alias");
         std::os::unix::fs::symlink(root, &symlink_path).unwrap();
 
-        let sym_err = match LocalServer::open(&symlink_path) {
-            Err(e) => e,
-            Ok(_) => panic!("expected LocalServer::open on symlink to fail with Conflict"),
-        };
+        let symlink_client =
+            LocalServer::open(&symlink_path).expect("symlink open should connect to lock owner");
         assert!(
-            matches!(sym_err, HtapError::Conflict(_)),
-            "expected Conflict on symlink open, got {sym_err:?}"
-        );
-        let sym_err_msg = sym_err.to_string();
-        assert!(
-            sym_err_msg.contains("exclusive root lock contention"),
-            "symlink error message: {sym_err_msg}"
+            !symlink_client.is_owner(),
+            "server opened through symlink while another process owns the root must be a client"
         );
     }
 
-    // 4. Second child opening same root must also fail with Conflict (exit code 42)
-    let child2_output = std::process::Command::new(child_binary())
-        .arg(root)
-        .arg("try_once")
-        .output()
-        .expect("spawn second child");
-    assert_eq!(
-        child2_output.status.code(),
-        Some(42),
-        "second child should exit with Conflict status code 42"
-    );
+    // 4. Additional processes connect as IPC clients, so lock-contention subprocess
+    // failure semantics no longer apply.
 
-    // 5. Release child lock by dropping its stdin (closing stream) and waiting for exit
+    // 5. The client can execute statements through the child owner's IPC listener.
+    let res = client
+        .execute("CREATE TABLE test_tbl (id BIGINT PRIMARY KEY, v VARCHAR);")
+        .expect("client statement should succeed through IPC owner");
+    assert!(matches!(res, StatementResult::Command(_)));
+
+    // 6. Release child lock by dropping its stdin (closing stream) and waiting for exit.
+    drop(client);
     drop(child.stdin.take());
     let status = child.wait().expect("wait on child");
     assert!(status.success(), "child did not exit cleanly: {status:?}");
 
-    // 6. After child exits, reopen succeeds and operates normally
+    // After child exits, opening the root succeeds as the new owner.
     let server = LocalServer::open(root).expect("reopen after child exit should succeed");
-    let res = server
-        .execute("CREATE TABLE test_tbl (id BIGINT PRIMARY KEY, v VARCHAR);")
-        .expect("statement should succeed");
-    assert!(matches!(res, StatementResult::Command(_)));
+    assert!(server.is_owner());
 }
 
 #[test]
@@ -3210,7 +3209,10 @@ fn test_partition_storage_format_row_column_converting_equivalence() {
         .unwrap();
 
     // Release the server's rowstore lock before opening a separate engine for conversion.
-    let colstore_dir = server.colstore_dir().to_path_buf();
+    let colstore_dir = server
+        .colstore_dir()
+        .expect("colstore directory must be available")
+        .to_path_buf();
     drop(server);
 
     // Now configure p1 as Column storage and p2 as Converting storage:

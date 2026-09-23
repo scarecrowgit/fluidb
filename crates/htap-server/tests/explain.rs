@@ -115,7 +115,7 @@ fn test_plain_explain_select_permitted_inside_open_transaction() {
         .execute("INSERT INTO t (id, value) VALUES (1, 10);")
         .unwrap();
 
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.execute("BEGIN;").unwrap();
     session
         .execute("INSERT INTO t (id, value) VALUES (2, 20);")

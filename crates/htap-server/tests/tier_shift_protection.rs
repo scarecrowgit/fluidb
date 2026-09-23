@@ -107,7 +107,7 @@ fn test_compaction_protects_ssts_containing_leased_tablet_partition() {
         "test setup must create a compactable tier of SSTs"
     );
 
-    let data_mover = server.data_mover();
+    let data_mover = server.data_mover().expect("data mover must be available");
     let lease = data_mover
         .try_acquire_reclaim_lease(&[protected_tablet])
         .expect("protected tablet reclaim lease should be acquired");

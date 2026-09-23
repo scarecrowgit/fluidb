@@ -701,6 +701,8 @@ version = "0.1.0"
 dependencies = [
  "htap-catalog",
  "htap-common",
+ "serde",
+ "serde_json",
  "sqlparser",
 ]
 

@@ -57,7 +57,7 @@ fn test_concurrent_sessions_write_write_conflict_first_committer_wins() {
                             "an increment never committed; retry loop is not making progress"
                         );
 
-                        let mut session = server.open_session();
+                        let mut session = server.open_session().unwrap();
                         session.begin().unwrap();
                         let current = match session.execute("SELECT v FROM counter WHERE id = 1;") {
                             Ok(result) => match as_rows(result)[0].get(0) {
@@ -123,7 +123,7 @@ fn test_r5_point_read_still_bypasses_analytics_inside_and_outside_transaction() 
     let cat_store = LocalCatalogStore::open(dir.path().join("catalog")).unwrap();
     let cat = cat_store.load().unwrap().unwrap();
     let tablet_id = cat.partitions[0].tablets[0];
-    let manifest_path = htap_convert::manifest_path(server.colstore_dir(), tablet_id);
+    let manifest_path = htap_convert::manifest_path(server.colstore_dir().unwrap(), tablet_id);
     assert!(manifest_path.is_file());
     std::fs::write(&manifest_path, b"CORRUPTED_GARBAGE_BYTES_MANIFEST").unwrap();
 
@@ -143,7 +143,7 @@ fn test_r5_point_read_still_bypasses_analytics_inside_and_outside_transaction() 
 
     // Inside an explicit transaction: same story. The point path still bypasses the corrupted
     // columnar storage entirely, including for a row this same transaction never wrote.
-    let mut session = server.open_session();
+    let mut session = server.open_session().unwrap();
     session.begin().unwrap();
     let txn_analytic_err = session
         .execute("SELECT id, v FROM t WHERE v > 0 ORDER BY id;")

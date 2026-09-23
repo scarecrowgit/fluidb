@@ -1,7 +1,27 @@
 //! Session privilege checks for bound SQL statements.
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use htap_catalog::{PrivilegeScope, PrivilegeSet};
 use htap_common::error::{HtapError, Result};
+
+#[cfg(test)]
+thread_local! {
+    static PRIVILEGE_CHECK_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Resets the current test thread's privilege-check call count.
+#[cfg(test)]
+pub(crate) fn reset_privilege_check_call_count() {
+    PRIVILEGE_CHECK_CALLS.with(|count| count.set(0));
+}
+
+/// Returns the current test thread's privilege-check call count.
+#[cfg(test)]
+pub(crate) fn privilege_check_call_count() -> usize {
+    PRIVILEGE_CHECK_CALLS.with(Cell::get)
+}
 use htap_sql::{
     ast::{BoundStatement, DeleteTarget, InsertSource, ShowStatement, UpdateTarget},
     referenced_table_names, table_not_found,
@@ -178,6 +198,9 @@ pub(crate) fn check_privileges(
     bound: &BoundStatement,
     catalog: &CatalogSnapshot,
 ) -> Result<()> {
+    #[cfg(test)]
+    PRIVILEGE_CHECK_CALLS.with(|count| count.set(count.get() + 1));
+
     let Principal::Account { id, username } = principal else {
         return Ok(());
     };

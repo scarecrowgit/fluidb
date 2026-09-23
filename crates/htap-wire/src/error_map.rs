@@ -22,6 +22,7 @@ pub fn map_htap_error(err: &HtapError) -> (u16, &'static str) {
         | HtapError::CounterOverflow { .. }
         | HtapError::DurablePending { .. }
         | HtapError::RecoveryRequired { .. }
+        | HtapError::Ambiguous(_)
         | HtapError::Internal(_) => ER_UNKNOWN,
     }
 }
@@ -162,6 +163,7 @@ mod tests {
                 },
                 1105,
             ),
+            (HtapError::Ambiguous("x".into()), 1105),
             (HtapError::Internal("x".into()), 1105),
         ];
         for (err, code) in cases {
@@ -220,6 +222,15 @@ mod tests {
         assert_ne!(mapped.0, 1213, "RecoveryRequired must not map to 1213");
         assert_ne!(mapped.1, "40001", "RecoveryRequired must not map to 40001");
         assert_eq!(mapped, ER_UNKNOWN, "RecoveryRequired maps to 1105/HY000");
+    }
+
+    #[test]
+    fn ambiguous_never_maps_to_the_retryable_conflict_code() {
+        let err = HtapError::Ambiguous("IPC commit outcome unknown".into());
+        let mapped = map_htap_error(&err);
+        assert_ne!(mapped.0, 1213, "Ambiguous must not map to 1213");
+        assert_ne!(mapped.1, "40001", "Ambiguous must not map to 40001");
+        assert_eq!(mapped, ER_UNKNOWN, "Ambiguous maps to 1105/HY000");
     }
 
     #[test]

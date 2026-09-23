@@ -13,7 +13,7 @@ use htap_sql::result::{CommandResult, StatementResult, StatementResult::Query};
 use htap_sql::route::{classify_route, Route};
 
 use crate::session::Principal;
-use crate::{ExecMode, LocalServer, VariableLookup};
+use crate::{ExecMode, OwnedServer, VariableLookup};
 
 struct CatalogStats<'a> {
     catalog: &'a CatalogSnapshot,
@@ -38,7 +38,7 @@ struct PlanRow {
 }
 
 pub(super) fn execute_explain(
-    server: &LocalServer,
+    server: &OwnedServer,
     inner: BoundStatement,
     analyze: bool,
     catalog: &CatalogSnapshot,
@@ -122,7 +122,7 @@ fn mode_for_nested<'a>(mode: &'a mut ExecMode<'_>) -> ExecMode<'a> {
 }
 
 fn route_for_statement(
-    server: &LocalServer,
+    server: &OwnedServer,
     statement: &BoundStatement,
     catalog: &CatalogSnapshot,
 ) -> Result<Route> {

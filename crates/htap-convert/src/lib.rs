@@ -88,6 +88,7 @@ impl From<&HtapError> for ConversionErrorCategory {
             HtapError::CounterOverflow { .. } => Self::Internal,
             HtapError::DurablePending { .. } => Self::Internal,
             HtapError::RecoveryRequired { .. } => Self::Internal,
+            HtapError::Ambiguous(_) => Self::Internal,
             HtapError::PermissionDenied(_) => Self::Internal,
             HtapError::Unsupported(_) => Self::Unsupported,
             HtapError::Internal(_) => Self::Internal,

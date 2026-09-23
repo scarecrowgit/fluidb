@@ -121,7 +121,7 @@ impl EmbeddedClient {
     /// session (read-your-own-writes); [`EmbeddedClient::execute`] and every other open session
     /// on this server keep seeing only committed state until `COMMIT`. Dropping a session with
     /// an open transaction rolls it back.
-    pub fn open_session(&self) -> Session {
+    pub fn open_session(&self) -> Result<Session> {
         self.server.open_session()
     }
 }

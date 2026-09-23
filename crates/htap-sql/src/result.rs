@@ -2,9 +2,10 @@
 
 use htap_common::types::{ColumnDef, Row, Value};
 use htap_common::version::Version;
+use serde::{Deserialize, Serialize};
 
 /// Result of executing a SQL statement.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StatementResult {
     /// Command execution result (DDL or DML).
     Command(CommandResult),
@@ -30,7 +31,7 @@ impl StatementResult {
 }
 
 /// Result of executing a mutating or schema-modifying command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandResult {
     /// Result of a DDL statement (e.g., CREATE TABLE).
     Ddl {
@@ -75,7 +76,7 @@ impl CommandResult {
 }
 
 /// Tabular result of executing a query statement.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryResult {
     /// Column definitions describing the projected output columns.
     pub columns: Vec<ColumnDef>,
@@ -190,6 +191,7 @@ impl From<QueryResult> for StatementResult {
 mod tests {
     use super::*;
     use htap_common::types::{DataType, Value};
+    use serde_json;
 
     #[test]
     fn test_command_result_accessors_and_conversions() {
@@ -314,5 +316,80 @@ mod tests {
                 Row::new(vec![Value::Int32(3), Value::Int32(10)]),
             ]
         );
+    }
+
+    #[test]
+    fn test_statement_result_serializes_as_command() {
+        let result = StatementResult::dml(3, Some(Version::new(17)));
+
+        let json = serde_json::to_string(&result).expect("statement result should serialize");
+
+        assert_eq!(json, r#"{"Command":{"Dml":{"affected":3,"version":17}}}"#);
+    }
+
+    #[test]
+    fn test_statement_result_deserializes_as_query() {
+        let expected = StatementResult::query(
+            vec![ColumnDef {
+                name: "count".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+            }],
+            vec![Row::new(vec![Value::Int64(9)])],
+        );
+
+        let json = serde_json::to_string(&expected).expect("statement result should serialize");
+        let result: StatementResult =
+            serde_json::from_str(&json).expect("statement result should deserialize");
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_query_result_round_trip_serialization() {
+        let result = QueryResult::new(
+            vec![
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnDef {
+                    name: "note".into(),
+                    data_type: DataType::String,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            vec![
+                Row::new(vec![Value::Int32(1), Value::String("ready".into())]),
+                Row::new(vec![Value::Int32(2), Value::Null]),
+            ],
+        );
+
+        let json = serde_json::to_string(&result).expect("query result should serialize");
+        let decoded: QueryResult =
+            serde_json::from_str(&json).expect("query result should deserialize");
+
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn test_command_result_round_trip_serialization() {
+        let cases = [
+            CommandResult::ddl(2),
+            CommandResult::dml(4, None),
+            CommandResult::dml(6, Some(Version::new(23))),
+        ];
+
+        for result in cases {
+            let json = serde_json::to_string(&result).expect("command result should serialize");
+            let decoded: CommandResult =
+                serde_json::from_str(&json).expect("command result should deserialize");
+
+            assert_eq!(decoded, result);
+        }
     }
 }

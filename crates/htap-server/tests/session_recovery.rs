@@ -32,7 +32,7 @@ fn test_uncommitted_writes_never_visible_after_reopen() {
             .execute("INSERT INTO t (id, v) VALUES (1, 10);")
             .unwrap();
 
-        let mut session = server.open_session();
+        let mut session = server.open_session().unwrap();
         session.begin().unwrap();
         session
             .execute("INSERT INTO t (id, v) VALUES (2, 20);")
@@ -74,7 +74,7 @@ fn test_uncommitted_delete_by_filter_vanishes_after_reopen() {
             .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);")
             .unwrap();
 
-        let mut session = server.open_session();
+        let mut session = server.open_session().unwrap();
         session.begin().unwrap();
         session.execute("DELETE FROM t WHERE v >= 20;").unwrap();
         assert_eq!(
@@ -106,7 +106,7 @@ fn test_committed_transaction_visible_after_reopen() {
             .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
             .unwrap();
 
-        let mut session = server.open_session();
+        let mut session = server.open_session().unwrap();
         session.begin().unwrap();
         session
             .execute("INSERT INTO t (id, v) VALUES (1, 10);")
@@ -174,17 +174,20 @@ fn test_reopen_after_session_commit_durable_pending_resolves_outcome() {
             .execute("INSERT INTO t (id, v) VALUES (1, 10);")
             .unwrap();
 
-        let mut session = server.open_session();
+        let mut session = server.open_session().unwrap();
         session.begin().unwrap();
         session
             .execute("INSERT INTO t (id, v) VALUES (2, 20);")
             .unwrap();
 
-        server.txn_manager().set_commit_sync_hook(|_journal| {
-            Err(HtapError::Io(std::io::Error::other(
-                "simulated fsync failure after the commit record was already appended",
-            )))
-        });
+        server
+            .txn_manager()
+            .expect("transaction manager is available")
+            .set_commit_sync_hook(|_journal| {
+                Err(HtapError::Io(std::io::Error::other(
+                    "simulated fsync failure after the commit record was already appended",
+                )))
+            });
 
         let err = session.commit().unwrap_err();
         assert!(
@@ -265,7 +268,7 @@ fn test_uncommitted_insert_select_vanishes_after_reopen() {
             .execute("INSERT INTO src (id, v) VALUES (1, 10), (2, 20);")
             .unwrap();
 
-        let mut session = server.open_session();
+        let mut session = server.open_session().unwrap();
         session.begin().unwrap();
         session
             .execute("INSERT INTO dst (id, v) SELECT id, v FROM src;")
@@ -312,7 +315,7 @@ fn test_uncommitted_truncate_vanishes_after_reopen() {
             .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30);")
             .unwrap();
 
-        let mut session = server.open_session();
+        let mut session = server.open_session().unwrap();
         session.begin().unwrap();
         session.execute("TRUNCATE TABLE t;").unwrap();
         assert!(as_rows(session.execute("SELECT id FROM t;").unwrap()).is_empty());

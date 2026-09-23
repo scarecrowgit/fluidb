@@ -100,7 +100,7 @@ fn leased_dropped_tablets_are_all_protected_in_one_tick() {
         .iter()
         .map(|name| table_and_tablet(root, name).1)
         .collect();
-    let mover = server.data_mover();
+    let mover = server.data_mover().expect("data mover must be available");
     let leases = mover
         .try_acquire_reclaim_lease(&tablets)
         .expect("failed to lease dropped tablets");

@@ -2,9 +2,10 @@
 
 **Date:** 2026-09-10  
 **Status:** Audit & Hardening Record (point-in-time snapshot — not kept current phase-by-phase; see
-`docs/ARCHITECTURE.md`, `docs/LIMITATIONS.md`, and `docs/PROGRESS.md` for the current contract). One
-specific item below is now stale as of Phase 15 and is annotated in place: item 1 in section 4 and the
-matching roadmap line in section 5 (`txn.journal` compaction).  
+`docs/ARCHITECTURE.md`, `docs/LIMITATIONS.md`, and `docs/PROGRESS.md` for the current contract). Two
+specific items below are now stale and are annotated in place: item 1 in section 4 and the
+matching roadmap line in section 5 (`txn.journal` compaction, stale as of Phase 15), and section 2's
+"Exclusive Root Ownership" scope boundary (stale as of Phase 16 — see ADR-025).  
 **Target:** Local HTAP Database Engine (`LocalServer` / `LocalCoordinator`)
 
 ---
@@ -22,9 +23,17 @@ The storage, transaction, and coordination components have undergone focused har
 ### Exclusive Root Ownership (`1083fbd`)
 
 - `LocalServer::open(root)` and `LocalCoordinator::open(root)` canonicalize the target directory path and acquire an OS-level non-blocking exclusive advisory lock (`flock`) on `<root>/LOCK`.
-- Any subsequent attempt by another operating system process (or redundant instance within the same process) to open the same root directory—or any symlink alias resolving to it—is immediately rejected with `HtapError::Conflict`.
+- **[Stale as of Phase 16 — see ADR-025]** At the time this review was written, any subsequent attempt by
+  another operating system process (or redundant instance within the same process) to open the same root
+  directory — or any symlink alias resolving to it — was immediately rejected with `HtapError::Conflict`. As
+  of Phase 16, `LocalServer::open` (not `LocalCoordinator::open`, which is unchanged) instead attempts to
+  connect to the owner's IPC listener at `<root>/htap.sock` and, on success, returns a client-mode handle that
+  forwards SQL/session calls instead of failing; `HtapError::Conflict` is now returned only when IPC forwarding
+  itself is unavailable (no listener, a degraded lock-only owner, a non-Unix target, or handshake failure). The
+  **Scope Boundary** below is correspondingly narrower than originally written: it still holds for direct
+  storage access, but not for process-level access to the root.
 - Contention errors include diagnostic metadata (lock-holding PID and start timestamp), but the held OS file lock is the authoritative source of ownership.
-- **Scope Boundary:** This mechanism provides **one-owner multiprocess-exclusive mode, not concurrent shared-root writers**. Concurrent multiprocess writers or readers against a shared directory root remain strictly unsupported and unsafe. Low-level standalone subsystem instances (`Engine`, `CatalogStore`, `LocalDataMover`) opened directly outside `LocalServer` do not acquire the root lock and must not be used concurrently on shared storage roots.
+- **Scope Boundary:** This mechanism provides **one-owner multiprocess-exclusive mode, not concurrent shared-root writers**: exactly one process ever touches storage directly. Concurrent multiprocess writers or readers against a shared directory root at the storage layer remain strictly unsupported and unsafe — but see the Phase 16 annotation above: multiple *processes* can now usefully share a root through IPC forwarding to that one storage owner. Low-level standalone subsystem instances (`Engine`, `CatalogStore`, `LocalDataMover`) opened directly outside `LocalServer` do not acquire the root lock, do not participate in IPC forwarding, and must not be used concurrently on shared storage roots.
 
 ---
 
@@ -91,7 +100,7 @@ The following critical and high-severity architectural issues have been verified
 - **Scenario:**
   Two or more OS processes attempted to open the same database or coordinator storage root simultaneously or via symlink aliases.
 - **Resolution:**
-  `LocalServer::open` and `LocalCoordinator::open` canonicalize paths and acquire an OS-level non-blocking exclusive advisory lock (`<root>/LOCK`). Contending processes immediately fail with `HtapError::Conflict`. Operates in one-owner multiprocess-exclusive mode (not concurrent shared-root writers).
+  `LocalServer::open` and `LocalCoordinator::open` canonicalize paths and acquire an OS-level non-blocking exclusive advisory lock (`<root>/LOCK`). At the time of this review, a contending process immediately failed with `HtapError::Conflict`; as of Phase 16 (ADR-025), a contending `LocalServer::open` instead becomes an IPC client of the owner when possible, falling back to `HtapError::Conflict` only if IPC forwarding is unavailable (see section 2's annotation above). Operates in one-owner multiprocess-exclusive mode (not concurrent shared-root writers) at the storage layer.
 
 ---
 
