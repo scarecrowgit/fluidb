@@ -4,9 +4,14 @@
 //! workloads, including checksummed block frames, dictionary encodings, zstd compression,
 //! and footer zone maps.
 //!
-//! # On-Disk Layout (Segment v1)
+//! # On-Disk Layout
 //!
 //! All integers are little-endian.
+//!
+//! Readers accept format versions in the inclusive range
+//! [`MIN_DECODABLE_VERSION`]..=[`FORMAT_VERSION`]. A segment whose format version is
+//! less than [`DECIMAL_INTRODUCTION_VERSION`] must not declare a DECIMAL column in its
+//! footer schema; such a segment is rejected as corruption.
 //!
 //! ```text
 //! file := header column_block_frame* footer_payload footer_trailer
@@ -25,7 +30,7 @@
 //!   body: [u8; null_bitmap_len + stored_payload_len]
 //!
 //! footer payload :=
-//!   format_version: u16 = 1      // 2 bytes
+//!   format_version: u16 = 2      // 2 bytes
 //!   schema_len: u32              // 4 bytes
 //!   schema_json: [u8; schema_len] // serde_json of Schema
 //!   total_rows: u64              // 8 bytes
@@ -56,12 +61,18 @@
 //!   footer_crc32c: u32           // 4 bytes (CRC32-C over footer payload only)
 //!   magic[4] = "HEND"            // 4 bytes
 //! ```
+//!
+//! DECIMAL payload values use the same representation as the other 64-bit column
+//! types: each non-NULL value is an 8-byte little-endian signed integer containing
+//! the value scaled by a power of ten. Its declared precision and scale are supplied
+//! by the segment footer schema and are not repeated for each value.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use htap_common::types::check_decimal_precision;
 use htap_common::{ColumnDef, DataType, HtapError, Result, Row, Schema, Value};
 use serde::{Deserialize, Serialize};
 
@@ -75,14 +86,20 @@ use crate::types::{
     MAX_FOOTER_BYTES, MAX_SEGMENT_BLOCKS, MAX_SEGMENT_COLUMNS,
 };
 
-/// Header magic identifier for Segment v1 files.
+/// Header magic identifier for columnar segment files.
 pub const HEADER_MAGIC: &[u8; 8] = b"HTAPCOL1";
 
-/// Trailer magic identifier for Segment v1 files.
+/// Trailer magic identifier for columnar segment files.
 pub const TRAILER_MAGIC: &[u8; 4] = b"HEND";
 
 /// Current on-disk columnar segment format version.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
+
+/// On-disk format version that introduced DECIMAL column support.
+pub const DECIMAL_INTRODUCTION_VERSION: u16 = 2;
+
+/// Oldest on-disk columnar segment format version this reader can decode.
+pub const MIN_DECODABLE_VERSION: u16 = 1;
 
 /// Length of the leading file header in bytes.
 pub const HEADER_LEN: usize = 8;
@@ -522,9 +539,9 @@ impl SegmentReader {
         let format_version = reader
             .read_u16_le()
             .map_err(|_| HtapError::Corruption("unexpected EOF reading format version".into()))?;
-        if format_version != FORMAT_VERSION {
+        if !(MIN_DECODABLE_VERSION..=FORMAT_VERSION).contains(&format_version) {
             return Err(HtapError::Corruption(format!(
-                "unsupported format version {format_version} (expected {FORMAT_VERSION})"
+                "unsupported format version {format_version} (supported range: {MIN_DECODABLE_VERSION}..={FORMAT_VERSION})"
             )));
         }
 
@@ -537,7 +554,19 @@ impl SegmentReader {
             .map_err(|_| HtapError::Corruption("unexpected EOF reading schema payload".into()))?;
         let schema: Schema = serde_json::from_slice(schema_payload)
             .map_err(|e| HtapError::Corruption(format!("failed to deserialize schema: {e}")))?;
-        validate_segment_schema(&schema)?;
+        validate_segment_schema(&schema)
+            .map_err(|e| HtapError::Corruption(format!("invalid segment schema in footer: {e}")))?;
+
+        if format_version < DECIMAL_INTRODUCTION_VERSION
+            && schema
+                .columns()
+                .iter()
+                .any(|column| matches!(column.data_type, DataType::Decimal { .. }))
+        {
+            return Err(HtapError::Corruption(
+                "format version 1 does not support decimal columns".into(),
+            ));
+        }
 
         let total_rows = reader
             .read_u64_le()
@@ -724,6 +753,21 @@ impl SegmentReader {
                             "zone map min value {min_v:?} exceeds max value {max_v:?} for column '{}'",
                             col_def.name
                         )));
+                    }
+                    for value in [&min_v, &max_v] {
+                        if let Value::Decimal {
+                            value,
+                            precision,
+                            scale,
+                        } = value
+                        {
+                            check_decimal_precision(*value, *precision, *scale).map_err(|e| {
+                                HtapError::Corruption(format!(
+                                    "invalid decimal zone map value for column '{}': {e}",
+                                    col_def.name
+                                ))
+                            })?;
+                        }
                     }
                     (Some(min_v), Some(max_v))
                 } else {
@@ -1179,6 +1223,44 @@ fn build_column_vector(
             }
             ColumnVector::Float64 { values, validity }
         }
+        DataType::Decimal { precision, scale } => {
+            let mut values = Vec::with_capacity(validity.len());
+            for &is_valid in &validity {
+                if is_valid {
+                    match val_iter.next() {
+                        Some(Value::Decimal {
+                            value,
+                            precision: value_precision,
+                            scale: value_scale,
+                        }) if value_precision == precision && value_scale == scale => {
+                            values.push(value);
+                        }
+                        Some(Value::Decimal {
+                            precision: value_precision,
+                            scale: value_scale,
+                            ..
+                        }) => {
+                            return Err(HtapError::Corruption(format!(
+                                "decimal precision/scale mismatch reconstructing vector: expected ({precision}, {scale}), got ({value_precision}, {value_scale})"
+                            )));
+                        }
+                        _ => {
+                            return Err(HtapError::Corruption(
+                                "type mismatch reconstructing decimal vector".into(),
+                            ));
+                        }
+                    }
+                } else {
+                    values.push(0);
+                }
+            }
+            ColumnVector::Decimal {
+                values,
+                precision,
+                scale,
+                validity,
+            }
+        }
         DataType::String => {
             let mut values = Vec::with_capacity(validity.len());
             for &is_valid in &validity {
@@ -1269,5 +1351,328 @@ mod tests {
         let res = SegmentWriter::write(&path, &schema, rows, &opts);
         assert!(res.is_err());
         assert!(!path.exists(), "partial file must be removed on failure");
+    }
+
+    fn patch_format_version(path: &Path, version: u16) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let footer_len =
+            u32::from_le_bytes(bytes[trailer_start..trailer_start + 4].try_into().unwrap())
+                as usize;
+        let footer_start = trailer_start - footer_len;
+
+        bytes[footer_start..footer_start + 2].copy_from_slice(&version.to_le_bytes());
+        let footer_crc = crc32c::crc32c(&bytes[footer_start..trailer_start]);
+        bytes[trailer_start + 4..trailer_start + 8].copy_from_slice(&footer_crc.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn patch_footer_schema_decimal(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let footer_len =
+            u32::from_le_bytes(bytes[trailer_start..trailer_start + 4].try_into().unwrap())
+                as usize;
+        let footer_start = trailer_start - footer_len;
+        let footer = &bytes[footer_start..trailer_start];
+
+        let schema_len = u32::from_le_bytes(footer[2..6].try_into().unwrap()) as usize;
+        let schema_json = &footer[6..6 + schema_len];
+
+        let mut schema_value: serde_json::Value = serde_json::from_slice(schema_json).unwrap();
+        schema_value["columns"][0]["data_type"] =
+            serde_json::json!({ "Decimal": { "precision": 0, "scale": 0 } });
+        let patched_schema_json = serde_json::to_vec(&schema_value).unwrap();
+
+        let mut patched_footer = Vec::new();
+        patched_footer.extend_from_slice(&footer[0..2]);
+        patched_footer.extend_from_slice(&(patched_schema_json.len() as u32).to_le_bytes());
+        patched_footer.extend_from_slice(&patched_schema_json);
+        patched_footer.extend_from_slice(&footer[6 + schema_len..]);
+
+        let footer_crc = crc32c::crc32c(&patched_footer);
+        let mut patched_bytes = bytes[..footer_start].to_vec();
+        patched_bytes.extend_from_slice(&patched_footer);
+        patched_bytes.extend_from_slice(&(patched_footer.len() as u32).to_le_bytes());
+        patched_bytes.extend_from_slice(&footer_crc.to_le_bytes());
+        patched_bytes.extend_from_slice(TRAILER_MAGIC);
+        std::fs::write(path, patched_bytes).unwrap();
+    }
+
+    fn assert_decimal(value: Value, expected: i64, precision: u8, scale: u8) {
+        let Value::Decimal {
+            value,
+            precision: actual_precision,
+            scale: actual_scale,
+        } = value
+        else {
+            panic!("expected decimal value");
+        };
+        assert_eq!(value, expected);
+        assert_eq!(actual_precision, precision);
+        assert_eq!(actual_scale, scale);
+    }
+
+    #[test]
+    fn decimal_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("decimal_roundtrip.col");
+        let schema = Schema::new(vec![
+            test_col("id", DataType::Int32, false),
+            test_col(
+                "amount",
+                DataType::Decimal {
+                    precision: 18,
+                    scale: 2,
+                },
+                false,
+            ),
+        ])
+        .unwrap();
+        let decimal_values = [100_i64, -250, 0, 999_999];
+        let rows = decimal_values
+            .iter()
+            .enumerate()
+            .map(|(id, &value)| {
+                Row::new(vec![
+                    Value::Int32(id as i32),
+                    Value::Decimal {
+                        value,
+                        precision: 18,
+                        scale: 2,
+                    },
+                ])
+            })
+            .collect::<Vec<_>>();
+
+        SegmentWriter::write(&path, &schema, rows, &SegmentOptions::new()).unwrap();
+        let mut reader = SegmentReader::open(&path).unwrap();
+        let decimals = reader.read_block(1, 0).unwrap();
+
+        for (row, &expected) in decimal_values.iter().enumerate() {
+            assert_decimal(decimals.get(row).unwrap(), expected, 18, 2);
+        }
+    }
+
+    #[test]
+    fn test_g2_out_of_precision_write_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out_of_precision.col");
+        let schema = Schema::new(vec![test_col(
+            "amount",
+            DataType::Decimal {
+                precision: 2,
+                scale: 0,
+            },
+            false,
+        )])
+        .unwrap();
+        let rows = vec![Row::new(vec![Value::Decimal {
+            value: 12_345,
+            precision: 2,
+            scale: 0,
+        }])];
+
+        let result = SegmentWriter::write(&path, &schema, rows, &SegmentOptions::new());
+        assert!(matches!(result, Err(HtapError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn legacy_format_still_readable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.col");
+        let schema = Schema::new(vec![
+            test_col("id", DataType::Int32, false),
+            test_col("name", DataType::String, false),
+        ])
+        .unwrap();
+        let expected = vec![
+            (1, "alpha".to_string()),
+            (2, "beta".to_string()),
+            (3, "gamma".to_string()),
+        ];
+        let rows = expected
+            .iter()
+            .map(|(id, name)| Row::new(vec![Value::Int32(*id), Value::String(name.clone())]))
+            .collect::<Vec<_>>();
+
+        SegmentWriter::write(&path, &schema, rows, &SegmentOptions::new()).unwrap();
+        patch_format_version(&path, DECIMAL_INTRODUCTION_VERSION - 1);
+
+        let reader = SegmentReader::open(&path).unwrap();
+        let result = reader.scan(&ScanRequest::new(vec![0, 1], None)).unwrap();
+        let actual = result
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows()).map(|row| {
+                    (
+                        batch.columns[0].get(row).unwrap(),
+                        batch.columns[1].get(row).unwrap(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual.len(), expected.len());
+        for ((id, name), (expected_id, expected_name)) in actual.iter().zip(&expected) {
+            assert_eq!(id, &Value::Int32(*expected_id));
+            assert_eq!(name, &Value::String(expected_name.clone()));
+        }
+    }
+
+    #[test]
+    fn decimal_multiblock_filter_eq_and_range() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("decimal_multiblock.col");
+        let decimal_type = DataType::Decimal {
+            precision: 18,
+            scale: 2,
+        };
+        let schema = Schema::new(vec![test_col("amount", decimal_type, false)]).unwrap();
+        let rows = (1_i64..=10)
+            .map(|value| {
+                Row::new(vec![Value::Decimal {
+                    value: value * 100,
+                    precision: 18,
+                    scale: 2,
+                }])
+            })
+            .collect::<Vec<_>>();
+        let options = SegmentOptions::new().with_rows_per_block(3);
+
+        SegmentWriter::write(&path, &schema, rows, &options).unwrap();
+        let reader = SegmentReader::open(&path).unwrap();
+
+        let eq_result = reader
+            .scan(&ScanRequest::new(
+                vec![0],
+                Some(crate::types::Predicate::Eq {
+                    column: 0,
+                    value: Value::Decimal {
+                        value: 500,
+                        precision: 18,
+                        scale: 2,
+                    },
+                }),
+            ))
+            .unwrap();
+        assert_eq!(eq_result.total_rows(), 1);
+        let eq_value = eq_result.batches[0].columns[0].get(0).unwrap();
+        assert_decimal(eq_value, 500, 18, 2);
+
+        let range_result = reader
+            .scan(&ScanRequest::new(
+                vec![0],
+                Some(crate::types::Predicate::Gte {
+                    column: 0,
+                    value: Value::Decimal {
+                        value: 700,
+                        precision: 18,
+                        scale: 2,
+                    },
+                }),
+            ))
+            .unwrap();
+        assert_eq!(range_result.total_rows(), 4);
+
+        let actual = range_result
+            .batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(|row| batch.columns[0].get(row).unwrap()))
+            .collect::<Vec<_>>();
+        for (value, expected) in actual.into_iter().zip([700_i64, 800, 900, 1_000]) {
+            assert_decimal(value, expected, 18, 2);
+        }
+    }
+
+    #[test]
+    fn legacy_version_with_decimal_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy_decimal.col");
+        let schema = Schema::new(vec![test_col(
+            "amount",
+            DataType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+            false,
+        )])
+        .unwrap();
+        let rows = vec![Row::new(vec![Value::Decimal {
+            value: 123,
+            precision: 18,
+            scale: 2,
+        }])];
+
+        SegmentWriter::write(&path, &schema, rows, &SegmentOptions::new()).unwrap();
+        patch_format_version(&path, DECIMAL_INTRODUCTION_VERSION - 1);
+
+        let result = SegmentReader::open(&path);
+        assert!(matches!(result, Err(HtapError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_g3_hostile_footer_schema_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hostile_footer_schema.col");
+        let schema = Schema::new(vec![test_col("amount", DataType::Int32, false)]).unwrap();
+        let rows = vec![Row::new(vec![Value::Int32(123)])];
+
+        SegmentWriter::write(&path, &schema, rows, &SegmentOptions::new()).unwrap();
+        patch_footer_schema_decimal(&path);
+
+        let result = SegmentReader::open(&path);
+        assert!(matches!(result, Err(HtapError::Corruption(_))));
+    }
+
+    #[test]
+    fn payload_crc_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("decimal_type_corruption.col");
+        let schema = Schema::new(vec![test_col(
+            "amount",
+            DataType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+            false,
+        )])
+        .unwrap();
+        let rows = vec![
+            Row::new(vec![Value::Decimal {
+                value: 100,
+                precision: 18,
+                scale: 2,
+            }]),
+            Row::new(vec![Value::Decimal {
+                value: 200,
+                precision: 18,
+                scale: 2,
+            }]),
+        ];
+
+        SegmentWriter::write(&path, &schema, rows, &SegmentOptions::new()).unwrap();
+        let reader = SegmentReader::open(&path).unwrap();
+        let block = reader.block_meta(0, 0).unwrap().clone();
+        drop(reader);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let bitmap_len = (block.row_count as usize).div_ceil(8);
+        let payload_offset = block.offset as usize + FRAME_HEADER_LEN + bitmap_len;
+        bytes[payload_offset] ^= 1;
+
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let footer_len =
+            u32::from_le_bytes(bytes[trailer_start..trailer_start + 4].try_into().unwrap())
+                as usize;
+        let footer_start = trailer_start - footer_len;
+        let footer_crc = crc32c::crc32c(&bytes[footer_start..trailer_start]);
+        bytes[trailer_start + 4..trailer_start + 8].copy_from_slice(&footer_crc.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let reader = SegmentReader::open(&path).unwrap();
+        let result = reader.scan(&ScanRequest::new(vec![0], None));
+        assert!(matches!(result, Err(HtapError::Corruption(_))));
     }
 }

@@ -648,6 +648,10 @@ fn remap_predicate_columns(expr: &mut Expr, select: &SelectBody, layout: &[usize
         Expr::InSubquery { expr, .. } => {
             remap_predicate_columns(expr, select, layout)?;
         }
+        Expr::CalendarInterval { expr, quantity, .. } => {
+            remap_predicate_columns(expr, select, layout)?;
+            remap_predicate_columns(quantity, select, layout)?;
+        }
         Expr::CorrelatedColumnRef { .. }
         | Expr::OutputColumn { .. }
         | Expr::Literal(_)

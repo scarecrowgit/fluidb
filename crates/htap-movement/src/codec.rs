@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 use std::fmt::Write;
 
+use htap_common::types::{check_decimal_precision, parse_decimal_text};
 use htap_common::{ColumnDef, DataType, HtapError, Result, Row, Schema, Value};
 
 use crate::job::DataFormat;
@@ -202,6 +203,27 @@ pub fn parse_csv_field(col: &ColumnDef, field: &str) -> Result<Value> {
                 field, col.name
             ))
         }),
+        DataType::Decimal { precision, scale } => {
+            let value = parse_decimal_text(field, scale).map_err(|e| {
+                HtapError::InvalidArgument(format!(
+                    "cannot parse '{}' as decimal for column '{}': {e}",
+                    field, col.name
+                ))
+            })?;
+            let value = i64::try_from(value).map_err(|_| {
+                HtapError::InvalidArgument(format!(
+                    "decimal value '{}' overflows i64 for column '{}'",
+                    field, col.name
+                ))
+            })?;
+            let value = check_decimal_precision(value, precision, scale)?;
+
+            Ok(Value::Decimal {
+                value,
+                precision,
+                scale,
+            })
+        }
     }
 }
 
@@ -250,22 +272,21 @@ pub fn decode_csv_record(
 }
 
 /// Format a single [`Value`] as a CSV field string according to HTAP conventions.
-pub fn format_csv_field(val: &Value) -> String {
+pub fn format_csv_field(val: &Value) -> Result<String> {
     match val {
-        Value::Null => r"\N".to_string(),
-        Value::Bool(b) => {
-            if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        Value::Int32(v) => v.to_string(),
-        Value::Int64(v) => v.to_string(),
-        Value::Float64(v) => v.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Bytes(b) => encode_hex(b),
-        Value::Timestamp(v) => v.to_string(),
+        Value::Null => Ok(r"\N".to_string()),
+        Value::Bool(b) => Ok(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        Value::Int32(v) => Ok(v.to_string()),
+        Value::Int64(v) => Ok(v.to_string()),
+        Value::Float64(v) => Ok(v.to_string()),
+        Value::String(s) => Ok(s.clone()),
+        Value::Bytes(b) => Ok(encode_hex(b)),
+        Value::Timestamp(v) => Ok(v.to_string()),
+        Value::Decimal { .. } => Ok(val.to_string()),
     }
 }
 
@@ -279,12 +300,12 @@ pub fn encode_csv_header(schema: &Schema) -> csv::StringRecord {
 }
 
 /// Format a [`Row`] as a CSV string record in schema declaration order.
-pub fn encode_csv_record(schema: &Schema, row: &Row) -> csv::StringRecord {
+pub fn encode_csv_record(schema: &Schema, row: &Row) -> Result<csv::StringRecord> {
     let mut rec = csv::StringRecord::with_capacity(schema.len(), schema.len());
     for val in row.values() {
-        rec.push_field(&format_csv_field(val));
+        rec.push_field(&format_csv_field(val)?);
     }
-    rec
+    Ok(rec)
 }
 
 /// Parse a single JSON value into a strongly-typed [`Value`] matching [`ColumnDef`].
@@ -436,6 +457,44 @@ pub fn parse_json_value(col: &ColumnDef, json_val: &serde_json::Value) -> Result
                 col.name
             ))),
         },
+        DataType::Decimal { precision, scale } => match json_val {
+            serde_json::Value::String(s) => {
+                if s.len() > MAX_FIELD_BYTES {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "decimal string for column '{}' exceeds maximum allowed size {}",
+                        col.name, MAX_FIELD_BYTES
+                    )));
+                }
+
+                let value = parse_decimal_text(s, scale).map_err(|e| {
+                    HtapError::InvalidArgument(format!(
+                        "cannot parse '{}' as decimal for column '{}': {e}",
+                        s, col.name
+                    ))
+                })?;
+                let value = i64::try_from(value).map_err(|_| {
+                    HtapError::InvalidArgument(format!(
+                        "decimal value '{}' overflows i64 for column '{}'",
+                        s, col.name
+                    ))
+                })?;
+                let value = check_decimal_precision(value, precision, scale)?;
+
+                Ok(Value::Decimal {
+                    value,
+                    precision,
+                    scale,
+                })
+            }
+            serde_json::Value::Number(_) => Err(HtapError::InvalidArgument(format!(
+                "decimal values in JSON for column '{}' must be strings, not numbers",
+                col.name
+            ))),
+            _ => Err(HtapError::InvalidArgument(format!(
+                "expected decimal string for column '{}'",
+                col.name
+            ))),
+        },
     }
 }
 
@@ -489,22 +548,21 @@ pub fn decode_json_line(schema: &Schema, line: &str) -> Result<Row> {
 }
 
 /// Format a single [`Value`] as a [`serde_json::Value`] according to HTAP conventions.
-pub fn format_json_value(val: &Value) -> serde_json::Value {
+pub fn format_json_value(val: &Value) -> Result<serde_json::Value> {
     match val {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int32(v) => serde_json::json!(*v),
-        Value::Int64(v) => serde_json::json!(*v),
-        Value::Float64(v) => {
-            if let Some(n) = serde_json::Number::from_f64(*v) {
-                serde_json::Value::Number(n)
-            } else {
-                serde_json::Value::String(v.to_string())
-            }
-        }
-        Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Bytes(b) => serde_json::Value::String(encode_hex(b)),
-        Value::Timestamp(v) => serde_json::json!(*v),
+        Value::Null => Ok(serde_json::Value::Null),
+        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Value::Int32(v) => Ok(serde_json::json!(*v)),
+        Value::Int64(v) => Ok(serde_json::json!(*v)),
+        Value::Float64(v) => Ok(if let Some(n) = serde_json::Number::from_f64(*v) {
+            serde_json::Value::Number(n)
+        } else {
+            serde_json::Value::String(v.to_string())
+        }),
+        Value::String(s) => Ok(serde_json::Value::String(s.clone())),
+        Value::Bytes(b) => Ok(serde_json::Value::String(encode_hex(b))),
+        Value::Timestamp(v) => Ok(serde_json::json!(*v)),
+        Value::Decimal { .. } => Ok(serde_json::Value::String(val.to_string())),
     }
 }
 
@@ -525,7 +583,7 @@ pub fn encode_json_line(schema: &Schema, row: &Row) -> Result<String> {
         }
         let key_json = serde_json::to_string(&col.name)
             .map_err(|e| HtapError::Internal(format!("failed to serialize key: {e}")))?;
-        let val_json = serde_json::to_string(&format_json_value(val))
+        let val_json = serde_json::to_string(&format_json_value(val)?)
             .map_err(|e| HtapError::Internal(format!("failed to serialize value: {e}")))?;
         out.push_str(&key_json);
         out.push(':');
@@ -566,7 +624,7 @@ pub fn decode_record(schema: &Schema, format: DataFormat, data: &[u8]) -> Result
 pub fn encode_record(schema: &Schema, format: DataFormat, row: &Row) -> Result<Vec<u8>> {
     match format {
         DataFormat::Csv => {
-            let rec = encode_csv_record(schema, row);
+            let rec = encode_csv_record(schema, row)?;
             let mut buf = Vec::new();
             {
                 let mut wtr = csv::WriterBuilder::new()

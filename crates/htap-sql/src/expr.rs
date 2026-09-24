@@ -18,8 +18,12 @@
 //! - `LIKE` matches `%` and `_` case-insensitively (MySQL default collation behaviour).
 //! - `CASE` evaluates lazily: only the selected branch is evaluated.
 
+use chrono::{Datelike, NaiveDate};
 use htap_common::error::{HtapError, Result};
-use htap_common::types::{DataType, Row, Value};
+use htap_common::types::{
+    check_decimal_precision, parse_date_to_timestamp_micros, parse_decimal_text,
+    timestamp_micros_to_date, DataType, Row, Value, MAX_DECIMAL_PRECISION,
+};
 
 /// Binary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +119,21 @@ pub enum ScalarFn {
     IfNull,
     /// `NULLIF(a, b)`
     NullIf,
+    /// `SUBSTRING(s, start[, length])`
+    Substring,
+    /// `EXTRACT(unit FROM timestamp)`
+    Extract(CalendarIntervalUnit),
+}
+
+/// Units supported by calendar intervals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarIntervalUnit {
+    /// Calendar years.
+    Year,
+    /// Calendar months.
+    Month,
+    /// Calendar days.
+    Day,
 }
 
 /// Supported aggregate functions.
@@ -183,7 +202,7 @@ impl ExprType {
     pub fn is_numeric(&self) -> bool {
         matches!(
             self.data_type,
-            DataType::Int32 | DataType::Int64 | DataType::Float64
+            DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Decimal { .. }
         )
     }
 
@@ -302,6 +321,17 @@ pub enum Expr {
         expr: Box<Expr>,
         /// Target type.
         to: DataType,
+    },
+    /// `expr + INTERVAL quantity unit` or `expr - INTERVAL quantity unit`.
+    CalendarInterval {
+        /// Timestamp operand.
+        expr: Box<Expr>,
+        /// Interval quantity.
+        quantity: Box<Expr>,
+        /// Calendar unit.
+        unit: CalendarIntervalUnit,
+        /// Whether to subtract rather than add the interval.
+        negated: bool,
     },
     /// Scalar function call.
     ScalarFunction {
@@ -591,8 +621,11 @@ impl Expr {
                 if op.is_comparison() || matches!(op, BinOp::And | BinOp::Or) {
                     ExprType::new(DataType::Bool, nullable)
                 } else {
+                    // The binder validates arithmetic result types before constructing a bound
+                    // expression. Reaching this fallback therefore indicates an invalid IR.
                     ExprType::new(
-                        arithmetic_result_type(*op, l.data_type, r.data_type),
+                        arithmetic_result_type(*op, l.data_type, r.data_type)
+                            .expect("bound arithmetic expression has an invalid result type"),
                         nullable,
                     )
                 }
@@ -624,6 +657,10 @@ impl Expr {
                 expr.expr_type().nullable || low.expr_type().nullable || high.expr_type().nullable,
             ),
             Expr::Cast { expr, to } => ExprType::new(*to, expr.expr_type().nullable),
+            Expr::CalendarInterval { expr, quantity, .. } => ExprType::new(
+                DataType::Timestamp,
+                expr.expr_type().nullable || quantity.expr_type().nullable,
+            ),
             Expr::ScalarSubquery { data_type, .. } => ExprType::new(*data_type, true),
             Expr::InSubquery { .. } => ExprType::new(DataType::Bool, true),
             Expr::Variable { .. } => ExprType {
@@ -759,6 +796,10 @@ impl Expr {
                 }
             }
             Expr::Cast { expr, .. } => expr.walk(f),
+            Expr::CalendarInterval { expr, quantity, .. } => {
+                expr.walk(f);
+                quantity.walk(f);
+            }
             Expr::ScalarFunction { args, .. } => {
                 for a in args {
                     a.walk(f);
@@ -811,6 +852,15 @@ impl Expr {
                 Value::Int64(v) => Value::Int64(v.checked_neg().ok_or_else(|| overflow("-"))?),
                 Value::Timestamp(v) => Value::Int64(v.checked_neg().ok_or_else(|| overflow("-"))?),
                 Value::Float64(v) => Value::Float64(-v),
+                Value::Decimal {
+                    value,
+                    precision,
+                    scale,
+                } => Value::Decimal {
+                    value: value.checked_neg().ok_or_else(|| overflow("-"))?,
+                    precision,
+                    scale,
+                },
                 other => return Err(type_error("unary -", &other)),
             }),
             Expr::IsNull(inner) => Ok(Value::Bool(inner.eval(ctx)?.is_null())),
@@ -899,6 +949,27 @@ impl Expr {
                 }
             }
             Expr::Cast { expr, to } => cast_value(expr.eval(ctx)?, *to),
+            Expr::CalendarInterval {
+                expr,
+                quantity,
+                unit,
+                negated,
+            } => {
+                let timestamp = expr.eval(ctx)?;
+                let quantity = quantity.eval(ctx)?;
+                match (timestamp, quantity) {
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                    (Value::Timestamp(timestamp), quantity) => {
+                        let quantity = match quantity {
+                            Value::Int32(value) => value as i64,
+                            Value::Int64(value) => value,
+                            other => return Err(type_error("calendar interval", &other)),
+                        };
+                        add_calendar_interval(timestamp, quantity, *unit, *negated)
+                    }
+                    (other, _) => Err(type_error("calendar interval", &other)),
+                }
+            }
             Expr::ScalarFunction {
                 func,
                 args,
@@ -997,6 +1068,25 @@ fn conform(v: Value, data_type: DataType) -> Result<Value> {
         (Value::Null, _) => Ok(v),
         (Value::Int32(_), DataType::Int64 | DataType::Float64)
         | (Value::Int64(_), DataType::Float64) => cast_value(v, data_type),
+        (
+            Value::Decimal {
+                value,
+                scale: source_scale,
+                ..
+            },
+            DataType::Decimal { scale, .. },
+        ) if source_scale > &scale => {
+            let factor = 10_i64
+                .checked_pow(u32::from(*source_scale - scale))
+                .ok_or_else(|| overflow("DECIMAL"))?;
+            if value % factor != 0 {
+                return Err(HtapError::InvalidArgument(format!(
+                    "cannot exactly conform DECIMAL value {v} to {data_type}"
+                )));
+            }
+            cast_value(v, data_type)
+        }
+        (_, DataType::Decimal { .. }) => cast_value(v, data_type),
         _ => Ok(v),
     }
 }
@@ -1080,6 +1170,72 @@ fn subquery_result_rows(ctx: &EvalContext<'_>, index: usize, correlated: bool) -
     result
 }
 
+fn add_calendar_interval(
+    timestamp: i64,
+    quantity: i64,
+    unit: CalendarIntervalUnit,
+    negated: bool,
+) -> Result<Value> {
+    let quantity = if negated {
+        quantity.checked_neg().ok_or_else(|| overflow("INTERVAL"))?
+    } else {
+        quantity
+    };
+    let date_string = timestamp_micros_to_date(timestamp)?;
+    let date = NaiveDate::parse_from_str(&date_string, "%Y-%m-%d").map_err(|error| {
+        HtapError::Internal(format!(
+            "failed to parse timestamp date '{date_string}': {error}"
+        ))
+    })?;
+    let adjusted = match unit {
+        CalendarIntervalUnit::Day => date
+            .checked_add_signed(chrono::Duration::days(quantity))
+            .ok_or_else(|| {
+                HtapError::InvalidArgument("calendar interval result is out of range".into())
+            })?,
+        CalendarIntervalUnit::Month | CalendarIntervalUnit::Year => {
+            let months = match unit {
+                CalendarIntervalUnit::Month => quantity,
+                CalendarIntervalUnit::Year => quantity
+                    .checked_mul(12)
+                    .ok_or_else(|| overflow("INTERVAL"))?,
+                CalendarIntervalUnit::Day => unreachable!(),
+            };
+            let month_index = i64::from(date.year())
+                .checked_mul(12)
+                .and_then(|value| value.checked_add(i64::from(date.month0())))
+                .and_then(|value| value.checked_add(months))
+                .ok_or_else(|| {
+                    HtapError::InvalidArgument("calendar interval result is out of range".into())
+                })?;
+            let year = i32::try_from(month_index.div_euclid(12)).map_err(|_| {
+                HtapError::InvalidArgument("calendar interval result is out of range".into())
+            })?;
+            let month = u32::try_from(month_index.rem_euclid(12) + 1).map_err(|_| {
+                HtapError::InvalidArgument("calendar interval result is out of range".into())
+            })?;
+
+            // Clamp to the last day of the target month, e.g. Jan 31 + 1 month = Feb 28/29.
+            let last_day = if month == 12 {
+                NaiveDate::from_ymd_opt(year + 1, 1, 1).and_then(|next| next.pred_opt())
+            } else {
+                NaiveDate::from_ymd_opt(year, month + 1, 1).and_then(|next| next.pred_opt())
+            }
+            .ok_or_else(|| {
+                HtapError::InvalidArgument("calendar interval result is out of range".into())
+            })?;
+
+            NaiveDate::from_ymd_opt(year, month, date.day().min(last_day.day())).ok_or_else(
+                || HtapError::InvalidArgument("calendar interval result is out of range".into()),
+            )?
+        }
+    };
+
+    Ok(Value::Timestamp(parse_date_to_timestamp_micros(
+        &adjusted.to_string(),
+    )?))
+}
+
 fn type_error(what: &str, v: &Value) -> HtapError {
     HtapError::InvalidArgument(format!(
         "operator {what} cannot be applied to a {} value",
@@ -1091,15 +1247,89 @@ fn overflow(op: &str) -> HtapError {
     HtapError::InvalidArgument(format!("integer overflow in '{op}'"))
 }
 
+/// Returns decimal precision and scale for decimal-compatible operands.
+fn decimal_operand(data_type: DataType) -> Option<(u8, u8)> {
+    match data_type {
+        DataType::Decimal { precision, scale } => Some((precision, scale)),
+        DataType::Int32 => Some((10, 0)),
+        DataType::Int64 | DataType::Timestamp => Some((19, 0)),
+        _ => None,
+    }
+}
+
 /// Result type of arithmetic after numeric promotion.
-pub fn arithmetic_result_type(op: BinOp, l: DataType, r: DataType) -> DataType {
-    if op == BinOp::Div {
-        return DataType::Float64;
+pub fn arithmetic_result_type(op: BinOp, l: DataType, r: DataType) -> Result<DataType> {
+    if !op.is_arithmetic() {
+        return Err(HtapError::InvalidArgument(format!(
+            "operator '{op}' is not an arithmetic operator"
+        )));
     }
     if l == DataType::Float64 || r == DataType::Float64 {
-        DataType::Float64
+        return Ok(DataType::Float64);
+    }
+    if let (Some((lp, ls)), Some((rp, rs))) = (decimal_operand(l), decimal_operand(r)) {
+        if matches!(l, DataType::Decimal { .. }) || matches!(r, DataType::Decimal { .. }) {
+            let decimal_result = |precision: u8, scale: u8| {
+                let precision = precision.min(MAX_DECIMAL_PRECISION);
+                let scale = scale.min(MAX_DECIMAL_PRECISION);
+                let scale = if scale > precision {
+                    // Drop fractional digits from the declared type when they do not fit, as MySQL does.
+                    precision
+                } else {
+                    scale
+                };
+                Ok(DataType::Decimal { precision, scale })
+            };
+            let checked_add = |left: u8, right: u8| {
+                left.checked_add(right).ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "DECIMAL result precision overflow in '{op}'"
+                    ))
+                })
+            };
+            let integer_digits = |precision: u8, scale: u8| {
+                precision.checked_sub(scale).ok_or_else(|| {
+                    HtapError::InvalidArgument(format!(
+                        "invalid DECIMAL({precision},{scale}) operand for '{op}'"
+                    ))
+                })
+            };
+
+            let (precision, scale) = match op {
+                BinOp::Add | BinOp::Sub => {
+                    let scale = ls.max(rs);
+                    let precision = checked_add(
+                        checked_add(integer_digits(lp, ls)?.max(integer_digits(rp, rs)?), scale)?,
+                        1,
+                    )?;
+                    (precision, scale)
+                }
+                BinOp::Mul => (checked_add(lp, rp)?, checked_add(ls, rs)?),
+                BinOp::Div => (
+                    MAX_DECIMAL_PRECISION,
+                    ls.checked_add(4).ok_or_else(|| {
+                        HtapError::InvalidArgument(format!(
+                            "DECIMAL result precision overflow in '{op}'"
+                        ))
+                    })?,
+                ),
+                BinOp::IntDiv => (MAX_DECIMAL_PRECISION, 0),
+                BinOp::Mod => {
+                    let scale = ls.max(rs);
+                    (
+                        checked_add(integer_digits(lp, ls)?.min(integer_digits(rp, rs)?), scale)?,
+                        scale,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            return decimal_result(precision, scale);
+        }
+    }
+    if op == BinOp::Div {
+        Ok(DataType::Float64)
     } else {
-        DataType::Int64
+        Ok(DataType::Int64)
     }
 }
 
@@ -1114,6 +1344,9 @@ fn as_num(v: &Value) -> Option<Num> {
         Value::Int32(i) => Some(Num::Int(*i as i64)),
         Value::Int64(i) | Value::Timestamp(i) => Some(Num::Int(*i)),
         Value::Float64(f) => Some(Num::Float(*f)),
+        Value::Decimal { value, scale, .. } => {
+            Some(Num::Float(*value as f64 / 10_f64.powi(i32::from(*scale))))
+        }
         _ => None,
     }
 }
@@ -1163,6 +1396,15 @@ fn eval_binary(op: BinOp, left: &Expr, right: &Expr, ctx: &EvalContext<'_>) -> R
 }
 
 fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
+    // Float64 takes precedence over DECIMAL so mixed decimal/float arithmetic uses the
+    // standard floating-point path rather than recursing through `decimal_arithmetic`.
+    if !matches!(l, Value::Float64(_))
+        && !matches!(r, Value::Float64(_))
+        && (matches!(l, Value::Decimal { .. }) || matches!(r, Value::Decimal { .. }))
+    {
+        return decimal_arithmetic(op, l, r);
+    }
+
     if op == BinOp::IntDiv {
         let (x, y) = match (l, r) {
             (Value::Int32(x), Value::Int32(y)) => (*x as i64, *y as i64),
@@ -1248,10 +1490,150 @@ fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
     }
 }
 
+fn decimal_arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
+    let (left, left_precision, left_scale) = match l {
+        Value::Decimal {
+            value,
+            precision,
+            scale,
+        } => (i128::from(*value), *precision, *scale),
+        Value::Int32(value) => (i128::from(*value), 10, 0),
+        Value::Int64(value) => (i128::from(*value), 19, 0),
+        Value::Timestamp(value) => (i128::from(*value), 19, 0),
+        Value::Float64(_) => return arithmetic(op, l, r),
+        other => return Err(type_error(&op.to_string(), other)),
+    };
+    let (right, right_precision, right_scale) = match r {
+        Value::Decimal {
+            value,
+            precision,
+            scale,
+        } => (i128::from(*value), *precision, *scale),
+        Value::Int32(value) => (i128::from(*value), 10, 0),
+        Value::Int64(value) => (i128::from(*value), 19, 0),
+        Value::Timestamp(value) => (i128::from(*value), 19, 0),
+        Value::Float64(_) => return arithmetic(op, l, r),
+        other => return Err(type_error(&op.to_string(), other)),
+    };
+
+    let left_type = DataType::Decimal {
+        precision: left_precision,
+        scale: left_scale,
+    };
+    let right_type = DataType::Decimal {
+        precision: right_precision,
+        scale: right_scale,
+    };
+    let DataType::Decimal { precision, scale } = arithmetic_result_type(op, left_type, right_type)?
+    else {
+        return Err(HtapError::InvalidArgument(format!(
+            "operator '{op}' does not produce a DECIMAL result"
+        )));
+    };
+
+    let (value, value_scale) = match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mod => {
+            let intermediate_scale = left_scale.max(right_scale);
+            let left = decimal_rescale(left, left_scale, intermediate_scale)?;
+            let right = decimal_rescale(right, right_scale, intermediate_scale)?;
+            if op == BinOp::Mod && right == 0 {
+                return Ok(Value::Null);
+            }
+            let value = match op {
+                BinOp::Add => left.checked_add(right),
+                BinOp::Sub => left.checked_sub(right),
+                BinOp::Mod => left.checked_rem(right),
+                _ => unreachable!(),
+            }
+            .ok_or_else(|| overflow(&op.to_string()))?;
+            (value, intermediate_scale)
+        }
+        BinOp::Mul => (
+            left.checked_mul(right).ok_or_else(|| overflow("*"))?,
+            left_scale
+                .checked_add(right_scale)
+                .ok_or_else(|| overflow("*"))?,
+        ),
+        BinOp::Div => {
+            if right == 0 {
+                return Ok(Value::Null);
+            }
+            let exponent = scale
+                .checked_add(right_scale)
+                .and_then(|value| value.checked_sub(left_scale))
+                .ok_or_else(|| overflow("/"))?;
+            (
+                decimal_div_round_half_away(decimal_rescale(left, 0, exponent)?, right)?,
+                scale,
+            )
+        }
+        BinOp::IntDiv => {
+            if right == 0 {
+                return Ok(Value::Null);
+            }
+            let intermediate_scale = left_scale.max(right_scale);
+            let left = decimal_rescale(left, left_scale, intermediate_scale)?;
+            let right = decimal_rescale(right, right_scale, intermediate_scale)?;
+            let value = left.checked_div(right).ok_or_else(|| overflow("DIV"))?;
+            return Ok(Value::Int64(
+                i64::try_from(value).map_err(|_| overflow("DIV"))?,
+            ));
+        }
+        _ => unreachable!(),
+    };
+
+    let value = decimal_rescale(value, value_scale, scale)?;
+    let value = i64::try_from(value).map_err(|_| overflow(&op.to_string()))?;
+    let value = check_decimal_precision(value, precision, scale)?;
+
+    Ok(Value::Decimal {
+        value,
+        precision,
+        scale,
+    })
+}
+
 fn num_to_f64(n: &Num) -> f64 {
     match n {
         Num::Int(i) => *i as f64,
         Num::Float(f) => *f,
+    }
+}
+
+fn decimal_rescale(value: i128, from_scale: u8, to_scale: u8) -> Result<i128> {
+    if from_scale == to_scale {
+        return Ok(value);
+    }
+    let factor = 10_i128
+        .checked_pow(u32::from(from_scale.abs_diff(to_scale)))
+        .ok_or_else(|| overflow("DECIMAL"))?;
+    if from_scale < to_scale {
+        value.checked_mul(factor).ok_or_else(|| overflow("DECIMAL"))
+    } else {
+        decimal_div_round_half_away(value, factor)
+    }
+}
+
+/// Divides with DECIMAL's round-half-away-from-zero rule.
+fn decimal_div_round_half_away(value: i128, divisor: i128) -> Result<i128> {
+    let quotient = value
+        .checked_div(divisor)
+        .ok_or_else(|| overflow("DECIMAL"))?;
+    let remainder = value
+        .checked_rem(divisor)
+        .ok_or_else(|| overflow("DECIMAL"))?;
+
+    let remainder_magnitude = remainder.unsigned_abs();
+    let divisor_magnitude = divisor.unsigned_abs();
+    // Round when 2 * |remainder| >= |divisor| without overflowing the doubled remainder.
+    if remainder_magnitude < divisor_magnitude.saturating_sub(remainder_magnitude) {
+        return Ok(quotient);
+    }
+    // The truncated quotient can be zero, so use the exact quotient's sign.
+    if (value < 0) != (divisor < 0) {
+        quotient.checked_sub(1).ok_or_else(|| overflow("DECIMAL"))
+    } else {
+        quotient.checked_add(1).ok_or_else(|| overflow("DECIMAL"))
     }
 }
 
@@ -1261,6 +1643,43 @@ fn num_to_f64(n: &Num) -> f64 {
 pub fn compare(l: &Value, r: &Value) -> Result<Option<std::cmp::Ordering>> {
     if l.is_null() || r.is_null() {
         return Ok(None);
+    }
+    if let (
+        Value::Decimal {
+            value: left,
+            scale: left_scale,
+            ..
+        },
+        Value::Decimal {
+            value: right,
+            scale: right_scale,
+            ..
+        },
+    ) = (l, r)
+    {
+        let scale = (*left_scale).max(*right_scale);
+        let left = decimal_rescale(i128::from(*left), *left_scale, scale)?;
+        let right = decimal_rescale(i128::from(*right), *right_scale, scale)?;
+        return Ok(Some(left.cmp(&right)));
+    }
+    match (l, r) {
+        (Value::Decimal { value, scale, .. }, Value::Int32(integer)) => {
+            let integer = decimal_rescale(i128::from(*integer), 0, *scale)?;
+            return Ok(Some(i128::from(*value).cmp(&integer)));
+        }
+        (Value::Decimal { value, scale, .. }, Value::Int64(integer)) => {
+            let integer = decimal_rescale(i128::from(*integer), 0, *scale)?;
+            return Ok(Some(i128::from(*value).cmp(&integer)));
+        }
+        (Value::Int32(integer), Value::Decimal { value, scale, .. }) => {
+            let integer = decimal_rescale(i128::from(*integer), 0, *scale)?;
+            return Ok(Some(integer.cmp(&i128::from(*value))));
+        }
+        (Value::Int64(integer), Value::Decimal { value, scale, .. }) => {
+            let integer = decimal_rescale(i128::from(*integer), 0, *scale)?;
+            return Ok(Some(integer.cmp(&i128::from(*value))));
+        }
+        _ => {}
     }
     if let (Some(a), Some(b)) = (as_num(l), as_num(r)) {
         return Ok(Some(match (a, b) {
@@ -1369,6 +1788,7 @@ pub fn cast_value(v: Value, to: DataType) -> Result<Value> {
             Value::Int32(i) => *i as f64,
             Value::Int64(i) | Value::Timestamp(i) => *i as f64,
             Value::Float64(f) => *f,
+            Value::Decimal { value, scale, .. } => *value as f64 / 10_f64.powi(i32::from(*scale)),
             Value::String(s) => {
                 let parsed: f64 = s.trim().parse().map_err(|_| bad(&v))?;
                 if !parsed.is_finite() {
@@ -1380,6 +1800,40 @@ pub fn cast_value(v: Value, to: DataType) -> Result<Value> {
             }
             _ => return Err(bad(&v)),
         }),
+        DataType::Decimal { precision, scale } => {
+            let unscaled = match &v {
+                Value::Bool(value) => decimal_rescale(i128::from(*value as i64), 0, scale)?,
+                Value::Int32(value) => decimal_rescale(i128::from(*value), 0, scale)?,
+                Value::Int64(value) | Value::Timestamp(value) => {
+                    decimal_rescale(i128::from(*value), 0, scale)?
+                }
+                Value::Float64(value) => {
+                    if !value.is_finite() {
+                        return Err(bad(&v));
+                    }
+                    let factor = 10_f64.powi(i32::from(scale));
+                    let scaled = (value * factor).round();
+                    if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled > i64::MAX as f64 {
+                        return Err(bad(&v));
+                    }
+                    i128::from(scaled as i64)
+                }
+                Value::Decimal {
+                    value,
+                    scale: source_scale,
+                    ..
+                } => decimal_rescale(i128::from(*value), *source_scale, scale)?,
+                Value::String(value) => parse_decimal_text(value, scale).map_err(|_| bad(&v))?,
+                _ => return Err(bad(&v)),
+            };
+            let value = i64::try_from(unscaled).map_err(|_| bad(&v))?;
+            let value = check_decimal_precision(value, precision, scale).map_err(|_| bad(&v))?;
+            Value::Decimal {
+                value,
+                precision,
+                scale,
+            }
+        }
         DataType::String => Value::String(match &v {
             Value::Bool(b) => {
                 if *b {
@@ -1412,6 +1866,9 @@ fn cast_to_i64(v: &Value) -> Option<i64> {
                 None
             }
         }
+        Value::Decimal { value, scale, .. } => decimal_rescale(i128::from(*value), *scale, 0)
+            .ok()
+            .and_then(|value| i64::try_from(value).ok()),
         Value::String(s) => s.trim().parse().ok(),
         _ => None,
     }
@@ -1433,6 +1890,66 @@ fn eval_scalar_fn(func: ScalarFn, args: &[Expr], ctx: &EvalContext<'_>) -> Resul
                 other => Err(type_error("string function", other)),
             }
         }
+        ScalarFn::Substring => {
+            if vals.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
+            let string = match &vals[0] {
+                Value::String(value) => value,
+                other => return Err(type_error("SUBSTRING", other)),
+            };
+            let start = match vals[1] {
+                Value::Int32(value) => i64::from(value),
+                Value::Int64(value) => value,
+                ref other => return Err(type_error("SUBSTRING", other)),
+            };
+            let length = match vals.get(2) {
+                Some(Value::Int32(value)) => Some(i64::from(*value)),
+                Some(Value::Int64(value)) => Some(*value),
+                Some(other) => return Err(type_error("SUBSTRING", other)),
+                None => None,
+            };
+            if length.is_some_and(|value| value <= 0) || start == 0 {
+                return Ok(Value::String(String::new()));
+            }
+
+            let chars: Vec<char> = string.chars().collect();
+            let start = if start > 0 {
+                usize::try_from(start - 1).unwrap_or(usize::MAX)
+            } else {
+                let offset = start.unsigned_abs();
+                chars
+                    .len()
+                    .saturating_sub(usize::try_from(offset).unwrap_or(usize::MAX))
+            };
+            let end = length
+                .map(|value| start.saturating_add(usize::try_from(value).unwrap_or(usize::MAX)))
+                .unwrap_or(chars.len())
+                .min(chars.len());
+
+            Ok(Value::String(
+                chars.get(start..end).unwrap_or(&[]).iter().collect(),
+            ))
+        }
+        ScalarFn::Extract(unit) => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Timestamp(timestamp) => {
+                let date_string = timestamp_micros_to_date(*timestamp)?;
+                let date =
+                    NaiveDate::parse_from_str(&date_string, "%Y-%m-%d").map_err(|error| {
+                        HtapError::Internal(format!(
+                            "failed to parse timestamp date '{date_string}': {error}"
+                        ))
+                    })?;
+                let value = match unit {
+                    CalendarIntervalUnit::Year => i64::from(date.year()),
+                    CalendarIntervalUnit::Month => i64::from(date.month()),
+                    CalendarIntervalUnit::Day => i64::from(date.day()),
+                };
+                Ok(Value::Int64(value))
+            }
+            other => Err(type_error("EXTRACT", other)),
+        },
         ScalarFn::Concat => {
             let mut out = String::new();
             for v in &vals {
@@ -1453,6 +1970,15 @@ fn eval_scalar_fn(func: ScalarFn, args: &[Expr], ctx: &EvalContext<'_>) -> Resul
             Value::Int32(i) => Value::Int32(i.checked_abs().ok_or_else(|| overflow("ABS"))?),
             Value::Int64(i) => Value::Int64(i.checked_abs().ok_or_else(|| overflow("ABS"))?),
             Value::Float64(f) => Value::Float64(f.abs()),
+            Value::Decimal {
+                value,
+                precision,
+                scale,
+            } => Value::Decimal {
+                value: value.checked_abs().ok_or_else(|| overflow("ABS"))?,
+                precision: *precision,
+                scale: *scale,
+            },
             other => return Err(type_error("ABS", other)),
         }),
         ScalarFn::Coalesce => Ok(vals
@@ -1586,12 +2112,456 @@ mod tests {
             Value::Int64(-5)
         );
         assert_eq!(
-            arithmetic_result_type(BinOp::Add, DataType::Int32, DataType::Int32),
+            arithmetic_result_type(BinOp::Add, DataType::Int32, DataType::Int32).unwrap(),
             DataType::Int64
         );
         assert_eq!(
-            arithmetic_result_type(BinOp::Div, DataType::Int32, DataType::Int32),
+            arithmetic_result_type(BinOp::Div, DataType::Int32, DataType::Int32).unwrap(),
             DataType::Float64
+        );
+    }
+
+    #[test]
+    fn test_decimal_exact_sum_and_float_difference() {
+        let decimal_4_2 = DataType::Decimal {
+            precision: 4,
+            scale: 2,
+        };
+        let penny = Value::Decimal {
+            value: 1,
+            precision: 4,
+            scale: 2,
+        };
+        let mut decimal_sum = Value::Decimal {
+            value: 0,
+            precision: 4,
+            scale: 2,
+        };
+        let mut float_sum = 0.0_f64;
+
+        for _ in 0..100 {
+            // Keep the accumulator at its declared type rather than letting derived
+            // arithmetic precision grow once per addition.
+            decimal_sum = cast_value(
+                arithmetic(BinOp::Add, &decimal_sum, &penny).unwrap(),
+                decimal_4_2,
+            )
+            .unwrap();
+            float_sum += 0.01_f64;
+        }
+
+        assert_eq!(
+            decimal_sum,
+            Value::Decimal {
+                value: 100,
+                precision: 4,
+                scale: 2,
+            }
+        );
+        assert_eq!(decimal_sum.to_string(), "1.00");
+        assert_ne!(float_sum, 1.0_f64);
+    }
+
+    #[test]
+    fn test_decimal_rounding_half_away_from_zero_for_rescale_division_and_cast() {
+        let assert_decimal = |result: Value, expected_value, expected_precision, expected_scale| {
+            let Value::Decimal {
+                value,
+                precision,
+                scale,
+            } = result
+            else {
+                panic!("expected DECIMAL");
+            };
+            assert_eq!(value, expected_value);
+            assert_eq!(precision, expected_precision);
+            assert_eq!(scale, expected_scale);
+        };
+
+        // Arithmetic rescaling uses DECIMAL's round-half-away-from-zero rule.
+        assert_eq!(decimal_rescale(1_005, 3, 2).unwrap(), 101);
+        assert_eq!(decimal_rescale(-1_005, 3, 2).unwrap(), -101);
+
+        let one = Value::Decimal {
+            value: 1,
+            precision: 1,
+            scale: 0,
+        };
+        let three = Value::Decimal {
+            value: 3,
+            precision: 1,
+            scale: 0,
+        };
+        assert_decimal(
+            arithmetic(BinOp::Div, &one, &three).unwrap(),
+            3_333,
+            MAX_DECIMAL_PRECISION,
+            4,
+        );
+        assert_decimal(
+            arithmetic(
+                BinOp::Div,
+                &Value::Decimal {
+                    value: 2,
+                    precision: 1,
+                    scale: 0,
+                },
+                &three,
+            )
+            .unwrap(),
+            6_667,
+            MAX_DECIMAL_PRECISION,
+            4,
+        );
+        assert_decimal(
+            arithmetic(
+                BinOp::Div,
+                &Value::Decimal {
+                    value: 12_345,
+                    precision: 5,
+                    scale: 2,
+                },
+                &one,
+            )
+            .unwrap(),
+            123_450_000,
+            MAX_DECIMAL_PRECISION,
+            6,
+        );
+
+        let decimal_5_2 = DataType::Decimal {
+            precision: 5,
+            scale: 2,
+        };
+        assert_decimal(
+            cast_value(Value::String("1.005".into()), decimal_5_2).unwrap(),
+            101,
+            5,
+            2,
+        );
+        assert_decimal(
+            cast_value(Value::String("-1.005".into()), decimal_5_2).unwrap(),
+            -101,
+            5,
+            2,
+        );
+    }
+
+    #[test]
+    fn decimal_casts_integral_sources_at_target_scale() {
+        let decimal_5_2 = DataType::Decimal {
+            precision: 5,
+            scale: 2,
+        };
+
+        assert_eq!(
+            cast_value(Value::Int32(42), decimal_5_2).unwrap(),
+            Value::Decimal {
+                value: 4_200,
+                precision: 5,
+                scale: 2,
+            }
+        );
+        assert_eq!(
+            cast_value(Value::Int64(-42), decimal_5_2).unwrap(),
+            Value::Decimal {
+                value: -4_200,
+                precision: 5,
+                scale: 2,
+            }
+        );
+        assert_eq!(
+            cast_value(Value::Timestamp(7), decimal_5_2).unwrap(),
+            Value::Decimal {
+                value: 700,
+                precision: 5,
+                scale: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn d9_decimal_division_rounding_direction_uses_exact_quotient_sign() {
+        let assert_decimal = |result: Value, expected_value| {
+            let Value::Decimal {
+                value,
+                precision,
+                scale,
+            } = result
+            else {
+                panic!("expected DECIMAL");
+            };
+            assert_eq!(value, expected_value);
+            assert_eq!(precision, MAX_DECIMAL_PRECISION);
+            assert_eq!(scale, 4);
+        };
+
+        assert_eq!(decimal_rescale(-5, 2, 1).unwrap(), -1);
+        assert_eq!(decimal_rescale(5, 2, 1).unwrap(), 1);
+
+        let decimal = |value| Value::Decimal {
+            value,
+            precision: 1,
+            scale: 0,
+        };
+
+        // Cover all dividend/divisor sign combinations through the division path. The first
+        // division is exact; the last truncates to zero before rounding away from zero.
+        assert_decimal(
+            arithmetic(BinOp::Div, &decimal(1), &decimal(2)).unwrap(),
+            5_000,
+        );
+        assert_decimal(
+            arithmetic(BinOp::Div, &decimal(-1), &decimal(3)).unwrap(),
+            -3_333,
+        );
+        assert_decimal(
+            arithmetic(BinOp::Div, &decimal(1), &decimal(-3)).unwrap(),
+            -3_333,
+        );
+        assert_decimal(
+            arithmetic(BinOp::Div, &decimal(-1), &decimal(-1_500_000)).unwrap(),
+            0,
+        );
+    }
+
+    #[test]
+    fn test_decimal_arithmetic_overflow_and_precision_errors() {
+        // A DECIMAL result that fits its at-most-18-digit declaration also fits i64, so
+        // stored-integer overflow of a valid result is unreachable. Derived precision is clamped.
+        let precision_overflow = arithmetic(
+            BinOp::Mul,
+            &Value::Decimal {
+                value: 999_999_999_999_999_999,
+                precision: 18,
+                scale: 0,
+            },
+            &Value::Decimal {
+                value: 2,
+                precision: 1,
+                scale: 0,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            precision_overflow.contains("1999999999999999998")
+                && precision_overflow.contains("DECIMAL(18,0)"),
+            "{precision_overflow}"
+        );
+
+        let cast_precision_overflow = cast_value(
+            Value::Int64(12_345),
+            DataType::Decimal {
+                precision: 3,
+                scale: 2,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            cast_precision_overflow.contains("cannot cast"),
+            "{cast_precision_overflow}"
+        );
+    }
+
+    #[test]
+    fn test_decimal_required_precision_is_clamped_to_supported_bound() {
+        assert_eq!(
+            arithmetic_result_type(
+                BinOp::Mul,
+                DataType::Decimal {
+                    precision: 18,
+                    scale: 0,
+                },
+                DataType::Decimal {
+                    precision: 18,
+                    scale: 0,
+                },
+            )
+            .unwrap(),
+            DataType::Decimal {
+                precision: 18,
+                scale: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_decimal_string_parsing_is_exact_and_rejects_non_decimal_syntax() {
+        let decimal_18_2 = DataType::Decimal {
+            precision: 18,
+            scale: 2,
+        };
+
+        assert_eq!(
+            cast_value(Value::String("1234567890123456.78".into()), decimal_18_2).unwrap(),
+            Value::Decimal {
+                value: 123_456_789_012_345_678,
+                precision: 18,
+                scale: 2,
+            }
+        );
+        assert_eq!(
+            cast_value(Value::String("000001.20".into()), decimal_18_2).unwrap(),
+            Value::Decimal {
+                value: 120,
+                precision: 18,
+                scale: 2,
+            }
+        );
+        assert_eq!(
+            cast_value(Value::String("1.2".into()), decimal_18_2).unwrap(),
+            Value::Decimal {
+                value: 120,
+                precision: 18,
+                scale: 2,
+            }
+        );
+        assert!(cast_value(Value::String("1e-2".into()), decimal_18_2).is_err());
+        assert!(cast_value(Value::String("not-a-number".into()), decimal_18_2).is_err());
+    }
+
+    #[test]
+    fn d7_decimal_division_rounds_non_tie_remainders_correctly() {
+        let third = Value::Decimal {
+            value: 3,
+            precision: 1,
+            scale: 0,
+        };
+        let expected_positive = Value::Decimal {
+            value: 3_333,
+            precision: MAX_DECIMAL_PRECISION,
+            scale: 4,
+        };
+        let expected_negative = Value::Decimal {
+            value: -3_333,
+            precision: MAX_DECIMAL_PRECISION,
+            scale: 4,
+        };
+
+        assert_eq!(
+            arithmetic(
+                BinOp::Div,
+                &Value::Decimal {
+                    value: 1,
+                    precision: 1,
+                    scale: 0,
+                },
+                &third,
+            )
+            .unwrap(),
+            expected_positive
+        );
+        assert_eq!(
+            arithmetic(
+                BinOp::Div,
+                &Value::Decimal {
+                    value: -1,
+                    precision: 1,
+                    scale: 0,
+                },
+                &third,
+            )
+            .unwrap(),
+            expected_negative
+        );
+    }
+
+    #[test]
+    fn decimal_arithmetic_and_comparison() {
+        let ev = |e: Expr| e.eval_constant().unwrap();
+
+        assert_eq!(
+            ev(bin(
+                BinOp::Add,
+                lit(Value::Decimal {
+                    value: 125,
+                    precision: 3,
+                    scale: 2,
+                }),
+                lit(Value::Decimal {
+                    value: 25,
+                    precision: 2,
+                    scale: 1,
+                }),
+            )),
+            Value::Decimal {
+                value: 375,
+                precision: 4,
+                scale: 2,
+            }
+        );
+        assert_eq!(
+            ev(bin(
+                BinOp::Mul,
+                lit(Value::Decimal {
+                    value: 125,
+                    precision: 3,
+                    scale: 2,
+                }),
+                lit(Value::Decimal {
+                    value: 20,
+                    precision: 2,
+                    scale: 1,
+                }),
+            )),
+            Value::Decimal {
+                value: 2500,
+                precision: 6,
+                scale: 3,
+            }
+        );
+        assert_eq!(
+            ev(bin(
+                BinOp::Div,
+                lit(Value::Decimal {
+                    value: 1000,
+                    precision: 4,
+                    scale: 2,
+                }),
+                lit(Value::Decimal {
+                    value: 400,
+                    precision: 3,
+                    scale: 2,
+                }),
+            )),
+            Value::Decimal {
+                value: 2_500_000,
+                precision: MAX_DECIMAL_PRECISION,
+                scale: 6,
+            }
+        );
+        assert_eq!(
+            ev(bin(
+                BinOp::Eq,
+                lit(Value::Decimal {
+                    value: 100,
+                    precision: 3,
+                    scale: 2,
+                }),
+                lit(Value::Decimal {
+                    value: 10,
+                    precision: 2,
+                    scale: 1,
+                }),
+            )),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            arithmetic_result_type(
+                BinOp::Add,
+                DataType::Decimal {
+                    precision: 5,
+                    scale: 2,
+                },
+                DataType::Int32,
+            )
+            .unwrap(),
+            DataType::Decimal {
+                precision: 13,
+                scale: 2,
+            }
         );
     }
 
@@ -1764,6 +2734,127 @@ mod tests {
                 DataType::Float64
             )),
             Value::Float64(1.5)
+        );
+    }
+
+    #[test]
+    fn calendar_intervals_extract_and_substring() {
+        let date = |value| parse_date_to_timestamp_micros(value).unwrap();
+        let date_expr = |value, quantity, unit, negated| Expr::CalendarInterval {
+            expr: Box::new(lit(Value::Timestamp(date(value)))),
+            quantity: Box::new(lit(Value::Int64(quantity))),
+            unit,
+            negated,
+        };
+        let as_date = |expr: Expr| match expr.eval_constant().unwrap() {
+            Value::Timestamp(value) => timestamp_micros_to_date(value).unwrap(),
+            other => panic!("expected timestamp, found {other:?}"),
+        };
+
+        assert_eq!(
+            as_date(date_expr(
+                "2023-01-31",
+                1,
+                CalendarIntervalUnit::Month,
+                false
+            )),
+            "2023-02-28"
+        );
+        assert_eq!(
+            as_date(date_expr(
+                "2024-01-31",
+                1,
+                CalendarIntervalUnit::Month,
+                false
+            )),
+            "2024-02-29"
+        );
+        assert_eq!(
+            as_date(date_expr(
+                "2024-02-29",
+                1,
+                CalendarIntervalUnit::Year,
+                false
+            )),
+            "2025-02-28"
+        );
+        assert_eq!(
+            as_date(date_expr("2024-03-01", 1, CalendarIntervalUnit::Day, true)),
+            "2024-02-29"
+        );
+        assert_eq!(
+            Expr::CalendarInterval {
+                expr: Box::new(Expr::null()),
+                quantity: Box::new(lit(Value::Int64(1))),
+                unit: CalendarIntervalUnit::Day,
+                negated: false,
+            }
+            .eval_constant()
+            .unwrap(),
+            Value::Null
+        );
+
+        let extract = |unit| Expr::ScalarFunction {
+            func: ScalarFn::Extract(unit),
+            args: vec![lit(Value::Timestamp(date("2024-02-29")))],
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        assert_eq!(
+            extract(CalendarIntervalUnit::Year).eval_constant().unwrap(),
+            Value::Int64(2024)
+        );
+        assert_eq!(
+            extract(CalendarIntervalUnit::Month)
+                .eval_constant()
+                .unwrap(),
+            Value::Int64(2)
+        );
+        assert_eq!(
+            extract(CalendarIntervalUnit::Day).eval_constant().unwrap(),
+            Value::Int64(29)
+        );
+        assert_eq!(
+            Expr::ScalarFunction {
+                func: ScalarFn::Extract(CalendarIntervalUnit::Day),
+                args: vec![Expr::null()],
+                data_type: DataType::Int64,
+                nullable: true,
+            }
+            .eval_constant()
+            .unwrap(),
+            Value::Null
+        );
+
+        let substring = |value: &str, start: i64, length: i64| Expr::ScalarFunction {
+            func: ScalarFn::Substring,
+            args: vec![
+                lit(Value::String(value.into())),
+                lit(Value::Int64(start)),
+                lit(Value::Int64(length)),
+            ],
+            data_type: DataType::String,
+            nullable: true,
+        };
+        assert_eq!(
+            substring("abcdef", 2, 3).eval_constant().unwrap(),
+            Value::String("bcd".into())
+        );
+        assert_eq!(
+            substring("abcdef", 20, 3).eval_constant().unwrap(),
+            Value::String(String::new())
+        );
+        assert_eq!(
+            substring("abcdef", 2, 0).eval_constant().unwrap(),
+            Value::String(String::new())
+        );
+        assert_eq!(
+            substring("abcdef", 2, -1).eval_constant().unwrap(),
+            Value::String(String::new())
+        );
+        assert_eq!(
+            substring("héllo", 2, 2).eval_constant().unwrap(),
+            Value::String("él".into())
         );
     }
 
@@ -1996,6 +3087,156 @@ mod tests {
                 None => Ok(Value::Null),
             }
         }
+    }
+
+    fn assert_decimal(
+        value: Value,
+        expected_value: i64,
+        expected_precision: u8,
+        expected_scale: u8,
+    ) {
+        let Value::Decimal {
+            value,
+            precision,
+            scale,
+        } = value
+        else {
+            panic!("expected DECIMAL");
+        };
+        assert_eq!(value, expected_value);
+        assert_eq!(precision, expected_precision);
+        assert_eq!(scale, expected_scale);
+    }
+
+    #[test]
+    fn decimal_cast_negation_and_abs() {
+        let decimal = |value, precision, scale| Value::Decimal {
+            value,
+            precision,
+            scale,
+        };
+
+        assert_eq!(
+            cast_value(decimal(1_234, 4, 2), DataType::Int64).unwrap(),
+            Value::Int64(12)
+        );
+        assert_eq!(
+            cast_value(decimal(1_250, 4, 2), DataType::Int64).unwrap(),
+            Value::Int64(13)
+        );
+        assert_eq!(
+            cast_value(decimal(-1_250, 4, 2), DataType::Int64).unwrap(),
+            Value::Int64(-13)
+        );
+
+        let column = Expr::ColumnRef {
+            slot: 0,
+            column: 0,
+            offset: 0,
+            name: "amount".into(),
+            data_type: DataType::Decimal {
+                precision: 18,
+                scale: 0,
+            },
+            nullable: false,
+        };
+        let row = [decimal(-999_999_999_999_999_999, 18, 0)];
+        assert_decimal(
+            Expr::Negate(Box::new(column))
+                .eval(&EvalContext::row_only(&row))
+                .unwrap(),
+            999_999_999_999_999_999,
+            18,
+            0,
+        );
+
+        let expression = Expr::Negate(Box::new(bin(
+            BinOp::Add,
+            lit(decimal(125, 3, 2)),
+            lit(decimal(25, 2, 1)),
+        )));
+        assert_decimal(expression.eval_constant().unwrap(), -375, 4, 2);
+
+        let abs = |value| Expr::ScalarFunction {
+            func: ScalarFn::Abs,
+            args: vec![lit(decimal(value, 4, 2))],
+            data_type: DataType::Decimal {
+                precision: 4,
+                scale: 2,
+            },
+            nullable: false,
+        };
+        assert_decimal(abs(123).eval_constant().unwrap(), 123, 4, 2);
+        assert_decimal(abs(-123).eval_constant().unwrap(), 123, 4, 2);
+        assert_decimal(abs(0).eval_constant().unwrap(), 0, 4, 2);
+    }
+
+    #[test]
+    fn conditional_integer_branch_conforms_to_declared_decimal_type() {
+        let expression = Expr::Case {
+            operand: None,
+            branches: vec![(lit(Value::Bool(true)), lit(Value::Int64(7)))],
+            else_result: Some(Box::new(lit(Value::Decimal {
+                value: 125,
+                precision: 5,
+                scale: 2,
+            }))),
+            data_type: DataType::Decimal {
+                precision: 12,
+                scale: 2,
+            },
+            nullable: false,
+        };
+
+        assert_decimal(expression.eval_constant().unwrap(), 700, 12, 2);
+    }
+
+    #[test]
+    fn null_coalescing_integer_column_conforms_to_declared_decimal_type() {
+        let expression = Expr::ScalarFunction {
+            func: ScalarFn::Coalesce,
+            args: vec![
+                Expr::ColumnRef {
+                    slot: 0,
+                    column: 0,
+                    offset: 0,
+                    name: "whole_amount".into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                },
+                Expr::ColumnRef {
+                    slot: 0,
+                    column: 1,
+                    offset: 1,
+                    name: "decimal_amount".into(),
+                    data_type: DataType::Decimal {
+                        precision: 12,
+                        scale: 2,
+                    },
+                    nullable: true,
+                },
+            ],
+            data_type: DataType::Decimal {
+                precision: 12,
+                scale: 2,
+            },
+            nullable: true,
+        };
+        let row = [
+            Value::Int64(7),
+            Value::Decimal {
+                value: 125,
+                precision: 12,
+                scale: 2,
+            },
+        ];
+
+        assert_decimal(
+            expression.eval(&EvalContext::row_only(&row)).unwrap(),
+            700,
+            12,
+            2,
+        );
     }
 
     #[test]

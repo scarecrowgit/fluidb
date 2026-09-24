@@ -112,7 +112,10 @@ pub fn execute_analytic_select(select: &AnalyticSelect, rows: Vec<Row>) -> Resul
 
             if filtered_rows.is_empty() {
                 // Empty global aggregate returns exactly one row: COUNT 0, other aggregates NULL.
-                let values: Vec<Value> = accumulators.iter().map(|acc| acc.finish()).collect();
+                let values: Vec<Value> = accumulators
+                    .iter()
+                    .map(Accumulator::finish)
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(QueryResult::new(output_columns, vec![Row::new(values)]))
             } else {
                 for row in &filtered_rows {
@@ -120,7 +123,10 @@ pub fn execute_analytic_select(select: &AnalyticSelect, rows: Vec<Row>) -> Resul
                         acc.update(row)?;
                     }
                 }
-                let values: Vec<Value> = accumulators.iter().map(|acc| acc.finish()).collect();
+                let values: Vec<Value> = accumulators
+                    .iter()
+                    .map(Accumulator::finish)
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(QueryResult::new(output_columns, vec![Row::new(values)]))
             }
         }
@@ -180,7 +186,7 @@ pub fn execute_analytic_select(select: &AnalyticSelect, rows: Vec<Row>) -> Resul
                         let acc = group_accs[i].as_ref().ok_or_else(|| {
                             HtapError::Internal("missing aggregate accumulator".into())
                         })?;
-                        row_values.push(acc.finish());
+                        row_values.push(acc.finish()?);
                     }
                 }
             }
@@ -510,6 +516,12 @@ enum Accumulator {
         column: usize,
         sum: Option<f64>,
     },
+    SumDecimal {
+        column: usize,
+        sum: Option<i128>,
+        precision: u8,
+        scale: u8,
+    },
     Min {
         column: usize,
         value: Option<Value>,
@@ -520,6 +532,61 @@ enum Accumulator {
         value: Option<Value>,
         data_type: DataType,
     },
+}
+
+fn decimal_scaled_value(value: &Value, target_scale: u8) -> Result<i128> {
+    match value {
+        Value::Decimal {
+            value,
+            scale: value_scale,
+            ..
+        } => {
+            let value = i128::from(*value);
+            match target_scale.cmp(value_scale) {
+                std::cmp::Ordering::Greater => {
+                    let factor = 10_i128
+                        .checked_pow(u32::from(target_scale - *value_scale))
+                        .ok_or_else(|| {
+                            HtapError::InvalidArgument("DECIMAL scale is out of range".into())
+                        })?;
+                    value
+                        .checked_mul(factor)
+                        .ok_or_else(|| HtapError::InvalidArgument("DECIMAL SUM overflow".into()))
+                }
+                std::cmp::Ordering::Less => {
+                    let factor = 10_i128
+                        .checked_pow(u32::from(*value_scale - target_scale))
+                        .ok_or_else(|| {
+                            HtapError::InvalidArgument("DECIMAL scale is out of range".into())
+                        })?;
+                    Ok(value / factor)
+                }
+                std::cmp::Ordering::Equal => Ok(value),
+            }
+        }
+        other => Err(HtapError::InvalidArgument(format!(
+            "unsupported value type for decimal SUM: {other:?}"
+        ))),
+    }
+}
+
+fn decimal_result_value(value: i128, precision: u8, scale: u8) -> Result<Value> {
+    let max = 10_i128
+        .checked_pow(u32::from(precision))
+        .ok_or_else(|| HtapError::InvalidArgument("DECIMAL precision is out of range".into()))?;
+    if value <= -max || value >= max {
+        return Err(HtapError::InvalidArgument(
+            "DECIMAL aggregate result is out of range".into(),
+        ));
+    }
+    let value = i64::try_from(value).map_err(|_| {
+        HtapError::InvalidArgument("DECIMAL aggregate result is out of range".into())
+    })?;
+    Ok(Value::Decimal {
+        value,
+        precision,
+        scale,
+    })
 }
 
 impl Accumulator {
@@ -551,6 +618,12 @@ impl Accumulator {
                         DataType::Float64 => Ok(Accumulator::SumFloat {
                             column: col,
                             sum: None,
+                        }),
+                        DataType::Decimal { precision, scale } => Ok(Accumulator::SumDecimal {
+                            column: col,
+                            sum: None,
+                            precision: *precision,
+                            scale: *scale,
                         }),
                         other => Err(HtapError::InvalidArgument(format!(
                             "unsupported data type for SUM: {other:?}"
@@ -660,6 +733,25 @@ impl Accumulator {
                     }
                 }
             }
+            Accumulator::SumDecimal {
+                column,
+                sum,
+                precision: _,
+                scale,
+            } => {
+                let val = row.get(*column).ok_or_else(|| {
+                    HtapError::Internal(format!("row missing column index {column}"))
+                })?;
+                if !val.is_null() {
+                    let value = decimal_scaled_value(val, *scale)?;
+                    *sum = Some(match *sum {
+                        Some(current) => current.checked_add(value).ok_or_else(|| {
+                            HtapError::InvalidArgument("DECIMAL SUM overflow".into())
+                        })?,
+                        None => value,
+                    });
+                }
+            }
             Accumulator::Min {
                 column,
                 value,
@@ -716,14 +808,23 @@ impl Accumulator {
         Ok(())
     }
 
-    fn finish(&self) -> Value {
+    fn finish(&self) -> Result<Value> {
         match self {
-            Accumulator::CountStar(c) => Value::Int64(*c),
-            Accumulator::Count { count, .. } => Value::Int64(*count),
-            Accumulator::SumInt { sum, .. } => sum.map(Value::Int64).unwrap_or(Value::Null),
-            Accumulator::SumFloat { sum, .. } => sum.map(Value::Float64).unwrap_or(Value::Null),
-            Accumulator::Min { value, .. } => value.clone().unwrap_or(Value::Null),
-            Accumulator::Max { value, .. } => value.clone().unwrap_or(Value::Null),
+            Accumulator::CountStar(c) => Ok(Value::Int64(*c)),
+            Accumulator::Count { count, .. } => Ok(Value::Int64(*count)),
+            Accumulator::SumInt { sum, .. } => Ok(sum.map(Value::Int64).unwrap_or(Value::Null)),
+            Accumulator::SumFloat { sum, .. } => Ok(sum.map(Value::Float64).unwrap_or(Value::Null)),
+            Accumulator::SumDecimal {
+                sum,
+                precision,
+                scale,
+                ..
+            } => sum
+                .map(|value| decimal_result_value(value, *precision, *scale))
+                .transpose()
+                .map(|value| value.unwrap_or(Value::Null)),
+            Accumulator::Min { value, .. } => Ok(value.clone().unwrap_or(Value::Null)),
+            Accumulator::Max { value, .. } => Ok(value.clone().unwrap_or(Value::Null)),
         }
     }
 }

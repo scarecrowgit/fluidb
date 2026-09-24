@@ -6,6 +6,8 @@ use htap_catalog::{
 };
 use htap_common::error::{HtapError, Result};
 use htap_common::types::{
+    check_decimal_precision, decimal_text_is_exact_at_scale, parse_date_to_timestamp_micros,
+    parse_decimal_text, parse_decimal_text_with_exactness, rewrite_decimal_predicate_literal,
     ColumnDef as CommonColumnDef, DataType as CommonDataType, Row, Schema, Value,
 };
 use sqlparser::ast::{
@@ -388,13 +390,43 @@ fn map_sql_data_type(data_type: &sqlparser::ast::DataType) -> Result<CommonDataT
         sqlparser::ast::DataType::Double(_) | sqlparser::ast::DataType::DoublePrecision => {
             Ok(CommonDataType::Float64)
         }
-        sqlparser::ast::DataType::Varchar(_) | sqlparser::ast::DataType::Text => {
-            Ok(CommonDataType::String)
-        }
+        sqlparser::ast::DataType::Char(_)
+        | sqlparser::ast::DataType::Varchar(_)
+        | sqlparser::ast::DataType::Text => Ok(CommonDataType::String),
         sqlparser::ast::DataType::Varbinary(_) | sqlparser::ast::DataType::Blob(_) => {
             Ok(CommonDataType::Bytes)
         }
-        sqlparser::ast::DataType::Timestamp(_, _) => Ok(CommonDataType::Timestamp),
+        sqlparser::ast::DataType::Timestamp(_, _) | sqlparser::ast::DataType::Date => {
+            Ok(CommonDataType::Timestamp)
+        }
+        sqlparser::ast::DataType::Decimal(info)
+        | sqlparser::ast::DataType::Numeric(info)
+        | sqlparser::ast::DataType::Dec(info) => {
+            let (precision, scale) = match info {
+                sqlparser::ast::ExactNumberInfo::None => (10, 0),
+                sqlparser::ast::ExactNumberInfo::Precision(precision) => (
+                    u8::try_from(*precision).map_err(|_| {
+                        HtapError::InvalidArgument(format!(
+                            "DECIMAL precision {precision} is out of range"
+                        ))
+                    })?,
+                    0,
+                ),
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(precision, scale) => (
+                    u8::try_from(*precision).map_err(|_| {
+                        HtapError::InvalidArgument(format!(
+                            "DECIMAL precision {precision} is out of range"
+                        ))
+                    })?,
+                    u8::try_from(*scale).map_err(|_| {
+                        HtapError::InvalidArgument(format!("DECIMAL scale {scale} is out of range"))
+                    })?,
+                ),
+            };
+            let data_type = CommonDataType::Decimal { precision, scale };
+            data_type.validate()?;
+            Ok(data_type)
+        }
         other => Err(HtapError::Unsupported(format!(
             "unsupported data type: {other}"
         ))),
@@ -861,7 +893,7 @@ fn bind_mysql_partitioning(
                         None
                     }
                     MysqlLessThanBound::Expr(bound_expr) => {
-                        let val = parse_literal_value(bound_expr, key_col_def)?;
+                        let val = parse_predicate_literal_value(bound_expr, key_col_def)?;
                         if val.is_null() {
                             return Err(HtapError::InvalidArgument(format!(
                                 "range partition '{part_name}' bound cannot be NULL"
@@ -946,7 +978,7 @@ fn bind_mysql_partitioning(
                 let mut part_values = Vec::with_capacity(exprs.len());
                 let mut seen_in_part = std::collections::HashSet::new();
                 for e in exprs {
-                    let val = parse_literal_value(e, key_col_def)?;
+                    let val = parse_predicate_literal_value(e, key_col_def)?;
                     if val.is_null() {
                         return Err(HtapError::InvalidArgument(format!(
                             "list partition '{part_name}' value cannot be NULL"
@@ -1181,7 +1213,7 @@ fn bind_alter_add_partition(
                         None
                     }
                     MysqlLessThanBound::Expr(bound_expr) => {
-                        let val = parse_literal_value(bound_expr, key_col)?;
+                        let val = parse_predicate_literal_value(bound_expr, key_col)?;
                         if val.is_null() {
                             return Err(HtapError::InvalidArgument(format!(
                                 "range partition '{part_name}' bound cannot be NULL"
@@ -1251,7 +1283,7 @@ fn bind_alter_add_partition(
                 let mut part_values = Vec::with_capacity(exprs.len());
                 let mut seen_in_part = std::collections::HashSet::new();
                 for e in exprs {
-                    let val = parse_literal_value(e, key_col)?;
+                    let val = parse_predicate_literal_value(e, key_col)?;
                     if val.is_null() {
                         return Err(HtapError::InvalidArgument(format!(
                             "list partition '{part_name}' value cannot be NULL"
@@ -1443,7 +1475,7 @@ fn bind_alter_reorganize_partition(
                         None
                     }
                     MysqlLessThanBound::Expr(bound_expr) => {
-                        let val = parse_literal_value(bound_expr, key_col)?;
+                        let val = parse_predicate_literal_value(bound_expr, key_col)?;
                         if val.is_null() {
                             return Err(HtapError::InvalidArgument(format!(
                                 "range partition '{part_name}' bound cannot be NULL"
@@ -1515,7 +1547,7 @@ fn bind_alter_reorganize_partition(
                 let mut part_values = Vec::with_capacity(exprs.len());
                 let mut seen_in_part = std::collections::HashSet::new();
                 for e in exprs {
-                    let val = parse_literal_value(e, key_col)?;
+                    let val = parse_predicate_literal_value(e, key_col)?;
                     if val.is_null() {
                         return Err(HtapError::InvalidArgument(format!(
                             "list partition '{part_name}' value cannot be NULL"
@@ -1695,7 +1727,89 @@ pub(crate) fn parse_hex_bytes(s: &str, col_name: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_literal_value(expr: &Expr, col_def: &CommonColumnDef) -> Result<Value> {
+fn parse_assignment_literal_value(expr: &Expr, col_def: &CommonColumnDef) -> Result<Value> {
+    parse_literal_value(expr, col_def, false)
+}
+
+fn parse_predicate_literal_value(expr: &Expr, col_def: &CommonColumnDef) -> Result<Value> {
+    parse_literal_value(expr, col_def, true)
+}
+
+fn decimal_predicate_literal_text(expr: &Expr, col_name: &str) -> Result<String> {
+    let mut current = expr;
+    while let Expr::Nested(inner) = current {
+        current = inner;
+    }
+
+    match current {
+        Expr::Value(value) => match &value.value {
+            sqlparser::ast::Value::Number(text, _) => Ok(text.clone()),
+            sqlparser::ast::Value::SingleQuotedString(text)
+            | sqlparser::ast::Value::DoubleQuotedString(text) => Ok(text.clone()),
+            _ => Err(HtapError::InvalidArgument(format!(
+                "type mismatch for column '{col_name}': expected decimal number or quoted decimal string"
+            ))),
+        },
+        Expr::UnaryOp { op, expr } => {
+            let sign = match op {
+                UnaryOperator::Plus => "+",
+                UnaryOperator::Minus => "-",
+                _ => {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "unsupported unary operator '{op}' in decimal literal for column '{col_name}'"
+                    )));
+                }
+            };
+            match &**expr {
+                Expr::Value(value) => match &value.value {
+                    sqlparser::ast::Value::Number(text, _) => Ok(format!("{sign}{text}")),
+                    _ => Err(HtapError::InvalidArgument(format!(
+                        "type mismatch for column '{col_name}': expected decimal number"
+                    ))),
+                },
+                _ => Err(HtapError::InvalidArgument(format!(
+                    "expressions not supported in values for column '{col_name}'"
+                ))),
+            }
+        }
+        _ => Err(HtapError::InvalidArgument(format!(
+            "expressions not supported in values for column '{col_name}'"
+        ))),
+    }
+}
+
+fn rewrite_predicate_decimal_value(
+    expr: &Expr,
+    col_def: &CommonColumnDef,
+    op: ComparisonOp,
+) -> Result<htap_common::types::DecimalPredicateLiteral> {
+    let CommonDataType::Decimal { precision, scale } = col_def.data_type else {
+        return Ok(htap_common::types::DecimalPredicateLiteral::Value(
+            parse_predicate_literal_value(expr, col_def)?,
+        ));
+    };
+
+    let operator = match op {
+        ComparisonOp::Eq => "=",
+        ComparisonOp::NotEq => "!=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Lte => "<=",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Gte => ">=",
+    };
+    rewrite_decimal_predicate_literal(
+        &decimal_predicate_literal_text(expr, &col_def.name)?,
+        precision,
+        scale,
+        operator,
+    )
+}
+
+fn parse_literal_value(
+    expr: &Expr,
+    col_def: &CommonColumnDef,
+    require_exact_decimal: bool,
+) -> Result<Value> {
     let mut current = expr;
     while let Expr::Nested(inner) = current {
         current = inner;
@@ -1768,6 +1882,40 @@ fn parse_literal_value(expr: &Expr, col_def: &CommonColumnDef) -> Result<Value> 
             Ok(Value::Int64(val))
         }
         CommonDataType::Timestamp => {
+            if let Expr::Value(v) = current {
+                if let sqlparser::ast::Value::SingleQuotedString(date)
+                | sqlparser::ast::Value::DoubleQuotedString(date) = &v.value
+                {
+                    return parse_date_to_timestamp_micros(date)
+                        .map(Value::Timestamp)
+                        .map_err(|_| {
+                            HtapError::InvalidArgument(format!(
+                                "invalid date literal for column '{}': '{date}'",
+                                col_def.name
+                            ))
+                        });
+                }
+            }
+
+            if let Expr::TypedString(typed_string) = current {
+                if matches!(typed_string.data_type, sqlparser::ast::DataType::Date) {
+                    let date = typed_string.value.value.clone().into_string().ok_or_else(|| {
+                        HtapError::InvalidArgument(format!(
+                            "invalid date literal for column '{}': DATE literal requires a string value",
+                            col_def.name
+                        ))
+                    })?;
+                    return parse_date_to_timestamp_micros(&date)
+                        .map(Value::Timestamp)
+                        .map_err(|_| {
+                            HtapError::InvalidArgument(format!(
+                                "invalid date literal for column '{}': '{date}'",
+                                col_def.name
+                            ))
+                        });
+                }
+            }
+
             let (prefix, num_str) = extract_number_parts(current, &col_def.name)?;
             let s = parse_integer_string(prefix, num_str, &col_def.name)?;
             let val: i64 = s.parse().map_err(|e| {
@@ -1823,6 +1971,91 @@ fn parse_literal_value(expr: &Expr, col_def: &CommonColumnDef) -> Result<Value> 
                 "type mismatch for column '{}': expected hex byte literal",
                 col_def.name
             )))
+        }
+        CommonDataType::Decimal { precision, scale } => {
+            let text = if let Expr::Value(v) = current {
+                match &v.value {
+                    sqlparser::ast::Value::Number(text, _) => text.clone(),
+                    sqlparser::ast::Value::SingleQuotedString(text)
+                    | sqlparser::ast::Value::DoubleQuotedString(text) => text.clone(),
+                    _ => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "type mismatch for column '{}': expected decimal number or quoted decimal string",
+                            col_def.name
+                        )));
+                    }
+                }
+            } else if let Expr::UnaryOp { op, expr } = current {
+                let sign = match op {
+                    UnaryOperator::Plus => "+",
+                    UnaryOperator::Minus => "-",
+                    _ => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "unsupported unary operator '{op}' in decimal literal for column '{}'",
+                            col_def.name
+                        )));
+                    }
+                };
+                match &**expr {
+                    Expr::Value(v) => match &v.value {
+                        sqlparser::ast::Value::Number(text, _) => format!("{sign}{text}"),
+                        _ => {
+                            return Err(HtapError::InvalidArgument(format!(
+                                "type mismatch for column '{}': expected decimal number",
+                                col_def.name
+                            )));
+                        }
+                    },
+                    _ => {
+                        return Err(HtapError::InvalidArgument(format!(
+                            "expressions not supported in values for column '{}'",
+                            col_def.name
+                        )));
+                    }
+                }
+            } else {
+                return Err(HtapError::InvalidArgument(format!(
+                    "expressions not supported in values for column '{}'",
+                    col_def.name
+                )));
+            };
+
+            let unscaled = if require_exact_decimal {
+                let (unscaled, exact) =
+                    parse_decimal_text_with_exactness(&text, scale).map_err(|_| {
+                        HtapError::InvalidArgument(format!(
+                            "invalid decimal literal for column '{}': '{text}'",
+                            col_def.name
+                        ))
+                    })?;
+                if !exact {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "decimal literal for predicate column '{}' is not exactly representable at scale {scale}: '{text}'",
+                        col_def.name
+                    )));
+                }
+                unscaled
+            } else {
+                parse_decimal_text(&text, scale).map_err(|_| {
+                    HtapError::InvalidArgument(format!(
+                        "invalid decimal literal for column '{}': '{text}'",
+                        col_def.name
+                    ))
+                })?
+            };
+            let unscaled = i64::try_from(unscaled).map_err(|_| {
+                HtapError::InvalidArgument(format!(
+                    "decimal overflow for column '{}': '{text}'",
+                    col_def.name
+                ))
+            })?;
+            let unscaled = check_decimal_precision(unscaled, precision, scale)?;
+
+            Ok(Value::Decimal {
+                value: unscaled,
+                precision,
+                scale,
+            })
         }
     }
 }
@@ -1997,7 +2230,7 @@ fn bind_insert(insert: &SqlInsert, catalog: &CatalogSnapshot) -> Result<BoundSta
                 .schema
                 .column(schema_idx)
                 .expect("index validated");
-            let val = parse_literal_value(expr, col_def)?;
+            let val = parse_assignment_literal_value(expr, col_def)?;
             row_values[schema_idx] = Some(val);
         }
 
@@ -2129,7 +2362,25 @@ pub(crate) fn bind_pk_where_predicate(
                     .schema
                     .column(col_idx)
                     .expect("column must exist");
-                let parsed_value = parse_literal_value(r, col_def)?;
+                let parsed_value =
+                    match rewrite_predicate_decimal_value(r, col_def, ComparisonOp::Eq)? {
+                        htap_common::types::DecimalPredicateLiteral::Value(value) => value,
+                        htap_common::types::DecimalPredicateLiteral::Constant(false) => {
+                            match col_def.data_type {
+                                CommonDataType::Decimal { precision, scale } => Value::Decimal {
+                                    value: i64::MIN + 1,
+                                    precision,
+                                    scale,
+                                },
+                                _ => unreachable!("only decimal predicates can be constant"),
+                            }
+                        }
+                        htap_common::types::DecimalPredicateLiteral::Constant(true) => {
+                            return Err(HtapError::Internal(
+                                "decimal equality predicate unexpectedly resolved to true".into(),
+                            ));
+                        }
+                    };
                 pk_values.insert(col_idx, parsed_value);
             }
             _ => {
@@ -3226,12 +3477,44 @@ fn bind_analytic_filter(
                     .schema
                     .column(col_idx)
                     .expect("column must exist");
-                let parsed_value = parse_literal_value(r, col_def)?;
-                bound_leaves.push(AnalyticFilter::Comparison {
-                    column: col_idx,
-                    op: comp_op,
-                    value: parsed_value,
-                });
+                let decimal_literal_is_exact = match col_def.data_type {
+                    CommonDataType::Decimal { scale, .. } => decimal_text_is_exact_at_scale(
+                        &decimal_predicate_literal_text(r, &col_def.name)?,
+                        scale,
+                    )?,
+                    _ => true,
+                };
+                match rewrite_predicate_decimal_value(r, col_def, comp_op)? {
+                    htap_common::types::DecimalPredicateLiteral::Value(parsed_value) => {
+                        let op = match (col_def.data_type, comp_op, decimal_literal_is_exact) {
+                            (
+                                CommonDataType::Decimal { .. },
+                                ComparisonOp::Gt | ComparisonOp::Gte,
+                                false,
+                            ) => ComparisonOp::Gte,
+                            (
+                                CommonDataType::Decimal { .. },
+                                ComparisonOp::Lt | ComparisonOp::Lte,
+                                false,
+                            ) => ComparisonOp::Lte,
+                            _ => comp_op,
+                        };
+                        bound_leaves.push(AnalyticFilter::Comparison {
+                            column: col_idx,
+                            op,
+                            value: parsed_value,
+                        });
+                    }
+                    htap_common::types::DecimalPredicateLiteral::Constant(true) => {
+                        // A constant true comparison remains unknown for NULL values.
+                        bound_leaves.push(AnalyticFilter::IsNotNull { column: col_idx });
+                    }
+                    htap_common::types::DecimalPredicateLiteral::Constant(false) => {
+                        // A constant false comparison never matches, including for NULL values.
+                        bound_leaves.push(AnalyticFilter::IsNull { column: col_idx });
+                        bound_leaves.push(AnalyticFilter::IsNotNull { column: col_idx });
+                    }
+                }
             }
             Expr::UnaryOp {
                 op: UnaryOperator::Not,

@@ -265,7 +265,7 @@ fn decode_binary_row(payload: &[u8], columns: &[ColumnDef]) -> Row {
             values.push(Value::Null);
             continue;
         }
-        let (type_code, ..) = mysql_type_for(c.data_type);
+        let (type_code, ..) = mysql_type_for(c.data_type).unwrap();
         let v = match type_code {
             MYSQL_TYPE_TINY => Value::Bool(read_fixed(payload, &mut pos, 1).unwrap()[0] != 0),
             MYSQL_TYPE_LONG => {
@@ -1613,6 +1613,92 @@ fn test_wire_prepare_and_execute_case_in_order_by() {
             Row::new(vec![Value::Int32(1)]),
         ]
     );
+
+    wire.shutdown();
+}
+
+#[test]
+fn test_wire_decimal_text_result_preserves_values_and_column_metadata() {
+    let (_dir, wire) = start(None, 4);
+    let mut stream = TcpStream::connect(addr(&wire)).unwrap();
+    raw_handshake(&mut stream);
+
+    raw_send_command(
+        &mut stream,
+        COM_QUERY,
+        b"CREATE TABLE wd (id INT PRIMARY KEY, amount DECIMAL(8, 3))",
+    );
+    let (_, response) = read_packet(&mut stream).unwrap();
+    assert_eq!(response[0], OK_HEADER, "{response:?}");
+
+    raw_send_command(
+        &mut stream,
+        COM_QUERY,
+        b"INSERT INTO wd (id, amount) VALUES (1, -12.340), (2, 7.5)",
+    );
+    let (_, response) = read_packet(&mut stream).unwrap();
+    assert_eq!(response[0], OK_HEADER, "{response:?}");
+
+    let mut client = WireClient::connect(addr(&wire), None).unwrap();
+    let result = client.query("SELECT amount FROM wd ORDER BY id").unwrap();
+    let WireResult::Rows { columns, rows } = result else {
+        panic!("expected decimal result rows");
+    };
+    assert_eq!(columns.len(), 1);
+    match columns[0].data_type {
+        DataType::Decimal { precision, scale } => {
+            assert_eq!(precision, 8);
+            assert_eq!(scale, 3);
+        }
+        ref other => panic!("expected DECIMAL metadata, got {other:?}"),
+    }
+
+    assert_eq!(rows.len(), 2);
+    match rows[0].get(0) {
+        Some(Value::Decimal {
+            value,
+            precision,
+            scale,
+        }) => {
+            assert_eq!(*value, -12_340);
+            assert_eq!(*precision, 8);
+            assert_eq!(*scale, 3);
+        }
+        other => panic!("expected first DECIMAL value, got {other:?}"),
+    }
+    match rows[1].get(0) {
+        Some(Value::Decimal {
+            value,
+            precision,
+            scale,
+        }) => {
+            assert_eq!(*value, 7_500);
+            assert_eq!(*precision, 8);
+            assert_eq!(*scale, 3);
+        }
+        other => panic!("expected padded DECIMAL value, got {other:?}"),
+    }
+
+    // Inspect the text-protocol column definition directly as well, so this checks the wire
+    // metadata encoding rather than only the client's decoded representation.
+    let mut metadata_stream = TcpStream::connect(addr(&wire)).unwrap();
+    raw_handshake(&mut metadata_stream);
+    raw_send_command(
+        &mut metadata_stream,
+        COM_QUERY,
+        b"SELECT amount FROM wd ORDER BY id",
+    );
+    let (_, count) = read_packet(&mut metadata_stream).unwrap();
+    assert_eq!(count, vec![1]);
+    let (_, definition) = read_packet(&mut metadata_stream).unwrap();
+    let definition = parse_column_def41(&definition).unwrap();
+    match definition.data_type {
+        DataType::Decimal { precision, scale } => {
+            assert_eq!(precision, 8);
+            assert_eq!(scale, 3);
+        }
+        ref other => panic!("expected DECIMAL column definition, got {other:?}"),
+    }
 
     wire.shutdown();
 }

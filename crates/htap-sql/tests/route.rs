@@ -188,7 +188,7 @@ fn test_route_classification() {
     }
 
     // UPDATE with a complete PK routes to the rowstore point update with the encoded key.
-    let update_sql = "UPDATE orders SET amount = 100.0 WHERE tenant_id = 42 AND order_id = 1000";
+    let update_sql = "UPDATE orders SET amount = 1e2 WHERE tenant_id = 42 AND order_id = 1000";
     let parsed_update = parse_one(update_sql).expect("parse UPDATE");
     let bound_update = bind(&parsed_update, &catalog).expect("bind UPDATE");
     let expected_key = encode_key(&[Value::Int32(42), Value::Int64(1000)]).unwrap();

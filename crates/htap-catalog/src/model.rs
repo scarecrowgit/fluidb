@@ -2047,6 +2047,12 @@ impl CatalogSnapshot {
                         table.name, col.name
                     )));
                 }
+                col.data_type.validate().map_err(|err| {
+                    HtapError::InvalidArgument(format!(
+                        "table '{}' column '{}' has invalid data type: {err}",
+                        table.name, col.name
+                    ))
+                })?;
             }
 
             // Primary key validation: non-empty, indices within bounds and unique,

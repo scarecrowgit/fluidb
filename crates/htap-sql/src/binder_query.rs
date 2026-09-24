@@ -14,7 +14,7 @@ use std::collections::HashSet;
 
 use htap_catalog::{CatalogSnapshot, TableDescriptor};
 use htap_common::error::{HtapError, Result};
-use htap_common::types::{ColumnDef, DataType, Value};
+use htap_common::types::{parse_date_to_timestamp_micros, ColumnDef, DataType, Value};
 use sqlparser::ast::{
     self as sql, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query,
@@ -27,7 +27,8 @@ use crate::ast::{
     UpdateStatement, UpdateTarget,
 };
 use crate::expr::{
-    arithmetic_result_type, cast_value, AggFn, AggregateSpec, BinOp, Expr, ExprType, ScalarFn,
+    arithmetic_result_type, cast_value, AggFn, AggregateSpec, BinOp, CalendarIntervalUnit, Expr,
+    ExprType, ScalarFn,
 };
 use crate::query::{
     BoundQuery, JoinKind, JoinSpec, JoinTree, OrderItem, PeerFrameBound, ProjectionItem, QueryBody,
@@ -521,15 +522,60 @@ fn union_type(l: DataType, r: DataType) -> Option<DataType> {
     if l == r {
         return Some(l);
     }
-    let numeric = |d: DataType| matches!(d, DataType::Int32 | DataType::Int64 | DataType::Float64);
-    if numeric(l) && numeric(r) {
-        if l == DataType::Float64 || r == DataType::Float64 {
-            Some(DataType::Float64)
-        } else {
-            Some(DataType::Int64)
+    let numeric = |d: DataType| {
+        matches!(
+            d,
+            DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Decimal { .. }
+        )
+    };
+    if !numeric(l) || !numeric(r) {
+        return None;
+    }
+    if l == DataType::Float64 || r == DataType::Float64 {
+        return Some(DataType::Float64);
+    }
+
+    match (l, r) {
+        (
+            DataType::Decimal {
+                precision: left_precision,
+                scale: left_scale,
+            },
+            DataType::Decimal {
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) => {
+            let scale = left_scale.max(right_scale);
+            let integer_digits = (left_precision - left_scale).max(right_precision - right_scale);
+            let precision = integer_digits
+                .checked_add(scale)?
+                .min(htap_common::types::MAX_DECIMAL_PRECISION);
+            // Clamping can drop fractional digits from the declared type, as MySQL does.
+            let scale = scale.min(precision);
+            Some(DataType::Decimal { precision, scale })
         }
-    } else {
-        None
+        (DataType::Decimal { precision, scale }, DataType::Int32)
+        | (DataType::Int32, DataType::Decimal { precision, scale }) => {
+            let integer_digits = (precision - scale).max(10);
+            let precision = integer_digits
+                .checked_add(scale)?
+                .min(htap_common::types::MAX_DECIMAL_PRECISION);
+            // Clamping can drop fractional digits from the declared type, as MySQL does.
+            let scale = scale.min(precision);
+            Some(DataType::Decimal { precision, scale })
+        }
+        (DataType::Decimal { precision, scale }, DataType::Int64)
+        | (DataType::Int64, DataType::Decimal { precision, scale }) => {
+            let integer_digits = (precision - scale).max(19);
+            let precision = integer_digits
+                .checked_add(scale)?
+                .min(htap_common::types::MAX_DECIMAL_PRECISION);
+            // Clamping can drop fractional digits from the declared type, as MySQL does.
+            let scale = scale.min(precision);
+            Some(DataType::Decimal { precision, scale })
+        }
+        _ => Some(DataType::Int64),
     }
 }
 
@@ -1087,6 +1133,10 @@ fn contains_window_through_output(expr: &Expr, projection: &[ProjectionItem]) ->
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::Cast { expr, .. } => contains_window_through_output(expr, projection),
+        Expr::CalendarInterval { expr, quantity, .. } => {
+            contains_window_through_output(expr, projection)
+                || contains_window_through_output(quantity, projection)
+        }
         Expr::Like { expr, pattern, .. } => {
             contains_window_through_output(expr, projection)
                 || contains_window_through_output(pattern, projection)
@@ -1294,6 +1344,10 @@ fn check_aggregate_argument_subqueries(
         | Expr::Cast { expr, .. } => {
             check_aggregate_argument_subqueries(expr, group_by, subqueries)
         }
+        Expr::CalendarInterval { expr, quantity, .. } => {
+            check_aggregate_argument_subqueries(expr, group_by, subqueries)?;
+            check_aggregate_argument_subqueries(quantity, group_by, subqueries)
+        }
         Expr::Like { expr, pattern, .. } => {
             check_aggregate_argument_subqueries(expr, group_by, subqueries)?;
             check_aggregate_argument_subqueries(pattern, group_by, subqueries)
@@ -1407,6 +1461,10 @@ fn check_grouped(
             Ok(())
         }
         Expr::Cast { expr, .. } => check_grouped(expr, group_by, what, subqueries),
+        Expr::CalendarInterval { expr, quantity, .. } => {
+            check_grouped(expr, group_by, what, subqueries)?;
+            check_grouped(quantity, group_by, what, subqueries)
+        }
         Expr::ScalarFunction { args, .. } => args
             .iter()
             .try_for_each(|e| check_grouped(e, group_by, what, subqueries)),
@@ -1699,7 +1757,11 @@ fn join_equi_key_types(
             let numeric = |data_type| {
                 matches!(
                     data_type,
-                    DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Timestamp
+                    DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float64
+                        | DataType::Decimal { .. }
+                        | DataType::Timestamp
                 )
             };
             Some(if numeric(left_type) && numeric(right_type) {
@@ -1707,7 +1769,30 @@ fn join_equi_key_types(
                     if left_type == DataType::Float64 || right_type == DataType::Float64 {
                         DataType::Float64
                     } else {
-                        DataType::Int64
+                        match (left_type, right_type) {
+                            (
+                                DataType::Decimal {
+                                    precision: left_precision,
+                                    scale: left_scale,
+                                },
+                                DataType::Decimal {
+                                    precision: right_precision,
+                                    scale: right_scale,
+                                },
+                            ) => {
+                                let scale = left_scale.max(right_scale);
+                                let integer_digits = (left_precision - left_scale)
+                                    .max(right_precision - right_scale);
+                                let precision = integer_digits.checked_add(scale)?;
+                                if precision > htap_common::types::MAX_DECIMAL_PRECISION {
+                                    return None;
+                                }
+                                DataType::Decimal { precision, scale }
+                            }
+                            (decimal @ DataType::Decimal { .. }, _)
+                            | (_, decimal @ DataType::Decimal { .. }) => decimal,
+                            _ => DataType::Int64,
+                        }
                     },
                 )
             } else {
@@ -2211,6 +2296,17 @@ fn rebase_expr(expr: Expr, base_offset: usize, slot_base: usize) -> Result<Expr>
         Expr::Cast { expr, to } => Expr::Cast {
             expr: Box::new(rebase_expr(*expr, base_offset, slot_base)?),
             to,
+        },
+        Expr::CalendarInterval {
+            expr,
+            quantity,
+            unit,
+            negated,
+        } => Expr::CalendarInterval {
+            expr: Box::new(rebase_expr(*expr, base_offset, slot_base)?),
+            quantity: Box::new(rebase_expr(*quantity, base_offset, slot_base)?),
+            unit,
+            negated,
         },
         Expr::ScalarFunction {
             func,
@@ -2789,7 +2885,19 @@ impl<'a> ExprBinder<'a> {
                 ))),
             },
             SqlExpr::Value(v) => bind_literal(&v.value),
-            SqlExpr::TypedString(_) | SqlExpr::Interval(_) => {
+            SqlExpr::TypedString(typed_string) => {
+                if matches!(typed_string.data_type, sql::DataType::Date) {
+                    let value = typed_string
+                        .value
+                        .clone()
+                        .into_string()
+                        .ok_or_else(|| invalid("DATE literal requires a value"))?;
+                    return parse_date_to_timestamp_micros(&value)
+                        .map(|micros| Expr::Literal(Value::Timestamp(micros)));
+                }
+                Err(unsupported(format!("typed literal not supported: {expr}")))
+            }
+            SqlExpr::Interval(_) => {
                 Err(unsupported(format!("typed literal not supported: {expr}")))
             }
             SqlExpr::UnaryOp { op, expr: inner } => match op {
@@ -2820,6 +2928,41 @@ impl<'a> ExprBinder<'a> {
                 other => Err(unsupported(format!("unary operator {other} not supported"))),
             },
             SqlExpr::BinaryOp { left, op, right } => {
+                if let SqlExpr::Interval(interval) = right.as_ref() {
+                    let negated = match op {
+                        sql::BinaryOperator::Plus => false,
+                        sql::BinaryOperator::Minus => true,
+                        _ => {
+                            return Err(invalid("calendar intervals may only be used with + or -"))
+                        }
+                    };
+                    let timestamp = self.bind(left)?;
+                    require_timestamp(&timestamp, "calendar interval")?;
+                    let (quantity, unit) = bind_calendar_interval(interval)?;
+                    return Ok(Expr::CalendarInterval {
+                        expr: Box::new(timestamp),
+                        quantity: Box::new(quantity),
+                        unit,
+                        negated,
+                    });
+                }
+                if let SqlExpr::Interval(interval) = left.as_ref() {
+                    if !matches!(op, sql::BinaryOperator::Plus) {
+                        return Err(invalid(
+                            "calendar intervals may only be used with timestamp + INTERVAL",
+                        ));
+                    }
+                    let timestamp = self.bind(right)?;
+                    require_timestamp(&timestamp, "calendar interval")?;
+                    let (quantity, unit) = bind_calendar_interval(interval)?;
+                    return Ok(Expr::CalendarInterval {
+                        expr: Box::new(timestamp),
+                        quantity: Box::new(quantity),
+                        unit,
+                        negated: false,
+                    });
+                }
+
                 let op = match op {
                     sql::BinaryOperator::Plus => BinOp::Add,
                     sql::BinaryOperator::Minus => BinOp::Sub,
@@ -2854,6 +2997,55 @@ impl<'a> ExprBinder<'a> {
                     op,
                     left: Box::new(l),
                     right: Box::new(r),
+                })
+            }
+            SqlExpr::Extract {
+                field,
+                expr,
+                syntax: _,
+            } => {
+                let unit = match field {
+                    sql::DateTimeField::Year => CalendarIntervalUnit::Year,
+                    sql::DateTimeField::Month => CalendarIntervalUnit::Month,
+                    sql::DateTimeField::Day => CalendarIntervalUnit::Day,
+                    other => {
+                        return Err(unsupported(format!("EXTRACT field {other} not supported")))
+                    }
+                };
+                let expr = self.bind(expr)?;
+                require_timestamp(&expr, "EXTRACT")?;
+                Ok(Expr::ScalarFunction {
+                    func: ScalarFn::Extract(unit),
+                    args: vec![expr],
+                    data_type: DataType::Int64,
+                    nullable: true,
+                })
+            }
+            SqlExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                special,
+                ..
+            } => {
+                let _ = special;
+                let start = substring_from
+                    .as_ref()
+                    .ok_or_else(|| unsupported("SUBSTRING requires start and length arguments"))?;
+                let length = substring_for
+                    .as_ref()
+                    .ok_or_else(|| unsupported("SUBSTRING requires start and length arguments"))?;
+                let expr = self.bind(expr)?;
+                let start = self.bind(start)?;
+                let length = self.bind(length)?;
+                require_string(&expr, "SUBSTRING")?;
+                require_numeric(&start, "SUBSTRING start")?;
+                require_numeric(&length, "SUBSTRING length")?;
+                Ok(Expr::ScalarFunction {
+                    func: ScalarFn::Substring,
+                    args: vec![expr, start, length],
+                    data_type: DataType::String,
+                    nullable: true,
                 })
             }
             SqlExpr::IsNull(inner) => Ok(Expr::IsNull(Box::new(self.bind(inner)?))),
@@ -3453,16 +3645,28 @@ impl<'a> ExprBinder<'a> {
                 let (kind, data_type) = match name {
                     "SUM" => {
                         require_numeric(&arg, name)?;
-                        let data_type = if arg_type.data_type == DataType::Float64 {
-                            DataType::Float64
-                        } else {
-                            DataType::Int64
+                        let data_type = match arg_type.data_type {
+                            DataType::Float64 => DataType::Float64,
+                            DataType::Decimal { scale, .. } => DataType::Decimal {
+                                precision: htap_common::types::MAX_DECIMAL_PRECISION,
+                                scale,
+                            },
+                            _ => DataType::Int64,
                         };
                         (WindowFunctionKind::Sum, data_type)
                     }
                     "AVG" => {
                         require_numeric(&arg, name)?;
-                        (WindowFunctionKind::Avg, DataType::Float64)
+                        let data_type = match arg_type.data_type {
+                            DataType::Decimal { scale, .. } => DataType::Decimal {
+                                precision: htap_common::types::MAX_DECIMAL_PRECISION,
+                                scale: scale
+                                    .saturating_add(4)
+                                    .min(htap_common::types::MAX_DECIMAL_PRECISION),
+                            },
+                            _ => DataType::Float64,
+                        };
+                        (WindowFunctionKind::Avg, data_type)
                     }
                     "MIN" => (WindowFunctionKind::Min, arg_type.data_type),
                     "MAX" => (WindowFunctionKind::Max, arg_type.data_type),
@@ -3713,17 +3917,32 @@ impl<'a> ExprBinder<'a> {
                 let t = a.expr_type();
                 require_numeric(a, name)?;
                 (
-                    if t.data_type == DataType::Float64 {
-                        DataType::Float64
-                    } else {
-                        DataType::Int64
+                    match t.data_type {
+                        DataType::Float64 => DataType::Float64,
+                        DataType::Decimal { scale, .. } => DataType::Decimal {
+                            precision: htap_common::types::MAX_DECIMAL_PRECISION,
+                            scale,
+                        },
+                        _ => DataType::Int64,
                     },
                     true,
                 )
             }
             (AggFn::Avg, Some(a)) => {
                 require_numeric(a, name)?;
-                (DataType::Float64, true)
+                (
+                    match a.expr_type().data_type {
+                        DataType::Decimal { scale, .. } => DataType::Decimal {
+                            precision: htap_common::types::MAX_DECIMAL_PRECISION,
+                            // AVG adds four fractional digits, capped by the maximum precision.
+                            scale: scale
+                                .saturating_add(4)
+                                .min(htap_common::types::MAX_DECIMAL_PRECISION),
+                        },
+                        _ => DataType::Float64,
+                    },
+                    true,
+                )
             }
             (AggFn::Min | AggFn::Max, Some(a)) => (a.expr_type().data_type, true),
             _ => unreachable!(),
@@ -3912,7 +4131,39 @@ fn bind_literal(v: &sql::Value) -> Result<Expr> {
         sql::Value::Null => Value::Null,
         sql::Value::Boolean(b) => Value::Bool(*b),
         sql::Value::Number(n, _) => {
-            if let Ok(i) = n.parse::<i64>() {
+            // Exact-value literals with a decimal point retain their declared scale. Numeric
+            // literals using exponent notation remain approximate DOUBLE values.
+            if n.contains('.') && !n.contains(['e', 'E']) {
+                let (whole, fraction) = n
+                    .split_once('.')
+                    .ok_or_else(|| invalid(format!("invalid numeric literal {n}")))?;
+                if !whole.chars().all(|c| c.is_ascii_digit())
+                    || !fraction.chars().all(|c| c.is_ascii_digit())
+                {
+                    return Err(invalid(format!("invalid numeric literal {n}")));
+                }
+
+                let precision = whole.len() + fraction.len();
+                if precision == 0
+                    || precision > usize::from(htap_common::types::MAX_DECIMAL_PRECISION)
+                {
+                    return Err(invalid(format!(
+                        "DECIMAL literal {n} exceeds maximum precision {}",
+                        htap_common::types::MAX_DECIMAL_PRECISION
+                    )));
+                }
+
+                let scale = u8::try_from(fraction.len())
+                    .map_err(|_| invalid(format!("invalid numeric literal {n}")))?;
+                let unscaled = format!("{whole}{fraction}")
+                    .parse::<i64>()
+                    .map_err(|_| invalid(format!("invalid numeric literal {n}")))?;
+                Value::Decimal {
+                    value: unscaled,
+                    precision: precision as u8,
+                    scale,
+                }
+            } else if let Ok(i) = n.parse::<i64>() {
                 Value::Int64(i)
             } else {
                 let value = n
@@ -3952,15 +4203,23 @@ fn map_cast_type(dt: &sql::DataType) -> Result<DataType> {
         | D::SignedInteger
         | D::Unsigned
         | D::UnsignedInteger => DataType::Int64,
-        D::Float(_)
-        | D::Float4
-        | D::Float8
-        | D::Real
-        | D::Double(_)
-        | D::DoublePrecision
-        | D::Decimal(_)
-        | D::Numeric(_)
-        | D::Dec(_) => DataType::Float64,
+        D::Float(_) | D::Float4 | D::Float8 | D::Real | D::Double(_) | D::DoublePrecision => {
+            DataType::Float64
+        }
+        D::Decimal(info) | D::Numeric(info) | D::Dec(info) => {
+            let (precision, scale) = match info {
+                sql::ExactNumberInfo::None => (10, 0),
+                sql::ExactNumberInfo::Precision(precision) => (*precision, 0),
+                sql::ExactNumberInfo::PrecisionAndScale(precision, scale) => (*precision, *scale),
+            };
+            let precision = u8::try_from(precision)
+                .map_err(|_| invalid(format!("invalid DECIMAL precision: {precision}")))?;
+            let scale = u8::try_from(scale)
+                .map_err(|_| invalid(format!("invalid DECIMAL scale: {scale}")))?;
+            let data_type = DataType::Decimal { precision, scale };
+            data_type.validate()?;
+            data_type
+        }
         D::Char(_)
         | D::Character(_)
         | D::Varchar(_)
@@ -3979,11 +4238,51 @@ fn map_cast_type(dt: &sql::DataType) -> Result<DataType> {
     })
 }
 
+fn bind_calendar_interval(interval: &sql::Interval) -> Result<(Expr, CalendarIntervalUnit)> {
+    let unit = match &interval.leading_field {
+        Some(sql::DateTimeField::Year) => CalendarIntervalUnit::Year,
+        Some(sql::DateTimeField::Month) => CalendarIntervalUnit::Month,
+        Some(sql::DateTimeField::Day) => CalendarIntervalUnit::Day,
+        Some(other) => return Err(unsupported(format!("INTERVAL unit {other} not supported"))),
+        None => return Err(invalid("INTERVAL requires a YEAR, MONTH, or DAY unit")),
+    };
+
+    let value = match interval.value.as_ref() {
+        SqlExpr::Value(value) => match &value.value {
+            sql::Value::Number(value, _)
+            | sql::Value::SingleQuotedString(value)
+            | sql::Value::DoubleQuotedString(value) => value,
+            _ => return Err(invalid("INTERVAL magnitude must be an integer literal")),
+        },
+        _ => return Err(invalid("INTERVAL magnitude must be an integer literal")),
+    };
+    let quantity = value
+        .parse::<i64>()
+        .map_err(|_| invalid("INTERVAL magnitude must be an integer literal"))?;
+
+    Ok((Expr::Literal(Value::Int64(quantity)), unit))
+}
+
 fn is_numeric_type(t: &ExprType) -> bool {
     matches!(
         t.data_type,
-        DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Timestamp
+        DataType::Int32
+            | DataType::Int64
+            | DataType::Float64
+            | DataType::Decimal { .. }
+            | DataType::Timestamp
     )
+}
+
+fn require_timestamp(e: &Expr, what: &str) -> Result<()> {
+    let t = e.expr_type();
+    if t.data_type != DataType::Timestamp && !t.is_permissive() {
+        return Err(invalid(format!(
+            "{what} requires a timestamp operand, found {}",
+            t.data_type.name()
+        )));
+    }
+    Ok(())
 }
 
 fn require_numeric(e: &Expr, what: &str) -> Result<()> {
@@ -4102,7 +4401,7 @@ fn check_binary_types(op: BinOp, l: &Expr, r: &Expr) -> Result<()> {
         op => {
             require_numeric(l, &op.to_string())?;
             require_numeric(r, &op.to_string())?;
-            let _ = arithmetic_result_type(op, l.expr_type().data_type, r.expr_type().data_type);
+            arithmetic_result_type(op, l.expr_type().data_type, r.expr_type().data_type)?;
             Ok(())
         }
     }
@@ -4177,7 +4476,11 @@ pub(crate) fn coerce_to_column(expr: Expr, col: &ColumnDef) -> Result<Expr> {
     let numeric = |d: DataType| {
         matches!(
             d,
-            DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Timestamp
+            DataType::Int32
+                | DataType::Int64
+                | DataType::Float64
+                | DataType::Decimal { .. }
+                | DataType::Timestamp
         )
     };
     if numeric(t.data_type) && numeric(col.data_type) {

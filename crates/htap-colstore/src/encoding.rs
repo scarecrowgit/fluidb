@@ -102,6 +102,16 @@ pub fn encode_plain(data_type: DataType, non_null_values: &[Value]) -> Result<Ve
                 buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 buf.extend_from_slice(b);
             }
+            (
+                DataType::Decimal { precision, scale },
+                Value::Decimal {
+                    value,
+                    precision: value_precision,
+                    scale: value_scale,
+                },
+            ) if precision == *value_precision && scale == *value_scale => {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
             _ => {
                 return Err(HtapError::InvalidArgument(format!(
                     "value {val:?} does not match expected column type {data_type}"
@@ -196,6 +206,16 @@ pub fn decode_plain(data_type: DataType, bytes: &[u8], count: usize) -> Result<V
                     })?
                     .to_vec();
                 values.push(Value::Bytes(b));
+            }
+            DataType::Decimal { precision, scale } => {
+                let value = reader.read_i64_le().map_err(|_| {
+                    HtapError::Corruption("unexpected EOF decoding plain decimal".into())
+                })?;
+                values.push(Value::Decimal {
+                    value,
+                    precision,
+                    scale,
+                });
             }
         }
     }
@@ -474,6 +494,10 @@ pub fn encode_typed_value(val: &Value, buf: &mut Vec<u8>) -> Result<()> {
             buf.extend_from_slice(b);
             Ok(())
         }
+        Value::Decimal { value, .. } => {
+            buf.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
     }
 }
 
@@ -581,6 +605,18 @@ pub fn decode_typed_value(dt: DataType, bytes: &[u8], cursor: &mut usize) -> Res
                 .to_vec();
             *cursor += len;
             Ok(Value::Bytes(b))
+        }
+        DataType::Decimal { precision, scale } => {
+            let mut reader = reader_from_cursor!("unexpected EOF decoding zone map decimal");
+            let value = reader.read_i64_le().map_err(|_| {
+                HtapError::Corruption("unexpected EOF decoding zone map decimal".into())
+            })?;
+            *cursor += reader.position();
+            Ok(Value::Decimal {
+                value,
+                precision,
+                scale,
+            })
         }
     }
 }

@@ -1214,6 +1214,52 @@ fn test_bind_create_table_valid() {
 }
 
 #[test]
+fn test_bind_decimal_ddl_types_and_validation() {
+    let catalog = CatalogSnapshot::empty();
+
+    let valid_cases = [
+        ("DECIMAL", 10, 0),
+        ("DECIMAL(12)", 12, 0),
+        ("DECIMAL(12, 4)", 12, 4),
+        ("NUMERIC", 10, 0),
+        ("DEC", 10, 0),
+    ];
+
+    for (data_type, precision, scale) in valid_cases {
+        let sql = format!("CREATE TABLE decimal_ddl (id {data_type} PRIMARY KEY)");
+        let bound = parse_and_bind(&sql, &catalog)
+            .unwrap_or_else(|error| panic!("expected {data_type} to bind: {error}"));
+
+        match bound {
+            BoundStatement::CreateTable(create) => {
+                assert_eq!(
+                    create.schema.column(0).unwrap().data_type,
+                    CommonDataType::Decimal { precision, scale },
+                    "unexpected decimal type for {data_type}"
+                );
+            }
+            other => panic!("expected CreateTable for {data_type}, got {other:?}"),
+        }
+    }
+
+    let invalid_cases = [
+        "CREATE TABLE decimal_too_wide (id DECIMAL(19, 0) PRIMARY KEY)",
+        "CREATE TABLE decimal_zero_precision (id DECIMAL(0, 0) PRIMARY KEY)",
+        "CREATE TABLE decimal_scale_too_large (id DECIMAL(5, 6) PRIMARY KEY)",
+    ];
+
+    for sql in invalid_cases {
+        let statement =
+            parse_one(sql).unwrap_or_else(|error| panic!("expected parse success: {error}"));
+        let result = bind(&statement, &catalog);
+        assert!(
+            matches!(result, Err(HtapError::InvalidArgument(_))),
+            "expected decimal DDL bind rejection for {sql:?}, got {result:?}"
+        );
+    }
+}
+
+#[test]
 fn test_bind_insert_valid() {
     let catalog = make_test_catalog();
 
@@ -1587,9 +1633,7 @@ fn test_negative_create_table() {
         // Foreign key
         "CREATE TABLE t (id INT PRIMARY KEY, fid INT REFERENCES other(id))",
         // Unsupported types
-        "CREATE TABLE t (id INT PRIMARY KEY, d DATE)",
         "CREATE TABLE t (id INT PRIMARY KEY, g GEOMETRY)",
-        "CREATE TABLE t (id INT PRIMARY KEY, dec DECIMAL(10, 2))",
         // Qualified table name
         "CREATE TABLE db.t (id INT PRIMARY KEY)",
         // Table PK USING index type

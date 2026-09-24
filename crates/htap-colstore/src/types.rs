@@ -3,6 +3,7 @@
 //! Defines segment configuration options, columnar vectors, record batches,
 //! scan specifications, filter predicates, and validation helpers.
 
+use htap_common::types::check_decimal_precision;
 use htap_common::{ColumnDef, DataType, HtapError, Result, Row, Schema, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -399,6 +400,17 @@ pub enum ColumnVector {
         /// Validity mask (`true` = non-null, `false` = null).
         validity: Vec<bool>,
     },
+    /// Fixed-point decimal column vector.
+    Decimal {
+        /// Unscaled element values.
+        values: Vec<i64>,
+        /// Declared decimal precision.
+        precision: u8,
+        /// Declared decimal scale.
+        scale: u8,
+        /// Validity mask (`true` = non-null, `false` = null).
+        validity: Vec<bool>,
+    },
 }
 
 impl ColumnVector {
@@ -430,6 +442,12 @@ impl ColumnVector {
             ColumnVector::String { .. } => DataType::String,
             ColumnVector::Bytes { .. } => DataType::Bytes,
             ColumnVector::Timestamp { .. } => DataType::Timestamp,
+            ColumnVector::Decimal {
+                precision, scale, ..
+            } => DataType::Decimal {
+                precision: *precision,
+                scale: *scale,
+            },
         }
     }
 
@@ -446,6 +464,9 @@ impl ColumnVector {
             ColumnVector::String { values, validity } => (values.len(), validity.as_slice()),
             ColumnVector::Bytes { values, validity } => (values.len(), validity.as_slice()),
             ColumnVector::Timestamp { values, validity } => (values.len(), validity.as_slice()),
+            ColumnVector::Decimal {
+                values, validity, ..
+            } => (values.len(), validity.as_slice()),
         };
         assert_eq!(
             v_len,
@@ -479,6 +500,16 @@ impl ColumnVector {
             ColumnVector::String { values, .. } => Some(Value::String(values[idx].clone())),
             ColumnVector::Bytes { values, .. } => Some(Value::Bytes(values[idx].clone())),
             ColumnVector::Timestamp { values, .. } => Some(Value::Timestamp(values[idx])),
+            ColumnVector::Decimal {
+                values,
+                precision,
+                scale,
+                ..
+            } => Some(Value::Decimal {
+                value: values[idx],
+                precision: *precision,
+                scale: *scale,
+            }),
         }
     }
 
@@ -515,6 +546,22 @@ impl ColumnVector {
                     }
                 }
             }
+            ColumnVector::Decimal {
+                values,
+                precision,
+                scale,
+                validity,
+            } => {
+                for (&value, &is_valid) in values.iter().zip(validity) {
+                    if is_valid {
+                        check_decimal_precision(value, *precision, *scale).map_err(|e| {
+                            HtapError::Corruption(format!(
+                                "invalid decimal value in column vector: {e}"
+                            ))
+                        })?;
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -529,6 +576,9 @@ impl ColumnVector {
             ColumnVector::String { values, validity } => (values.len(), validity.len()),
             ColumnVector::Bytes { values, validity } => (values.len(), validity.len()),
             ColumnVector::Timestamp { values, validity } => (values.len(), validity.len()),
+            ColumnVector::Decimal {
+                values, validity, ..
+            } => (values.len(), validity.len()),
         }
     }
 }
@@ -622,6 +672,9 @@ pub fn validate_segment_schema(schema: &Schema) -> Result<()> {
             schema.len()
         )));
     }
+    for column in schema.columns() {
+        column.data_type.validate()?;
+    }
     Ok(())
 }
 
@@ -673,6 +726,14 @@ pub fn validate_value(col_def: &ColumnDef, val: &Value) -> Result<()> {
                     "type mismatch for column '{}': expected {}, got {}",
                     col_def.name, col_def.data_type, actual
                 )));
+            }
+            if let Value::Decimal {
+                value,
+                precision,
+                scale,
+            } = val
+            {
+                check_decimal_precision(*value, *precision, *scale)?;
             }
             if let Value::String(s) = val {
                 if s.len() > MAX_VALUE_BYTES {

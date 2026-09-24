@@ -257,6 +257,83 @@ after bytes had already reached the owner, an owner-gone login that was misrepor
 of a transport failure, and a handshake read that failed spuriously on an interrupted system call instead of
 retrying against its deadline. See ADR-025's "Post-review fixes (batch D)", "Post-review fixes (batch E)", and
 "Post-review fixes (batch F)" sections and `docs/PROGRESS.md`'s Phase 16 row for the fix-by-fix test evidence.
+Phase 17 (A6a/A6b) adds `DECIMAL` as a supported SQL type: a fixed-point value carrying its own precision and
+scale, stored as a signed 64-bit integer scaled by a power of ten (maximum 18 digits), with exact arithmetic
+(round-half-away-from-zero), a declared-precision check on every value, and derived *result* precision clamped
+to the 18-digit maximum rather than the query being rejected (Amendment 4 — see ADR-026 in `docs/DECISIONS.md`,
+"Derived `DECIMAL` precision and scale rules" below, and `docs/PROGRESS.md`'s Phase 17 row); nothing ever
+silently becomes a float. A6a delivered this across the query
+layer — literals, `CAST`, arithmetic, comparisons, ordering/hashing, and `SUM`/`AVG`/`MIN`/`MAX`/
+`COUNT(DISTINCT)` (grouped and windowed) on both the row and columnar execution paths. A6b then lifted
+persistence across all five of its tasks: `CREATE TABLE`/`INSERT`/literal coercion, the columnar segment format
+(`HTAPCOL1` v1 -> v2, see above and ADR-008's addendum), the composite-key codec, the rowstore memtable's size
+estimator, catalog recovery evidence, the movement crate's CSV/JSON-lines codec (task 4 — a value with more
+fractional digits than the column's declared scale is rounded half-away-from-zero on import rather than
+rejected, matching ordinary `INSERT`/`UPDATE` semantics; a decimal is a JSON string, not a JSON number, in
+JSON-lines; see `docs/OPERATIONS.md` section 2 for the operator-facing statement), and the MySQL wire protocol
+(task 5 — a `DECIMAL` result column and parameter both work over the text and binary protocols, bounded at the
+engine's own 18-digit maximum, not arbitrary precision). See `docs/PROGRESS.md`'s Phase 17 row for the full
+task-by-task test evidence and `docs/LIMITATIONS.md` for the disclosed gaps.
+
+### Derived `DECIMAL` precision and scale rules (Phase 17)
+
+These rules govern the *type* — precision and scale — of an arithmetic or aggregate result; they are
+independent of whether a specific *value* fits that type (a value that overflows its declared precision is
+always a hard error at evaluation time, on every path, never silently truncated, wrapped, or turned into a
+float — `crates/htap-sql/src/expr.rs::expr::tests::test_decimal_arithmetic_overflow_and_precision_errors`,
+`crates/htap-server/tests/decimal_aggregation.rs::test_decimal_sum_reports_precision_overflow`). All are
+implemented in `crates/htap-sql/src/expr.rs::arithmetic_result_type` (per-operation arithmetic) and
+`crates/htap-sql/src/binder_query.rs` (`SUM`/`AVG`), with the maximum precision (`MAX_DECIMAL_PRECISION = 18`)
+defined in `crates/htap-common/src/types.rs`:
+
+- **`+`/`-` (Add/Sub):** scale is the larger operand scale; precision is the larger operand's integer-digit
+  count plus that scale plus one, clamped to 18. Verified in
+  `expr::tests::decimal_arithmetic_and_comparison` (e.g. `DECIMAL(5,2) + INT32` derives `DECIMAL(13,2)`).
+- **`*` (Mul):** precision is the sum of the operand precisions; scale is the sum of the operand scales; both
+  clamped to 18. Verified in `expr::tests::test_decimal_required_precision_is_clamped_to_supported_bound` and
+  `expr::tests::test_decimal_arithmetic_overflow_and_precision_errors` (the latter also shows the clamp-vs-
+  value-error distinction: `DECIMAL(18,0) * DECIMAL(1,0)` derives a clamped `DECIMAL(18,0)`, and the actual
+  19-digit product then fails the value's own precision check).
+- **`/` (Div):** precision is always 18 (the maximum); scale is the dividend's (left operand's) scale plus
+  four — MySQL's `div_precision_increment`, not derived from the divisor at all. Verified in
+  `expr::tests::{d7_decimal_division_rounds_non_tie_remainders_correctly, d9_decimal_division_rounding_direction_uses_exact_quotient_sign, test_decimal_rounding_half_away_from_zero_for_rescale_division_and_cast}`.
+- **`SUM`:** precision is 18 (the maximum); scale is the input's own scale, unchanged. **`AVG`:** precision is
+  18; scale is the input's scale plus four (the same `div_precision_increment`, clamped to 18). Verified in
+  `crates/htap-server/tests/decimal_aggregation.rs::{test_tpch_style_money_aggregation_uses_exact_decimal_precision, test_decimal_sum_avg_min_max_and_distinct_count}` and
+  `crates/htap-server/tests/decimal_avg_rounding.rs::test_decimal_avg_rounds_half_away_from_zero`.
+- **Clamped, not rejected.** An earlier, narrower position rejected a query whose *worst-case* derived
+  precision exceeded 18 digits, which made ordinary money arithmetic like `SUM(amount_cents * 0.01)` or
+  `DECIMAL(15,2) * DECIMAL(15,2)` (TPC-H's own shape) unrepresentable even though the actual values fit easily.
+  ADR-026 (Amendment 4) reverses that in favor of clamping the derived type instead, which is MySQL's own
+  behavior for an over-wide derived decimal; see ADR-026 for the full argument.
+- **Predicate-literal semantics (not derivation, but load-bearing alongside it).** A comparison literal that is
+  not exactly representable at a column's declared scale is handled by *exact boundary rewriting*, not
+  rounding: `col > 5.555` on a `DECIMAL(_,2)` column rewrites to `col >= 5.56` (`ceil`), `col < 5.555` rewrites
+  to `col <= 5.55` (`floor`) — exact, because no representable value lies strictly between the literal and its
+  rounded neighbor. Equality against a non-representable literal matches no rows; inequality matches every
+  non-null row. A literal outside the column's representable range (not just its scale) resolves to a constant
+  true/false rather than being evaluated per row. An *assignment* (`INSERT`/`UPDATE SET`) still rounds
+  half-away-from-zero, as MySQL does. A *partition bound* (`CREATE TABLE ... PARTITION BY`/`ALTER TABLE ...
+  ADD`/`REORGANIZE PARTITION`) always rejects a non-representable literal outright, because a durable routing
+  boundary must be exactly what the DDL wrote. Verified in
+  `crates/htap-server/tests/decimal_deletion_regression.rs` (16 tests, including
+  `test_decimal_comparison_filter_non_representable_literal_rewrites_boundary`,
+  `test_decimal_equality_non_representable_literal_matches_no_rows`,
+  `test_decimal_inequality_non_representable_literal_matches_all_non_null_rows`,
+  `test_decimal_assignment_rounds_non_representable_literal`,
+  `test_decimal_partition_bound_rejects_non_representable_literal`,
+  `test_decimal_add_range_partition_rejects_non_representable_literal`,
+  `test_decimal_add_list_partition_rejects_non_representable_literal`,
+  `test_decimal_reorganize_range_partition_rejects_non_representable_literal`,
+  `test_decimal_reorganize_list_partition_rejects_non_representable_literal`),
+  `crates/htap-server/tests/decimal_columnar_pushdown.rs` (
+  `test_columnar_decimal_strict_greater_than_rewrites_to_rounded_up_boundary`,
+  `test_columnar_decimal_strict_less_than_rewrites_to_rounded_down_boundary`,
+  `test_decimal_non_representable_strict_boundaries_match_before_and_after_conversion`), and
+  `crates/htap-server/tests/decimal_out_of_range.rs` (
+  `test_decimal_comparisons_above_representable_range`,
+  `test_decimal_comparisons_below_representable_range`,
+  `test_decimal_comparisons_at_representable_boundary`).
 
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
@@ -269,11 +346,11 @@ vectorized/pipelined execution, worker-pool parallelism for `LEFT`/`RIGHT`/`FULL
 executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spillable as of Phase 14 — see above),
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
-physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), semi-join rewrites of IN/EXISTS, broader string/date function coverage,
+physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), semi-join rewrites of IN/EXISTS, broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),
-Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors; server-side cursors via `COM_STMT_FETCH`, exact DECIMAL, and `TIME`-typed bound parameters also remain deferred — see "Prepared statements and binary protocol (Phase 11)" below);
+Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors; server-side cursors via `COM_STMT_FETCH`, arbitrary-precision DECIMAL over the wire protocol specifically (the engine's own bounded `DECIMAL` type, including a decimal result column over both the text and binary protocols, is implemented as of Phase 17 — see above — but only up to the engine's own 18-digit maximum, not arbitrary precision), and `TIME`-typed bound parameters also remain deferred — see "Prepared statements and binary protocol (Phase 11)" below);
 note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation of demoted column files remain deferred — this is unrelated to Phase 15's `DROP TABLE` reclaim, which only reclaims a *dropped* table's artifacts, not a demoted table's retained column files).
 See [`PROGRESS.md`](./PROGRESS.md).
 
@@ -942,9 +1019,12 @@ login as a catalog account). See ADR-021 for the full design rationale and optio
 ## Prepared statements and binary protocol (Phase 11)
 
 **Status: `implemented (local MVP)`** (`htap-wire::{binary_codec, prepared}`, `htap-sql::prepare`,
-`htap-client::RemoteClient`; `COM_STMT_FETCH`/server-side cursors, exact `DECIMAL`, `TIME`-typed bound
-parameters, and unsigned 64-bit values above `i64::MAX` remain planned/deferred. Per-user ACL is implemented
-as of Phase 12 — see "Accounts and privileges (Phase 12)" below — including for `COM_STMT_PREPARE`/`EXECUTE`).
+`htap-client::RemoteClient`; `COM_STMT_FETCH`/server-side cursors, arbitrary-precision `DECIMAL` over the wire
+(the engine's own bounded `DECIMAL` type, including a decimal result column over both the text and binary
+protocols, is implemented as of Phase 17 — see above — but only up to the engine's own 18-digit maximum),
+`TIME`-typed bound parameters, and unsigned 64-bit values above `i64::MAX` remain planned/deferred. Per-user
+ACL is implemented as of Phase 12 — see "Accounts and privileges (Phase 12)" below — including for
+`COM_STMT_PREPARE`/`EXECUTE`).
 
 - **Parameterization is AST-level substitution, not text re-render.** `htap_sql::prepare` walks the parsed
   `sqlparser` AST once to find every `?` placeholder (`count_placeholders`/`substitute_placeholders` share one
@@ -983,8 +1063,12 @@ as of Phase 12 — see "Accounts and privileges (Phase 12)" below — including 
   4-byte form; "24" is only the SQL display width), `LONG`, `LONGLONG` (unsigned values above `i64::MAX`
   rejected cleanly — there is no `UInt64` `Value` variant in the engine; documented as a first-class
   limitation), `YEAR`, `FLOAT`, `DOUBLE`, `NEWDECIMAL`/`DECIMAL` (kept as validated text and substituted as a
-  numeric literal so the binder's own numeric-literal handling applies — no exact-decimal type exists in the
-  engine, so this is a text pass-through, not arbitrary-precision arithmetic), `VARCHAR`/`VAR_STRING`/
+  numeric literal so the binder's own numeric-literal handling applies — as of Phase 17 that binder can bind
+  the literal exactly into a `DECIMAL(p, s)` target column, up to the engine's bounded 18-digit maximum; this
+  is still a text pass-through into that bounded fixed-point type, not arbitrary-precision arithmetic. A
+  decimal *result* column is also implemented over both the text and binary result-row protocols as of Phase
+  17 (`crates/htap-wire/src/{result_codec,binary_codec}.rs`), bounded at the same 18 digits — see "`DECIMAL`
+  type (Phase 17) scope and deferred features" in `docs/LIMITATIONS.md`), `VARCHAR`/`VAR_STRING`/
   `STRING`/`ENUM`/`SET`/`TINY_BLOB`/`MEDIUM_BLOB`/`LONG_BLOB`/`BLOB`, `DATE`/`DATETIME`/`TIMESTAMP` (decoded to
   integer microseconds), and `NULL`. `TIME` and any other type code are a clean decode error naming the
   unsupported type. Binary `DATE`/`DATETIME`/`TIMESTAMP` values are range-validated on decode (Phase 11 fix
@@ -1064,6 +1148,14 @@ and `crates/htap-colstore/tests/zone_map_skip.rs`).
 Phase 4 integrates `htap-colstore` segments into partition-scoped conversion (`htap-convert`),
 registering columnar segments in durable tablet manifests while keeping the rowstore authoritative
 for online point mutations and post-conversion base-plus-delta queries.
+Phase 17 adds `DECIMAL` as an eighth column type (`FORMAT_VERSION` 1 -> 2, `MIN_DECODABLE_VERSION` unchanged
+at 1, so version 1 segments — none of which can contain a decimal column — still decode via the widened
+`1..=2` accepted range); decimal reuses the existing 8-byte little-endian plain-value layout already used for
+`Int64`/`Timestamp`, with precision and scale sourced from the footer's schema rather than stored per block. A
+segment tagged below `DECIMAL_INTRODUCTION_VERSION` (2) whose schema declares a decimal column is rejected as
+`HtapError::Corruption` rather than decoded. See ADR-008's decimal addendum in `docs/DECISIONS.md` for the full
+contract (including the per-envelope reasoning for why no other durable format needed a matching bump) and
+`docs/PROGRESS.md`'s Phase 17 row for the test evidence.
 
 Both formats share **one MVCC version domain** (`htap-common::Version`, which
 is `implemented`). In the target architecture, a unified WAL across formats is envisioned.
@@ -1105,6 +1197,13 @@ in the named source file, not an assertion.
 envelopes in this shape (magic-only header, format version in a trailing footer, per-block framing) and were
 not migrated onto `decode_envelope`; stage R only replaced their hand-written little-endian field reads with
 `htap_common::bytecursor::ByteReader`, leaving their header/footer/block control flow untouched.
+
+`HTAPCOL1` has its own version scheme, separate from the table above: `FORMAT_VERSION` (written) is `2` as of
+Phase 17 (previously `1`), `MIN_DECODABLE_VERSION` (the legacy floor, unchanged) is `1`, so the accepted range
+on read is `1..=2`, and `DECIMAL_INTRODUCTION_VERSION` is `2` — the version a segment must be at least, keyed
+separately from the legacy floor, for its schema to legally declare a `DECIMAL` column. See "Column store
+(OLAP) (`htap-colstore`)" below and ADR-008's decimal addendum in `docs/DECISIONS.md` for the full contract,
+including why every other envelope in the table above did not need a matching bump.
 
 `htap-rowstore/src/wal.rs::fsync_dir` is a directory-fsync helper with the same intent as the five migrated
 `sync_dir` copies but is not `cfg(unix)`-gated (unconditional on every platform); it was deliberately left
@@ -2024,6 +2123,22 @@ When `partition.storage` is `StorageDescriptor::Column` (or manifest-bearing `St
    - **Rowstore post-base delta scan:** Scans `self.engine.scan_partition` at `snapshot`, identifying all mutations committed after the columnar base version (`entry.key.version > base_version`). The newest post-base mutation per user key is recorded into `post_base_puts` or `post_base_deletes`.
    - **Delta suppression and overlay (`htap-convert`):** Base rows decoded from columnar segments whose primary keys match `post_base_deletes` or `post_base_puts` are suppressed. Surviving base rows are placed into a `BTreeMap<Vec<u8>, Row>` keyed by encoded primary key. Post-base puts are projected to the requested columns and overlaid into the map.
    - **Deterministic row ordering:** Extracting values from the `BTreeMap` yields deterministically ordered compact rows by primary key along with execution `ScanStats`.
+
+   **Key-codec invariant this overlay depends on (Phase 17).** `htap_common::keycodec::encode_key` encodes a
+   `DECIMAL` key component as its raw unscaled `i64` (sign-flipped big-endian, identical in shape to the
+   existing `Int64`/`Float64` branches — no digit-alignment across scales). This is order-preserving **only**
+   because every value ever encoded at a given key position shares that column's one declared scale for the
+   table's entire lifetime: a column's declared type cannot change after `CREATE TABLE`, and every write path
+   (literal `INSERT`, `INSERT ... SELECT`, `UPDATE`) coerces a decimal value to the target column's scale
+   before it ever reaches the key codec, rather than passing through the literal text's own apparent scale.
+   The base-plus-delta overlay above depends on this: base rows (decoded from columnar segments, scale from the
+   segment's own footer schema) and post-base rowstore deltas (scale from the rowstore write path's coercion)
+   are matched by comparing encoded key bytes for equality, so a decimal key component that disagreed on scale
+   between the two sides would silently fail to match rather than erroring. `htap-common/src/keycodec.rs`'s own
+   module documentation states this invariant explicitly; `test_decimal_encoding_uses_normalized_unscaled_value`
+   proves two differently-spelled literals for the same number ("1" and "1.00") normalize to identical stored
+   key bytes, and `test_decimal_encoding_preserves_unscaled_order` proves the resulting byte order matches
+   numeric order across negative, zero, and positive values.
 5. **Residual SQL evaluation:** `olap::execute_analytic_select_compact(&select, compact_res.rows, &mapping)` evaluates all residual SQL filter leaves not pushed down, evaluates groups via `BTreeMap`, and computes aggregate values (`COUNT`, `SUM`, `MIN`, `MAX`).
 
 ### Vectorized scan primitive vs. non-vectorized SQL aggregation

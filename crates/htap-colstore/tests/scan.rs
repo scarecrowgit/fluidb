@@ -1055,3 +1055,393 @@ fn test_float_comparisons_preserve_value_total_ordering() {
     let val = res_nan.batches[0].columns[0].get(0).unwrap();
     assert!(matches!(val, Value::Float64(f) if f.is_nan()));
 }
+
+#[test]
+fn test_decimal_lt_across_multiple_blocks_prunes_zone_maps() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("decimal_lt.col");
+    let schema = Schema::new(vec![test_col(
+        "c_decimal",
+        DataType::Decimal {
+            precision: 10,
+            scale: 2,
+        },
+        false,
+    )])
+    .unwrap();
+
+    let opts = SegmentOptions::new().with_rows_per_block(4);
+    let rows = vec![
+        Row::new(vec![Value::Decimal {
+            value: 100,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 200,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 300,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 400,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 500,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 600,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 700,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 800,
+            precision: 10,
+            scale: 2,
+        }]),
+    ];
+
+    SegmentWriter::write(&path, &schema, rows, &opts).unwrap();
+    let reader = SegmentReader::open(&path).unwrap();
+
+    let req = ScanRequest::new(
+        vec![0],
+        Some(Predicate::Lt {
+            column: 0,
+            value: Value::Decimal {
+                value: 450,
+                precision: 10,
+                scale: 2,
+            },
+        }),
+    );
+    let result = reader.scan(&req).unwrap();
+
+    assert_eq!(result.stats.candidate_blocks, 2);
+    assert_eq!(result.stats.skipped_blocks, 1);
+    assert_eq!(result.stats.decoded_blocks, 1);
+    assert_eq!(result.stats.returned_rows, 4);
+    assert_eq!(result.batches.len(), 1);
+
+    let expected_values = [100, 200, 300, 400];
+    for (row_idx, expected_value) in expected_values.iter().enumerate() {
+        match result.batches[0].columns[0].get(row_idx).unwrap() {
+            Value::Decimal {
+                value,
+                precision,
+                scale,
+            } => {
+                assert_eq!(value, *expected_value);
+                assert_eq!(precision, 10);
+                assert_eq!(scale, 2);
+            }
+            value => panic!("expected decimal value, got {value:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_decimal_lte_across_multiple_blocks_prunes_zone_maps() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("decimal_lte.col");
+    let schema = Schema::new(vec![test_col(
+        "c_decimal",
+        DataType::Decimal {
+            precision: 10,
+            scale: 2,
+        },
+        false,
+    )])
+    .unwrap();
+
+    let opts = SegmentOptions::new().with_rows_per_block(4);
+    let rows = vec![
+        Row::new(vec![Value::Decimal {
+            value: 100,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 200,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 300,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 400,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 500,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 600,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 700,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 800,
+            precision: 10,
+            scale: 2,
+        }]),
+    ];
+
+    SegmentWriter::write(&path, &schema, rows, &opts).unwrap();
+    let reader = SegmentReader::open(&path).unwrap();
+
+    let req = ScanRequest::new(
+        vec![0],
+        Some(Predicate::Lte {
+            column: 0,
+            value: Value::Decimal {
+                value: 400,
+                precision: 10,
+                scale: 2,
+            },
+        }),
+    );
+    let result = reader.scan(&req).unwrap();
+
+    assert_eq!(result.stats.candidate_blocks, 2);
+    assert_eq!(result.stats.skipped_blocks, 1);
+    assert_eq!(result.stats.decoded_blocks, 1);
+    assert_eq!(result.stats.returned_rows, 4);
+    assert_eq!(result.batches.len(), 1);
+
+    let expected_values = [100, 200, 300, 400];
+    for (row_idx, expected_value) in expected_values.iter().enumerate() {
+        match result.batches[0].columns[0].get(row_idx).unwrap() {
+            Value::Decimal {
+                value,
+                precision,
+                scale,
+            } => {
+                assert_eq!(value, *expected_value);
+                assert_eq!(precision, 10);
+                assert_eq!(scale, 2);
+            }
+            value => panic!("expected decimal value, got {value:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_decimal_gt_across_multiple_blocks_prunes_zone_maps() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("decimal_gt.col");
+    let schema = Schema::new(vec![test_col(
+        "c_decimal",
+        DataType::Decimal {
+            precision: 10,
+            scale: 2,
+        },
+        false,
+    )])
+    .unwrap();
+
+    let opts = SegmentOptions::new().with_rows_per_block(4);
+    let rows = vec![
+        Row::new(vec![Value::Decimal {
+            value: 100,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 200,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 300,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 400,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 500,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 600,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 700,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 800,
+            precision: 10,
+            scale: 2,
+        }]),
+    ];
+
+    SegmentWriter::write(&path, &schema, rows, &opts).unwrap();
+    let reader = SegmentReader::open(&path).unwrap();
+
+    let req = ScanRequest::new(
+        vec![0],
+        Some(Predicate::Gt {
+            column: 0,
+            value: Value::Decimal {
+                value: 450,
+                precision: 10,
+                scale: 2,
+            },
+        }),
+    );
+    let result = reader.scan(&req).unwrap();
+
+    assert_eq!(result.stats.candidate_blocks, 2);
+    assert_eq!(result.stats.skipped_blocks, 1);
+    assert_eq!(result.stats.decoded_blocks, 1);
+    assert_eq!(result.stats.returned_rows, 4);
+    assert_eq!(result.batches.len(), 1);
+
+    let expected_values = [500, 600, 700, 800];
+    for (row_idx, expected_value) in expected_values.iter().enumerate() {
+        match result.batches[0].columns[0].get(row_idx).unwrap() {
+            Value::Decimal {
+                value,
+                precision,
+                scale,
+            } => {
+                assert_eq!(value, *expected_value);
+                assert_eq!(precision, 10);
+                assert_eq!(scale, 2);
+            }
+            value => panic!("expected decimal value, got {value:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_nullable_decimal_gt_and_gte_retain_null_containing_blocks() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nullable_decimal_gt_gte.col");
+    let schema = Schema::new(vec![test_col(
+        "c_decimal",
+        DataType::Decimal {
+            precision: 10,
+            scale: 2,
+        },
+        true,
+    )])
+    .unwrap();
+
+    let opts = SegmentOptions::new().with_rows_per_block(4);
+    let rows = vec![
+        Row::new(vec![Value::Null]),
+        Row::new(vec![Value::Decimal {
+            value: 100,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Null]),
+        Row::new(vec![Value::Decimal {
+            value: 200,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 500,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 600,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 700,
+            precision: 10,
+            scale: 2,
+        }]),
+        Row::new(vec![Value::Decimal {
+            value: 800,
+            precision: 10,
+            scale: 2,
+        }]),
+    ];
+
+    SegmentWriter::write(&path, &schema, rows, &opts).unwrap();
+    let reader = SegmentReader::open(&path).unwrap();
+
+    for predicate in [
+        Predicate::Gt {
+            column: 0,
+            value: Value::Decimal {
+                value: 400,
+                precision: 10,
+                scale: 2,
+            },
+        },
+        Predicate::Gte {
+            column: 0,
+            value: Value::Decimal {
+                value: 500,
+                precision: 10,
+                scale: 2,
+            },
+        },
+    ] {
+        let req = ScanRequest::new(vec![0], Some(predicate));
+        let result = reader.scan(&req).unwrap();
+
+        // The first block is retained because it contains NULL values.
+        assert_eq!(result.stats.candidate_blocks, 2);
+        assert_eq!(result.stats.skipped_blocks, 0);
+        assert_eq!(result.stats.decoded_blocks, 2);
+        assert_eq!(result.stats.returned_rows, 4);
+        assert_eq!(result.batches.len(), 1);
+
+        let expected_values = [500, 600, 700, 800];
+        for (row_idx, expected_value) in expected_values.iter().enumerate() {
+            match result.batches[0].columns[0].get(row_idx).unwrap() {
+                Value::Decimal {
+                    value,
+                    precision,
+                    scale,
+                } => {
+                    assert_eq!(value, *expected_value);
+                    assert_eq!(precision, 10);
+                    assert_eq!(scale, 2);
+                }
+                value => panic!("expected decimal value, got {value:?}"),
+            }
+        }
+    }
+}

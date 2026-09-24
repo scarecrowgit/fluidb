@@ -68,7 +68,7 @@
 
 use std::io;
 
-use htap_common::types::{ColumnDef, Row, Value};
+use htap_common::types::{check_decimal_precision, parse_decimal_text, ColumnDef, Row, Value};
 
 use crate::codec::{read_fixed, read_lenenc_str, read_u16, read_u32, write_lenenc_str};
 use crate::proto::*;
@@ -80,6 +80,24 @@ const PARAM_UNSIGNED_FLAG: u8 = 0x80;
 
 fn bad(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_string())
+}
+
+fn decode_decimal_value(bytes: &[u8], precision: u8, scale: u8) -> io::Result<Value> {
+    let text = std::str::from_utf8(bytes).map_err(|_| bad("invalid UTF-8 in DECIMAL value"))?;
+    let value = parse_decimal_text(text, scale)
+        .map_err(|err| bad(&format!("invalid DECIMAL value {text:?}: {err}")))?;
+    let value = i64::try_from(value)
+        .map_err(|_| bad(&format!("DECIMAL value {text:?} exceeds i64 range")))?;
+    check_decimal_precision(value, precision, scale).map_err(|err| {
+        bad(&format!(
+            "DECIMAL value {text:?} exceeds DECIMAL({precision},{scale}): {err}"
+        ))
+    })?;
+    Ok(Value::Decimal {
+        value,
+        precision,
+        scale,
+    })
 }
 
 /// A parameter's declared wire type: the `(type, unsigned)` pair from a `COM_STMT_EXECUTE`
@@ -701,7 +719,7 @@ pub fn encode_binary_row(row: &Row, columns: &[ColumnDef]) -> io::Result<Vec<u8>
     }
     buf.extend_from_slice(&bitmap);
     for (value, col) in row.values().iter().zip(columns) {
-        let (type_code, ..) = mysql_type_for(col.data_type);
+        let (type_code, ..) = mysql_type_for(col.data_type)?;
         match value {
             Value::Null => {}
             Value::Bool(b) => {
@@ -727,6 +745,10 @@ pub fn encode_binary_row(row: &Row, columns: &[ColumnDef]) -> io::Result<Vec<u8>
             Value::Bytes(b) => {
                 debug_assert_eq!(type_code, MYSQL_TYPE_BLOB);
                 write_lenenc_str(&mut buf, b);
+            }
+            Value::Decimal { .. } => {
+                debug_assert_eq!(type_code, MYSQL_TYPE_NEWDECIMAL);
+                write_lenenc_str(&mut buf, value.to_string().as_bytes());
             }
             Value::Timestamp(micros) => {
                 debug_assert_eq!(type_code, MYSQL_TYPE_DATETIME);
@@ -765,7 +787,7 @@ pub fn decode_binary_row(payload: &[u8], columns: &[ColumnDef]) -> io::Result<Ro
             values.push(Value::Null);
             continue;
         }
-        let (type_code, ..) = mysql_type_for(col.data_type);
+        let (type_code, ..) = mysql_type_for(col.data_type)?;
         let value = match type_code {
             MYSQL_TYPE_TINY => Value::Bool(read_fixed(payload, &mut pos, 1)?[0] != 0),
             MYSQL_TYPE_LONG => {
@@ -794,6 +816,12 @@ pub fn decode_binary_row(payload: &[u8], columns: &[ColumnDef]) -> io::Result<Ro
                 )
             }
             MYSQL_TYPE_BLOB => Value::Bytes(read_lenenc_str(payload, &mut pos)?.to_vec()),
+            MYSQL_TYPE_NEWDECIMAL => match col.data_type {
+                htap_common::types::DataType::Decimal { precision, scale } => {
+                    decode_decimal_value(read_lenenc_str(payload, &mut pos)?, precision, scale)?
+                }
+                _ => return Err(bad("NEWDECIMAL wire type on a non-DECIMAL column")),
+            },
             MYSQL_TYPE_DATETIME => Value::Timestamp(decode_binary_datetime(payload, &mut pos)?),
             other => {
                 return Err(bad(&format!(
@@ -859,6 +887,7 @@ pub fn encode_execute_request(stmt_id: u32, params: &[Value]) -> io::Result<Vec<
                 Value::String(_) => MYSQL_TYPE_VAR_STRING,
                 Value::Bytes(_) => MYSQL_TYPE_BLOB,
                 Value::Timestamp(_) => MYSQL_TYPE_DATETIME,
+                Value::Decimal { .. } => MYSQL_TYPE_NEWDECIMAL,
             };
             buf.push(type_code);
             buf.push(0); // unsigned flag: never set (this client only ever sends signed values)
@@ -873,6 +902,7 @@ pub fn encode_execute_request(stmt_id: u32, params: &[Value]) -> io::Result<Vec<
                 Value::Float64(f) => buf.extend_from_slice(&f.to_le_bytes()),
                 Value::String(s) => write_lenenc_str(&mut buf, s.as_bytes()),
                 Value::Bytes(b) => write_lenenc_str(&mut buf, b),
+                Value::Decimal { .. } => write_lenenc_str(&mut buf, v.to_string().as_bytes()),
                 Value::Timestamp(micros) => {
                     buf.extend_from_slice(&encode_binary_datetime(*micros)?)
                 }
@@ -1376,6 +1406,39 @@ mod tests {
         ]);
         let payload = encode_binary_row(&row, &columns).unwrap();
         assert_eq!(decode_binary_row(&payload, &columns).unwrap(), row);
+    }
+
+    #[test]
+    fn binary_row_decimal_round_trip_preserves_value_precision_and_scale() {
+        let columns = vec![col(
+            "amount",
+            DataType::Decimal {
+                precision: 12,
+                scale: 4,
+            },
+            false,
+        )];
+        let row = Row::new(vec![Value::Decimal {
+            value: -123456,
+            precision: 12,
+            scale: 4,
+        }]);
+
+        let payload = encode_binary_row(&row, &columns).unwrap();
+        let decoded = decode_binary_row(&payload, &columns).unwrap();
+
+        match &decoded.values()[0] {
+            Value::Decimal {
+                value,
+                precision,
+                scale,
+            } => {
+                assert_eq!(*value, -123456);
+                assert_eq!(*precision, 12);
+                assert_eq!(*scale, 4);
+            }
+            other => panic!("expected Decimal value, got {other:?}"),
+        }
     }
 
     #[test]

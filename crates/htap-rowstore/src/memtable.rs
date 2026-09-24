@@ -158,7 +158,7 @@ impl Memtable {
             )));
         }
 
-        let entry_size = estimate_entry_size(key.user_key.len(), &value);
+        let entry_size = estimate_entry_size(key.user_key.len(), &value)?;
         self.approximate_size_bytes += entry_size;
         self.max_version = Some(self.max_version.map_or(version, |mv| mv.max(version)));
         self.entries
@@ -242,7 +242,7 @@ impl<'a> IntoIterator for &'a Memtable {
 }
 
 /// Compute a cheap structural size estimate for a memtable entry without serialization.
-fn estimate_entry_size(user_key_len: usize, value: &ValueKind) -> usize {
+fn estimate_entry_size(user_key_len: usize, value: &ValueKind) -> Result<usize> {
     let mut size = size_of::<InternalKey>() + user_key_len + size_of::<ValueKind>();
     if let ValueKind::Put(row) = value {
         for v in row.values() {
@@ -254,11 +254,12 @@ fn estimate_entry_size(user_key_len: usize, value: &ValueKind) -> usize {
                 | Value::Int32(_)
                 | Value::Int64(_)
                 | Value::Float64(_)
-                | Value::Timestamp(_) => {}
+                | Value::Timestamp(_)
+                | Value::Decimal { .. } => {}
             }
         }
     }
-    size
+    Ok(size)
 }
 
 #[cfg(test)]
@@ -545,5 +546,44 @@ mod tests {
         assert_eq!(entries[3].key.partition_id, 1);
         assert_eq!(entries[3].key.user_key, b"k1");
         assert_eq!(entries[3].key.version, Version::new(1));
+    }
+
+    #[test]
+    fn test_decimal_value_is_persistable() {
+        let mut memtable = Memtable::new();
+        let decimal = Value::Decimal {
+            value: 123,
+            precision: 3,
+            scale: 2,
+        };
+        let row = Row::new(vec![decimal.clone()]);
+
+        memtable
+            .apply(0, b"decimal".to_vec(), Version::new(1), ValueKind::Put(row))
+            .unwrap();
+
+        let entry = memtable
+            .get(0, b"decimal", Version::new(1))
+            .expect("decimal row should be visible");
+        let ValueKind::Put(row) = entry.value else {
+            panic!("expected decimal row");
+        };
+        let Value::Decimal {
+            value,
+            precision,
+            scale,
+        } = row.get(0).expect("decimal column should exist")
+        else {
+            panic!("expected decimal value");
+        };
+
+        assert_eq!(*value, 123);
+        assert_eq!(*precision, 3);
+        assert_eq!(*scale, 2);
+        assert_eq!(
+            memtable.approximate_size_bytes(),
+            size_of::<InternalKey>() + b"decimal".len() + size_of::<ValueKind>()
+        );
+        assert_eq!(memtable.max_version(), Some(Version::new(1)));
     }
 }

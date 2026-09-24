@@ -371,6 +371,77 @@ Option **(c)**.
   folds deltas into the columnar base or advances a conversion's own snapshot version.
 - Physical reverse transcoding is unsupported (metadata demotion back to Row is supported via ADR-015).
 
+### Decimal column type in the columnar segment (`HTAPCOL1` v1 -> v2, Phase 17 / A6b task 2)
+
+Phase 17 adds `DataType::Decimal { precision, scale }` as an eighth column type end to end, including
+persistence. This is recorded here, as a consequence of this ADR rather than as a new ADR, per the storage
+review that gated it (see `docs/PROGRESS.md`'s Phase 17 row and CLAUDE.md's format-bump rule): the change is
+additive to the columnar segment's existing byte layout and does not introduce a new conversion-state-machine
+decision, so it does not warrant its own ADR number the way ADR-017/021/023/024's format bumps did (those each
+bundled a genuinely new design, not a mechanical type addition).
+
+1. **Version bump, floor, and readable range.** `htap-colstore/src/segment.rs`'s `FORMAT_VERSION` goes 1 -> 2.
+   `MIN_DECODABLE_VERSION` stays `1` (the legacy floor), so `SegmentReader::open` accepts the inclusive range
+   `MIN_DECODABLE_VERSION..=FORMAT_VERSION` (`1..=2`), widened from the previous strict-equality check.
+2. **Version 1 stays readable — verified by inspection, not by test.** Decimal reuses the identical 8-byte
+   little-endian layout already used for `Int64`/`Timestamp` blocks (an unscaled `i64`, precision and scale
+   supplied by the footer's schema, never stored per value or per block); no existing column type's plain
+   encoding, dictionary encoding, zone-map layout, block framing, or footer shape changed. **This claim is
+   verified by inspection of `encoding.rs`/`segment.rs`'s encode/decode paths, not proven by a test**, because
+   no genuine version-1 segment fixture is checked into this repository — the closest available test,
+   `segment::tests::legacy_format_still_readable`, hand-patches a version-2-written, non-decimal segment's
+   footer `format_version` field down to `1` (recomputing the footer checksum) and asserts it still opens and
+   scans correctly; it demonstrates that a footer tagged `1` still decodes, not that every possible historical
+   version-1 byte layout is unchanged, which is why the underlying claim about byte layout is stated as an
+   inspection result here rather than attributed to that test.
+3. **A legacy-tagged segment declaring a decimal column is rejected, keyed to the decimal-introduction
+   version, not the legacy floor.** A version-1 segment can never genuinely contain a decimal column, because
+   the pre-Phase-17 writer had no decimal branch at all — but nothing in a reader that merely widens the
+   version check to a range would otherwise stop a hand-crafted or corrupted file from pairing an old version
+   number with a schema that declares one, since a decimal block's bytes are indistinguishable in shape from
+   an existing 64-bit type's. `SegmentReader::open` therefore checks, immediately after decoding the footer's
+   schema: if `format_version < DECIMAL_INTRODUCTION_VERSION` (`DECIMAL_INTRODUCTION_VERSION = 2`, deliberately
+   the version decimal support was introduced in, not `MIN_DECODABLE_VERSION`, so the guard still applies
+   correctly even if `MIN_DECODABLE_VERSION` is ever raised past 1 later) and the schema contains any decimal
+   column, it fails with `HtapError::Corruption` rather than decoding numerically plausible but unversioned
+   data. Covered by `segment::tests::legacy_version_with_decimal_rejected`.
+4. **Why every other durable envelope stays unbumped, per envelope.** `HTAPCAT1` (catalog), `HTAPSST1`
+   (rowstore SST), `HTAPMNF1` (movement tablet manifest), the bare WAL/journal frames, and the rest of the
+   whole-file envelopes in the compatibility table above are untouched by this phase's byte output for any
+   existing row: each already carries its payload as a generic `serde`-derived structure (JSON for the
+   envelopes above; the columnar segment's own footer schema is also JSON) rather than a positional binary
+   layout, and `Value`/`DataType`'s decimal variant was already added to those shared enums back in the
+   query-layer half of this phase with no reaction needed then, since nothing could construct one on a
+   persistence path yet. The safety property this project's format-version checks exist to guarantee — an old
+   binary must refuse to decode bytes it does not understand, rather than silently misinterpreting them (see
+   this document's account of the catalog's v1->v2 bump above) — already holds for these envelopes without a
+   version bump, through a different, equally fail-loud mechanism: `serde`'s own strict, closed-set enum-tag
+   matching. An old binary's `Value`/`DataType` enum simply has no `Decimal` variant to match, so deserializing
+   a payload that contains one returns a clean deserialization error (`HtapError::Corruption` after this
+   project's envelope decode wrapping), never a silently wrong value, a panic, or a misread as some other
+   variant. `htap-catalog/tests/catalog_recovery.rs::test_catalog_invalid_decimal_type_tag_is_corruption`
+   exercises exactly this failure mode directly (an unrecognized type tag in a decimal variant's position is
+   rejected as `HtapError::Corruption`, not misread). **This depends on those enums keeping their current,
+   plain derived `serde` serialization** — no `#[serde(untagged)]`, no catch-all "other variant" arm that
+   would swallow an unrecognized tag instead of failing, and no numeric discriminant encoding that could
+   silently alias one variant's tag onto another's. Any future change to how `Value`/`DataType`/the catalog's
+   other tagged enums serialize must re-examine this argument before relying on "no bump needed" again for the
+   next additive variant.
+
+Storage-review sign-off (Phase 17, per the plan's binding validator edit requiring either an `architect`
+tie-break or an explicit reviewer sign-off on this exact claim — the `architect` route was exhausted after
+three failed attempts across two failure modes): the reviewer confirmed reusing the existing 8-byte layout
+with precision/scale held only in the schema is sound because the footer and its block data are written
+atomically in the same file, in the same write call — a segment's own footer is always the ground truth for
+its own blocks, so schema/data disagreement cannot arise from any code path that writes a segment, only from
+a hand-edited or corrupted file, which item 3's guard and the footer's own CRC both already cover; that
+bumping only `HTAPCOL1` while leaving the `serde_json`-based envelopes unbumped is defensible under CLAUDE.md's
+"a layout change bumps the format version" rule specifically because those envelopes' *byte output for
+existing data* is unchanged and their fail-loud behavior for new data is mechanically different but
+equally reliable (item 4); that no new ADR is warranted, for the reasons given above; and that the residual
+risk is confined to a hand-crafted or corrupted file, already guarded against by item 3's version-keyed check
+and the footer checksum.
+
 ### How to reverse it
 
 Replace the online state machine and rowstore overlay with an offline transcode and catalog swap
@@ -3744,3 +3815,102 @@ client unit tests inside `crates/htap-server/src/ipc/{protocol,owner,client}.rs`
 invariants, unchanged — the socket carries no durable state), ADR-018 (the `DurablePending`/`RecoveryRequired`
 quarantine pattern `Ambiguous` and `RemoteDisconnected` extend), ADR-019 (binary-blob literal substitution,
 the concrete case the AST-serialization decision above protects).
+
+---
+
+## ADR-026: Clamp derived `DECIMAL` precision to the supported maximum rather than rejecting the query (Amendment 4)
+
+`Status: Accepted`
+`Date: 2026-09-24`
+
+### Context
+
+Phase 17 pins `DECIMAL` as a fixed-point value: a signed 64-bit unscaled integer plus a declared precision and
+scale, maximum 18 digits, exact round-half-away-from-zero arithmetic, and a hard error on any *value* that
+does not fit its own declared precision. Separately from that, every arithmetic operator (`+ - * / %`) and
+aggregate (`SUM`/`AVG`) must derive a result *type* — its own precision and scale — from its operand types,
+before any value is known. An earlier decision in this same phase required rejecting a query outright, at bind
+time, whenever that derived type's *worst-case* precision exceeded the 18-digit maximum — matching the
+already-settled decision to reject silent `Float64` fallback for an inexact result, which this project's user
+explicitly ruled out.
+
+That rejection turned out to reject ordinary, realistic queries, not just pathological ones. Textbook
+multiplication precision is the sum of the operand precisions (`lp + rp`, or `lp + rp + 1` in some
+formulations); `SUM(amount_cents * 0.01)`, with `amount_cents` a `BIGINT` (modeled as 19 integer digits) and
+`0.01` binding as `DECIMAL(3,2)`, derives a 23-digit result and was rejected outright, even though every actual
+value fits comfortably in 18 digits — a `BIGINT` column holding cents does not actually contain 19-digit
+values in any realistic dataset. TPC-H's own money shape, `DECIMAL(15,2) * DECIMAL(15,2)`, derives 31 digits
+and fails the same way. Four of five A6a-2 checkpoint test failures traced to this one cause: worst-case
+precision derivation combined with an 18-digit bound cannot express the ordinary arithmetic this phase exists
+to support.
+
+### Options considered
+
+- **(a)** Keep worst-case-derived-precision rejection at bind time (the original decision). Safe — it never
+  produces a wrong or silently-narrowed result — but self-defeating for a phase whose purpose is to make money
+  arithmetic expressible: it rejects the overwhelming majority of realistic decimal expressions on the strength
+  of a bound that describes only a theoretical maximum no real query's values approach.
+- **(b)** Fall back to `Float64` when a derived decimal result would not fit. Rejected outright: this is
+  exactly the silent-inexactness fallback this project's decimal work exists to avoid, already rejected earlier
+  in A6a for the same reason and not reopened here.
+- **(c)** Clamp the derived *type's* precision (and, where necessary, its scale) to the 18-digit maximum rather
+  than rejecting the query, while leaving the existing per-*value* precision check (`check_decimal_precision`,
+  run on the actual computed value at evaluation time) completely unchanged as the only place an actual
+  overflow is ever caught.
+
+### Decision
+
+Option **(c)**. This is MySQL's own behavior when a derived `DECIMAL` exceeds its own maximum precision: MySQL
+does not reject the query, it narrows the declared type and still errors if an actual value does not fit.
+Adopting it here does not touch the settled invariants — the in-memory representation stays a scaled `i64`
+with precision and scale, the maximum stays 18 digits, and a value that does not fit its declared precision is
+still always a hard error, never a silent truncation or wraparound. Only the derivation of the result *type*
+changes, and only in `crates/htap-sql/src/expr.rs::arithmetic_result_type` (arithmetic) and
+`crates/htap-sql/src/binder_query.rs` (`SUM`/`AVG`) — see `docs/ARCHITECTURE.md`'s "Derived `DECIMAL`
+precision and scale rules" for the exact per-operator formulas and their test citations, which this ADR does
+not repeat.
+
+Two consequences of the derivation rules are worth naming explicitly here because they are easy to get wrong
+(both did, in this phase, before being caught by tests specifically written to probe them):
+
+- **`DIV`'s scale must come from the dividend plus a fixed increment, not from the divisor's precision.** An
+  earlier rule grew the scale with the *divisor's* precision (`max(6, ls + rp + 1)`), which for an integer
+  divisor derives a scale of 20 — already above the 18-digit bound, and once clamped would consume every digit
+  as fractional, leaving no room for the integer part at all. The corrected rule — scale is the dividend's own
+  scale plus four, unconditionally — is both saner and is literally MySQL's `div_precision_increment`.
+- **Clamping can force scale above the (already-clamped) precision; when it does, scale is reduced to fit, not
+  precision raised past the maximum.** This drops fractional digits from the declared *type* exactly as MySQL
+  does. It is not the same thing as losing a fractional digit from a *value* — the value's own scale, and
+  therefore its exactness, is set at evaluation time from the actual rescale/round performed, not retroactively
+  changed by this clamp; the clamp only affects what a *further* operation downstream declares as its operand
+  type. This is called out with an inline comment at the clamp site in `arithmetic_result_type`.
+
+### Consequences
+
+- Ordinary, realistic decimal arithmetic (money math, TPC-H-shaped queries) is now expressible; a query is
+  never rejected merely because a theoretical worst case exceeds the maximum.
+- A derived type's declared precision can now be narrower than the textbook formula would give for an extreme
+  operand combination (e.g. two `DECIMAL(18,0)` operands multiplied derive a *declared* `DECIMAL(18,0)`, not
+  `DECIMAL(36,0)`), which is a real, disclosed narrowing of the type system's honesty about extreme cases — but
+  it was already true in the sense that the storage layer could never have held more than 18 digits regardless
+  of what the type said, so no *value* becomes representable that was not already representable before.
+- The one behavior this ADR deliberately does not touch: exactness of a computed *value*. A `DECIMAL(18,0) *
+  DECIMAL(1,0)` whose actual product needs 19 digits still fails at evaluation time
+  (`crates/htap-sql/src/expr.rs::expr::tests::test_decimal_arithmetic_overflow_and_precision_errors`), exactly
+  as it did before this ADR — only the bind-time rejection of the *query* (regardless of the actual values
+  involved) is gone.
+
+### How to reverse it
+
+Revert `arithmetic_result_type`'s per-operator precision/scale formulas to reject (return `Err`) whenever the
+unclamped derived precision would exceed `MAX_DECIMAL_PRECISION`, and do the same for `SUM`/`AVG` in
+`binder_query.rs`. Nothing here is persisted — this is a query-layer, bind-time-only decision with no on-disk
+format dependency — so a reversal carries no migration and no format-version change.
+
+### Verification
+
+`crates/htap-sql/src/expr.rs::expr::tests::{test_decimal_required_precision_is_clamped_to_supported_bound, test_decimal_arithmetic_overflow_and_precision_errors, decimal_arithmetic_and_comparison, d7_decimal_division_rounds_non_tie_remainders_correctly, d9_decimal_division_rounding_direction_uses_exact_quotient_sign, test_decimal_rounding_half_away_from_zero_for_rescale_division_and_cast}`,
+`crates/htap-server/tests/decimal_aggregation.rs::{test_tpch_style_money_aggregation_uses_exact_decimal_precision, test_decimal_sum_avg_min_max_and_distinct_count, test_decimal_sum_reports_precision_overflow}`, and
+`crates/htap-server/tests/decimal_avg_rounding.rs::test_decimal_avg_rounds_half_away_from_zero`. Cross-references:
+ADR-008's decimal addendum (the columnar persistence side of the same phase, a separate concern from this
+query-layer derivation decision).

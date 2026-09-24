@@ -46,6 +46,7 @@ fn literal_of(v: &Value) -> String {
         Value::Int32(i) => i.to_string(),
         Value::Int64(i) => i.to_string(),
         Value::Float64(f) => format!("{f}"),
+        Value::Decimal { .. } => v.to_string(),
         Value::String(s) => format!("'{}'", s.replace('\'', "''")),
         Value::Bytes(b) => format!(
             "X'{}'",
@@ -176,6 +177,72 @@ fn test_remote_prepared_statement_matches_embedded_literal_execution() {
         embedded.execute(after_delete).unwrap(),
         remote.execute(after_delete).unwrap()
     );
+
+    remote.close().unwrap();
+    wire.shutdown();
+}
+
+#[test]
+fn test_remote_prepared_decimal_parameter_round_trips_into_decimal_column() {
+    let embedded_dir = TempDir::new().unwrap();
+    let embedded = EmbeddedClient::open(embedded_dir.path()).unwrap();
+    let (_remote_dir, wire, mut remote) = start_remote();
+
+    let create = "CREATE TABLE decimal_t (id BIGINT PRIMARY KEY, amount DECIMAL(8, 3))";
+    assert_eq!(
+        embedded.execute(create).unwrap(),
+        remote.execute(create).unwrap()
+    );
+
+    let statement = remote
+        .prepare("INSERT INTO decimal_t (id, amount) VALUES (?, ?)")
+        .unwrap();
+    let amount = Value::Decimal {
+        value: -12_340,
+        precision: 8,
+        scale: 3,
+    };
+    let expected = embedded
+        .execute(&format!(
+            "INSERT INTO decimal_t (id, amount) VALUES (1, {})",
+            literal_of(&amount)
+        ))
+        .unwrap();
+    let actual = remote
+        .execute_prepared(&statement, &[Value::Int64(1), amount.clone()])
+        .unwrap();
+    assert_eq!(expected, actual);
+    remote.close_prepared(statement).unwrap();
+
+    let selected = remote
+        .execute("SELECT amount FROM decimal_t WHERE id = 1")
+        .unwrap();
+    let htap_client::StatementResult::Query(query_result) = selected else {
+        panic!("expected selected decimal row");
+    };
+    let columns = query_result.columns;
+    let rows = query_result.rows;
+    assert_eq!(columns.len(), 1);
+    match columns[0].data_type {
+        htap_common::types::DataType::Decimal { precision, scale } => {
+            assert_eq!(precision, 8);
+            assert_eq!(scale, 3);
+        }
+        ref other => panic!("expected DECIMAL column metadata, got {other:?}"),
+    }
+    assert_eq!(rows.len(), 1);
+    match rows[0].get(0) {
+        Some(Value::Decimal {
+            value,
+            precision,
+            scale,
+        }) => {
+            assert_eq!(*value, -12_340);
+            assert_eq!(*precision, 8);
+            assert_eq!(*scale, 3);
+        }
+        other => panic!("expected round-tripped DECIMAL value, got {other:?}"),
+    }
 
     remote.close().unwrap();
     wire.shutdown();

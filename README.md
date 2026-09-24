@@ -30,10 +30,25 @@ components are **deliberately not implemented** and are out of scope for this lo
   explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, session variables) are implemented — see "Sessions and
   explicit transactions" below — but there is no locking-read syntax, no savepoints, and no distributed (XA)
   transactions. There is also no idle-transaction timeout/reaping yet.
-- **No unsigned 64-bit values, exact `DECIMAL`, or `TIME` parameters in prepared statements:** there is no
-  `UInt64` value type in the engine (a permanent limitation, not "not yet implemented"); `DECIMAL`/
-  `NEWDECIMAL` parameters are kept as text and bound as a numeric literal (no arbitrary-precision decimal
-  type); `TIME`-typed parameters are rejected. See "Prepared statements" below.
+- **`DECIMAL` (Phase 17): supported end to end — `CREATE TABLE`/`INSERT`/queries, columnar+catalog+key-codec
+  persistence, movement CSV/JSON-lines import/export, and the MySQL wire protocol — bounded at 18 digits, not
+  arbitrary precision.** `DECIMAL(p, s)`/`NUMERIC`/`DEC` is a fixed-point type (signed 64-bit unscaled integer,
+  up to 18 digits, exact round-half-away-from-zero arithmetic, derived result precision clamped to the maximum
+  rather than the query being rejected — see "Supported SQL Subset" below, `docs/ARCHITECTURE.md`'s "Derived
+  `DECIMAL` precision and scale rules", and `docs/DECISIONS.md`'s ADR-026 (Amendment 4)); a
+  value exceeding its own declared precision is still an error, and nothing ever silently becomes a float.
+  `CREATE TABLE`, literal/`CAST` binding, arithmetic, aggregation (row and columnar paths), the columnar
+  segment format (`HTAPCOL1` v1 -> v2), the catalog, the composite-key codec, the rowstore, the CSV/JSON-lines
+  movement codec, and the MySQL wire protocol's result/binary-row encoding are all done — see
+  `docs/PROGRESS.md`'s Phase 17 row for the task-by-task test evidence. Bulk CSV/JSON-lines import rounds a
+  value with more fractional digits than the column's declared scale (half-away-from-zero, matching ordinary
+  `INSERT`/`UPDATE` assignment) rather than rejecting it, and JSON-lines represents a decimal as a string, not
+  a bare JSON number — see `docs/OPERATIONS.md` section 2.
+- **No unsigned 64-bit values or `TIME` parameters in prepared statements:** there is no `UInt64` value type in
+  the engine (a permanent limitation, not "not yet implemented"); `DECIMAL`/`NEWDECIMAL` bound *parameters* are
+  kept as text and bound as a numeric literal (a `DECIMAL` result column also works over the wire, up to the
+  engine's own 18-digit bound — no arbitrary-precision decimal wire type — see the bullet above); `TIME`-typed
+  parameters are rejected. See "Prepared statements" below.
 - **No TPC-C or TPC-H compliance:** The system does not implement the TPC-C or TPC-H benchmark specifications, relational transaction models, or analytical query profiles. Microbenchmarks evaluate isolated internal subsystem performance only.
 - **No vectorized execution, and no worker-pool parallelism or memory-bounded spilling for outer joins:** The
   general query executor (see "Supported SQL Subset" below) handles joins (including arbitrarily nested join
@@ -447,7 +462,7 @@ The workspace consists of 14 modular crates (plus the vendored `vendor/sqlparser
 
 The SQL engine and embedded client execute an explicit, synchronous subset of SQL across unpartitioned and partitioned tables:
 
-- **`CREATE TABLE`:** Defines table schema with typed columns (`BIGINT`, `INT`, `VARCHAR`, etc.) and a primary key constraint. Tables created without partitioning clauses receive a default single-partition / single-tablet row topology (`partitions.len() == 1`, `tablets.len() == 1`, default partition `"p0"`). MySQL `PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via SQL DDL as well as via the native admin API.
+- **`CREATE TABLE`:** Defines table schema with typed columns (`BIGINT`, `INT`, `VARCHAR`, `DECIMAL(p, s)`/`NUMERIC(p, s)`/`DEC(p, s)` — fixed-point, up to 18 digits, MySQL-compatible defaults when `p`/`s` are omitted, as of Phase 17 — etc.) and a primary key constraint (a `DECIMAL` primary key is supported). Tables created without partitioning clauses receive a default single-partition / single-tablet row topology (`partitions.len() == 1`, `tablets.len() == 1`, default partition `"p0"`). MySQL `PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via SQL DDL as well as via the native admin API.
 - **`ALTER TABLE` (Partition Lifecycle):** Supports typed MySQL partition lifecycle DDL:
   - `ALTER TABLE t ADD PARTITION (PARTITION p VALUES LESS THAN (v|MAXVALUE))` or `VALUES IN (v1, ...)`.
   - `ALTER TABLE t DROP PARTITION p[, ...]`.
@@ -648,7 +663,7 @@ Direct `SegmentReader` pushdown optimization is implemented for the compact base
   merge/order are implemented locally; local disk spilling for the general query path is implemented as of
   Phase 14 — see below — distributed spill/fanout is not).
 - DataFusion and Apache Arrow integration.
-- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, and broader string/date/`DATE`/`DECIMAL`/`EXTRACT`/`SUBSTRING`/`INTERVAL`/view functions. (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
+- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, and broader string/date/view functions beyond a narrow slice (`DATE`, `EXTRACT`/`INTERVAL` for `YEAR`/`MONTH`/`DAY` only, and three-argument `SUBSTRING` are supported as of the TPC-H prerequisite work — see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"; `DECIMAL` is supported end to end as of Phase 17 — see "Important Scope Exclusions" above and `docs/PROGRESS.md`'s Phase 17 row). (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
 - **MySQL Partition DDL & Partition Lifecycle Boundary:**
   - Supported SQL partitioning: MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via vendored `sqlparser` and bound to validated catalog partition models.
   - Supported SQL lifecycle DDL: `ALTER TABLE <table> ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` for strict finite range and list forms and final `MAXVALUE` where supported, gated by empty-source rowstore checks before catalog mutation.

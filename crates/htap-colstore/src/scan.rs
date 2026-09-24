@@ -3,7 +3,7 @@
 //! Provides conservative zone-map pushdown filtering, selection vector construction,
 //! and selective column decoding for analytical query processing.
 
-use htap_common::{Result, Value};
+use htap_common::{HtapError, Result, Value};
 
 use crate::segment::{BlockMeta, SegmentReader};
 use crate::types::{ColumnVector, Predicate, RecordBatch, ScanRequest, ScanResult, ScanStats};
@@ -164,6 +164,26 @@ pub fn filter_column_vector(vector: &ColumnVector, selected_rows: &[u32]) -> Col
                 validity: new_valids,
             }
         }
+        ColumnVector::Decimal {
+            values,
+            validity,
+            precision,
+            scale,
+        } => {
+            let mut new_vals = Vec::with_capacity(count);
+            let mut new_valids = Vec::with_capacity(count);
+            for &idx in selected_rows {
+                let i = idx as usize;
+                new_vals.push(values[i]);
+                new_valids.push(validity[i]);
+            }
+            ColumnVector::Decimal {
+                values: new_vals,
+                validity: new_valids,
+                precision: *precision,
+                scale: *scale,
+            }
+        }
         ColumnVector::String { values, validity } => {
             let mut new_vals = Vec::with_capacity(count);
             let mut new_valids = Vec::with_capacity(count);
@@ -191,6 +211,36 @@ pub fn filter_column_vector(vector: &ColumnVector, selected_rows: &[u32]) -> Col
             }
         }
     }
+}
+
+fn resolve_predicate_matcher<'predicate, 'column>(
+    predicate: &'predicate Predicate,
+    col: &'column ColumnVector,
+) -> Result<Box<dyn Fn(usize) -> bool + 'column>>
+where
+    'predicate: 'column,
+{
+    if let Predicate::Eq { value, .. }
+    | Predicate::Lt { value, .. }
+    | Predicate::Lte { value, .. }
+    | Predicate::Gt { value, .. }
+    | Predicate::Gte { value, .. } = predicate
+    {
+        let predicate_type = value.data_type().ok_or_else(|| {
+            HtapError::Corruption("comparison predicate contains an untyped NULL value".into())
+        })?;
+        let column_type = col.data_type();
+
+        if predicate_type != column_type {
+            return Err(HtapError::Corruption(format!(
+                "predicate value type {predicate_type:?} does not match column vector type {column_type:?}"
+            )));
+        }
+    }
+
+    Ok(Box::new(move |row_idx| {
+        predicate_matches_non_null(predicate, col, row_idx)
+    }))
 }
 
 #[allow(clippy::bool_comparison)]
@@ -230,6 +280,13 @@ fn predicate_matches_non_null(predicate: &Predicate, col: &ColumnVector, row_idx
                 ..
             },
             ColumnVector::Timestamp { values, .. },
+        ) => values[row_idx] == *lit,
+        (
+            Predicate::Eq {
+                value: Value::Decimal { value: lit, .. },
+                ..
+            },
+            ColumnVector::Decimal { values, .. },
         ) => values[row_idx] == *lit,
         (
             Predicate::Eq {
@@ -281,6 +338,14 @@ fn predicate_matches_non_null(predicate: &Predicate, col: &ColumnVector, row_idx
             },
             ColumnVector::Timestamp { values, .. },
         ) => values[row_idx] < *lit,
+        // Decimal values are raw unscaled integers; validation ensures scales match.
+        (
+            Predicate::Lt {
+                value: Value::Decimal { value: lit, .. },
+                ..
+            },
+            ColumnVector::Decimal { values, .. },
+        ) => values[row_idx] < *lit,
         (
             Predicate::Lt {
                 value: Value::String(lit),
@@ -330,6 +395,14 @@ fn predicate_matches_non_null(predicate: &Predicate, col: &ColumnVector, row_idx
                 ..
             },
             ColumnVector::Timestamp { values, .. },
+        ) => values[row_idx] <= *lit,
+        // Decimal values are raw unscaled integers; validation ensures scales match.
+        (
+            Predicate::Lte {
+                value: Value::Decimal { value: lit, .. },
+                ..
+            },
+            ColumnVector::Decimal { values, .. },
         ) => values[row_idx] <= *lit,
         (
             Predicate::Lte {
@@ -381,6 +454,14 @@ fn predicate_matches_non_null(predicate: &Predicate, col: &ColumnVector, row_idx
             },
             ColumnVector::Timestamp { values, .. },
         ) => values[row_idx] > *lit,
+        // Decimal values are raw unscaled integers; validation ensures scales match.
+        (
+            Predicate::Gt {
+                value: Value::Decimal { value: lit, .. },
+                ..
+            },
+            ColumnVector::Decimal { values, .. },
+        ) => values[row_idx] > *lit,
         (
             Predicate::Gt {
                 value: Value::String(lit),
@@ -431,6 +512,14 @@ fn predicate_matches_non_null(predicate: &Predicate, col: &ColumnVector, row_idx
             },
             ColumnVector::Timestamp { values, .. },
         ) => values[row_idx] >= *lit,
+        // Decimal values are raw unscaled integers; validation ensures scales match.
+        (
+            Predicate::Gte {
+                value: Value::Decimal { value: lit, .. },
+                ..
+            },
+            ColumnVector::Decimal { values, .. },
+        ) => values[row_idx] >= *lit,
         (
             Predicate::Gte {
                 value: Value::String(lit),
@@ -446,6 +535,52 @@ fn predicate_matches_non_null(predicate: &Predicate, col: &ColumnVector, row_idx
             ColumnVector::Bytes { values, .. },
         ) => &values[row_idx] >= lit,
 
+        // Null predicates are evaluated from validity bitmaps before a matcher is constructed;
+        // non-match is safe if one reaches this comparison-only matcher.
+        (
+            Predicate::IsNull { .. } | Predicate::IsNotNull { .. },
+            ColumnVector::Bool { .. }
+            | ColumnVector::Int32 { .. }
+            | ColumnVector::Int64 { .. }
+            | ColumnVector::Float64 { .. }
+            | ColumnVector::Timestamp { .. }
+            | ColumnVector::Decimal { .. }
+            | ColumnVector::String { .. }
+            | ColumnVector::Bytes { .. },
+        ) => false,
+
+        // NULL comparison literals are rejected during request validation and matcher resolution;
+        // non-match is safe if a malformed predicate reaches this matcher.
+        (
+            Predicate::Eq {
+                value: Value::Null, ..
+            }
+            | Predicate::Lt {
+                value: Value::Null, ..
+            }
+            | Predicate::Lte {
+                value: Value::Null, ..
+            }
+            | Predicate::Gt {
+                value: Value::Null, ..
+            }
+            | Predicate::Gte {
+                value: Value::Null, ..
+            },
+            ColumnVector::Bool { .. }
+            | ColumnVector::Int32 { .. }
+            | ColumnVector::Int64 { .. }
+            | ColumnVector::Float64 { .. }
+            | ColumnVector::Timestamp { .. }
+            | ColumnVector::Decimal { .. }
+            | ColumnVector::String { .. }
+            | ColumnVector::Bytes { .. },
+        ) => false,
+
+        // Correctness is enforced by resolve_predicate_matcher's logical-type comparison,
+        // not by compiler exhaustiveness. A non-match is deliberate because a scan-path
+        // crash is worse; this is unreachable for current column types. If revisited,
+        // narrow this function's input to comparison predicates for compiler enforcement.
         _ => false,
     }
 }
@@ -525,6 +660,7 @@ pub fn execute_scan(reader: &SegmentReader, request: &ScanRequest) -> Result<Sca
                 } else {
                     // Must decode predicate column
                     let col_vec = reader.read_block_internal(pred_col_idx, b_idx)?;
+                    col_vec.validate()?;
                     let mut selected = Vec::new();
                     let validity = col_vec.validity();
                     match pred {
@@ -543,8 +679,9 @@ pub fn execute_scan(reader: &SegmentReader, request: &ScanRequest) -> Result<Sca
                             }
                         }
                         _ => {
+                            let matcher = resolve_predicate_matcher(pred, &col_vec)?;
                             for (r, &is_valid) in validity.iter().enumerate() {
-                                if is_valid && predicate_matches_non_null(pred, &col_vec, r) {
+                                if is_valid && matcher(r) {
                                     selected.push(r as u32);
                                 }
                             }
@@ -592,4 +729,51 @@ pub fn execute_scan(reader: &SegmentReader, request: &ScanRequest) -> Result<Sca
     }
 
     Ok(ScanResult::new(batches, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn predicate_matcher_type_mismatch_is_corruption() {
+        let predicate = Predicate::Eq {
+            column: 0,
+            value: Value::Int32(1),
+        };
+        let column = ColumnVector::String {
+            values: vec!["value".to_owned()],
+            validity: vec![true],
+        };
+
+        let error = match resolve_predicate_matcher(&predicate, &column) {
+            Err(error) => error,
+            Ok(_) => panic!("expected corruption error"),
+        };
+
+        let HtapError::Corruption(message) = error else {
+            panic!("expected corruption error");
+        };
+        assert!(message.contains("Int32"));
+        assert!(message.contains("String"));
+    }
+
+    #[test]
+    fn predicate_matcher_null_comparison_literal_is_corruption() {
+        let predicate = Predicate::Eq {
+            column: 0,
+            value: Value::Null,
+        };
+        let column = ColumnVector::Int32 {
+            values: vec![1],
+            validity: vec![true],
+        };
+
+        let error = match resolve_predicate_matcher(&predicate, &column) {
+            Err(error) => error,
+            Ok(_) => panic!("expected corruption error"),
+        };
+
+        assert!(matches!(error, HtapError::Corruption(_)));
+    }
 }

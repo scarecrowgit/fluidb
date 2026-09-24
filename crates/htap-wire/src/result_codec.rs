@@ -13,7 +13,9 @@
 
 use std::io;
 
-use htap_common::types::{ColumnDef, DataType, Row, Value};
+use htap_common::types::{
+    check_decimal_precision, parse_decimal_text, ColumnDef, DataType, Row, Value,
+};
 
 use crate::codec::{
     read_fixed, read_lenenc_int, read_lenenc_str, read_u16, read_u32, write_lenenc_int,
@@ -22,26 +24,67 @@ use crate::codec::{
 use crate::proto::*;
 
 /// Wire description of a column type: `(type_code, collation, column_length, decimals)`.
-pub fn mysql_type_for(dt: DataType) -> (u8, u16, u32, u8) {
-    match dt {
+pub fn mysql_type_for(dt: DataType) -> io::Result<(u8, u16, u32, u8)> {
+    Ok(match dt {
         DataType::Bool => (MYSQL_TYPE_TINY, COLLATION_BINARY, 1, 0),
         DataType::Int32 => (MYSQL_TYPE_LONG, COLLATION_BINARY, 11, 0),
         DataType::Int64 => (MYSQL_TYPE_LONGLONG, COLLATION_BINARY, 20, 0),
         DataType::Float64 => (MYSQL_TYPE_DOUBLE, COLLATION_BINARY, 22, 31),
         DataType::String => (MYSQL_TYPE_VAR_STRING, COLLATION_UTF8MB4, 65_535 * 4, 0),
         DataType::Bytes => (MYSQL_TYPE_BLOB, COLLATION_BINARY, u32::MAX, 0),
+        DataType::Decimal { precision, scale } => (
+            MYSQL_TYPE_NEWDECIMAL,
+            COLLATION_BINARY,
+            u32::from(precision) + 1 + u32::from(scale > 0),
+            scale,
+        ),
         DataType::Timestamp => (MYSQL_TYPE_DATETIME, COLLATION_BINARY, 26, 6),
-    }
+    })
 }
 
 /// Inverse of [`mysql_type_for`] for decoding column definitions on the client.
-pub fn data_type_for(type_code: u8, collation: u16) -> io::Result<DataType> {
+pub fn data_type_for(
+    type_code: u8,
+    collation: u16,
+    length: u32,
+    decimals: u8,
+) -> io::Result<DataType> {
     Ok(match type_code {
         MYSQL_TYPE_TINY => DataType::Bool,
         MYSQL_TYPE_LONG => DataType::Int32,
         MYSQL_TYPE_LONGLONG => DataType::Int64,
         MYSQL_TYPE_DOUBLE => DataType::Float64,
         MYSQL_TYPE_DATETIME => DataType::Timestamp,
+        MYSQL_TYPE_NEWDECIMAL => {
+            let overhead = if decimals > 0 { 2 } else { 1 };
+            let precision = length.checked_sub(overhead).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid DECIMAL column length {length} for scale {decimals}: too short"
+                    ),
+                )
+            })?;
+            let precision = u8::try_from(precision).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid DECIMAL column precision {precision}: exceeds supported range"
+                    ),
+                )
+            })?;
+            let data_type = DataType::Decimal {
+                precision,
+                scale: decimals,
+            };
+            data_type.validate().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid DECIMAL column definition: {err}"),
+                )
+            })?;
+            data_type
+        }
         MYSQL_TYPE_VAR_STRING | 0x0f | 0xfe => DataType::String,
         MYSQL_TYPE_BLOB if collation == COLLATION_BINARY => DataType::Bytes,
         MYSQL_TYPE_BLOB => DataType::String,
@@ -55,8 +98,8 @@ pub fn data_type_for(type_code: u8, collation: u16) -> io::Result<DataType> {
 }
 
 /// Builds a `ColumnDefinition41` payload.
-pub fn build_column_def41(col: &ColumnDef) -> Vec<u8> {
-    let (type_code, collation, length, decimals) = mysql_type_for(col.data_type);
+pub fn build_column_def41(col: &ColumnDef) -> io::Result<Vec<u8>> {
+    let (type_code, collation, length, decimals) = mysql_type_for(col.data_type)?;
     let mut buf = Vec::with_capacity(48 + col.name.len() * 2);
     write_lenenc_str(&mut buf, b"def");
     write_lenenc_str(&mut buf, DEFAULT_SCHEMA.as_bytes());
@@ -81,7 +124,7 @@ pub fn build_column_def41(col: &ColumnDef) -> Vec<u8> {
     buf.extend_from_slice(&flags.to_le_bytes());
     buf.push(decimals);
     buf.extend_from_slice(&[0, 0]);
-    buf
+    Ok(buf)
 }
 
 /// Parses a `ColumnDefinition41` payload (client side).
@@ -95,10 +138,11 @@ pub fn parse_column_def41(payload: &[u8]) -> io::Result<ColumnDef> {
     let _org_name = read_lenenc_str(payload, &mut pos)?;
     let _fixed = read_lenenc_int(payload, &mut pos)?;
     let collation = read_u16(payload, &mut pos)?;
-    let _length = read_u32(payload, &mut pos)?;
+    let length = read_u32(payload, &mut pos)?;
     let type_code = read_fixed(payload, &mut pos, 1)?[0];
     let flags = read_u16(payload, &mut pos)?;
-    let data_type = data_type_for(type_code, collation)?;
+    let decimals = read_fixed(payload, &mut pos, 1)?[0];
+    let data_type = data_type_for(type_code, collation, length, decimals)?;
     Ok(ColumnDef {
         name,
         data_type,
@@ -335,6 +379,38 @@ pub fn encode_text_row(row: &Row) -> Vec<u8> {
     buf
 }
 
+fn decimal_text_value(bytes: &[u8], precision: u8, scale: u8) -> io::Result<Value> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid UTF-8 in DECIMAL text value",
+        )
+    })?;
+    let value = parse_decimal_text(text, scale).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid DECIMAL text value: {err}"),
+        )
+    })?;
+    let value = i64::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("DECIMAL text value out of i64 range: {text:?}"),
+        )
+    })?;
+    check_decimal_precision(value, precision, scale).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("DECIMAL text value exceeds DECIMAL({precision},{scale}): {err}"),
+        )
+    })?;
+    Ok(Value::Decimal {
+        value,
+        precision,
+        scale,
+    })
+}
+
 fn parse_text_value(bytes: &[u8], dt: DataType) -> io::Result<Value> {
     let bad = |what: &str| {
         io::Error::new(
@@ -357,6 +433,7 @@ fn parse_text_value(bytes: &[u8], dt: DataType) -> io::Result<Value> {
         DataType::Float64 => Value::Float64(text()?.parse().map_err(|_| bad("double"))?),
         DataType::String => Value::String(text()?.to_string()),
         DataType::Bytes => Value::Bytes(bytes.to_vec()),
+        DataType::Decimal { precision, scale } => decimal_text_value(bytes, precision, scale)?,
         DataType::Timestamp => Value::Timestamp(datetime_string_to_micros(text()?)?),
     })
 }
@@ -409,10 +486,47 @@ mod tests {
         ];
         for (i, dt) in types.iter().enumerate() {
             let c = col(&format!("c{i}"), *dt, i % 2 == 0, i == 1);
-            let decoded = parse_column_def41(&build_column_def41(&c)).unwrap();
+            let decoded = parse_column_def41(&build_column_def41(&c).unwrap()).unwrap();
             assert_eq!(decoded, c);
         }
-        assert!(data_type_for(0x10, 63).is_err());
+        assert!(data_type_for(0x10, 63, 0, 0).is_err());
+    }
+
+    #[test]
+    fn decimal_column_definition_and_text_row_round_trip() {
+        let column = col(
+            "amount",
+            DataType::Decimal {
+                precision: 12,
+                scale: 4,
+            },
+            false,
+            false,
+        );
+        let decoded_column = parse_column_def41(&build_column_def41(&column).unwrap()).unwrap();
+        let DataType::Decimal { precision, scale } = decoded_column.data_type else {
+            panic!("expected DECIMAL column type");
+        };
+        assert_eq!(precision, 12);
+        assert_eq!(scale, 4);
+
+        let row = Row::new(vec![Value::Decimal {
+            value: -123_456,
+            precision,
+            scale,
+        }]);
+        let decoded_row = decode_text_row(&encode_text_row(&row), &[decoded_column]).unwrap();
+        let Value::Decimal {
+            value,
+            precision,
+            scale,
+        } = decoded_row.get(0).unwrap()
+        else {
+            panic!("expected DECIMAL value");
+        };
+        assert_eq!(*value, -123_456);
+        assert_eq!(*precision, 12);
+        assert_eq!(*scale, 4);
     }
 
     #[test]

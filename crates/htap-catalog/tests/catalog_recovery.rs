@@ -69,6 +69,153 @@ fn make_valid_snapshot(generation: u64) -> CatalogSnapshot {
 }
 
 #[test]
+fn test_decimal_schema_json_round_trip_preserves_parameters() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "amount".to_string(),
+        data_type: DataType::Decimal {
+            precision: 8,
+            scale: 2,
+        },
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+
+    let encoded = serde_json::to_vec(&schema).unwrap();
+    let decoded: Schema = serde_json::from_slice(&encoded).unwrap();
+    let DataType::Decimal { precision, scale } = decoded.column(0).unwrap().data_type else {
+        panic!("expected DECIMAL column");
+    };
+
+    assert_eq!(decoded.column(0).unwrap().name, "amount");
+    assert_eq!(precision, 8);
+    assert_eq!(scale, 2);
+}
+
+#[test]
+fn test_catalog_snapshot_zero_scale_decimal_round_trip() {
+    let schema = Schema::new(vec![ColumnDef {
+        name: "sequence".to_string(),
+        data_type: DataType::Decimal {
+            precision: 8,
+            scale: 0,
+        },
+        nullable: false,
+        primary_key: true,
+    }])
+    .unwrap();
+    let table = TableDescriptor::new(
+        TableId::new(1),
+        "decimal_keys",
+        schema,
+        vec![0],
+        vec![PartitionId::new(10)],
+        1,
+    );
+    let partition = PartitionDescriptor::new(
+        PartitionId::new(10),
+        TableId::new(1),
+        "p0",
+        StorageDescriptor::Row,
+        vec![TabletId::new(100)],
+        1,
+    );
+    let tablet = TabletDescriptor::new(
+        TabletId::new(100),
+        PartitionId::new(10),
+        0,
+        vec![ReplicaId::new(1000)],
+        1,
+    );
+    let replica = ReplicaDescriptor::new(
+        ReplicaId::new(1000),
+        TabletId::new(100),
+        NodeId::new(1),
+        true,
+        true,
+        1,
+    );
+    let snapshot =
+        CatalogSnapshot::new(1, vec![table], vec![partition], vec![tablet], vec![replica]);
+
+    let encoded = encode_snapshot(&snapshot).unwrap();
+    let decoded = htap_catalog::local::decode_snapshot(&encoded).unwrap();
+    let column = decoded.tables[0].schema.column(0).unwrap();
+    let DataType::Decimal { precision, scale } = column.data_type else {
+        panic!("expected DECIMAL column");
+    };
+
+    assert_eq!(decoded.generation, snapshot.generation);
+    assert_eq!(decoded.tables[0].name, snapshot.tables[0].name);
+    assert_eq!(precision, 8);
+    assert_eq!(scale, 0);
+    decoded.validate().unwrap();
+}
+
+#[test]
+fn test_catalog_invalid_decimal_type_tag_is_corruption() {
+    let snapshot = make_valid_snapshot(1);
+    let mut json = serde_json::to_value(&snapshot).unwrap();
+    json.get_mut("tables")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|tables| tables.first_mut())
+        .and_then(|table| table.get_mut("schema"))
+        .and_then(|schema| schema.get_mut("columns"))
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|columns| columns.first_mut())
+        .and_then(|column| column.get_mut("data_type"))
+        .map(|data_type| *data_type = serde_json::Value::String("InvalidDecimal".into()))
+        .expect("test snapshot should contain a column type");
+
+    let payload = serde_json::to_vec(&json).unwrap();
+    let mut raw = Vec::new();
+    raw.extend_from_slice(HEADER_MAGIC);
+    raw.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+    raw.extend_from_slice(&payload);
+
+    let err = htap_catalog::local::decode_snapshot(&raw).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("InvalidDecimal"));
+}
+
+#[test]
+fn test_catalog_invalid_decimal_parameters_are_corruption() {
+    let snapshot = make_valid_snapshot(1);
+    let mut json = serde_json::to_value(&snapshot).unwrap();
+    json.get_mut("tables")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|tables| tables.first_mut())
+        .and_then(|table| table.get_mut("schema"))
+        .and_then(|schema| schema.get_mut("columns"))
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|columns| columns.first_mut())
+        .and_then(|column| column.get_mut("data_type"))
+        .map(|data_type| {
+            *data_type = serde_json::json!({
+                "Decimal": {
+                    "precision": 0,
+                    "scale": 0
+                }
+            })
+        })
+        .expect("test snapshot should contain a column type");
+
+    let payload = serde_json::to_vec(&json).unwrap();
+    let mut raw = Vec::new();
+    raw.extend_from_slice(HEADER_MAGIC);
+    raw.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+    raw.extend_from_slice(&payload);
+
+    let err = htap_catalog::local::decode_snapshot(&raw).unwrap_err();
+    assert!(matches!(err, HtapError::Corruption(_)));
+    assert!(err.to_string().contains("invalid data type"));
+}
+
+#[test]
 fn test_empty_load() {
     let temp = TempDir::new().unwrap();
     let store = LocalCatalogStore::open(temp.path()).unwrap();

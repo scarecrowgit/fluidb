@@ -1089,6 +1089,7 @@ fn value_to_expr(value: &Value) -> Result<SqlExpr> {
         // (e.g. `htap_wire::result_codec::micros_to_datetime_string`) is involved here.
         Value::Timestamp(i) => signed_integer_expr(*i),
         Value::Float64(f) => signed_float_expr(*f)?,
+        Value::Decimal { .. } => numeric_text_to_expr(&value.to_string())?,
         Value::String(s) => sql_value_expr(SqlValue::SingleQuotedString(s.clone())),
         Value::Bytes(b) => sql_value_expr(SqlValue::HexStringLiteral(hex_encode(b))),
     })
@@ -1197,7 +1198,7 @@ fn signed_float_expr(v: f64) -> Result<SqlExpr> {
                 .into(),
         ));
     }
-    let magnitude = format!("{:?}", v.abs());
+    let magnitude = format!("{:e}", v.abs());
     let literal = sql_value_expr(SqlValue::Number(magnitude, false));
     Ok(if v.is_sign_negative() {
         negate(literal)
@@ -1837,7 +1838,7 @@ pub fn resolve_prepare_output_schema(
             let probe_values: Vec<Value> = hints
                 .into_iter()
                 .map(|h| probe_value_for(h.expect("checked for None above")))
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let mut probe = statement.clone();
             substitute_placeholders(&mut probe, &probe_values)?;
             let bound = bind(&probe, catalog)?;
@@ -1847,15 +1848,20 @@ pub fn resolve_prepare_output_schema(
     }
 }
 
-fn probe_value_for(dt: DataType) -> Value {
+fn probe_value_for(dt: DataType) -> Result<Value> {
     match dt {
-        DataType::Bool => Value::Bool(false),
-        DataType::Int32 => Value::Int32(0),
-        DataType::Int64 => Value::Int64(0),
-        DataType::Float64 => Value::Float64(0.0),
-        DataType::String => Value::String(String::new()),
-        DataType::Bytes => Value::Bytes(Vec::new()),
-        DataType::Timestamp => Value::Timestamp(0),
+        DataType::Bool => Ok(Value::Bool(false)),
+        DataType::Int32 => Ok(Value::Int32(0)),
+        DataType::Int64 => Ok(Value::Int64(0)),
+        DataType::Float64 => Ok(Value::Float64(0.0)),
+        DataType::String => Ok(Value::String(String::new())),
+        DataType::Bytes => Ok(Value::Bytes(Vec::new())),
+        DataType::Timestamp => Ok(Value::Timestamp(0)),
+        DataType::Decimal { precision, scale } => Ok(Value::Decimal {
+            value: 0,
+            precision,
+            scale,
+        }),
     }
 }
 

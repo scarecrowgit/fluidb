@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use htap_catalog::{CatalogSnapshot, TableDescriptor};
 use htap_common::error::{HtapError, Result};
-use htap_common::types::{ColumnDef, DataType, Row, Value};
+use htap_common::types::{rewrite_decimal_predicate_literal, ColumnDef, DataType, Row, Value};
 use htap_rowstore::Snapshot;
 use htap_sql::ast::{AnalyticFilter, ComparisonOp};
 use htap_sql::expr::{
@@ -2987,20 +2987,47 @@ fn pushdown_filter(conjuncts: &[&Expr], table: &TableDescriptor) -> Option<Analy
                 }
                 let col_type = table.schema.column(column).map(|c| c.data_type);
                 let Some(col_type) = col_type else { continue };
-                let Ok(value) = cast_value(value.clone(), col_type) else {
-                    continue;
-                };
-                if value.data_type() != Some(col_type) {
-                    continue;
-                }
-                // Casting a fractional literal to an integer column would change the predicate.
-                if let (Value::Float64(f), DataType::Int32 | DataType::Int64) =
-                    (value_source(left, right), col_type)
-                {
-                    if f.fract() != 0.0 {
-                        continue;
+                let (value, op) = match col_type {
+                    DataType::Decimal { precision, scale } => {
+                        let literal = value.to_string();
+                        let operator = match op {
+                            BinOp::Eq => "=",
+                            BinOp::NotEq => "!=",
+                            BinOp::Lt => "<",
+                            BinOp::Lte => "<=",
+                            BinOp::Gt => ">",
+                            BinOp::Gte => ">=",
+                            _ => continue,
+                        };
+                        let value = match rewrite_decimal_predicate_literal(
+                            &literal, precision, scale, operator,
+                        )
+                        .ok()?
+                        {
+                            htap_common::types::DecimalPredicateLiteral::Value(value) => value,
+                            // Constant predicates must remain residual so SQL NULL semantics are preserved.
+                            htap_common::types::DecimalPredicateLiteral::Constant(_) => continue,
+                        };
+                        (value, op)
                     }
-                }
+                    _ => {
+                        let Ok(value) = cast_value(value.clone(), col_type) else {
+                            continue;
+                        };
+                        if value.data_type() != Some(col_type) {
+                            continue;
+                        }
+                        // Casting a fractional literal to an integer column would change the predicate.
+                        if let (Value::Float64(f), DataType::Int32 | DataType::Int64) =
+                            (value_source(left, right), col_type)
+                        {
+                            if f.fract() != 0.0 {
+                                continue;
+                            }
+                        }
+                        (value, op)
+                    }
+                };
                 let cmp = match op {
                     BinOp::Eq => ComparisonOp::Eq,
                     BinOp::NotEq => ComparisonOp::NotEq,
@@ -3309,17 +3336,39 @@ fn join_equi_key_types(
             let numeric = |data_type| {
                 matches!(
                     data_type,
-                    DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Timestamp
+                    DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float64
+                        | DataType::Timestamp
+                        | DataType::Decimal { .. }
                 )
             };
             Some(if numeric(left_type) && numeric(right_type) {
-                Some(
-                    if left_type == DataType::Float64 || right_type == DataType::Float64 {
-                        DataType::Float64
-                    } else {
-                        DataType::Int64
+                Some(match (left_type, right_type) {
+                    (
+                        DataType::Decimal {
+                            precision: left_precision,
+                            scale: left_scale,
+                        },
+                        DataType::Decimal {
+                            precision: right_precision,
+                            scale: right_scale,
+                        },
+                    ) => DataType::Decimal {
+                        precision: left_precision.max(right_precision),
+                        scale: left_scale.max(right_scale),
                     },
-                )
+                    (
+                        DataType::Decimal { precision, scale },
+                        DataType::Int32 | DataType::Int64 | DataType::Timestamp,
+                    )
+                    | (
+                        DataType::Int32 | DataType::Int64 | DataType::Timestamp,
+                        DataType::Decimal { precision, scale },
+                    ) => DataType::Decimal { precision, scale },
+                    (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
+                    _ => DataType::Int64,
+                })
             } else {
                 None
             })
@@ -4004,8 +4053,14 @@ fn normalize_key(value: Value, canonical_type: DataType) -> Result<Value> {
             Value::Int32(value) => Ok(Value::Float64(value as f64)),
             Value::Int64(value) | Value::Timestamp(value) => Ok(Value::Float64(value as f64)),
             Value::Float64(value) => Ok(Value::Float64(value)),
+            Value::Decimal { value, scale, .. } => {
+                Ok(Value::Float64(value as f64 / 10_f64.powi(i32::from(scale))))
+            }
             other => cast_value(other, DataType::Float64),
         },
+        DataType::Decimal { precision, scale } => {
+            cast_value(value, DataType::Decimal { precision, scale })
+        }
         other => Err(HtapError::Internal(format!(
             "unsupported canonical join key type {}",
             other.name()
@@ -4019,7 +4074,21 @@ enum AggState {
     Count(i64),
     SumInt(Option<i64>),
     SumFloat(Option<f64>),
-    Avg { sum: f64, count: i64 },
+    SumDecimal {
+        sum: Option<i128>,
+        precision: u8,
+        scale: u8,
+    },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
+    AvgDecimal {
+        sum: i128,
+        count: i64,
+        precision: u8,
+        scale: u8,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
     Distinct(BTreeSet<Value>),
@@ -4032,14 +4101,24 @@ impl AggState {
         }
         match spec.func {
             AggFn::CountStar | AggFn::Count => AggState::Count(0),
-            AggFn::Sum => {
-                if spec.data_type == DataType::Float64 {
-                    AggState::SumFloat(None)
-                } else {
-                    AggState::SumInt(None)
-                }
-            }
-            AggFn::Avg => AggState::Avg { sum: 0.0, count: 0 },
+            AggFn::Sum => match spec.data_type {
+                DataType::Float64 => AggState::SumFloat(None),
+                DataType::Decimal { precision, scale } => AggState::SumDecimal {
+                    sum: None,
+                    precision,
+                    scale,
+                },
+                _ => AggState::SumInt(None),
+            },
+            AggFn::Avg => match spec.data_type {
+                DataType::Decimal { precision, scale } => AggState::AvgDecimal {
+                    sum: 0,
+                    count: 0,
+                    precision,
+                    scale,
+                },
+                _ => AggState::Avg { sum: 0.0, count: 0 },
+            },
             AggFn::Min => AggState::Min(None),
             AggFn::Max => AggState::Max(None),
         }
@@ -4050,7 +4129,9 @@ impl AggState {
             AggState::Count(_)
             | AggState::SumInt(_)
             | AggState::SumFloat(_)
-            | AggState::Avg { .. } => std::mem::size_of::<Self>(),
+            | AggState::SumDecimal { .. }
+            | AggState::Avg { .. }
+            | AggState::AvgDecimal { .. } => std::mem::size_of::<Self>(),
             AggState::Min(value) | AggState::Max(value) => {
                 std::mem::size_of::<Self>()
                     + value
@@ -4093,6 +4174,19 @@ impl AggState {
                 }
                 *acc = Some(next);
             }
+            AggState::SumDecimal {
+                sum,
+                precision,
+                scale,
+            } => {
+                let value = decimal_scaled_value(&v, *precision, *scale)?;
+                *sum = Some(match *sum {
+                    Some(current) => current
+                        .checked_add(value)
+                        .ok_or_else(|| HtapError::InvalidArgument("DECIMAL SUM overflow".into()))?,
+                    None => value,
+                });
+            }
             AggState::Avg { sum, count } => {
                 *sum += to_f64(&v)?;
                 if !sum.is_finite() {
@@ -4101,6 +4195,20 @@ impl AggState {
                     ));
                 }
                 *count += 1;
+            }
+            AggState::AvgDecimal {
+                sum,
+                count,
+                precision,
+                scale,
+            } => {
+                let value = decimal_scaled_value(&v, *precision, *scale)?;
+                *sum = sum
+                    .checked_add(value)
+                    .ok_or_else(|| HtapError::InvalidArgument("DECIMAL AVG overflow".into()))?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| HtapError::InvalidArgument("AVG count overflow".into()))?;
             }
             AggState::Min(cur) => {
                 let replace = match cur {
@@ -4156,6 +4264,27 @@ impl AggState {
                 }
             }
             (
+                AggState::SumDecimal {
+                    sum: target_sum,
+                    precision: target_precision,
+                    scale: target_scale,
+                },
+                AggState::SumDecimal {
+                    sum: source_sum,
+                    precision: source_precision,
+                    scale: source_scale,
+                },
+            ) if target_precision == &source_precision && target_scale == &source_scale => {
+                if let Some(source_sum) = source_sum {
+                    *target_sum = Some(match *target_sum {
+                        Some(current) => current.checked_add(source_sum).ok_or_else(|| {
+                            HtapError::InvalidArgument("DECIMAL SUM overflow".into())
+                        })?,
+                        None => source_sum,
+                    });
+                }
+            }
+            (
                 AggState::Avg {
                     sum: target_sum,
                     count: target_count,
@@ -4172,6 +4301,27 @@ impl AggState {
                     ));
                 }
                 *target_sum = merged_sum;
+                *target_count = target_count
+                    .checked_add(source_count)
+                    .ok_or_else(|| HtapError::InvalidArgument("AVG count overflow".into()))?;
+            }
+            (
+                AggState::AvgDecimal {
+                    sum: target_sum,
+                    count: target_count,
+                    precision: target_precision,
+                    scale: target_scale,
+                },
+                AggState::AvgDecimal {
+                    sum: source_sum,
+                    count: source_count,
+                    precision: source_precision,
+                    scale: source_scale,
+                },
+            ) if target_precision == &source_precision && target_scale == &source_scale => {
+                *target_sum = target_sum
+                    .checked_add(source_sum)
+                    .ok_or_else(|| HtapError::InvalidArgument("DECIMAL AVG overflow".into()))?;
                 *target_count = target_count
                     .checked_add(source_count)
                     .ok_or_else(|| HtapError::InvalidArgument("AVG count overflow".into()))?;
@@ -4220,11 +4370,52 @@ impl AggState {
             AggState::Count(n) => Value::Int64(*n),
             AggState::SumInt(acc) => acc.map(Value::Int64).unwrap_or(Value::Null),
             AggState::SumFloat(acc) => acc.map(Value::Float64).unwrap_or(Value::Null),
+            AggState::SumDecimal {
+                sum,
+                precision,
+                scale,
+            } => sum
+                .map(|sum| decimal_value(sum, *precision, *scale))
+                .transpose()?
+                .unwrap_or(Value::Null),
             AggState::Avg { sum, count } => {
                 if *count == 0 {
                     Value::Null
                 } else {
                     Value::Float64(sum / *count as f64)
+                }
+            }
+            AggState::AvgDecimal {
+                sum,
+                count,
+                precision,
+                scale,
+            } => {
+                if *count == 0 {
+                    Value::Null
+                } else {
+                    let divisor = i128::from(*count);
+                    let quotient = sum
+                        .checked_div(divisor)
+                        .ok_or_else(|| HtapError::InvalidArgument("DECIMAL AVG overflow".into()))?;
+                    let remainder = sum
+                        .checked_rem(divisor)
+                        .ok_or_else(|| HtapError::InvalidArgument("DECIMAL AVG overflow".into()))?;
+                    let rounded = if remainder.unsigned_abs()
+                        >= divisor
+                            .unsigned_abs()
+                            .saturating_sub(remainder.unsigned_abs())
+                    {
+                        if sum.is_negative() {
+                            quotient.checked_sub(1)
+                        } else {
+                            quotient.checked_add(1)
+                        }
+                        .ok_or_else(|| HtapError::InvalidArgument("DECIMAL AVG overflow".into()))?
+                    } else {
+                        quotient
+                    };
+                    decimal_value(rounded, *precision, *scale)?
                 }
             }
             AggState::Min(v) | AggState::Max(v) => v.clone().unwrap_or(Value::Null),
@@ -4244,11 +4435,72 @@ impl AggState {
     }
 }
 
+fn decimal_scaled_value(value: &Value, _precision: u8, scale: u8) -> Result<i128> {
+    let Value::Decimal {
+        value,
+        precision: _,
+        scale: value_scale,
+    } = value
+    else {
+        return Err(HtapError::InvalidArgument(format!(
+            "cannot aggregate non-decimal value {value}"
+        )));
+    };
+
+    let value = i128::from(*value);
+    if *value_scale < scale {
+        let factor = 10_i128
+            .checked_pow(u32::from(scale - *value_scale))
+            .ok_or_else(|| {
+                HtapError::InvalidArgument("DECIMAL aggregate scale is out of range".into())
+            })?;
+        value
+            .checked_mul(factor)
+            .ok_or_else(|| HtapError::InvalidArgument("DECIMAL aggregate rescale overflow".into()))
+    } else if *value_scale > scale {
+        let factor = 10_i128
+            .checked_pow(u32::from(*value_scale - scale))
+            .ok_or_else(|| {
+                HtapError::InvalidArgument("DECIMAL aggregate scale is out of range".into())
+            })?;
+        Ok(value / factor)
+    } else {
+        Ok(value)
+    }
+}
+
+fn decimal_value(value: i128, precision: u8, scale: u8) -> Result<Value> {
+    let max = 10_i128
+        .checked_pow(precision as u32)
+        .ok_or_else(|| HtapError::InvalidArgument("DECIMAL precision is out of range".into()))?;
+    if value <= -max || value >= max {
+        return Err(HtapError::InvalidArgument(
+            "DECIMAL aggregate result is out of range".into(),
+        ));
+    }
+    let value = i64::try_from(value).map_err(|_| {
+        HtapError::InvalidArgument("DECIMAL aggregate result is out of range".into())
+    })?;
+    Ok(Value::Decimal {
+        value,
+        precision,
+        scale,
+    })
+}
+
 fn to_i64(v: &Value) -> Result<i64> {
     match v {
         Value::Int32(i) => Ok(*i as i64),
         Value::Int64(i) | Value::Timestamp(i) => Ok(*i),
         Value::Float64(f) => Ok(*f as i64),
+        Value::Decimal {
+            precision, scale, ..
+        } => {
+            let scaled = decimal_scaled_value(v, *precision, *scale)?;
+            i64::try_from(scaled).map_err(|_| {
+                HtapError::InvalidArgument("DECIMAL value is out of range for integer sum".into())
+            })
+        }
         other => Err(HtapError::InvalidArgument(format!(
             "cannot sum non-numeric value {other}"
         ))),
@@ -4260,6 +4512,12 @@ fn to_f64(v: &Value) -> Result<f64> {
         Value::Int32(i) => Ok(*i as f64),
         Value::Int64(i) | Value::Timestamp(i) => Ok(*i as f64),
         Value::Float64(f) => Ok(*f),
+        Value::Decimal {
+            precision, scale, ..
+        } => {
+            let scaled = decimal_scaled_value(v, *precision, *scale)?;
+            Ok(scaled as f64 / 10_f64.powi(i32::from(*scale)))
+        }
         other => Err(HtapError::InvalidArgument(format!(
             "cannot average non-numeric value {other}"
         ))),

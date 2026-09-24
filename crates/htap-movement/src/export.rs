@@ -101,7 +101,7 @@ pub fn copy_to_csv_writer<W: Write>(
     }
 
     for row in &rows {
-        let rec = encode_csv_record(&topology.table_desc.schema, row);
+        let rec = encode_csv_record(&topology.table_desc.schema, row)?;
         wtr.write_record(&rec)
             .map_err(|e| HtapError::Io(e.into()))?;
     }
@@ -274,7 +274,7 @@ fn export_to_file(
                         .map_err(|e| HtapError::Io(e.into()))?;
                 }
                 for row in &rows {
-                    let rec = encode_csv_record(&topology.table_desc.schema, row);
+                    let rec = encode_csv_record(&topology.table_desc.schema, row)?;
                     wtr.write_record(&rec)
                         .map_err(|e| HtapError::Io(e.into()))?;
                 }

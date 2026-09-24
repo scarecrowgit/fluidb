@@ -1128,7 +1128,7 @@ fn encode_resultset(
     write_lenenc_int(&mut count, columns.len() as u64);
     write_message(out, seq, &count)?;
     for col in columns {
-        write_message(out, seq, &build_column_def41(col))?;
+        write_message(out, seq, &build_column_def41(col)?)?;
     }
     if !deprecate_eof {
         // The legacy mid-resultset terminator marks the end of the column-definitions block,
@@ -1369,7 +1369,7 @@ fn respond_stmt_prepare(
                     write_message(
                         &mut out,
                         seq,
-                        &build_column_def41(&generic_param_column_def()),
+                        &build_column_def41(&generic_param_column_def())?,
                     )?;
                 }
                 write_message(
@@ -1384,7 +1384,7 @@ fn respond_stmt_prepare(
             if let Some(columns) = &output_schema {
                 if !columns.is_empty() {
                     for col in columns {
-                        write_message(&mut out, seq, &build_column_def41(col))?;
+                        write_message(&mut out, seq, &build_column_def41(col)?)?;
                     }
                     write_message(
                         &mut out,

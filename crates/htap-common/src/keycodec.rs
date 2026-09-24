@@ -22,6 +22,20 @@
 //! Variable-length components (`String`, `Bytes`) are written raw when they are
 //! the final component, and otherwise `0x00`-escaped and terminated.
 //!
+//! Decimal components encode their signed unscaled `i64` value. Callers must
+//! pass decimal values already coerced to the column's declared scale: the
+//! scale itself is not encoded. This invariant is enforced by the SQL binder
+//! when values are bound, the columnar segment's row validation, and the
+//! server's type-equality checks on `INSERT ... SELECT` and `UPDATE`.
+//!
+//! Conversion and overlay re-encode primary-key values decoded using the
+//! segment footer's schema, then compare them with delta keys encoded using
+//! the catalog's schema. If those schemas disagree on a decimal scale, an
+//! updated row's delta key no longer suppresses its base row, so the row is
+//! returned twice. Both artifacts are durable, making this look like a
+//! snapshot-isolation failure rather than a schema failure and allowing it to
+//! survive restart.
+//!
 //! # Attribution
 //!
 //! This design — sign-bit flipping for integers and `0x00` escaping with a
@@ -63,7 +77,7 @@ pub fn encode_key(values: &[Value]) -> Result<Vec<u8>> {
     let last = values.len() - 1;
     let mut out = Vec::with_capacity(values.len() * 9);
     for (i, v) in values.iter().enumerate() {
-        encode_component(&mut out, v, i == last);
+        encode_component(&mut out, v, i == last)?;
     }
     Ok(out)
 }
@@ -83,7 +97,7 @@ pub fn encode_key(values: &[Value]) -> Result<Vec<u8>> {
 pub fn encode_key_prefix(values: &[Value]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(values.len() * 9);
     for v in values {
-        encode_component(&mut out, v, false);
+        encode_component(&mut out, v, false)?;
     }
     Ok(out)
 }
@@ -91,7 +105,7 @@ pub fn encode_key_prefix(values: &[Value]) -> Result<Vec<u8>> {
 /// Encode one component into `out`.
 ///
 /// `is_last` selects the raw (unterminated) form for variable-length values.
-fn encode_component(out: &mut Vec<u8>, value: &Value, is_last: bool) {
+fn encode_component(out: &mut Vec<u8>, value: &Value, is_last: bool) -> Result<()> {
     match value {
         Value::Null => {
             // Nothing follows the marker: NULL is the smallest encoding.
@@ -130,7 +144,13 @@ fn encode_component(out: &mut Vec<u8>, value: &Value, is_last: bool) {
             out.push(NOT_NULL_MARKER);
             encode_var_len(out, v, is_last);
         }
+        Value::Decimal { value, .. } => {
+            out.push(NOT_NULL_MARKER);
+            let biased = (*value as u64) ^ (1u64 << 63);
+            out.extend_from_slice(&biased.to_be_bytes());
+        }
     }
+    Ok(())
 }
 
 /// Map an `f64` onto a `u64` whose unsigned order equals [`f64::total_cmp`].
@@ -265,6 +285,109 @@ mod tests {
 
             let keys: Vec<Vec<Value>> = group.iter().cloned().map(|v| vec![v]).collect();
             assert_encodings_ascending(&keys);
+        }
+    }
+
+    #[test]
+    fn test_decimal_equal_values_at_different_scales_encode_differently() {
+        let scale_one = Value::Decimal {
+            value: 55,
+            precision: 2,
+            scale: 1,
+        };
+        let scale_two = Value::Decimal {
+            value: 550,
+            precision: 3,
+            scale: 2,
+        };
+
+        // Decimal equality is numeric and deliberately ignores declared scale.
+        assert_eq!(scale_one, scale_two);
+        assert_ne!(
+            encode_key(&[scale_one]).unwrap(),
+            encode_key(&[scale_two]).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_decimal_non_final_component_precedes_next_component() {
+        let decimal = Value::Decimal {
+            value: 550,
+            precision: 3,
+            scale: 2,
+        };
+        let key = vec![decimal.clone(), Value::String("next".into())];
+        let encoded = encode_key(&key).unwrap();
+        let decimal_encoding = encode_key(&[decimal]).unwrap();
+
+        // A decimal is fixed-width, so the next component starts after 9 bytes.
+        assert_eq!(&encoded[..decimal_encoding.len()], decimal_encoding);
+        assert_eq!(encoded[decimal_encoding.len()], NOT_NULL_MARKER);
+        assert_eq!(
+            encoded.cmp(&encode_key(&[key[0].clone(), Value::String("later".into())]).unwrap()),
+            key.cmp(&vec![key[0].clone(), Value::String("later".into())])
+        );
+    }
+
+    #[test]
+    fn test_decimal_primary_key_spellings_collide() {
+        let from_short_spelling = crate::types::parse_decimal_text("5.5", 2).unwrap();
+        let from_long_spelling = crate::types::parse_decimal_text("5.50", 2).unwrap();
+
+        assert_eq!(from_short_spelling, 550);
+        assert_eq!(from_long_spelling, 550);
+
+        let short = Value::Decimal {
+            value: i64::try_from(from_short_spelling).unwrap(),
+            precision: 3,
+            scale: 2,
+        };
+        let long = Value::Decimal {
+            value: i64::try_from(from_long_spelling).unwrap(),
+            precision: 3,
+            scale: 2,
+        };
+
+        let mut primary_index = std::collections::BTreeMap::new();
+        primary_index.insert(encode_key(&[short]).unwrap(), "5.5");
+        primary_index.insert(encode_key(&[long]).unwrap(), "5.50");
+
+        assert_eq!(primary_index.len(), 1);
+        assert_eq!(primary_index.values().next(), Some(&"5.50"));
+    }
+
+    #[test]
+    fn test_decimal_encoding_preserves_unscaled_order() {
+        let values = single(&[
+            Value::Decimal {
+                value: -101,
+                precision: 5,
+                scale: 2,
+            },
+            Value::Decimal {
+                value: -100,
+                precision: 5,
+                scale: 2,
+            },
+            Value::Decimal {
+                value: 0,
+                precision: 5,
+                scale: 2,
+            },
+            Value::Decimal {
+                value: 100,
+                precision: 5,
+                scale: 2,
+            },
+            Value::Decimal {
+                value: 101,
+                precision: 5,
+                scale: 2,
+            },
+        ]);
+
+        for pair in values.windows(2) {
+            assert!(pair[0] < pair[1]);
         }
     }
 
@@ -497,6 +620,20 @@ mod tests {
                 .prop_map(|(a, b)| (Value::Bytes(a), Value::Bytes(b))),
             (any::<i64>(), any::<i64>())
                 .prop_map(|(a, b)| (Value::Timestamp(a), Value::Timestamp(b))),
+            (any::<i64>(), any::<i64>()).prop_map(|(a, b)| {
+                (
+                    Value::Decimal {
+                        value: a,
+                        precision: 18,
+                        scale: 4,
+                    },
+                    Value::Decimal {
+                        value: b,
+                        precision: 18,
+                        scale: 4,
+                    },
+                )
+            }),
         ]
     }
 

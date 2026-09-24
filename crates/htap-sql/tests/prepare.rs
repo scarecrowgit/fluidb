@@ -34,6 +34,10 @@ fn catalog() -> CatalogSnapshot {
             user_id BIGINT, \
             amount DOUBLE\
         )",
+        "CREATE TABLE decimal_values (\
+            id BIGINT PRIMARY KEY, \
+            amount DECIMAL(8, 3)\
+        )",
     ];
     let mut tables = Vec::new();
     for (i, ddl) in ddls.iter().enumerate() {
@@ -101,7 +105,7 @@ fn int_literal(v: i64) -> String {
 /// Renders `v` using `{:?}` (not `{}`), guaranteeing the text always contains a `.` or `e` so it
 /// is never misread as an integer literal, mirroring `signed_float_expr`'s magnitude formatting.
 fn float_literal(v: f64) -> String {
-    format!("{v:?}")
+    format!("{v:e}")
 }
 
 fn value_literal(v: &Value) -> String {
@@ -112,6 +116,7 @@ fn value_literal(v: &Value) -> String {
         Value::Int64(i) => int_literal(*i),
         Value::Timestamp(i) => int_literal(*i),
         Value::Float64(f) => float_literal(*f),
+        Value::Decimal { .. } => panic!("decimal type is not yet persistable"),
         Value::String(s) => string_literal(s),
         Value::Bytes(b) => hex_literal(b),
     }
@@ -714,6 +719,26 @@ fn test_resolve_prepare_output_schema_dml_is_empty() {
         let schema = resolve_prepare_output_schema(&stmt, &cat)
             .unwrap_or_else(|e| panic!("resolution should succeed for {sql}: {e:?}"));
         assert_eq!(schema, Some(Vec::new()), "expected empty schema for {sql}");
+    }
+}
+
+#[test]
+fn test_resolve_prepare_output_schema_decimal_placeholder_preserves_decimal_metadata() {
+    let cat = catalog();
+    let statement = parse_one("SELECT amount FROM decimal_values WHERE amount = ?").unwrap();
+
+    let schema = resolve_prepare_output_schema(&statement, &cat)
+        .expect("decimal placeholder schema resolution should succeed")
+        .expect("decimal placeholder schema should be resolvable");
+
+    assert_eq!(schema.len(), 1);
+    assert_eq!(schema[0].name, "amount");
+    match schema[0].data_type {
+        DataType::Decimal { precision, scale } => {
+            assert_eq!(precision, 8);
+            assert_eq!(scale, 3);
+        }
+        ref other => panic!("expected DECIMAL output type, got {other:?}"),
     }
 }
 

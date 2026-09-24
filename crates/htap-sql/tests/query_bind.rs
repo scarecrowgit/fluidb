@@ -1934,3 +1934,93 @@ fn test_correlated_subquery_window_order_by() {
         )
     }));
 }
+
+#[test]
+fn test_decimal_literal_binding() {
+    let q = bind_query("SELECT 0.05, 123.456 FROM users");
+    assert_eq!(
+        q.output_columns[0].data_type,
+        DataType::Decimal {
+            precision: 3,
+            scale: 2,
+        }
+    );
+    assert_eq!(
+        q.output_columns[1].data_type,
+        DataType::Decimal {
+            precision: 6,
+            scale: 3,
+        }
+    );
+
+    // Exponent notation retains its existing DOUBLE literal behavior.
+    let q = bind_query("SELECT 1.0e2 FROM users");
+    assert_eq!(q.output_columns[0].data_type, DataType::Float64);
+
+    let literal = "1234567890123456789.0";
+    let err = bind_err(&format!("SELECT {literal} FROM users"));
+    assert!(
+        err.to_string().contains(literal),
+        "expected decimal precision error to name {literal}: {err}"
+    );
+}
+
+#[test]
+fn test_cast_to_decimal_binding() {
+    // MySQL-compatible defaults: DECIMAL is DECIMAL(10, 0), and DECIMAL(p) is DECIMAL(p, 0).
+    let q = bind_query(
+        "SELECT \
+             CAST(id AS DECIMAL), \
+             CAST(id AS DECIMAL(7)), \
+             CAST(id AS DECIMAL(7, 2)), \
+             CAST(id AS NUMERIC(8, 3)), \
+             CAST(id AS DEC(9, 4)) \
+         FROM users",
+    );
+    assert_eq!(
+        q.output_columns[0].data_type,
+        DataType::Decimal {
+            precision: 10,
+            scale: 0,
+        }
+    );
+    assert_eq!(
+        q.output_columns[1].data_type,
+        DataType::Decimal {
+            precision: 7,
+            scale: 0,
+        }
+    );
+    assert_eq!(
+        q.output_columns[2].data_type,
+        DataType::Decimal {
+            precision: 7,
+            scale: 2,
+        }
+    );
+    assert_eq!(
+        q.output_columns[3].data_type,
+        DataType::Decimal {
+            precision: 8,
+            scale: 3,
+        }
+    );
+    assert_eq!(
+        q.output_columns[4].data_type,
+        DataType::Decimal {
+            precision: 9,
+            scale: 4,
+        }
+    );
+
+    for sql in [
+        "SELECT CAST(id AS DECIMAL(19, 0)) FROM users",
+        "SELECT CAST(id AS DECIMAL(0, 0)) FROM users",
+        "SELECT CAST(id AS DECIMAL(2, 3)) FROM users",
+    ] {
+        assert!(
+            matches!(bind_err(sql), HtapError::InvalidArgument(_)),
+            "{sql}"
+        );
+    }
+}

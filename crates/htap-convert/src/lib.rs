@@ -1416,6 +1416,11 @@ pub fn read_column_partition_core(
     }
 
     let manifest = open(colstore_root, tablet_id)?;
+    if manifest.schema != *schema {
+        return Err(HtapError::Corruption(format!(
+            "manifest schema does not match catalog schema for partition {partition_id}"
+        )));
+    }
     let base_version = manifest.base_version;
 
     // Rowstore is authoritative for historical reads before manifest base_version.
@@ -1625,6 +1630,11 @@ pub fn read_column_partition_compact_core(
     }
 
     let manifest = open(colstore_root, tablet_id)?;
+    if manifest.schema != *schema {
+        return Err(HtapError::Corruption(format!(
+            "manifest schema does not match catalog schema for partition {partition_id}"
+        )));
+    }
     let base_version = manifest.base_version;
 
     // Rowstore is authoritative for historical reads before manifest base_version.
