@@ -1,5 +1,7 @@
 examples
 target/
+# `target` may be a symlink to a build directory on another volume.
+target
 *.log
 data/
 .DS_Store

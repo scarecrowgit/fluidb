@@ -13,7 +13,9 @@
 use std::collections::HashSet;
 use std::fmt::Write;
 
-use htap_common::types::{check_decimal_precision, parse_decimal_text};
+use htap_common::types::{
+    check_decimal_precision, parse_date_to_timestamp_micros, parse_decimal_text,
+};
 use htap_common::{ColumnDef, DataType, HtapError, Result, Row, Schema, Value};
 
 use crate::job::DataFormat;
@@ -56,6 +58,74 @@ pub fn decode_hex(s: &str) -> Result<Vec<u8>> {
     }
 
     Ok(bytes)
+}
+
+/// Parse timestamp text as integer microseconds, an ISO calendar date, or a datetime.
+///
+/// Datetimes use `YYYY-MM-DD HH:MM:SS` and are interpreted as UTC.
+fn parse_timestamp_text(text: &str) -> Result<i64> {
+    if let Ok(micros) = text.parse::<i64>() {
+        return Ok(micros);
+    }
+
+    if let Some((date_text, time_text)) = text.split_once(' ') {
+        if date_text.is_empty() || time_text.is_empty() || time_text.contains(' ') {
+            return Err(HtapError::InvalidArgument(format!(
+                "invalid datetime format '{text}', expected YYYY-MM-DD HH:MM:SS"
+            )));
+        }
+
+        let date_micros = parse_date_to_timestamp_micros(date_text)?;
+        let mut parts = time_text.split(':');
+        let (hours_text, minutes_text, seconds_text) =
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some(hours), Some(minutes), Some(seconds), None)
+                    if [hours, minutes, seconds].iter().all(|part| {
+                        part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_digit())
+                    }) =>
+                {
+                    (hours, minutes, seconds)
+                }
+                _ => {
+                    return Err(HtapError::InvalidArgument(format!(
+                        "invalid datetime time component in '{text}', expected HH:MM:SS"
+                    )))
+                }
+            };
+
+        let hours = hours_text.parse::<i64>().map_err(|_| {
+            HtapError::InvalidArgument(format!(
+                "invalid datetime time component in '{text}', expected HH:MM:SS"
+            ))
+        })?;
+        let minutes = minutes_text.parse::<i64>().map_err(|_| {
+            HtapError::InvalidArgument(format!(
+                "invalid datetime time component in '{text}', expected HH:MM:SS"
+            ))
+        })?;
+        let seconds = seconds_text.parse::<i64>().map_err(|_| {
+            HtapError::InvalidArgument(format!(
+                "invalid datetime time component in '{text}', expected HH:MM:SS"
+            ))
+        })?;
+
+        if !(0..24).contains(&hours) || !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
+            return Err(HtapError::InvalidArgument(format!(
+                "invalid datetime time component in '{text}', expected HH:MM:SS"
+            )));
+        }
+
+        let time_micros = (hours * 3600 + minutes * 60 + seconds) * 1_000_000;
+        return date_micros.checked_add(time_micros).ok_or_else(|| {
+            HtapError::InvalidArgument(format!("datetime '{text}' is out of timestamp range"))
+        });
+    }
+
+    parse_date_to_timestamp_micros(text).map_err(|e| {
+        HtapError::InvalidArgument(format!(
+            "cannot parse '{text}' as timestamp microseconds, calendar date, or datetime: {e}"
+        ))
+    })
 }
 
 /// Column index permutation map matching CSV record positions to table schema columns.
@@ -197,12 +267,14 @@ pub fn parse_csv_field(col: &ColumnDef, field: &str) -> Result<Value> {
                 field, col.name
             ))
         }),
-        DataType::Timestamp => field.parse::<i64>().map(Value::Timestamp).map_err(|e| {
-            HtapError::InvalidArgument(format!(
-                "cannot parse '{}' as timestamp microseconds for column '{}': {e}",
-                field, col.name
-            ))
-        }),
+        DataType::Timestamp => parse_timestamp_text(field)
+            .map(Value::Timestamp)
+            .map_err(|e| {
+                HtapError::InvalidArgument(format!(
+                    "cannot parse '{}' as timestamp for column '{}': {e}",
+                    field, col.name
+                ))
+            }),
         DataType::Decimal { precision, scale } => {
             let value = parse_decimal_text(field, scale).map_err(|e| {
                 HtapError::InvalidArgument(format!(
@@ -446,12 +518,14 @@ pub fn parse_json_value(col: &ColumnDef, json_val: &serde_json::Value) -> Result
                     )))
                 }
             }
-            serde_json::Value::String(s) => s.parse::<i64>().map(Value::Timestamp).map_err(|e| {
-                HtapError::InvalidArgument(format!(
-                    "cannot parse '{}' as timestamp microseconds for column '{}': {e}",
-                    s, col.name
-                ))
-            }),
+            serde_json::Value::String(s) => {
+                parse_timestamp_text(s).map(Value::Timestamp).map_err(|e| {
+                    HtapError::InvalidArgument(format!(
+                        "cannot parse '{}' as timestamp for column '{}': {e}",
+                        s, col.name
+                    ))
+                })
+            }
             _ => Err(HtapError::InvalidArgument(format!(
                 "expected number or string for timestamp column '{}'",
                 col.name
@@ -757,6 +831,71 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_calendar_date_and_datetime_imports() {
+        let timestamp_col = ColumnDef {
+            name: "ts".into(),
+            data_type: DataType::Timestamp,
+            nullable: false,
+            primary_key: false,
+        };
+
+        let date_text = "2024-01-02";
+        let datetime_text = "2024-01-02 03:04:05";
+        let raw_micros = "1704164645000000";
+
+        let expected_date = Value::Timestamp(parse_date_to_timestamp_micros(date_text).unwrap());
+        let expected_datetime = Value::Timestamp(
+            parse_date_to_timestamp_micros(date_text).unwrap()
+                + (3 * 3600 + 4 * 60 + 5) * 1_000_000,
+        );
+        let expected_raw = Value::Timestamp(raw_micros.parse::<i64>().unwrap());
+
+        // CSV imports support raw microseconds, calendar dates, and space-separated datetimes.
+        assert_eq!(
+            parse_csv_field(&timestamp_col, raw_micros).unwrap(),
+            expected_raw
+        );
+        assert_eq!(
+            parse_csv_field(&timestamp_col, date_text).unwrap(),
+            expected_date
+        );
+        assert_eq!(
+            parse_csv_field(&timestamp_col, datetime_text).unwrap(),
+            expected_datetime
+        );
+        assert!(parse_csv_field(&timestamp_col, "2024-02-30").is_err());
+
+        // JSONLines imports support the same timestamp representations.
+        assert_eq!(
+            parse_json_value(
+                &timestamp_col,
+                &serde_json::Value::Number(serde_json::Number::from(
+                    raw_micros.parse::<i64>().unwrap()
+                ))
+            )
+            .unwrap(),
+            expected_raw
+        );
+        assert_eq!(
+            parse_json_value(&timestamp_col, &serde_json::Value::String(date_text.into())).unwrap(),
+            expected_date
+        );
+        assert_eq!(
+            parse_json_value(
+                &timestamp_col,
+                &serde_json::Value::String(datetime_text.into())
+            )
+            .unwrap(),
+            expected_datetime
+        );
+        assert!(parse_json_value(
+            &timestamp_col,
+            &serde_json::Value::String("2024-02-30".into())
+        )
+        .is_err());
+    }
+
+    #[test]
     fn test_csv_header_map_and_headerless_decode() {
         let schema = Schema::new(vec![
             ColumnDef {
@@ -807,5 +946,19 @@ mod tests {
         let rec_many = csv::StringRecord::from(vec!["42", "alice", "true", "extra"]);
         let err = decode_csv_record(&schema, &header_map, &rec_many).unwrap_err();
         assert!(matches!(err, HtapError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_timestamp_datetime_requires_two_digit_time_components() {
+        for invalid in [
+            "2024-01-02 3:4:5",
+            "2024-01-02 +1:02:03",
+            "2024-01-02 01:02:003",
+        ] {
+            assert!(
+                parse_timestamp_text(invalid).is_err(),
+                "expected invalid datetime '{invalid}' to be rejected"
+            );
+        }
     }
 }
