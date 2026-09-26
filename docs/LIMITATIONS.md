@@ -510,9 +510,11 @@ flat-lowering/differential-test design).
 - **Ordering and paging:** `ORDER BY` expressions/aliases/ordinals with `ASC`/`DESC` and `NULLS FIRST`/`LAST`
   (`ASC` defaults `NULLS FIRST`, `DESC` defaults `NULLS LAST`), `LIMIT`/`OFFSET` and MySQL `LIMIT off, cnt`.
 - **Set operations and composition:** `UNION`/`UNION ALL` with numeric widening (`Int32`->`Int64`->
-  `Float64`), derived tables (subquery in `FROM`, alias required, unique column names), non-recursive `WITH`
-  CTEs (chained), uncorrelated scalar/`IN`/`EXISTS` subqueries (a scalar subquery returning more than one row
-  is a runtime error), and `FROM`-less `SELECT`.
+  `Float64`), derived tables (subquery in `FROM`, alias required, an optional column list to rename output
+  columns — `(SELECT ...) AS t(a, b)`, see "TPC-H prerequisite additions" below — unique column names after
+  any such rename), non-recursive `WITH` CTEs (chained, also accepting an optional column list exactly like
+  `WITH RECURSIVE` already did), uncorrelated scalar/`IN`/`EXISTS` subqueries (a scalar subquery returning
+  more than one row is a runtime error), and `FROM`-less `SELECT`.
 - **Cross-engine materialization:** Every base table side of a join is read through the same
   `scan_partition_compact` storage path the narrow `Route::OlapScan` executor uses — `Row` from the rowstore,
   `Column`/manifest-bearing `Converting` from columnar segments with the rowstore delta overlay, and
@@ -876,17 +878,21 @@ flat-lowering/differential-test design).
   cast). `DECIMAL` is supported as of Phase 17 — see "`DECIMAL` type (Phase 17) scope and deferred features"
   below.
   - **`DATE`/`EXTRACT`/`INTERVAL`/`SUBSTRING` are supported, as a narrow local slice, not full MySQL
-    date/string function coverage.** A `DATE` column and a `DATE 'yyyy-mm-dd'` literal are both recorded as
-    `Timestamp` (`htap_common::types::parse_date_to_timestamp_micros`) — a deliberate choice to avoid an
-    on-disk type change, so introducing a genuinely distinct `DATE` type later would need a data migration,
-    not just a binder change. `EXTRACT(unit FROM expr)` and calendar `+`/`-` `INTERVAL 'n' unit` arithmetic
-    support exactly three units — `YEAR`, `MONTH`, `DAY` (`CalendarIntervalUnit`) — `HOUR`/`MINUTE`/`SECOND`
-    and any other unit remain unsupported. `SUBSTRING` requires both a `FROM` start and a `FOR` length
-    (`SUBSTRING(s FROM start FOR length)`); the two-argument form without `FOR` is rejected as unsupported.
-    Covered by
+    date/string function coverage.** A `DATE` column, a `DATE 'yyyy-mm-dd'` literal, and (as of Phase 17 Batch
+    A/B checkpoint 1) the `DATE(string)` function form are all recorded as `Timestamp`
+    (`htap_common::types::parse_date_to_timestamp_micros`, shared by both the literal and function paths so
+    they agree exactly) — a deliberate choice to avoid an on-disk type change, so introducing a genuinely
+    distinct `DATE` type later would need a data migration, not just a binder change. `EXTRACT(unit FROM
+    expr)` and calendar `+`/`-` `INTERVAL 'n' unit` arithmetic support exactly three units — `YEAR`, `MONTH`,
+    `DAY` (`CalendarIntervalUnit`) — `HOUR`/`MINUTE`/`SECOND` and any other unit remain unsupported.
+    `SUBSTRING` requires both a `FROM` start and a `FOR` length (`SUBSTRING(s FROM start FOR length)`); the
+    two-argument form without `FOR` is rejected as unsupported. Covered by
     `crates/htap-server/tests/tpch_sql_prerequisites.rs::test_tpch_sql_prerequisites_parse_bind_and_execute_dates_and_strings`
-    (DATE storage/comparison/arithmetic, `EXTRACT` of year/month/day, three-argument `SUBSTRING`) and
-    `crates/htap-sql/src/expr.rs::expr::tests::calendar_intervals_extract_and_substring`.
+    (DATE storage/comparison/arithmetic, `EXTRACT` of year/month/day, three-argument `SUBSTRING`),
+    `crates/htap-sql/src/expr.rs::expr::tests::calendar_intervals_extract_and_substring`, and — for the
+    `DATE(string)` function form specifically —
+    `crates/htap-server/tests/tpch_sql_prerequisites.rs::{test_date_function_produces_same_result_as_literal, test_date_function_invalid_date_rejected, test_date_function_and_literal_mixed_in_query}`
+    (see "Completed local MVP — TPC-H prerequisite additions" above).
 - **Fixed test gap from Phase 13:**
   `crates/htap-client/tests/embedded_client.rs::test_embedded_client_unsupported_sql_preserves_error_categories`
   and `crates/htap-client/tests/remote_client.rs::test_remote_client_matches_embedded_client_ddl_dml_select`
@@ -895,6 +901,33 @@ flat-lowering/differential-test design).
   (`SELECT name FROM products FOR UPDATE`) and pass (`cargo test -p htap-client`, verified with
   `-- --list`/`--exact`). This section is kept as a record that the gap was tracked and closed, not silently
   dropped.
+
+### Completed local MVP — TPC-H prerequisite additions (Phase 17, Batch A / Batch B checkpoint 1)
+
+Three SQL binder features landed as prerequisites for the `htap-tpch` workload kit (see
+`docs/ARCHITECTURE.md`'s "TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1)" and
+`docs/PROGRESS.md`'s Phase 17 (continued) row); none was documented anywhere before this checkpoint. All
+three are general SQL-layer features, not gated to TPC-H query text in any way.
+
+- **Derived-table column lists:** `(SELECT ...) AS t(a, b)` renames the derived table's output columns
+  positionally. A column-list length that does not match the underlying query's own output column count is a
+  bind error naming both counts. The rename is applied *before* the existing unique-output-name check
+  (`ensure_unique_output_names`), so a duplicate name the column list itself introduces — not just one already
+  present in the underlying query — is caught; reversing that order would validate the pre-rename names and
+  let a column-list-introduced duplicate pass through silently. Covered by
+  `crates/htap-server/tests/tpch_sql_prerequisites.rs::{test_derived_table_column_list_renames_and_filters, test_derived_table_column_list_count_mismatch_error, test_derived_table_column_list_duplicate_name_error}`.
+- **Column lists on non-recursive `WITH` CTEs:** `WITH t(a, b) AS (...)` renames a CTE's output columns the
+  same way, closing a gap where this previously returned an explicit "CTE column lists not supported" bind
+  error; `WITH RECURSIVE` already accepted one. Same rename-before-uniqueness-check ordering and
+  count-mismatch/duplicate-name errors as the derived-table case above; a CTE with a column list referenced
+  twice in the same query still resolves both references correctly, and a pre-existing recursive-CTE column
+  list is unaffected by this change. Covered by
+  `crates/htap-server/tests/tpch_sql_prerequisites.rs::{test_cte_column_list_renames_and_filters, test_cte_referenced_twice_with_column_list, test_cte_column_list_too_few_names_error, test_cte_column_list_too_many_names_error, test_cte_column_list_duplicate_name_error, test_recursive_cte_with_column_list_regression}`.
+- **`DATE(string)` function form:** `DATE(expr)` now binds (`ScalarFn::DateFromString`) alongside the existing
+  `DATE 'yyyy-mm-dd'` literal syntax, through the same `parse_date_to_timestamp_micros` helper, so both forms
+  produce the identical `Timestamp` value, share the same invalid-date error, and can be mixed in one query
+  (e.g. one side of a comparison as a literal, the other as a function call). Covered by
+  `crates/htap-server/tests/tpch_sql_prerequisites.rs::{test_date_function_produces_same_result_as_literal, test_date_function_invalid_date_rejected, test_date_function_and_literal_mixed_in_query}`.
 
 ### Verification and test coverage
 
@@ -1446,6 +1479,73 @@ The Phase 6 implementation delivers local coordination, leadership fencing, dete
 
 ---
 
+## TPC-H workload kit scope and deferred features (Phase 17, Batch A / Batch B checkpoint 1)
+
+**Status: `in progress`.** A new crate, `crates/htap-tpch`, is the foundation for a TPC-H-derived workload
+kit; Batch A (SQL/movement prerequisites — see "Completed local MVP — TPC-H prerequisite additions" above)
+is complete, Batch B checkpoint 1 delivers the schema/query-text/scale-factor/correctness-fixture layer
+below, and the rest of Batch B (a data generator, bulk loader, refresh functions, and power/throughput test
+drivers) is not yet built. See `docs/ARCHITECTURE.md`'s "TPC-H workload kit foundations (Phase 17, Batch A /
+Batch B checkpoint 1)", `docs/PROGRESS.md`'s Phase 17 (continued) row, and ADR-027 in `docs/DECISIONS.md`.
+
+### Completed
+
+- **Schema:** the eight TPC-H tables in foreign-key dependency order (`schema::{TABLE_NAMES, ddl_statements}`);
+  foreign-key relationships are represented by plain columns only, never enforced as engine constraints.
+  Covered by `crates/htap-tpch/tests/schema_ddl.rs::test_tpch_schema_ddl_creates_expected_catalog_schema`.
+- **Query texts and validation parameters:** all 22 published query texts (`queries::query`) with the
+  specification's published validation-default substitution parameters (`params::fixed_parameters`) — these
+  document the published defaults, not the official parameter-generation-and-validation algorithm.
+  `params::tests::test_fixed_parameters_appear_in_query_texts` cross-checks every one of those defaults
+  against the query text `queries::query` returns for the matching query number, matched in the syntactic
+  position each value belongs to rather than as a loose substring: a whole-token numeric match (a value
+  cannot match on an incidental occurrence of the same digits elsewhere in the text — query 19's quantity `1`
+  is the case this closes), query 16's sizes checked as exact comma-delimited entries of its own `p_size`
+  list (so a single-digit size cannot match inside one of its own two-digit sizes), and query 19's quantities
+  checked against their own `l_quantity` lower-bound comparisons. This catches drift between two independent
+  transcriptions of the same published data — the parameter table and the query texts — and does not itself
+  validate either one against the specification. Query 11 preserves its exact `0.0001 / SF` formula as SQL
+  text rather than pre-computing it through floating point —
+  `queries::tests::test_query_11_preserves_fraction_scale_factor` extracts the divisor that actually appears
+  in the generated `FRACTION` formula at scale factors `"1"`, `"2"`, and `"0.5"` and asserts it equals the
+  supplied scale factor each time (checking only scale factor 1 cannot distinguish a correct implementation
+  from one that ignores the parameter entirely, since the divisor is 1 either way), then executes each
+  generated statement against the schema; `queries::tests::test_query_11_rejects_zero_scale_factor` separately
+  proves only that an invalid, zero scale factor is rejected.
+- **Exact-integer scale-factor helper:** `scale_factor::scale_factor` parses decimal scale-factor text into an
+  `i128` numerator/denominator pair rather than through `f64`, avoiding a demonstrated float-rounding pitfall
+  (`0.29 * 50` lands one below `14.5` in ordinary binary floating point); 7 unit tests, including that
+  discrimination case, rounding-boundary, floor, and overflow cases.
+- **Row-limiting mechanism (Clause 2.1.2.9), a conformance choice, not a deviation:** queries 2, 3, 10, 18, and
+  21 carry `LIMIT 100`/`10`/`20`/`100`/`100` respectively (row counts from each query's own Functional Query
+  Definition, Clause 2.4.N.2), using the clause's third permitted mechanism — vendor-specific `SELECT`-statement
+  syntax, as opposed to an interactive-interface control statement or an implementation-specific fetch-loop
+  control — consistently across all five queries that need it — see ADR-027.
+- **Correctness fixtures, 5 of 22 queries validated:** a small hand-authored dataset
+  (`crates/htap-tpch/tests/fixture.rs`) plus an ordered/unordered multiset-comparison helper
+  (`compare_results`, itself covered by `test_multiset_validation`,
+  `test_multiset_validation_accepts_permuted_rows`, `test_multiset_validation_rejects_decimal_precision_mismatch`)
+  back hand-derived expected row values (not just row counts) for queries 1, 2, 3, 4, and 6
+  (`crates/htap-tpch/tests/correctness_fixture.rs::{test_q1, test_q2, test_q3, test_q4, test_q6}`).
+
+### Explicitly not claimed
+
+- **The other 17 queries (5, 7-22) are not correctness-validated.** They are only proven to bind and execute
+  without error against the schema at scale factor 1
+  (`crates/htap-tpch/src/queries.rs::queries::tests::test_all_22_queries_bind_and_execute`) — a materially
+  weaker claim than the hand-derived fixtures above: it does not check a single returned row.
+- **No data generator, bulk loader, refresh functions, or power/throughput drivers yet.** Checkpoint 1 is
+  schema, query text, parameters, and a scale-factor helper only; there is no TPC-H-conformant dataset
+  generator, no bulk load path exercised against this schema beyond the hand-authored fixture rows above, and
+  no `RF1`/`RF2` refresh-function or Power/Throughput-test driver implementation.
+- **No TPC-H compliance or comparability claim.** `fixed_parameters()` documents the published
+  validation-default *values*, not the specification's own parameter-generation-and-validation algorithm; a
+  TPC compliance/deviations disclosure document (the required disclaimer, deviations list, non-comparability
+  statement, "Derived from TPC-H" naming, and the prohibition on the QphH/QppH/QthH metric names) is a later
+  Batch B deliverable and is not written yet.
+
+---
+
 ## Scope
 
 - The brief describes a production HTAP database engine: an LSM row store, a
@@ -1483,6 +1583,8 @@ The Phase 6 implementation delivers local coordination, leadership fencing, dete
 | Phase 14 — Cost-based optimization, `EXPLAIN`, spilling, and bounded parallelism | `Complete (local MVP)` | Lifted exactly three named gaps for the general executor only (`Route::RowstorePointRead`/`Route::OlapScan` byte-for-byte unchanged): `ANALYZE TABLE` (exact table/column statistics, capped exact-distinct count, `HTAPCAT1` format v3 -> v4, `stats` published by single-field CAS); a storage-agnostic `htap-sql::optimize` cost-based optimizer (statistics-driven estimators with disclosed provenance, predicate-atom reordering with an always-on conservation validator, subset-DP join reordering up to 8 relations then greedy, enabled by default); `EXPLAIN`/`EXPLAIN ANALYZE` (verified to bypass the optimizer entirely for the two narrow routes, including on DDL such as `EXPLAIN CREATE TABLE`); a per-statement memory budget, `Route::Query` only (a single-table `SELECT` with `ORDER BY`/`GROUP BY`/a plain aggregate still routes to the unbudgeted, non-spilling `Route::OlapScan` path — by design), with one level of disk spilling (non-durable scratch under `<data-root>/spill/`, swept on `LocalServer::open`; hash joins and windows capped at 128 partitions, `GROUP BY`/set operators at a fixed 16) for hash joins/`GROUP BY`/`ORDER BY`/set operators/windows, with per-operator spill test telemetry; and bounded intra-query parallelism for `GROUP BY` and `INNER`/`CROSS` hash joins. A second external-review round also closed a catalog-statistics brick risk (structural validation, including finite-float bounds — no format change) and made float overflow (`+`/`-`/`*`/`/`/`SUM`/`AVG`) return an out-of-range error instead of writing a non-finite value. A third, independent storage review then enabled `serde_json`'s `float_roundtrip` feature workspace-wide as a precaution (tested with the feature off, the default parser round-tripped every value tried, so no drift was demonstrated — not a bug fix), made spilled set operations/`DISTINCT` emit rows by source index rather than a decoded-row-keyed map (hardening), tightened the hash-join/window spill partition cap from 256 to 128, closed the previously-unverified analytic-path `SUM` overflow gap (`CAST(... AS DOUBLE)` from a string and non-finite literals are now rejected the same way), and fixed `ANALYZE`'s min/max bound to reserve memory before swapping so a failed reservation leaves accounting exact — see ADR-023's second external-review round. Also partially fixed `docs/PROBLEMS.md` P2: one `EvalContext` constructor, one join evaluator (`SelectBody.join_tree` always populated, the old flat-loop branch removed), and zero `too_many_arguments` allows in `query_exec.rs` — but the planned shared binder leaf-helper module was **not** delivered; the two binder entry points still each hold their own copy of that logic, by the deliberate Option B choice recorded in ADR-023 (keeping R5 structural). See ADR-023, `docs/PROGRESS.md`'s Phase 14 row, and "General query executor scope and deferred features" above for the full contract and evidence. `ANALYZE TABLE` is gated by the "no DDL inside an open transaction" rule exactly like other catalog DDL (`crates/htap-server/tests/session.rs::test_analyze_table_rejected_inside_explicit_transaction_and_txn_survives`, `test_explain_analyze_wrapping_ddl_rejected_inside_open_transaction`, `test_explain_analyze_wrapping_insert_rejected_inside_read_only_transaction`), and `EXPLAIN ANALYZE` follows the transaction rules of the statement it executes while plain `EXPLAIN` remains permitted (`crates/htap-server/tests/explain.rs::test_plain_explain_select_permitted_inside_open_transaction`). One disclosed gap remains: hash-join spilling is not itself kind-restricted in code but is only tested for `INNER` joins. Deferred: vectorized/pipelined execution, worker-pool parallelism for `LEFT`/`RIGHT`/`FULL` joins, memory-bounded spilling for non-equi/`CROSS` joins (a genuine gap — evaluated by an in-memory nested loop with no budget check at all, unlike `LEFT`/`RIGHT`/`FULL` equi-hash spilling, which exists in code but only `INNER` is tested), statistics histograms and per-partition statistics, automatic statistics staleness detection, `LIMIT BY`, `UPDATE` with joins/subqueries/`ORDER BY`/`LIMIT`, and non-partition `ALTER TABLE`. |
 | Phase 15 — DROP reclaim, rowstore compaction/GC, journal checkpoint | `Complete (local MVP)` | Built contiguous-run, entry-count-tiered `Engine::compact_once` (`crates/htap-rowstore/src/engine.rs`) splicing its output into the selected run's original manifest position — fixing an initial-draft prepend bug a storage-review panel found that could resurrect a stale value behind a tombstone (pinned by `crates/htap-rowstore/tests/compaction_ordering.rs`); a rowstore `MANIFEST` format bump (`HTAPMAN1` v2 -> v3) adding `committed_version_high_water`/`gc_low_water`, both monotonic, refusing to publish a regression, with a hard read-rejection below `gc_low_water`; an exclusive `Engine::open` lock on `<rowstore>/LOCK`; a per-tablet movement/reclaim lease set in `LocalDataMover` (all-or-nothing for `DROP TABLE`'s forced set, best-effort/partial for the ordinary tiered pass); catalog `pending_reclaim` (`HTAPCAT1` v4 -> v5) driving `DROP TABLE` column-store/movement artifact deletion (including that tablet's movement job records) and rowstore purge confirmation to completion across ticks; and `TransactionManager::checkpoint()` (a new `HTAPTXC1` journal-checkpoint envelope) compacting `txn.journal`, triggered opportunistically after commits and finalized once at `LocalServer::open`, latching `RecoveryRequired` unconditionally on any rewrite-step error. See ADR-024, `docs/PROGRESS.md`'s Phase 15 row, and "Rowstore compaction, garbage collection, and DROP TABLE reclaim scope and deferred features" / "Transaction journal checkpoint scope and deferred features" above for the full contract. Deferred/disclosed: shared-keyspace protection is per SST not per row (a busy tablet blocks every SST that spans it); the explicit-SST-id compaction path compacts only one contiguous run per call; compaction is explicit-tick-only with no background thread or SQL trigger; tombstones are never elided; movement/reclaim leases are intentionally non-durable (a stated precondition, not a gap, given today's non-resumable movement jobs); `ALTER TABLE ... DROP/REORGANIZE PARTITION` reclamation remains untouched; the `MANIFEST` v2 external-apply ledger's own hard cap is untouched and unrelated to the journal checkpoint; and delete vectors / delta-to-base columnar background compaction remain deferred, unchanged. |
 | Phase 16 — Owner plus IPC (concurrent multiprocess use) | `Complete (local MVP)` | Built owner/client forwarding so a second local process opening an already-owned root becomes an IPC client instead of failing outright, over a length-prefixed JSON protocol on a Unix domain socket at `<root>/htap.sock` (mode `0600`, Unix-only; a locked root on a non-Unix target still returns the ordinary `Conflict`, unchanged). Fixed `docs/PROBLEMS.md` P3 (the server's two independent statement pipelines each ran the privilege check) with a shared `prepare_statement` step. Added a new `HtapError::Ambiguous` variant, distinct from `Conflict` (safe to retry) and `DurablePending` (has load-bearing txn identity), for an IPC request that may or may not have reached the owner; a client-side write-boundary rule classifies a failure as `Ambiguous` unless zero request bytes were sent or the request is one of the two statically-read-only kinds. A `Session` gained two new terminal states mirroring the existing `DurablePending` quarantine: `AmbiguousOutcomePending` (re-raises the stored `Ambiguous` error on every later call, including `reset`) and `RemoteDisconnected` (a confirmed-dead connection; re-raises `Conflict`); neither is ever exited by silent reconnection. An explicit ownership graph (`OwnedServer`, `ServerMode`, `OwnerRuntime`) replaces `LocalServer`'s single struct so the IPC listener can mint owner-side sessions directly from the storage core without needing the caller's own `Arc` wrapper, and `OwnerRuntime`'s hand-written `Drop` joins the listener (stop flag, force-close every live connection, unbounded join of the accept and connection threads) before its own storage-core handle drops, guaranteeing the socket is gone before `<root>/LOCK` is released. A bound statement forwards as a serialized AST (the vendored parser's own `serde` feature, turned on additively in two package manifests, not a vendored-source change) rather than re-rendered SQL text, avoiding a lossy round trip for already-substituted binary/non-finite-float literals; the plain-text execute/query path is unaffected. A first storage/external-review round (batch D) found and fixed 12 of 13 defects the passing suite had missed, the clearest a completely broken prepared-statement path for every client-mode session and process panics on roughly 30 owner-only methods for a client-mode handle; a second storage re-review (batch E) found and fixed 8 more, including a socket creation-window that would have granted an unauthenticated local user a superuser session, and a second client-mode `open_session`/`authenticate_session` panic path that batch D's own "panics are fixed" claim had missed. A third storage re-review (batch F) found and fixed 7 more: two of the batch D/E fixes above had shipped with tests that could not have caught a regression (the socket-permission fix's own test reimplemented publication instead of calling the real startup path; the no-panic fix had no test at all), and replacing the first of those with a real test immediately exposed a leak the review had only partly identified — the private staging directory used to publish the socket was never removed on a successful start, not only after a crash. Batch F also fixed a post-dispatch response-serialization failure misreported as bad input instead of an unknown outcome, a failed write that left a connection looking reusable after bytes had already reached the owner, an owner-gone login misreported as bad credentials, and a handshake read that failed spuriously on an interrupted system call. See ADR-025 (including its "Post-review fixes (batch D)", "Post-review fixes (batch E)", and "Post-review fixes (batch F)" sections), `docs/PROGRESS.md`'s Phase 16 row, and "Owner plus IPC (Phase 16) scope and deferred features" above for the full contract. Deferred/disclosed: a socket path too long for a Unix socket, or a non-socket file at that path, falls back to the pre-existing lock-only mode; the wire format is tied to the build's AST shape (a version-skewed pair fails cleanly at decode, no schema-compatibility scheme); changing users on a client session is unsupported; a client-mode handle's `last_query_*` diagnostic getters report fixed defaults, not the owner's real state; administrative/data-mover/conversion/compaction/reclaim operations remain owner-only; standalone subsystem opens bypassing `LocalServer` remain unsafe for concurrent use, unchanged. |
+| Phase 17 — `DECIMAL` type: query layer and persistence (A6a + A6b, all five tasks) | `Complete (local MVP)` | Added `DataType::Decimal { precision, scale }` / `Value::Decimal` (a fixed-point value: signed 64-bit unscaled integer, maximum 18 digits, exact round-half-away-from-zero arithmetic, a declared-precision check on every value) across the query layer (A6a: literals, `CAST`, arithmetic, comparisons, ordering/hashing, `SUM`/`AVG`/`MIN`/`MAX`/`COUNT(DISTINCT)` grouped and windowed, on both the row and columnar execution paths) and persistence (A6b, all five tasks: `CREATE TABLE`/`INSERT`/literal coercion; the columnar segment format, `HTAPCOL1` v1 -> v2, including real decimal pushdown filtering; the composite-key codec; the rowstore memtable's size estimator; catalog recovery; the movement crate's CSV/JSON-lines codec; and the MySQL wire protocol's `NEWDECIMAL` result/binary-row encoding). ADR-026 (Amendment 4) clamps a derived arithmetic/aggregate *result* precision to the 18-digit maximum rather than rejecting the query outright — matching MySQL's own behavior for an over-wide derived decimal — while a *value* that overflows its own declared precision is still always a hard error, never silently truncated, wrapped, or turned into a float. See ADR-008's decimal addendum (the `HTAPCOL1` format bump) and ADR-026, `docs/ARCHITECTURE.md`'s "Derived `DECIMAL` precision and scale rules", and `docs/PROGRESS.md`'s Phase 17 row for the full task-by-task test evidence. Bounded at the engine's own 18-digit maximum everywhere, including the wire protocol — not arbitrary precision. Disclosed: bulk CSV/JSON-lines import rounds a value with more fractional digits than the column's declared scale half-away-from-zero (matching ordinary `INSERT`/`UPDATE` assignment) rather than rejecting it, and a decimal is a JSON string, not a JSON number, in JSON-lines — see `docs/OPERATIONS.md` section 2 and "`DECIMAL` type (Phase 17) scope and deferred features" above. |
+| Phase 17 (continued) — TPC-H workload kit: prerequisites (Batch A) and query-kit foundations (Batch B checkpoint 1) | `In progress` | Batch A (complete): movement's timestamp text import now accepts calendar date/datetime text as well as raw microseconds; regression tests pinned the exact TPC-H correlated-subquery and doubly-referenced-CTE query shapes the kit needs against pre-existing support, no code change required; reproduced specification query text carries the TPC copyright/permission notice. Batch B checkpoint 1 (new `crates/htap-tpch` crate, in progress): eight-table schema, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper, and hand-derived correctness fixtures for queries 1, 2, 3, 4, and 6 (the other 17 are proven only to bind and execute, not correct). Three previously-undocumented SQL binder features this kit depends on: derived-table column lists, non-recursive-CTE column lists, and the `DATE(string)` function form. See "TPC-H workload kit scope and deferred features" and "General query executor scope and deferred features" above, `docs/PROGRESS.md`'s Phase 17 (continued) row, and ADR-027. Not yet built: the data generator, bulk loader, refresh functions, power/throughput drivers, and the TPC compliance/deviations disclosure document. |
 
 ---
 

@@ -1,0 +1,16 @@
+[package]
+name = "htap-tpch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+htap-common = { path = "../htap-common" }
+htap-sql = { path = "../htap-sql" }
+htap-catalog = { path = "../htap-catalog" }
+htap-movement = { path = "../htap-movement" }
+htap-server = { path = "../htap-server" }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tempfile = { workspace = true }

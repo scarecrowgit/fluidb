@@ -295,16 +295,26 @@ fn bind_query_scoped(
                 if cte.from.is_some() {
                     return Err(unsupported("CTE FROM clause not supported"));
                 }
-                if !cte.alias.columns.is_empty() {
-                    return Err(unsupported("CTE column lists not supported"));
-                }
-                let bound = bind_query_scoped(
+                let mut bound = bind_query_scoped(
                     &cte.query,
                     catalog,
                     &local_scope,
                     outer,
                     immediate_outer_len,
                 )?;
+                if !cte.alias.columns.is_empty() {
+                    if cte.alias.columns.len() != bound.output_columns.len() {
+                        return Err(invalid(format!(
+                            "CTE '{}' has {} column name(s), but its query has {} column(s)",
+                            cte.alias.name,
+                            cte.alias.columns.len(),
+                            bound.output_columns.len()
+                        )));
+                    }
+                    for (column, name) in bound.output_columns.iter_mut().zip(&cte.alias.columns) {
+                        column.name = name.name.value.clone();
+                    }
+                }
                 ensure_unique_output_names(&bound, &cte.alias.name.value)?;
                 local_scope.ctes.push((
                     cte.alias.name.value.clone(),
@@ -1942,10 +1952,20 @@ fn bind_table_factor_leaf(
             let alias = alias
                 .as_ref()
                 .ok_or_else(|| invalid("every derived table must have its own alias"))?;
+            let mut bound = bind_query_scoped(subquery, catalog, ctes, outer, 0)?;
             if !alias.columns.is_empty() {
-                return Err(unsupported("derived table column lists not supported"));
+                if alias.columns.len() != bound.output_columns.len() {
+                    return Err(invalid(format!(
+                        "derived table '{}' has {} column name(s), but its query has {} column(s)",
+                        alias.name,
+                        alias.columns.len(),
+                        bound.output_columns.len()
+                    )));
+                }
+                for (column, alias_column) in bound.output_columns.iter_mut().zip(&alias.columns) {
+                    column.name = alias_column.name.value.clone();
+                }
             }
-            let bound = bind_query_scoped(subquery, catalog, ctes, outer, 0)?;
             ensure_unique_output_names(&bound, &alias.name.value)?;
             Ok(TableSlot::Derived {
                 columns: bound.output_columns.clone(),
@@ -3407,6 +3427,15 @@ impl<'a> ExprBinder<'a> {
                 check_comparable(&args[0], &args[1], "NULLIF")?;
                 let t = args[0].expr_type();
                 (ScalarFn::NullIf, t.data_type, true)
+            }
+            "DATE" => {
+                arity(1)?;
+                require_string(&args[0], "DATE")?;
+                (
+                    ScalarFn::DateFromString,
+                    DataType::Timestamp,
+                    args[0].expr_type().nullable,
+                )
             }
             other => return Err(unsupported(format!("function '{other}' not supported"))),
         };

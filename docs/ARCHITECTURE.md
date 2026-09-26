@@ -303,9 +303,11 @@ defined in `crates/htap-common/src/types.rs`:
   `crates/htap-server/tests/decimal_avg_rounding.rs::test_decimal_avg_rounds_half_away_from_zero`.
 - **Clamped, not rejected.** An earlier, narrower position rejected a query whose *worst-case* derived
   precision exceeded 18 digits, which made ordinary money arithmetic like `SUM(amount_cents * 0.01)` or
-  `DECIMAL(15,2) * DECIMAL(15,2)` (TPC-H's own shape) unrepresentable even though the actual values fit easily.
-  ADR-026 (Amendment 4) reverses that in favor of clamping the derived type instead, which is MySQL's own
-  behavior for an over-wide derived decimal; see ADR-026 for the full argument.
+  `DECIMAL(15,2) * DECIMAL(15,2)` (the money-column shape our TPC-H kit uses; `(15,2)` is a widely used
+  convention that exceeds the spec's own minimum, not something TPC-H mandates — see ADR-026) unrepresentable
+  even though the actual values fit easily. ADR-026 (Amendment 4) reverses that in favor of clamping the
+  derived type instead, which is MySQL's own behavior for an over-wide derived decimal; see ADR-026 for the
+  full argument.
 - **Predicate-literal semantics (not derivation, but load-bearing alongside it).** A comparison literal that is
   not exactly representable at a column's declared scale is handled by *exact boundary rewriting*, not
   rounding: `col > 5.555` on a `DECIMAL(_,2)` column rewrites to `col >= 5.56` (`ceil`), `col < 5.555` rewrites
@@ -335,6 +337,63 @@ defined in `crates/htap-common/src/types.rs`:
   `test_decimal_comparisons_below_representable_range`,
   `test_decimal_comparisons_at_representable_boundary`).
 
+### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1)
+
+**Status: `in progress`.** Phase 17 continues past A6a/A6b (`DECIMAL`, above) into a TPC-H-derived workload
+kit. Batch A (complete) closed three prerequisites the kit depends on, with no on-disk format change: movement's
+timestamp text import (`crates/htap-movement/src/codec.rs`) now accepts calendar date and datetime text in
+addition to raw integer microseconds (raw-microseconds parsing is still tried first, so nothing that worked
+before changes behavior; a datetime's time-of-day component requires exactly two digits per field, and an
+out-of-range hour/minute/second is a hard error rather than rolling into the next day — covered by
+`crates/htap-movement/src/codec.rs::codec::tests::{test_timestamp_calendar_date_and_datetime_imports, test_timestamp_datetime_requires_two_digit_time_components}`); regression tests pinned
+the exact query text of the TPC-H correlated-subquery shapes the kit needs — queries 2, 4, 17, 20, 21, 22 —
+against the depth-1 correlated-subquery execution boundary ADR-022 already built
+(`crates/htap-server/tests/tpch_correlated_subqueries.rs`, 6 tests, one per query), each clause proven
+load-bearing by deleting it and observing the specific test fail; the doubly-referenced-CTE shape (query 15)
+needed no code change either, verified by `test_all_22_queries_bind_and_execute` (bind/execute only) and, at
+smaller scale, `test_cte_referenced_twice_with_column_list`; and reproduced specification query text now
+carries the TPC copyright/permission notice.
+
+Batch B checkpoint 1 adds a new crate, `crates/htap-tpch` — the foundation for the rest of Batch B (a data
+generator, bulk loader, refresh functions, and power/throughput drivers are not yet built): the eight-table
+schema (`schema::ddl_statements`, foreign keys represented as plain columns, never enforced as engine
+constraints), all 22 published query texts with the specification's published validation-default parameters
+(`queries::query`, `params::fixed_parameters` — these document the published defaults, not the official
+parameter-generation-and-validation algorithm), and an exact-integer scale-factor helper
+(`scale_factor::scale_factor`) that parses decimal scale-factor text through `i128` rational arithmetic rather
+than `f64`, avoiding a demonstrated float-rounding pitfall. Two SQL binder features this kit's query texts
+need, and one conformance choice its query texts encode, are recorded together here since none was documented
+anywhere before this checkpoint (see `docs/LIMITATIONS.md`'s "Completed local MVP — TPC-H prerequisite
+additions" for the full test list):
+
+- **Derived-table and non-recursive-CTE column lists** (`(SELECT ...) AS t(a, b)`, `WITH t(a, b) AS (...)`):
+  both the derived-table path (`bind_table_factor_leaf`) and the CTE path (`bind_query_scoped`, in
+  `crates/htap-sql/src/binder_query.rs`) apply the column list's positional rename to the bound query's output
+  columns *before* calling `ensure_unique_output_names`, so a duplicate name the column list itself
+  introduces — not merely one already present in the underlying query — is caught, rather than silently
+  passing a stale, pre-rename uniqueness check. A column-list length that does not match the underlying
+  query's own output column count is a bind error naming both counts. `WITH RECURSIVE` already accepted a
+  column list before this checkpoint; the non-recursive path previously returned an explicit "not supported"
+  error.
+- **`DATE(string)` function form:** a new `ScalarFn::DateFromString` binds `DATE(expr)` through the same
+  `parse_date_to_timestamp_micros` helper the existing `DATE 'yyyy-mm-dd'` literal syntax already used, so
+  both forms produce bit-identical `Timestamp` values, share the same invalid-date error, and mix freely in
+  one query.
+- **Row-limiting mechanism (TPC-H Clause 2.1.2.9), a conformance choice, not a deviation:** queries 2, 3, 10,
+  18, and 21 carry a `LIMIT` (100, 10, 20, 100, 100 respectively) to satisfy the clause's "first N rows"
+  requirement, using the clause's own third permitted mechanism (row-limiting `SELECT` syntax) consistently
+  across all five queries that need it — see ADR-027 in `docs/DECISIONS.md`.
+
+`crates/htap-tpch/tests/correctness_fixture.rs` hand-derives expected row values (not just row counts) for
+queries 1, 2, 3, 4, and 6 against a small hand-authored fixture dataset (`crates/htap-tpch/tests/fixture.rs`),
+using an ordered/unordered multiset-comparison helper whose own tests prove it rejects a wrong multiset and
+accepts a permuted one. The remaining 17 queries are only proven to bind and execute without error
+(`crates/htap-tpch/src/queries.rs::queries::tests::test_all_22_queries_bind_and_execute`) — a materially
+weaker claim that does not check a single returned row. See `docs/PROGRESS.md`'s Phase 17 (continued) row for
+the full task-by-task test evidence, and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred
+features" for the disclosed gaps. A TPC-H compliance/deviations disclosure document remains a later Batch B
+deliverable and is not written yet.
+
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent *direct storage access* to a shared root remains unsupported — Phase 16 above adds only local, same-host IPC forwarding for a second process, not a second storage writer),
@@ -347,6 +406,7 @@ executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spilla
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), semi-join rewrites of IN/EXISTS, broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
+a TPC-H data generator, bulk loader, refresh functions, power/throughput test drivers, and compliance/deviations disclosure document (Batch B checkpoint 1 delivered only the schema/query-text/scale-factor/correctness-fixture foundation — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),

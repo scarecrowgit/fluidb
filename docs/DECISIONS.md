@@ -3839,10 +3839,13 @@ multiplication precision is the sum of the operand precisions (`lp + rp`, or `lp
 formulations); `SUM(amount_cents * 0.01)`, with `amount_cents` a `BIGINT` (modeled as 19 integer digits) and
 `0.01` binding as `DECIMAL(3,2)`, derives a 23-digit result and was rejected outright, even though every actual
 value fits comfortably in 18 digits — a `BIGINT` column holding cents does not actually contain 19-digit
-values in any realistic dataset. TPC-H's own money shape, `DECIMAL(15,2) * DECIMAL(15,2)`, derives 31 digits
-and fails the same way. Four of five A6a-2 checkpoint test failures traced to this one cause: worst-case
-precision derivation combined with an 18-digit bound cannot express the ordinary arithmetic this phase exists
-to support.
+values in any realistic dataset. The money-column shape our TPC-H kit uses, `DECIMAL(15,2) * DECIMAL(15,2)`,
+derives 31 digits and fails the same way — `(15,2)` is our own choice (a widely used convention that exceeds
+the spec's stated minimum), not something the TPC-H specification requires: Clause 1.3.1 defines its
+"Decimal" type only as a range of ±9,999,999,999.99 (a minimum of 12 total digits, 2 fractional), and Clause
+1.4's schema definition states no per-column precision or scale anywhere. Four of five A6a-2 checkpoint test
+failures traced to this one cause: worst-case precision derivation combined with an 18-digit bound cannot
+express the ordinary arithmetic this phase exists to support.
 
 ### Options considered
 
@@ -3889,6 +3892,12 @@ Two consequences of the derivation rules are worth naming explicitly here becaus
 
 - Ordinary, realistic decimal arithmetic (money math, TPC-H-shaped queries) is now expressible; a query is
   never rejected merely because a theoretical worst case exceeds the maximum.
+- This incidentally covers TPC-H's separate, wider "Big Decimal" notion (Clause 1.3.1), which exists because
+  an aggregate over millions of rows can exceed a base column's own range: `SUM`/`AVG` here are always clamped
+  to the 18-digit maximum regardless of the base column's declared precision, which comfortably holds a
+  `SUM(l_extendedprice)`-style aggregate at any scale factor this project's TPC-H kit will realistically run
+  (loading cost from fsynced commits becomes the practical ceiling long before an 18-digit aggregate would).
+  This is not a claim of exact correctness at scale factors nobody runs.
 - A derived type's declared precision can now be narrower than the textbook formula would give for an extreme
   operand combination (e.g. two `DECIMAL(18,0)` operands multiplied derive a *declared* `DECIMAL(18,0)`, not
   `DECIMAL(36,0)`), which is a real, disclosed narrowing of the type system's honesty about extreme cases — but
@@ -3914,3 +3923,118 @@ format dependency — so a reversal carries no migration and no format-version c
 `crates/htap-server/tests/decimal_avg_rounding.rs::test_decimal_avg_rounds_half_away_from_zero`. Cross-references:
 ADR-008's decimal addendum (the columnar persistence side of the same phase, a separate concern from this
 query-layer derivation decision).
+
+## ADR-027: TPC-H query-kit conformance choices — row-limiting `SELECT` syntax for Clause 2.1.2.9; exact rational scale-factor arithmetic
+
+`Status: Accepted`
+`Date: 2026-09-26`
+
+### Context
+
+Phase 17 Batch B checkpoint 1 adds `crates/htap-tpch`, a foundation crate carrying the TPC-H schema, all 22
+published query texts, and an exact-integer scale-factor helper. Two of that crate's choices are genuine,
+hard-to-reverse design decisions rather than incidental implementation details, so both are recorded here
+together rather than left to be reconstructed from the code later.
+
+**Row limiting.** Five of the 22 published queries (2, 3, 10, 18, 21) require that a given number of rows be
+returned — exactly the first N unless fewer than N qualify. TPC-H Clause 2.1.2.9 permits exactly three
+mechanisms for this, and requires that a test sponsor select one and use it consistently for every query that
+needs it: (1) vendor-specific control statements supported by the test sponsor's interactive SQL interface
+(the clause's own example: `SET ROWCOUNT n`); (2) control statements recognized by the implementation-specific
+layer (Clause 6.2.4) used to control a loop that fetches the rows (the clause's own example: `while rowcount <=
+n`); or (3) vendor-specific SQL syntax added to the `SELECT` statement itself (the clause's own example:
+`SELECT FIRST n`). Of mechanism 3 specifically, the clause states: "This syntax is not classified as a minor
+query modification since it completes the functional requirements of the functional query definition and
+there is no standardized syntax defined." — i.e. the specification itself treats the limiting mechanism as
+completing the query's own functional definition, not as an execution detail external to it, precisely because
+no standard SQL syntax for it exists.
+
+**Scale-factor arithmetic.** `scale_factor::scale_factor(text, multiplier)` converts a decimal scale-factor
+string and a per-table row-count multiplier into an exact row count. A workload kit's row counts need to be
+exactly reproducible for a given scale factor on every platform and every future run — a data generator built
+against this helper later in Batch B, and any correctness fixture sized against a specific scale factor, both
+depend on that determinism holding forever, not just today.
+
+### Options considered — row limiting
+
+1. **Mechanism 1: a vendor-specific interactive-SQL-interface control statement (e.g. `SET ROWCOUNT n`)
+   issued alongside an otherwise-unlimited query.** Rejected for this kit: it moves the row limit outside the
+   query text entirely, so a tool that only ever sees the SQL string this crate hands out (`queries::query`,
+   `EXPLAIN`, or a later disclosure report reproducing the query text) would show an unlimited query whose
+   result is actually limited by a side channel the tool never sees.
+2. **Mechanism 2: an implementation-specific fetch-loop control statement (e.g. `while rowcount <= n`, per
+   Clause 6.2.4).** Rejected for the same reason as (1): the limit lives in the caller driving the fetch loop,
+   not in the query text itself, so `queries::query`'s return value alone would not be the complete
+   specification of what actually runs.
+3. **Mechanism 3: vendor-specific SQL syntax added to the `SELECT` statement itself (the clause's own example:
+   `SELECT FIRST n`; this engine's own syntax is `LIMIT n`).** **Chosen.** The query text this crate returns is
+   already the complete, self-contained specification of what runs; a `LIMIT` clause keeps that true for the
+   five queries that need a row bound, matches what the clause itself says this mechanism is for (completing
+   the functional query definition, since no standard syntax exists), and is the one mechanism of the three
+   that this engine's SQL layer already supports natively, so no separate result-truncation code is needed in
+   any caller.
+
+### Decision — row limiting
+
+Mechanism 3, applied consistently to all five affected queries and only those five: `queries::query` returns
+query 2 with `limit 100`, query 3 with `limit 10`, query 10 with `limit 20`, query 18 with `limit 100`, and
+query 21 with `limit 100`. These row counts come from each query's own Functional Query Definition
+(Clause 2.4.N.2), not from that query's substitution-parameter defaults (Clause 2.4.N.4, a separate
+sub-clause) — the two are easy to conflate but are not the same provenance. No other query in the kit carries
+a `LIMIT` that Clause 2.1.2.9 did not ask for.
+
+### Options considered — scale-factor arithmetic
+
+1. **Parse the scale-factor text as `f64`, multiply by the multiplier, round.** Rejected: binary floating
+   point cannot exactly represent most decimal fractions, so a scale factor and multiplier that should produce
+   an exact integer can drift below or above it before rounding — demonstrated directly by `0.29 * 50` in
+   ordinary binary floating point, which lands on `14.499999999999998`, one representable step below the exact
+   decimal value `14.5` (`scale_factor::tests::test_scale_factor_exact_vs_float_discrimination`). A row-count
+   helper that can silently round a boundary case the wrong way is exactly the kind of drift a workload kit's
+   generator must not have.
+2. **Parse the scale-factor text into an exact rational number — an `i128` numerator over a power-of-ten
+   denominator — multiply and divide with `i128` intermediates, and round half-up in integer arithmetic.**
+   **Chosen.** The decimal text is finite by construction (it is not an arbitrary irrational value), so an
+   exact rational representation exists and every arithmetic step stays exact until the final, deliberate
+   half-up rounding to an integer row count — no intermediate step can introduce drift.
+
+### Decision — scale-factor arithmetic
+
+Option 2. `scale_factor::scale_factor` rejects non-finite/non-positive/malformed input and an `i128` overflow
+explicitly (`ScaleFactorError::{InvalidScaleFactor, Overflow}`) rather than wrapping or silently producing a
+wrong count, and clamps the minimum result to one row so a very small fractional scale factor still preserves
+a caller's structural invariants (e.g. a table that must have at least one row).
+
+### Consequences
+
+- The row-limiting choice commits every future consumer of this crate's query texts (a data generator's
+  expected-row-count checks, a disclosure report reproducing the query text, `EXPLAIN` output) to seeing the
+  `LIMIT` as part of the query, not as an invisible side channel — this is deliberate, per Clause 2.1.2.9's own
+  reasoning, and must stay consistent if a future query is added that also needs a row cap.
+- The scale-factor helper's row counts for a given scale factor and multiplier are now a permanent contract:
+  anything built against it later in Batch B (a data generator, a correctness fixture sized to a scale factor)
+  depends on today's exact counts continuing to hold.
+- Neither decision touches any on-disk format or durability invariant; both are query-text/bind-time-adjacent,
+  local to `crates/htap-tpch`.
+
+### How to reverse it
+
+Row limiting: replace the `limit n` clause in the affected `queries::query` match arms with plain `Some(query)`
+text and implement one of the other two Clause 2.1.2.9-permitted mechanisms at the caller instead (mechanism 1,
+a `SET ROWCOUNT`-style interactive-interface control statement, or mechanism 2, an implementation-specific
+fetch-loop row-count control per Clause 6.2.4), disclosing the switch as a deviation from the row-limiting
+syntax choice recorded here.
+Scale-factor arithmetic: replace `scale_factor::scale_factor`'s `i128` rational parse/round with an `f64`
+parse-multiply-round; no persisted state or on-disk format depends on it, so a reversal carries no migration,
+but every row count it has ever produced for a fractional scale factor could change.
+
+### Verification
+
+`crates/htap-tpch/src/queries.rs` (queries 2, 3, 10, 18, 21 carry `limit 100`/`10`/`20`/`100`/`100`
+respectively in their returned text; `queries::tests::test_all_22_queries_bind_and_execute` proves every
+query, `LIMIT` included, still binds and executes against the schema) and
+`crates/htap-tpch/src/scale_factor.rs::scale_factor::tests::{test_scale_factor_exact, test_scale_factor_fractional, test_scale_factor_rounding_boundary, test_scale_factor_floor, test_scale_factor_overflow, test_scale_factor_invalid_input, test_scale_factor_exact_vs_float_discrimination}`
+(7 tests). See `docs/PROGRESS.md`'s Phase 17 (continued) row and `docs/LIMITATIONS.md`'s "TPC-H workload kit
+scope and deferred features" for the surrounding contract; the TPC compliance/deviations disclosure document
+that will formally record the row-limiting choice as a stated (not violating) conformance path is a later
+Batch B deliverable and is not written yet.

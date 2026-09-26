@@ -121,6 +121,8 @@ pub enum ScalarFn {
     NullIf,
     /// `SUBSTRING(s, start[, length])`
     Substring,
+    /// `DATE(s)`
+    DateFromString,
     /// `EXTRACT(unit FROM timestamp)`
     Extract(CalendarIntervalUnit),
 }
@@ -1949,6 +1951,11 @@ fn eval_scalar_fn(func: ScalarFn, args: &[Expr], ctx: &EvalContext<'_>) -> Resul
                 Ok(Value::Int64(value))
             }
             other => Err(type_error("EXTRACT", other)),
+        },
+        ScalarFn::DateFromString => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::String(value) => Ok(Value::Timestamp(parse_date_to_timestamp_micros(value)?)),
+            other => Err(type_error("DATE", other)),
         },
         ScalarFn::Concat => {
             let mut out = String::new();

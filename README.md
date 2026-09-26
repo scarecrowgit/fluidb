@@ -49,7 +49,16 @@ components are **deliberately not implemented** and are out of scope for this lo
   kept as text and bound as a numeric literal (a `DECIMAL` result column also works over the wire, up to the
   engine's own 18-digit bound — no arbitrary-precision decimal wire type — see the bullet above); `TIME`-typed
   parameters are rejected. See "Prepared statements" below.
-- **No TPC-C or TPC-H compliance:** The system does not implement the TPC-C or TPC-H benchmark specifications, relational transaction models, or analytical query profiles. Microbenchmarks evaluate isolated internal subsystem performance only.
+- **No TPC-C compliance; TPC-H compliance not yet claimed (Phase 17 Batch A/B checkpoint 1, `in progress`):**
+  The system does not implement the TPC-C benchmark specification. A TPC-H-derived workload kit
+  (`crates/htap-tpch`) is under construction: the eight-table schema, all 22 published query texts with
+  validation-default parameters, an exact-integer scale-factor helper, and hand-derived correctness fixtures
+  for 5 of the 22 queries (the other 17 are proven only to bind and execute, not correct) are in place — see
+  `docs/PROGRESS.md`'s Phase 17 (continued) row and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and
+  deferred features". The data generator, bulk loader, refresh functions, and power/throughput test drivers
+  are not yet built, and no compliance, comparability, or benchmark-metric claim is made; a TPC compliance/
+  deviations disclosure document is a later deliverable and is not written yet. Microbenchmarks (see
+  `docs/BENCHMARKS.md`) still evaluate isolated internal subsystem performance only.
 - **No vectorized execution, and no worker-pool parallelism or memory-bounded spilling for outer joins:** The
   general query executor (see "Supported SQL Subset" below) handles joins (including arbitrarily nested join
   trees), window functions, correlated subqueries (one level deep only), recursive CTEs, `EXCEPT`/
@@ -437,7 +446,7 @@ numeric literal (no arbitrary-precision decimal type); `TIME`-typed parameters a
 
 ## Workspace Architecture
 
-The workspace consists of 14 modular crates (plus the vendored `vendor/sqlparser`) separated by architectural boundaries:
+The workspace consists of 15 modular crates (plus the vendored `vendor/sqlparser`) separated by architectural boundaries:
 
 | Crate | Role & Status |
 | ----- | ------------- |
@@ -451,6 +460,7 @@ The workspace consists of 14 modular crates (plus the vendored `vendor/sqlparser
 | `crates/htap-coord` | Local coordination and placement engine (`LocalCoordinator`, `HTAPCRD1` state envelope, monotonic fencing tokens, and deterministic placement planner). |
 | `crates/htap-sql` | SQL front-end using `sqlparser` (MySQL dialect): strict narrow catalog binder (typed `PointSelect`/`AnalyticSelect`), a general query binder (`query`/`expr`/`binder_query`: joins, expressions, subqueries, `UPDATE`/`DROP TABLE`/`SHOW`), and structural query router (`Route::RowstorePointRead`, `Route::OlapScan`, `Route::Query`, `Route::RowstoreUpdate`, `Route::CatalogRead`). |
 | `crates/htap-server` | Durable synchronous in-process engine façade (`LocalServer`) integrating catalog, rowstore, transactions, data movement, narrow analytical scan execution (`<root>/colstore`), and the general query executor (`query_exec`: joins, expressions, subqueries, `UNION`, `UPDATE`, `DROP TABLE`, `SHOW`). |
+| `crates/htap-tpch` | TPC-H-derived schema, query-text, and workload-parameter support crate (`in progress`, Phase 17 Batch A/B checkpoint 1): the eight-table schema DDL, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper, and hand-derived correctness fixtures for 5 of the 22 queries; the data generator, bulk loader, refresh functions, and power/throughput drivers remain to be built — see `docs/PROGRESS.md`'s Phase 17 (continued) row. |
 | `crates/htap-client` | Synchronous in-process embedded client (`EmbeddedClient`) and network client (`RemoteClient`) providing an ergonomic SQL execution interface over `LocalServer`, in-process or over TCP. |
 | `crates/htap-wire` | Hand-written, synchronous MySQL text- and binary-protocol server (`WireServer`) exposing `LocalServer` over TCP, including prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/`SEND_LONG_DATA`), `COM_RESET_CONNECTION`/`COM_CHANGE_USER`, and the `WireClient` used by `RemoteClient`. |
 | `crates/htapd` | Network daemon binary: opens a `LocalServer` root and serves it via `htap-wire::WireServer`. |
@@ -522,9 +532,10 @@ The SQL engine and embedded client execute an explicit, synchronous subset of SQ
   - Ordering/paging: `ORDER BY` expressions/aliases/ordinals with `ASC`/`DESC`/`NULLS FIRST`/`LAST`,
     `LIMIT`/`OFFSET` (incl. MySQL `LIMIT off, cnt`).
   - Composition: `UNION`/`UNION ALL`/`EXCEPT`/`INTERSECT` (`ALL`/`DISTINCT`) with numeric widening and
-    correct multiset semantics, derived tables, non-recursive and recursive (`WITH RECURSIVE`, one
-    self-referencing CTE, capped iterations/rows/bytes) CTEs, and uncorrelated/correlated scalar/`IN`/
-    `EXISTS` subqueries.
+    correct multiset semantics, derived tables (with an optional column list to rename output columns, e.g.
+    `(SELECT ...) AS t(a, b)`), non-recursive and recursive (`WITH RECURSIVE`, one self-referencing CTE,
+    capped iterations/rows/bytes) CTEs (both accepting an optional column list, e.g. `WITH t(a, b) AS (...)`),
+    and uncorrelated/correlated scalar/`IN`/`EXISTS` subqueries.
   - Cross-engine consistency: every base table side of a join is read through the same storage path as
     `Route::OlapScan` above, all at **one** MVCC snapshot per statement, so a join between a `Row` table and
     a converted `Column`/`Converting` table is consistent. Per-slot partition pruning and single-leaf
@@ -663,7 +674,7 @@ Direct `SegmentReader` pushdown optimization is implemented for the compact base
   merge/order are implemented locally; local disk spilling for the general query path is implemented as of
   Phase 14 — see below — distributed spill/fanout is not).
 - DataFusion and Apache Arrow integration.
-- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, and broader string/date/view functions beyond a narrow slice (`DATE`, `EXTRACT`/`INTERVAL` for `YEAR`/`MONTH`/`DAY` only, and three-argument `SUBSTRING` are supported as of the TPC-H prerequisite work — see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"; `DECIMAL` is supported end to end as of Phase 17 — see "Important Scope Exclusions" above and `docs/PROGRESS.md`'s Phase 17 row). (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
+- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, and broader string/date/view functions beyond a narrow slice (`DATE` — as both a `DATE 'yyyy-mm-dd'` literal and, as of Phase 17 Batch A/B checkpoint 1, a `DATE(string)` function form producing the identical value —, `EXTRACT`/`INTERVAL` for `YEAR`/`MONTH`/`DAY` only, and three-argument `SUBSTRING` are supported as of the TPC-H prerequisite work — see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"; `DECIMAL` is supported end to end as of Phase 17 — see "Important Scope Exclusions" above and `docs/PROGRESS.md`'s Phase 17 row). (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
 - **MySQL Partition DDL & Partition Lifecycle Boundary:**
   - Supported SQL partitioning: MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via vendored `sqlparser` and bound to validated catalog partition models.
   - Supported SQL lifecycle DDL: `ALTER TABLE <table> ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` for strict finite range and list forms and final `MAXVALUE` where supported, gated by empty-source rowstore checks before catalog mutation.
