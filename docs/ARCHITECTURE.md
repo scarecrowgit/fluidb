@@ -385,14 +385,31 @@ additions" for the full test list):
   across all five queries that need it — see ADR-027 in `docs/DECISIONS.md`.
 
 `crates/htap-tpch/tests/correctness_fixture.rs` hand-derives expected row values (not just row counts) for
-queries 1, 2, 3, 4, and 6 against a small hand-authored fixture dataset (`crates/htap-tpch/tests/fixture.rs`),
-using an ordered/unordered multiset-comparison helper whose own tests prove it rejects a wrong multiset and
-accepts a permuted one. The remaining 17 queries are only proven to bind and execute without error
+12 of the 22 queries. Queries 1, 2, 3, 4, and 6 (Batch B checkpoint 1) run against a small hand-authored
+fixture dataset (`crates/htap-tpch/tests/fixture.rs`), which is now frozen — task B5b, which adds queries 9,
+10, 11, 12, 13, 14, and 15, deliberately did not extend it, since `test_q1` sums every lineitem row inside its
+own date filter and would be perturbed by any added row, and only one of the six possible
+`l_returnflag`/`l_linestatus` pairs remained unused (TPC-H's return-flag domain has exactly three values, so
+there was no further slot). Instead, task B5b's data lives in a subdirectory test module,
+`crates/htap-tpch/tests/fixtures/` (`join.rs` for queries 9, 10, 11, 12, 14, and 15; `outer_join.rs` for query
+13's own customer/order dataset) — a subdirectory module compiles into the existing `correctness_fixture`
+test binary instead of a separate one, adding no new statically linked test binaries. All twelve queries use
+an ordered/unordered multiset-comparison helper whose own tests prove it rejects a wrong multiset and accepts
+a permuted one. Each of the seven new tests was built so that dropping any single clause of its query changes
+the result; `test_q13` additionally proves, for the first time with a correctness check rather than only a
+binding smoke test, that a `LEFT OUTER JOIN` whose `ON` clause carries a non-equality predicate alongside the
+equality predicate is evaluated correctly end to end (a customer whose only order fails that predicate is
+preserved with a null right side, and `COUNT` of a right-side column over that row yields zero); `test_q13`
+and `test_q15` are also the first real regression coverage against returned rows (not just bind/execute) for
+the derived-table and non-recursive-CTE column-list features described above. The remaining 10 queries (5, 7,
+8, and 16 through 22) are only proven to bind and execute without error
 (`crates/htap-tpch/src/queries.rs::queries::tests::test_all_22_queries_bind_and_execute`) — a materially
-weaker claim that does not check a single returned row. See `docs/PROGRESS.md`'s Phase 17 (continued) row for
-the full task-by-task test evidence, and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred
-features" for the disclosed gaps. A TPC-H compliance/deviations disclosure document remains a later Batch B
-deliverable and is not written yet.
+weaker claim that does not check a single returned row. All twelve hand-derived tests run against small
+hand-authored datasets at no particular scale factor: they are not evidence about performance, behavior at
+scale, or specification compliance. See `docs/PROGRESS.md`'s Phase 17 (continued) row for the full
+task-by-task test evidence, and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for
+the disclosed gaps. A TPC-H compliance/deviations disclosure document remains a later Batch B deliverable
+and is not written yet.
 
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,

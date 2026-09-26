@@ -49,12 +49,12 @@ components are **deliberately not implemented** and are out of scope for this lo
   kept as text and bound as a numeric literal (a `DECIMAL` result column also works over the wire, up to the
   engine's own 18-digit bound — no arbitrary-precision decimal wire type — see the bullet above); `TIME`-typed
   parameters are rejected. See "Prepared statements" below.
-- **No TPC-C compliance; TPC-H compliance not yet claimed (Phase 17 Batch A/B checkpoint 1, `in progress`):**
-  The system does not implement the TPC-C benchmark specification. A TPC-H-derived workload kit
-  (`crates/htap-tpch`) is under construction: the eight-table schema, all 22 published query texts with
+- **No TPC-C compliance; TPC-H compliance not yet claimed (Phase 17 Batch A/B checkpoint 1 + task B5b,
+  `in progress`):** The system does not implement the TPC-C benchmark specification. A TPC-H-derived workload
+  kit (`crates/htap-tpch`) is under construction: the eight-table schema, all 22 published query texts with
   validation-default parameters, an exact-integer scale-factor helper, and hand-derived correctness fixtures
-  for 5 of the 22 queries (the other 17 are proven only to bind and execute, not correct) are in place — see
-  `docs/PROGRESS.md`'s Phase 17 (continued) row and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and
+  for 12 of the 22 queries (5, 7, 8, and 16-22 are proven only to bind and execute, not correct) are in place —
+  see `docs/PROGRESS.md`'s Phase 17 (continued) row and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and
   deferred features". The data generator, bulk loader, refresh functions, and power/throughput test drivers
   are not yet built, and no compliance, comparability, or benchmark-metric claim is made; a TPC compliance/
   deviations disclosure document is a later deliverable and is not written yet. Microbenchmarks (see
@@ -460,7 +460,7 @@ The workspace consists of 15 modular crates (plus the vendored `vendor/sqlparser
 | `crates/htap-coord` | Local coordination and placement engine (`LocalCoordinator`, `HTAPCRD1` state envelope, monotonic fencing tokens, and deterministic placement planner). |
 | `crates/htap-sql` | SQL front-end using `sqlparser` (MySQL dialect): strict narrow catalog binder (typed `PointSelect`/`AnalyticSelect`), a general query binder (`query`/`expr`/`binder_query`: joins, expressions, subqueries, `UPDATE`/`DROP TABLE`/`SHOW`), and structural query router (`Route::RowstorePointRead`, `Route::OlapScan`, `Route::Query`, `Route::RowstoreUpdate`, `Route::CatalogRead`). |
 | `crates/htap-server` | Durable synchronous in-process engine façade (`LocalServer`) integrating catalog, rowstore, transactions, data movement, narrow analytical scan execution (`<root>/colstore`), and the general query executor (`query_exec`: joins, expressions, subqueries, `UNION`, `UPDATE`, `DROP TABLE`, `SHOW`). |
-| `crates/htap-tpch` | TPC-H-derived schema, query-text, and workload-parameter support crate (`in progress`, Phase 17 Batch A/B checkpoint 1): the eight-table schema DDL, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper, and hand-derived correctness fixtures for 5 of the 22 queries; the data generator, bulk loader, refresh functions, and power/throughput drivers remain to be built — see `docs/PROGRESS.md`'s Phase 17 (continued) row. |
+| `crates/htap-tpch` | TPC-H-derived schema, query-text, and workload-parameter support crate (`in progress`, Phase 17 Batch A/B checkpoint 1 + task B5b): the eight-table schema DDL, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper, and hand-derived correctness fixtures for 12 of the 22 queries; the data generator, bulk loader, refresh functions, and power/throughput drivers remain to be built — see `docs/PROGRESS.md`'s Phase 17 (continued) row. |
 | `crates/htap-client` | Synchronous in-process embedded client (`EmbeddedClient`) and network client (`RemoteClient`) providing an ergonomic SQL execution interface over `LocalServer`, in-process or over TCP. |
 | `crates/htap-wire` | Hand-written, synchronous MySQL text- and binary-protocol server (`WireServer`) exposing `LocalServer` over TCP, including prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/`SEND_LONG_DATA`), `COM_RESET_CONNECTION`/`COM_CHANGE_USER`, and the `WireClient` used by `RemoteClient`. |
 | `crates/htapd` | Network daemon binary: opens a `LocalServer` root and serves it via `htap-wire::WireServer`. |

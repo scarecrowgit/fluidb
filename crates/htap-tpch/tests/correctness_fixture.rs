@@ -1,4 +1,5 @@
 mod fixture;
+mod fixtures;
 
 use htap_common::types::{parse_date_to_timestamp_micros, Value};
 use htap_sql::result::StatementResult;
@@ -191,6 +192,222 @@ fn test_q4() {
 
     fixture::compare_results(&actual, expected, true)
         .expect("Q4 result matches hand-derived result");
+}
+
+#[test]
+fn test_q13() {
+    let server = fixtures::outer_join::load_fixture();
+    let sql = htap_tpch::query(13, "1").expect("TPC-H query exists");
+
+    let actual = match server.execute(&sql).expect("execute TPC-H query") {
+        StatementResult::Query(result) => result,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    // Customer 1 has two orders, customer 2 has one, customer 3 has none,
+    // customer 4 has one order excluded by the ON clause but is preserved by the
+    // left join, and customer 5 has two orders with one excluded. The ON-clause
+    // exclusion prevents matching "special ... requests" orders without removing
+    // their customers. The tie at custdist 2 for c_count values 1 and 0 proves
+    // the secondary sort orders the tied distributions by c_count descending.
+    let expected: &[Vec<Value>] = &[
+        vec![Value::Int64(1), Value::Int64(2)],
+        vec![Value::Int64(0), Value::Int64(2)],
+        vec![Value::Int64(2), Value::Int64(1)],
+    ];
+
+    fixture::compare_results(&actual, expected, true)
+        .expect("Q13 result matches outer-join fixture result");
+}
+
+#[test]
+fn test_q11() {
+    let server = fixtures::join::load_fixture();
+    let sql = htap_tpch::query(11, "1").expect("TPC-H query exists");
+
+    let actual = match server.execute(&sql).expect("execute TPC-H query") {
+        StatementResult::Query(result) => result,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    // The German parts have values 100000.00 (part 100), 80000.00 (part 101),
+    // and 1.00 (part 102). Their total is 180001.00, so the scalar subquery's
+    // 0.01% threshold is approximately 18.0001: parts 100 and 101 pass it,
+    // while part 102 fails.
+    //
+    // The large French decoy, supplier 3's part 103, has value 800000000.00
+    // (ps_supplycost 10000.00 * ps_availqty 80000). It proves that the nation
+    // filter is applied both in the outer query and inside the scalar subquery.
+    // If the outer filter alone were missing, part 103 would appear in the outer
+    // output and change the result. If the subquery filter alone were missing,
+    // the total would become 800180001.00 and the threshold approximately
+    // 80018.00; part 101, with value 80000.00, would drop out, leaving only
+    // part 100 rather than the correct output of parts 100 and 101.
+    let expected: &[Vec<Value>] = &[
+        vec![Value::Int64(100), decimal(10_000_000, 18, 2)],
+        vec![Value::Int64(101), decimal(8_000_000, 18, 2)],
+    ];
+
+    fixture::compare_results(&actual, expected, true)
+        .expect("Q11 result matches join fixture result");
+}
+
+#[test]
+fn test_q12() {
+    let server = fixtures::join::load_fixture();
+    let sql = htap_tpch::query(12, "1").expect("TPC-H query exists");
+
+    let actual = match server.execute(&sql).expect("execute TPC-H query") {
+        StatementResult::Query(result) => result,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    let expected: &[Vec<Value>] = &[
+        vec![
+            Value::String("MAIL".into()),
+            Value::Int64(2),
+            Value::Int64(0),
+        ],
+        vec![
+            Value::String("SHIP".into()),
+            Value::Int64(0),
+            Value::Int64(1),
+        ],
+    ];
+
+    fixture::compare_results(&actual, expected, true)
+        .expect("Q12 result matches join fixture result");
+}
+
+#[test]
+fn test_q9() {
+    let server = fixtures::join::load_fixture();
+    let sql = htap_tpch::query(9, "1").expect("TPC-H query exists");
+
+    let actual = match server.execute(&sql).expect("execute TPC-H query") {
+        StatementResult::Query(result) => result,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    // Hand-derived from green part 301 only. For FRANCE in 1995, the two lines
+    // from supplier 3 contribute 100.00 * (1 - 0.00) - 10.00 * 1.00 = 90.0000
+    // and 200.00 * (1 - 0.00) - 10.00 * 1.00 = 190.0000, totaling 280.0000.
+    // FRANCE in 1994 contributes 50.00 - 10.00 = 40.0000; its order date
+    // determines the extracted year even though its lineitem dates are in 1995
+    // to keep it outside Q12's receipt-date range. ITALY in 1995 uses supplier
+    // 4's distinct 20.00 cost, contributing 100.00 - 20.00 = 80.0000.
+    // The 999.00 line for non-green part 302 is excluded by the part-name filter.
+    // Within FRANCE, 1995 precedes 1994 because the query orders years descending.
+    let expected: &[Vec<Value>] = &[
+        vec![
+            Value::String("FRANCE".into()),
+            Value::Int64(1995),
+            decimal(2_800_000, 18, 4),
+        ],
+        vec![
+            Value::String("FRANCE".into()),
+            Value::Int64(1994),
+            decimal(400_000, 18, 4),
+        ],
+        vec![
+            Value::String("ITALY".into()),
+            Value::Int64(1995),
+            decimal(800_000, 18, 4),
+        ],
+    ];
+
+    fixture::compare_results(&actual, expected, true)
+        .expect("Q9 result matches join fixture result");
+}
+
+#[test]
+fn test_q10() {
+    let server = fixtures::join::load_fixture();
+    let sql = htap_tpch::query(10, "1").expect("TPC-H query exists");
+
+    let actual = match server.execute(&sql).expect("execute TPC-H query") {
+        StatementResult::Query(result) => result,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    let expected: &[Vec<Value>] = &[
+        vec![
+            Value::Int64(102),
+            Value::String("Customer France".into()),
+            decimal(3_800_000, 18, 4),
+            decimal(200_000, 15, 2),
+            Value::String("FRANCE".into()),
+            Value::String("Address 102".into()),
+            Value::String("31-102-000-0000".into()),
+            Value::String("customer".into()),
+        ],
+        vec![
+            Value::Int64(101),
+            Value::String("Customer Germany".into()),
+            decimal(3_300_000, 18, 4),
+            decimal(100_000, 15, 2),
+            Value::String("GERMANY".into()),
+            Value::String("Address 101".into()),
+            Value::String("13-101-000-0000".into()),
+            Value::String("customer".into()),
+        ],
+    ];
+
+    fixture::compare_results(&actual, expected, true)
+        .expect("Q10 result matches join fixture result");
+}
+
+#[test]
+fn test_q14() {
+    let server = fixtures::join::load_fixture();
+    let sql = htap_tpch::query(14, "1").expect("TPC-H query exists");
+
+    let actual = match server.execute(&sql).expect("execute TPC-H query") {
+        StatementResult::Query(result) => result,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    let expected: &[Vec<Value>] = &[vec![decimal(500_000_000_000, 18, 10)]];
+
+    fixture::compare_results(&actual, expected, true)
+        .expect("Q14 result matches join fixture result");
+}
+
+#[test]
+fn test_q15() {
+    let server = fixtures::join::load_fixture();
+    let sql = htap_tpch::query(15, "1").expect("TPC-H query exists");
+
+    let actual = match server.execute(&sql).expect("execute TPC-H query") {
+        StatementResult::Query(result) => result,
+        other => panic!("expected query result, got {other:?}"),
+    };
+
+    // Hand-derived over shipments in [1996-01-01, 1996-04-01). Supplier 10 has
+    // one line worth 1000.00 * (1 - 0.00) = 1000.0000. Supplier 11 has two
+    // lines worth 600.00 * (1 - 0.00) = 600.0000 and 500.00 * (1 - 0.20) =
+    // 400.0000, also totaling 1000.0000. Supplier 12 totals only 900.0000;
+    // its 99999.00 line ships exactly on 1996-04-01 and is excluded. Both
+    // suppliers tied at the maximum must survive, ordered by supplier key.
+    let expected: &[Vec<Value>] = &[
+        vec![
+            Value::Int64(10),
+            Value::String("Q15 Single Line Supplier".into()),
+            Value::String("Address 10".into()),
+            Value::String("33-010-000-0000".into()),
+            decimal(10_000_000, 18, 4),
+        ],
+        vec![
+            Value::Int64(11),
+            Value::String("Q15 Multi Line Supplier".into()),
+            Value::String("Address 11".into()),
+            Value::String("39-011-000-0000".into()),
+            decimal(10_000_000, 18, 4),
+        ],
+    ];
+
+    fixture::compare_results(&actual, expected, true)
+        .expect("Q15 result matches join fixture result");
 }
 
 #[test]
