@@ -1,11 +1,10 @@
-mod fixture;
 mod fixtures;
 
 use htap_common::types::{parse_date_to_timestamp_micros, Value};
 use htap_sql::result::StatementResult;
 
 fn execute_query(query_number: u8) -> htap_sql::QueryResult {
-    let server = fixture::load_fixture();
+    let (_directory, server) = fixtures::correctness::load_fixture();
     let sql = htap_tpch::query(query_number, "1").expect("TPC-H query exists");
 
     match server.execute(&sql).expect("execute TPC-H query") {
@@ -24,6 +23,164 @@ fn decimal(value: i64, precision: u8, scale: u8) -> Value {
 
 fn date(value: &str) -> Value {
     Value::Timestamp(parse_date_to_timestamp_micros(value).expect("valid fixture date"))
+}
+
+fn values_match(actual: &Value, expected: &Value) -> bool {
+    match (actual, expected) {
+        (
+            Value::Decimal {
+                value: actual_value,
+                precision: actual_precision,
+                scale: actual_scale,
+            },
+            Value::Decimal {
+                value: expected_value,
+                precision: expected_precision,
+                scale: expected_scale,
+            },
+        ) => {
+            actual_value == expected_value
+                && actual_precision == expected_precision
+                && actual_scale == expected_scale
+        }
+        _ => actual == expected,
+    }
+}
+
+fn rows_match(actual: &htap_common::types::Row, expected: &[Value]) -> anyhow::Result<()> {
+    if actual.len() != expected.len() {
+        anyhow::bail!(
+            "column count mismatch: expected {}, got {}",
+            expected.len(),
+            actual.len()
+        );
+    }
+
+    for (column_index, (actual_value, expected_value)) in
+        actual.values().iter().zip(expected).enumerate()
+    {
+        match (actual_value, expected_value) {
+            (
+                Value::Decimal {
+                    value: actual_value,
+                    precision: actual_precision,
+                    scale: actual_scale,
+                },
+                Value::Decimal {
+                    value: expected_value,
+                    precision: expected_precision,
+                    scale: expected_scale,
+                },
+            ) if actual_value != expected_value
+                || actual_precision != expected_precision
+                || actual_scale != expected_scale =>
+            {
+                anyhow::bail!(
+                    "column {column_index} decimal mismatch: expected value {expected_value} \
+                     with DECIMAL({expected_precision},{expected_scale}), got value \
+                     {actual_value} with DECIMAL({actual_precision},{actual_scale})"
+                );
+            }
+            _ if !values_match(actual_value, expected_value) => {
+                anyhow::bail!(
+                    "column {column_index} mismatch: expected {expected_value:?}, got {actual_value:?}"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn compare_results(
+    actual: &htap_sql::QueryResult,
+    expected: &[Vec<Value>],
+    ordered: bool,
+) -> anyhow::Result<()> {
+    let expected_column_count = expected
+        .first()
+        .map(Vec::len)
+        .unwrap_or_else(|| actual.columns.len());
+
+    if actual.columns.len() != expected_column_count {
+        anyhow::bail!(
+            "result column count mismatch: expected {}, got {}",
+            expected_column_count,
+            actual.columns.len()
+        );
+    }
+
+    for (row_index, expected_row) in expected.iter().enumerate() {
+        if expected_row.len() != expected_column_count {
+            anyhow::bail!(
+                "expected row {row_index} has {} columns; expected {expected_column_count}",
+                expected_row.len()
+            );
+        }
+    }
+
+    for (row_index, actual_row) in actual.rows.iter().enumerate() {
+        if actual_row.len() != actual.columns.len() {
+            anyhow::bail!(
+                "actual row {row_index} has {} columns; result declares {}",
+                actual_row.len(),
+                actual.columns.len()
+            );
+        }
+    }
+
+    if actual.rows.len() != expected.len() {
+        anyhow::bail!(
+            "row count mismatch: expected {}, got {}",
+            expected.len(),
+            actual.rows.len()
+        );
+    }
+
+    if ordered {
+        for (row_index, (actual_row, expected_row)) in actual.rows.iter().zip(expected).enumerate()
+        {
+            rows_match(actual_row, expected_row)
+                .map_err(|error| anyhow::anyhow!("ordered row {row_index} mismatch: {error}"))?;
+        }
+    } else {
+        let mut matched = vec![false; expected.len()];
+
+        for (actual_index, actual_row) in actual.rows.iter().enumerate() {
+            let mut mismatch_details = Vec::new();
+            let mut matching_index = None;
+
+            for (expected_index, expected_row) in expected.iter().enumerate() {
+                if matched[expected_index] {
+                    continue;
+                }
+
+                match rows_match(actual_row, expected_row) {
+                    Ok(()) => {
+                        matching_index = Some(expected_index);
+                        break;
+                    }
+                    Err(error) => {
+                        mismatch_details.push(format!("expected row {expected_index}: {error}"))
+                    }
+                }
+            }
+
+            let Some(expected_index) = matching_index else {
+                anyhow::bail!(
+                    "actual row {actual_index} does not match any remaining expected row: {}; \
+                     actual values: {:?}",
+                    mismatch_details.join("; "),
+                    actual_row.values()
+                );
+            };
+
+            matched[expected_index] = true;
+        }
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -101,8 +258,7 @@ fn test_q1() {
         ],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q1 result matches hand-derived result");
+    compare_results(&actual, expected, true).expect("Q1 result matches hand-derived result");
 }
 
 #[test]
@@ -147,8 +303,7 @@ fn test_q2() {
         ],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q2 result matches hand-derived result");
+    compare_results(&actual, expected, true).expect("Q2 result matches hand-derived result");
 }
 
 #[test]
@@ -175,8 +330,7 @@ fn test_q3() {
         ],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q3 result matches hand-derived result");
+    compare_results(&actual, expected, true).expect("Q3 result matches hand-derived result");
 }
 
 #[test]
@@ -190,13 +344,12 @@ fn test_q4() {
     // remain empty groups; it has no ties, outer joins, or NULL aggregates.
     let expected: &[Vec<Value>] = &[vec![Value::String("1-URGENT".into()), Value::Int64(1)]];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q4 result matches hand-derived result");
+    compare_results(&actual, expected, true).expect("Q4 result matches hand-derived result");
 }
 
 #[test]
 fn test_q13() {
-    let server = fixtures::outer_join::load_fixture();
+    let (_directory, server) = fixtures::outer_join::load_fixture();
     let sql = htap_tpch::query(13, "1").expect("TPC-H query exists");
 
     let actual = match server.execute(&sql).expect("execute TPC-H query") {
@@ -216,13 +369,12 @@ fn test_q13() {
         vec![Value::Int64(2), Value::Int64(1)],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q13 result matches outer-join fixture result");
+    compare_results(&actual, expected, true).expect("Q13 result matches outer-join fixture result");
 }
 
 #[test]
 fn test_q11() {
-    let server = fixtures::join::load_fixture();
+    let (_directory, server) = fixtures::join::load_fixture();
     let sql = htap_tpch::query(11, "1").expect("TPC-H query exists");
 
     let actual = match server.execute(&sql).expect("execute TPC-H query") {
@@ -248,13 +400,12 @@ fn test_q11() {
         vec![Value::Int64(101), decimal(8_000_000, 18, 2)],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q11 result matches join fixture result");
+    compare_results(&actual, expected, true).expect("Q11 result matches join fixture result");
 }
 
 #[test]
 fn test_q12() {
-    let server = fixtures::join::load_fixture();
+    let (_directory, server) = fixtures::join::load_fixture();
     let sql = htap_tpch::query(12, "1").expect("TPC-H query exists");
 
     let actual = match server.execute(&sql).expect("execute TPC-H query") {
@@ -275,13 +426,12 @@ fn test_q12() {
         ],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q12 result matches join fixture result");
+    compare_results(&actual, expected, true).expect("Q12 result matches join fixture result");
 }
 
 #[test]
 fn test_q9() {
-    let server = fixtures::join::load_fixture();
+    let (_directory, server) = fixtures::join::load_fixture();
     let sql = htap_tpch::query(9, "1").expect("TPC-H query exists");
 
     let actual = match server.execute(&sql).expect("execute TPC-H query") {
@@ -316,13 +466,12 @@ fn test_q9() {
         ],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q9 result matches join fixture result");
+    compare_results(&actual, expected, true).expect("Q9 result matches join fixture result");
 }
 
 #[test]
 fn test_q10() {
-    let server = fixtures::join::load_fixture();
+    let (_directory, server) = fixtures::join::load_fixture();
     let sql = htap_tpch::query(10, "1").expect("TPC-H query exists");
 
     let actual = match server.execute(&sql).expect("execute TPC-H query") {
@@ -353,13 +502,12 @@ fn test_q10() {
         ],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q10 result matches join fixture result");
+    compare_results(&actual, expected, true).expect("Q10 result matches join fixture result");
 }
 
 #[test]
 fn test_q14() {
-    let server = fixtures::join::load_fixture();
+    let (_directory, server) = fixtures::join::load_fixture();
     let sql = htap_tpch::query(14, "1").expect("TPC-H query exists");
 
     let actual = match server.execute(&sql).expect("execute TPC-H query") {
@@ -369,13 +517,12 @@ fn test_q14() {
 
     let expected: &[Vec<Value>] = &[vec![decimal(500_000_000_000, 18, 10)]];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q14 result matches join fixture result");
+    compare_results(&actual, expected, true).expect("Q14 result matches join fixture result");
 }
 
 #[test]
 fn test_q15() {
-    let server = fixtures::join::load_fixture();
+    let (_directory, server) = fixtures::join::load_fixture();
     let sql = htap_tpch::query(15, "1").expect("TPC-H query exists");
 
     let actual = match server.execute(&sql).expect("execute TPC-H query") {
@@ -406,13 +553,12 @@ fn test_q15() {
         ],
     ];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q15 result matches join fixture result");
+    compare_results(&actual, expected, true).expect("Q15 result matches join fixture result");
 }
 
 #[test]
 fn test_multiset_validation() {
-    let server = fixture::load_fixture();
+    let (_directory, server) = fixtures::correctness::load_fixture();
     let sql = "SELECT r_regionkey FROM region WHERE r_regionkey IN (0, 1) ORDER BY r_regionkey";
 
     let actual = match server.execute(sql).expect("execute region query") {
@@ -423,7 +569,7 @@ fn test_multiset_validation() {
     let expected: &[Vec<Value>] = &[vec![Value::Int64(0)], vec![Value::Int64(0)]];
 
     assert!(
-        fixture::compare_results(&actual, expected, false).is_err(),
+        compare_results(&actual, expected, false).is_err(),
         "unordered comparison must reject a wrong multiset"
     );
 }
@@ -452,13 +598,12 @@ fn test_q6() {
     // used to cover is no longer covered here, so nobody assumes it is.
     let expected: &[Vec<Value>] = &[vec![decimal(1_200_000, 18, 4)]];
 
-    fixture::compare_results(&actual, expected, true)
-        .expect("Q6 result matches hand-derived result");
+    compare_results(&actual, expected, true).expect("Q6 result matches hand-derived result");
 }
 
 #[test]
 fn test_multiset_validation_accepts_permuted_rows() {
-    let server = fixture::load_fixture();
+    let (_directory, server) = fixtures::correctness::load_fixture();
     let sql = "SELECT r_regionkey FROM region WHERE r_regionkey IN (0, 1) ORDER BY r_regionkey";
 
     let actual = match server.execute(sql).expect("execute region query") {
@@ -468,7 +613,7 @@ fn test_multiset_validation_accepts_permuted_rows() {
 
     let expected: &[Vec<Value>] = &[vec![Value::Int64(1)], vec![Value::Int64(0)]];
 
-    fixture::compare_results(&actual, expected, false)
+    compare_results(&actual, expected, false)
         .expect("unordered comparison accepts the same rows in a different order");
 }
 
@@ -478,7 +623,7 @@ fn test_multiset_validation_rejects_decimal_precision_mismatch() {
     let expected: &[Vec<Value>] = &[vec![decimal(1_200_000, 17, 4)]];
 
     assert!(
-        fixture::compare_results(&actual, expected, false).is_err(),
+        compare_results(&actual, expected, false).is_err(),
         "unordered comparison must reject a decimal with different precision"
     );
 }

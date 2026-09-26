@@ -3,10 +3,9 @@ use std::sync::Arc;
 use htap_server::LocalServer;
 use tempfile::TempDir;
 
-pub fn load_fixture() -> Arc<LocalServer> {
+pub fn load_fixture() -> (TempDir, Arc<LocalServer>) {
     let directory = TempDir::new().expect("create temporary fixture directory");
-    let path = directory.keep();
-    let server = Arc::new(LocalServer::open(&path).expect("open fixture server"));
+    let server = Arc::new(LocalServer::open(directory.path()).expect("open fixture server"));
 
     for ddl in htap_tpch::schema::ddl_statements() {
         server.execute(ddl).expect("create fixture table");
@@ -35,5 +34,5 @@ pub fn load_fixture() -> Arc<LocalServer> {
         )
         .expect("insert orders");
 
-    server
+    (directory, server)
 }

@@ -1,14 +1,11 @@
 use std::sync::Arc;
 
-use anyhow::bail;
-use htap_common::types::Value;
 use htap_server::LocalServer;
 use tempfile::TempDir;
 
-pub fn load_fixture() -> Arc<LocalServer> {
+pub fn load_fixture() -> (TempDir, Arc<LocalServer>) {
     let directory = TempDir::new().expect("create temporary fixture directory");
-    let path = directory.keep();
-    let server = Arc::new(LocalServer::open(&path).expect("open fixture server"));
+    let server = Arc::new(LocalServer::open(directory.path()).expect("open fixture server"));
 
     for ddl in htap_tpch::schema::ddl_statements() {
         server.execute(ddl).expect("create fixture table");
@@ -175,141 +172,5 @@ pub fn load_fixture() -> Arc<LocalServer> {
         )
         .expect("insert line items");
 
-    server
-}
-
-fn values_match(actual: &Value, expected: &Value) -> bool {
-    match (actual, expected) {
-        (
-            Value::Decimal {
-                value: actual_value,
-                precision: actual_precision,
-                scale: actual_scale,
-            },
-            Value::Decimal {
-                value: expected_value,
-                precision: expected_precision,
-                scale: expected_scale,
-            },
-        ) => {
-            actual_value == expected_value
-                && actual_precision == expected_precision
-                && actual_scale == expected_scale
-        }
-        _ => actual == expected,
-    }
-}
-
-fn rows_match(actual: &htap_common::types::Row, expected: &[Value]) -> bool {
-    actual.values().len() == expected.len()
-        && actual
-            .values()
-            .iter()
-            .zip(expected)
-            .all(|(actual_value, expected_value)| values_match(actual_value, expected_value))
-}
-
-#[allow(dead_code)]
-pub fn compare_results(
-    actual: &htap_sql::QueryResult,
-    expected: &[Vec<Value>],
-    ordered: bool,
-) -> anyhow::Result<()> {
-    if actual.rows.len() != expected.len() {
-        bail!(
-            "row count mismatch: actual {}, expected {}",
-            actual.rows.len(),
-            expected.len()
-        );
-    }
-
-    if let Some(expected_row) = expected.first() {
-        if actual.columns.len() != expected_row.len() {
-            bail!(
-                "column count mismatch: actual {}, expected {}",
-                actual.columns.len(),
-                expected_row.len()
-            );
-        }
-    }
-
-    if !ordered {
-        let mut matched_actual_rows = vec![false; actual.rows.len()];
-
-        for (expected_row_index, expected_row) in expected.iter().enumerate() {
-            let matching_actual_row =
-                actual
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .find_map(|(actual_row_index, actual_row)| {
-                        (!matched_actual_rows[actual_row_index]
-                            && rows_match(actual_row, expected_row))
-                        .then_some(actual_row_index)
-                    });
-
-            let Some(actual_row_index) = matching_actual_row else {
-                bail!("no matching actual row found for expected row {expected_row_index}");
-            };
-
-            matched_actual_rows[actual_row_index] = true;
-        }
-
-        return Ok(());
-    }
-
-    for (row_index, expected_row) in expected.iter().enumerate() {
-        let actual_row = actual
-            .rows
-            .get(row_index)
-            .ok_or_else(|| anyhow::anyhow!("missing row {row_index}"))?;
-
-        if rows_match(actual_row, expected_row) {
-            continue;
-        }
-
-        for (column_index, expected_value) in expected_row.iter().enumerate() {
-            let actual_value = actual_row
-                .get(column_index)
-                .ok_or_else(|| anyhow::anyhow!("missing row {row_index}, column {column_index}"))?;
-
-            match (actual_value, expected_value) {
-                (
-                    Value::Decimal {
-                        value: actual_decimal_value,
-                        precision: actual_precision,
-                        scale: actual_scale,
-                    },
-                    Value::Decimal {
-                        value: expected_decimal_value,
-                        precision: expected_precision,
-                        scale: expected_scale,
-                    },
-                ) if !values_match(actual_value, expected_value) => {
-                    bail!(
-                        "decimal mismatch at row {row_index}, column {column_index}: \
-                         actual value={}, precision={}, scale={}; \
-                         expected value={}, precision={}, scale={}",
-                        actual_decimal_value,
-                        actual_precision,
-                        actual_scale,
-                        expected_decimal_value,
-                        expected_precision,
-                        expected_scale
-                    );
-                }
-                _ if !values_match(actual_value, expected_value) => {
-                    bail!(
-                        "value mismatch at row {row_index}, column {column_index}: \
-                         actual {actual_value:?}, expected {expected_value:?}"
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        bail!("row mismatch at row {row_index}");
-    }
-
-    Ok(())
+    (directory, server)
 }
