@@ -1491,14 +1491,16 @@ The Phase 6 implementation delivers local coordination, leadership fencing, dete
 
 ---
 
-## TPC-H workload kit scope and deferred features (Phase 17, Batch A / Batch B checkpoint 1 + task B5b)
+## TPC-H workload kit scope and deferred features (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c)
 
 **Status: `in progress`.** A new crate, `crates/htap-tpch`, is the foundation for a TPC-H-derived workload
 kit; Batch A (SQL/movement prerequisites — see "Completed local MVP — TPC-H prerequisite additions" above)
-is complete, Batch B checkpoint 1 plus task B5b deliver the schema/query-text/scale-factor/correctness-fixture
-layer below, and the rest of Batch B (a data generator, bulk loader, refresh functions, and power/throughput test
+is complete, Batch B checkpoint 1 plus tasks B5b and B5c deliver the schema/query-text/scale-factor/
+correctness-fixture layer below — now with hand-derived correctness coverage for all 22 published queries —
+and the rest of Batch B (a data generator, bulk loader, refresh functions, and power/throughput test
 drivers) is not yet built. See `docs/ARCHITECTURE.md`'s "TPC-H workload kit foundations (Phase 17, Batch A /
 Batch B checkpoint 1)", `docs/PROGRESS.md`'s Phase 17 (continued) row, and ADR-027 in `docs/DECISIONS.md`.
+No new ADR was needed for task B5c: it is test-only, with no format, protocol, or semantics change.
 
 ### Completed
 
@@ -1532,39 +1534,93 @@ Batch B checkpoint 1)", `docs/PROGRESS.md`'s Phase 17 (continued) row, and ADR-0
   21 carry `LIMIT 100`/`10`/`20`/`100`/`100` respectively (row counts from each query's own Functional Query
   Definition, Clause 2.4.N.2), using the clause's third permitted mechanism — vendor-specific `SELECT`-statement
   syntax, as opposed to an interactive-interface control statement or an implementation-specific fetch-loop
-  control — consistently across all five queries that need it — see ADR-027.
-- **Correctness fixtures, 12 of 22 queries validated (Batch B checkpoint 1 covered 5; task B5b adds 7 more):**
-  a small hand-authored dataset (`crates/htap-tpch/tests/fixture.rs`) plus an ordered/unordered
+  control — consistently across all five queries that need it — see ADR-027. The truncation mechanism itself
+  (not just its bind/parse) is now covered by a dedicated suite over a synthetic table,
+  `crates/htap-server/tests/limit_truncation.rs` (`limit_returns_only_the_requested_number_of_rows`,
+  `limit_applies_after_ordering`, `limit_larger_than_result_returns_all_rows`, `limit_zero_returns_no_rows`,
+  `limit_with_offset_skips_rows_before_truncating`), including one assertion of *which* rows survive an ordered
+  limit, not merely how many — see "Explicitly not claimed" below for what this does and does not close.
+- **Correctness fixtures, all 22 of 22 queries validated (Batch B checkpoint 1 covered 5; task B5b added 7 more;
+  task B5c covers the remaining 10):** a small hand-authored dataset (`crates/htap-tpch/tests/fixture.rs`,
+  since relocated to `crates/htap-tpch/tests/fixtures/correctness.rs` — see below) plus an ordered/unordered
   multiset-comparison helper (`compare_results`, itself covered by `test_multiset_validation`,
   `test_multiset_validation_accepts_permuted_rows`, `test_multiset_validation_rejects_decimal_precision_mismatch`)
   back hand-derived expected row values (not just row counts) for queries 1, 2, 3, 4, and 6
-  (`crates/htap-tpch/tests/correctness_fixture.rs::{test_q1, test_q2, test_q3, test_q4, test_q6}`). `fixture.rs`
-  is now frozen: `test_q1` sums every lineitem row inside its own date filter and would be perturbed by an
-  added row, and only one of the six possible `l_returnflag`/`l_linestatus` pairs remained unused (TPC-H's
-  return-flag domain has exactly three values, so there was no further slot). Task B5b's data for queries 9,
-  10, 11, 12, 13, 14, and 15 instead lives in a subdirectory test module, `crates/htap-tpch/tests/fixtures/`
+  (`crates/htap-tpch/tests/correctness_fixture.rs::{test_q1, test_q2, test_q3, test_q4, test_q6}`). That
+  original fixture is frozen: `test_q1` sums every lineitem row inside its own date filter and would be
+  perturbed by an added row, and only one of the six possible `l_returnflag`/`l_linestatus` pairs remained
+  unused (TPC-H's return-flag domain has exactly three values, so there was no further slot). Task B5b's data
+  for queries 9, 10, 11, 12, 13, 14, and 15 lives in a subdirectory test module, `crates/htap-tpch/tests/fixtures/`
   (`join.rs`, shared by queries 9, 10, 11, 12, 14, and 15; `outer_join.rs`, a distinct customer/order dataset
   for query 13) — a subdirectory module compiles into the existing `correctness_fixture` test binary rather
   than a new one, which matters because this project has hit disk exhaustion from the number of statically
-  linked test binaries before. `crates/htap-tpch/tests/correctness_fixture.rs::{test_q9, test_q10, test_q11,
-  test_q12, test_q13, test_q14, test_q15}` assert hand-derived expected row values for those seven queries,
-  each built so that dropping any single clause of its query changes the result. `test_q13` additionally
-  proves, for the first time with a correctness check, that a `LEFT OUTER JOIN` whose `ON` clause carries a
-  non-equality predicate alongside the equality predicate is evaluated correctly end to end (a customer whose
-  only order fails the predicate is preserved with a null right side; `COUNT` of a right-side column over that
-  row yields zero); `test_q13` and `test_q15` are also the first real regression coverage against returned
-  rows for the derived-table and non-recursive-CTE column-list features respectively — see "Completed local
-  MVP — TPC-H prerequisite additions" above.
+  linked test binaries before. A follow-up test-only pass unified the fixture layout (the original top-level
+  `fixture.rs` moved into the same subdirectory module, as `fixtures/correctness.rs`, so it no longer built as
+  its own empty test binary), stopped every fixture loader from leaking its temporary directory (the loader
+  now hands the `TempDir` guard back to the caller instead of suppressing its cleanup), and de-duplicated the
+  `compare_results` comparison helper that the move had briefly left in two copies. `crates/htap-tpch/tests/correctness_fixture.rs::{test_q9,
+  test_q10, test_q11, test_q12, test_q13, test_q14, test_q15}` assert hand-derived expected row values for
+  those seven queries, each built so that dropping any single clause of its query changes the result.
+  `test_q13` additionally proves, for the first time with a correctness check, that a `LEFT OUTER JOIN` whose
+  `ON` clause carries a non-equality predicate alongside the equality predicate is evaluated correctly end to
+  end (a customer whose only order fails the predicate is preserved with a null right side; `COUNT` of a
+  right-side column over that row yields zero); `test_q13` and `test_q15` are also the first real regression
+  coverage against returned rows for the derived-table and non-recursive-CTE column-list features
+  respectively — see "Completed local MVP — TPC-H prerequisite additions" above.
+
+  **Task B5c closes out the remaining 10 queries (5, 7, 8, and 16 through 22) plus one extra test, 11 new
+  tests in total:** `test_q5`, `test_q7`, `test_q8`, `test_q16`, `test_q17`,
+  `test_q17_zero_qualifying_rows_is_null`, `test_q18`, `test_q19`, `test_q20`, `test_q21`, `test_q22`. Five new
+  fixture submodules under `crates/htap-tpch/tests/fixtures/` each build their own dataset on their own server:
+  `nation_region` (queries 5, 7, and 8, which share a nation/region shape), `anti_join` (16 and 21, which share
+  a supplier/comment anti-join shape), `quantity_threshold` (17 and 18), `part_predicates` (19 and 20), and
+  `customer_avg` (22). The split is deliberate, not incidental: each fixture opens its own server, so a row
+  collision is only possible within one file, never across them; and the plan that scoped this task found a
+  concrete case where reusing an existing dataset would have silently corrupted an expectation — an existing
+  row already satisfied query 7's nation-pair shape inside its date window purely by coincidence, which a
+  shared dataset would have hidden as a false pass.
+
+  Every one of the 11 tests is built to the same standard as the earlier fixtures: removing any single clause
+  of its query changes the result, and each test's comment states the actual output rows that result from
+  removing each clause — the thing that makes the test evidence rather than decoration. Building fixtures to
+  that standard required correcting several during implementation, where an initial decoy could not actually
+  have changed the output: a decoy shadowed by a sibling row that already qualified on its own, a decoy that
+  failed a different predicate than the one it was meant to target, and a filter whose removal moved an
+  intermediate value without moving any output row.
+
+  **Three capability facts task B5c establishes, none previously known:**
+  - An aggregate over an empty input returns `NULL`, not zero, verified end to end by
+    `test_q17_zero_qualifying_rows_is_null`. This restores the coverage the kit lost when `test_q6` changed
+    from asserting an empty-group `NULL` sum to asserting a computed one (`test_q6`'s own comment records that
+    loss, and it went undocumented here at the time).
+  - An `EXISTS` and a `NOT EXISTS` condition over the same table aliased twice, with an inequality between the
+    aliases in both, behaves correctly — `test_q21`. This was an open question before this task, not a
+    previously-known-good behavior.
+  - A three-way bracketed disjunction with a conjunct repeated in each bracket behaves correctly —
+    `test_q19`. All twenty-four of that query's individual predicates are separately covered, including each
+    bracket's own copy of the repeated conjunct, which is not redundant to test: removing one bracket's copy
+    while leaving the other two yields a strictly more permissive query with a different, larger result.
+
+  **Two decimal-derivation facts worth reading together, so as not to be conflated:** query 8's market share
+  derives to 18 digits with 8 fractional digits, while query 14's promotional-revenue share derives to 18
+  digits with 10 (`decimal(50_000_000, 18, 8)`/`decimal(100_000_000, 18, 8)` for query 8 vs.
+  `decimal(500_000_000_000, 18, 10)` for query 14, both in `correctness_fixture.rs`). They look like the same
+  shape — a ratio of two money sums — but query 14 multiplies by a literal before dividing, which raises the
+  dividend's scale first, whereas query 8 divides two plain sums directly. See "Derived `DECIMAL` precision and
+  scale rules" in `docs/ARCHITECTURE.md` for the general rule these two results follow.
 
 ### Explicitly not claimed
 
-- **10 queries (5, 7, 8, and 16-22) are not correctness-validated.** They are only proven to bind and execute
-  without error against the schema at scale factor 1
-  (`crates/htap-tpch/src/queries.rs::queries::tests::test_all_22_queries_bind_and_execute`) — a materially
-  weaker claim than the hand-derived fixtures above: it does not check a single returned row.
-- **The 12 hand-derived fixtures are not scale, performance, or specification-compliance evidence.** Each runs
+- **The 22 hand-derived fixtures are not scale, performance, or specification-compliance evidence.** Each runs
   against a small hand-authored dataset at no particular scale factor, built only so that dropping any single
   clause of its query changes the result.
+- **TPC-H fixtures still never reach their queries' `LIMIT` clauses.** In every hand-derived fixture the result
+  set is far smaller than the limit on the five queries that carry one, so deleting the `LIMIT` clause from any
+  of them would not change the result. The truncation mechanism itself is no longer untested, though: a
+  separate, non-TPC-H suite over a synthetic table now covers it directly — see the row-limiting bullet above.
+- **An aggregate over a group mixing null and non-null inputs remains unreachable from this kit.** No column in
+  the TPC-H schema is nullable, and none of the 22 queries produces a null through an outer join or a
+  conditional expression, so this case has no path to a test here.
 - **No data generator, bulk loader, refresh functions, or power/throughput drivers yet.** Checkpoint 1 is
   schema, query text, parameters, and a scale-factor helper only; there is no TPC-H-conformant dataset
   generator, no bulk load path exercised against this schema beyond the hand-authored fixture rows above, and
@@ -1615,7 +1671,7 @@ Batch B checkpoint 1)", `docs/PROGRESS.md`'s Phase 17 (continued) row, and ADR-0
 | Phase 15 — DROP reclaim, rowstore compaction/GC, journal checkpoint | `Complete (local MVP)` | Built contiguous-run, entry-count-tiered `Engine::compact_once` (`crates/htap-rowstore/src/engine.rs`) splicing its output into the selected run's original manifest position — fixing an initial-draft prepend bug a storage-review panel found that could resurrect a stale value behind a tombstone (pinned by `crates/htap-rowstore/tests/compaction_ordering.rs`); a rowstore `MANIFEST` format bump (`HTAPMAN1` v2 -> v3) adding `committed_version_high_water`/`gc_low_water`, both monotonic, refusing to publish a regression, with a hard read-rejection below `gc_low_water`; an exclusive `Engine::open` lock on `<rowstore>/LOCK`; a per-tablet movement/reclaim lease set in `LocalDataMover` (all-or-nothing for `DROP TABLE`'s forced set, best-effort/partial for the ordinary tiered pass); catalog `pending_reclaim` (`HTAPCAT1` v4 -> v5) driving `DROP TABLE` column-store/movement artifact deletion (including that tablet's movement job records) and rowstore purge confirmation to completion across ticks; and `TransactionManager::checkpoint()` (a new `HTAPTXC1` journal-checkpoint envelope) compacting `txn.journal`, triggered opportunistically after commits and finalized once at `LocalServer::open`, latching `RecoveryRequired` unconditionally on any rewrite-step error. See ADR-024, `docs/PROGRESS.md`'s Phase 15 row, and "Rowstore compaction, garbage collection, and DROP TABLE reclaim scope and deferred features" / "Transaction journal checkpoint scope and deferred features" above for the full contract. Deferred/disclosed: shared-keyspace protection is per SST not per row (a busy tablet blocks every SST that spans it); the explicit-SST-id compaction path compacts only one contiguous run per call; compaction is explicit-tick-only with no background thread or SQL trigger; tombstones are never elided; movement/reclaim leases are intentionally non-durable (a stated precondition, not a gap, given today's non-resumable movement jobs); `ALTER TABLE ... DROP/REORGANIZE PARTITION` reclamation remains untouched; the `MANIFEST` v2 external-apply ledger's own hard cap is untouched and unrelated to the journal checkpoint; and delete vectors / delta-to-base columnar background compaction remain deferred, unchanged. |
 | Phase 16 — Owner plus IPC (concurrent multiprocess use) | `Complete (local MVP)` | Built owner/client forwarding so a second local process opening an already-owned root becomes an IPC client instead of failing outright, over a length-prefixed JSON protocol on a Unix domain socket at `<root>/htap.sock` (mode `0600`, Unix-only; a locked root on a non-Unix target still returns the ordinary `Conflict`, unchanged). Fixed `docs/PROBLEMS.md` P3 (the server's two independent statement pipelines each ran the privilege check) with a shared `prepare_statement` step. Added a new `HtapError::Ambiguous` variant, distinct from `Conflict` (safe to retry) and `DurablePending` (has load-bearing txn identity), for an IPC request that may or may not have reached the owner; a client-side write-boundary rule classifies a failure as `Ambiguous` unless zero request bytes were sent or the request is one of the two statically-read-only kinds. A `Session` gained two new terminal states mirroring the existing `DurablePending` quarantine: `AmbiguousOutcomePending` (re-raises the stored `Ambiguous` error on every later call, including `reset`) and `RemoteDisconnected` (a confirmed-dead connection; re-raises `Conflict`); neither is ever exited by silent reconnection. An explicit ownership graph (`OwnedServer`, `ServerMode`, `OwnerRuntime`) replaces `LocalServer`'s single struct so the IPC listener can mint owner-side sessions directly from the storage core without needing the caller's own `Arc` wrapper, and `OwnerRuntime`'s hand-written `Drop` joins the listener (stop flag, force-close every live connection, unbounded join of the accept and connection threads) before its own storage-core handle drops, guaranteeing the socket is gone before `<root>/LOCK` is released. A bound statement forwards as a serialized AST (the vendored parser's own `serde` feature, turned on additively in two package manifests, not a vendored-source change) rather than re-rendered SQL text, avoiding a lossy round trip for already-substituted binary/non-finite-float literals; the plain-text execute/query path is unaffected. A first storage/external-review round (batch D) found and fixed 12 of 13 defects the passing suite had missed, the clearest a completely broken prepared-statement path for every client-mode session and process panics on roughly 30 owner-only methods for a client-mode handle; a second storage re-review (batch E) found and fixed 8 more, including a socket creation-window that would have granted an unauthenticated local user a superuser session, and a second client-mode `open_session`/`authenticate_session` panic path that batch D's own "panics are fixed" claim had missed. A third storage re-review (batch F) found and fixed 7 more: two of the batch D/E fixes above had shipped with tests that could not have caught a regression (the socket-permission fix's own test reimplemented publication instead of calling the real startup path; the no-panic fix had no test at all), and replacing the first of those with a real test immediately exposed a leak the review had only partly identified — the private staging directory used to publish the socket was never removed on a successful start, not only after a crash. Batch F also fixed a post-dispatch response-serialization failure misreported as bad input instead of an unknown outcome, a failed write that left a connection looking reusable after bytes had already reached the owner, an owner-gone login misreported as bad credentials, and a handshake read that failed spuriously on an interrupted system call. See ADR-025 (including its "Post-review fixes (batch D)", "Post-review fixes (batch E)", and "Post-review fixes (batch F)" sections), `docs/PROGRESS.md`'s Phase 16 row, and "Owner plus IPC (Phase 16) scope and deferred features" above for the full contract. Deferred/disclosed: a socket path too long for a Unix socket, or a non-socket file at that path, falls back to the pre-existing lock-only mode; the wire format is tied to the build's AST shape (a version-skewed pair fails cleanly at decode, no schema-compatibility scheme); changing users on a client session is unsupported; a client-mode handle's `last_query_*` diagnostic getters report fixed defaults, not the owner's real state; administrative/data-mover/conversion/compaction/reclaim operations remain owner-only; standalone subsystem opens bypassing `LocalServer` remain unsafe for concurrent use, unchanged. |
 | Phase 17 — `DECIMAL` type: query layer and persistence (A6a + A6b, all five tasks) | `Complete (local MVP)` | Added `DataType::Decimal { precision, scale }` / `Value::Decimal` (a fixed-point value: signed 64-bit unscaled integer, maximum 18 digits, exact round-half-away-from-zero arithmetic, a declared-precision check on every value) across the query layer (A6a: literals, `CAST`, arithmetic, comparisons, ordering/hashing, `SUM`/`AVG`/`MIN`/`MAX`/`COUNT(DISTINCT)` grouped and windowed, on both the row and columnar execution paths) and persistence (A6b, all five tasks: `CREATE TABLE`/`INSERT`/literal coercion; the columnar segment format, `HTAPCOL1` v1 -> v2, including real decimal pushdown filtering; the composite-key codec; the rowstore memtable's size estimator; catalog recovery; the movement crate's CSV/JSON-lines codec; and the MySQL wire protocol's `NEWDECIMAL` result/binary-row encoding). ADR-026 (Amendment 4) clamps a derived arithmetic/aggregate *result* precision to the 18-digit maximum rather than rejecting the query outright — matching MySQL's own behavior for an over-wide derived decimal — while a *value* that overflows its own declared precision is still always a hard error, never silently truncated, wrapped, or turned into a float. See ADR-008's decimal addendum (the `HTAPCOL1` format bump) and ADR-026, `docs/ARCHITECTURE.md`'s "Derived `DECIMAL` precision and scale rules", and `docs/PROGRESS.md`'s Phase 17 row for the full task-by-task test evidence. Bounded at the engine's own 18-digit maximum everywhere, including the wire protocol — not arbitrary precision. Disclosed: bulk CSV/JSON-lines import rounds a value with more fractional digits than the column's declared scale half-away-from-zero (matching ordinary `INSERT`/`UPDATE` assignment) rather than rejecting it, and a decimal is a JSON string, not a JSON number, in JSON-lines — see `docs/OPERATIONS.md` section 2 and "`DECIMAL` type (Phase 17) scope and deferred features" above. |
-| Phase 17 (continued) — TPC-H workload kit: prerequisites (Batch A) and query-kit foundations (Batch B checkpoint 1 + task B5b) | `In progress` | Batch A (complete): movement's timestamp text import now accepts calendar date/datetime text as well as raw microseconds; regression tests pinned the exact TPC-H correlated-subquery and doubly-referenced-CTE query shapes the kit needs against pre-existing support, no code change required; reproduced specification query text carries the TPC copyright/permission notice. Batch B checkpoint 1 (new `crates/htap-tpch` crate, in progress): eight-table schema, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper. Three previously-undocumented SQL binder features this kit depends on: derived-table column lists, non-recursive-CTE column lists, and the `DATE(string)` function form. Task B5b adds hand-derived correctness fixtures for 7 more queries (9, 10, 11, 12, 13, 14, 15), bringing validated coverage to 12 of 22 (5, 7, 8, and 16-22 remain bind/execute-only); the new data lives in a subdirectory test module (`crates/htap-tpch/tests/fixtures/`) rather than extending the checkpoint-1 fixture, so as not to perturb `test_q1`'s complete-result-set assertion, and so it compiles into the existing test binary rather than a new one. `test_q13` is the first correctness check (not just bind/execute) that a `LEFT OUTER JOIN` with a non-equality `ON` predicate alongside the equality predicate is evaluated correctly, and `test_q13`/`test_q15` are the first regression coverage against returned rows for the derived-table and non-recursive-CTE column-list features respectively. See "TPC-H workload kit scope and deferred features" and "General query executor scope and deferred features" above, `docs/PROGRESS.md`'s Phase 17 (continued) row, and ADR-027. Not yet built: the data generator, bulk loader, refresh functions, power/throughput drivers, and the TPC compliance/deviations disclosure document. |
+| Phase 17 (continued) — TPC-H workload kit: prerequisites (Batch A), query-kit foundations (Batch B checkpoint 1), and full correctness-fixture coverage (tasks B5b-B5c) | `In progress` | Batch A (complete): movement's timestamp text import now accepts calendar date/datetime text as well as raw microseconds; regression tests pinned the exact TPC-H correlated-subquery and doubly-referenced-CTE query shapes the kit needs against pre-existing support, no code change required; reproduced specification query text carries the TPC copyright/permission notice. Batch B checkpoint 1 (new `crates/htap-tpch` crate, in progress): eight-table schema, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper. Three previously-undocumented SQL binder features this kit depends on: derived-table column lists, non-recursive-CTE column lists, and the `DATE(string)` function form. Task B5b added hand-derived correctness fixtures for 7 more queries (9, 10, 11, 12, 13, 14, 15), bringing validated coverage to 12 of 22; the new data lives in a subdirectory test module (`crates/htap-tpch/tests/fixtures/`) rather than extending the checkpoint-1 fixture, so as not to perturb `test_q1`'s complete-result-set assertion, and so it compiles into the existing test binary rather than a new one. `test_q13` is the first correctness check (not just bind/execute) that a `LEFT OUTER JOIN` with a non-equality `ON` predicate alongside the equality predicate is evaluated correctly, and `test_q13`/`test_q15` are the first regression coverage against returned rows for the derived-table and non-recursive-CTE column-list features respectively. A test-only follow-up stopped every fixture loader from leaking its temporary directory, unified the fixture layout (the original top-level `fixture.rs` moved into `fixtures/correctness.rs`), de-duplicated the `compare_results` helper, and added the first coverage of row-limit truncation itself, over a synthetic table (`crates/htap-server/tests/limit_truncation.rs`). Task B5c then closed the remaining 10 queries (5, 7, 8, and 16-22) plus one extra test — 11 new tests across five new fixture submodules (`nation_region`, `anti_join`, `quantity_threshold`, `part_predicates`, `customer_avg`), each on its own server — bringing correctness-validated coverage to all 22 of 22, and newly establishing that an aggregate over an empty input returns `NULL` (`test_q17_zero_qualifying_rows_is_null`), that an `EXISTS`/`NOT EXISTS` pair over a doubly-aliased table with an inequality behaves correctly (`test_q21`), and that a three-way bracketed disjunction with a conjunct repeated in each bracket behaves correctly (`test_q19`). See "TPC-H workload kit scope and deferred features" and "General query executor scope and deferred features" above, `docs/PROGRESS.md`'s Phase 17 (continued) row, and ADR-027 (no new ADR for B5c or the follow-up: both are test-only). Not yet built: the data generator, bulk loader, refresh functions, power/throughput drivers, and the TPC compliance/deviations disclosure document. |
 
 ---
 
