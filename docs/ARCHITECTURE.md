@@ -337,7 +337,7 @@ defined in `crates/htap-common/src/types.rs`:
   `test_decimal_comparisons_below_representable_range`,
   `test_decimal_comparisons_at_representable_boundary`).
 
-### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c)
+### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2)
 
 **Status: `in progress`.** Phase 17 continues past A6a/A6b (`DECIMAL`, above) into a TPC-H-derived workload
 kit. Batch A (complete) closed three prerequisites the kit depends on, with no on-disk format change: movement's
@@ -354,10 +354,11 @@ needed no code change either, verified by `test_all_22_queries_bind_and_execute`
 smaller scale, `test_cte_referenced_twice_with_column_list`; and reproduced specification query text now
 carries the TPC copyright/permission notice.
 
-Batch B checkpoint 1 adds a new crate, `crates/htap-tpch` — the foundation for the rest of Batch B (a data
-generator, bulk loader, refresh functions, and power/throughput drivers are not yet built): the eight-table
-schema (`schema::ddl_statements`, foreign keys represented as plain columns, never enforced as engine
-constraints), all 22 published query texts with the specification's published validation-default parameters
+Batch B checkpoint 1 adds a new crate, `crates/htap-tpch` — the foundation for the rest of Batch B (a bulk
+loader, refresh functions, an independent oracle, and power/throughput drivers are not yet built; task B2
+below adds the data generator): the eight-table schema (`schema::ddl_statements`, foreign keys represented as
+plain columns, never enforced as engine constraints), all 22 published query texts with the specification's
+published validation-default parameters
 (`queries::query`, `params::fixed_parameters` — these document the published defaults, not the official
 parameter-generation-and-validation algorithm), and an exact-integer scale-factor helper
 (`scale_factor::scale_factor`) that parses decimal scale-factor text through `i128` rational arithmetic rather
@@ -420,6 +421,40 @@ for the full task-by-task test evidence, and `docs/LIMITATIONS.md`'s "TPC-H work
 features" for the disclosed gaps. A TPC-H compliance/deviations disclosure document remains a later Batch B
 deliverable and is not written yet.
 
+Task B2 adds a new module, `crates/htap-tpch/src/generate`, the first Batch B task to add production code
+rather than tests — `generate::generate(scale_factor, seed) -> Result<Dataset, ScaleFactorError>` produces
+all eight TPC-H tables as typed Rust structs, deterministically from a scale factor and seed
+(`generate::tests::generation_is_deterministic`, `generate::lineitem::tests::whole_dataset_is_deterministic`),
+never as CSV text and never through a call into any engine crate, since it commits to neither the eventual
+bulk loader's (B3) nor the independent oracle's (B6) serialization. Because the specification names no
+random-number algorithm at all for row data (only Clause 2.1.3.3's query-substitution-parameter seeding is
+spec-governed), matching another implementation's actual sequence is not spec-derivable and would require
+that implementation's source, which this project's no-copied-code rule forbids; the generator instead uses a
+hand-rolled splitmix64 with two independently seeded sub-streams, one structural and one for text
+(`generate::rng::RandomState`), so an edit to text generation cannot reshuffle every downstream key and date
+draw, and unbiased rejection sampling for bounded draws. It reproduces the specification verbatim for the
+REGION/NATION tables (carrying the TPC copyright/permission notice), every row-count formula, the structured
+domain lists, the referential-integrity modulo formulas, phone-number country prefixes, the
+divisible-by-three customer exclusion, the sparse order-key scheme, and the date-offset chain, while using
+original text for comment/address vocabulary (the specification's own comment-grammar word lists ship in the
+TPC-H Tools distribution under stricter terms than the specification document itself, and no query filters on
+that vocabulary). Orders are generated as incomplete shells (`orders::OrderShell`, omitting `O_TOTALPRICE`/
+`O_ORDERSTATUS`) and only finalized once their lineitems exist, since the total sums the order's own lineitems
+and the status depends on all of their line statuses
+(`generate::lineitem::tests::sample_order_totals_and_statuses_recompute`). Two additions are disclosed as the
+generator's own rather than specification fidelity — a Query 13 O_COMMENT forced two-word phrase (Clause
+4.2.3 gives O_COMMENT only a length range, and the words Query 13 filters on appear solely as
+query-parameter candidates) and the O_TOTALPRICE rounding convention (`i128` accumulation, rounded half-up
+once per order, since the specification gives the formula without fixed-point mechanics) — and one
+specification quirk is recorded without reconciling it: the Mode domain's `REG AIR` versus Query 19's
+published `AIR REG` predicate, which the specification itself acknowledges names a non-existing mode. See
+`docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for the full disclosure, including
+why no ADR was opened for this task (pure in-memory generation, no on-disk format, wire protocol, or
+engine-crate durability path touched). The generator's 28 tests establish invariants — exact counts,
+exhaustive referential closure, domain membership, date bounds, forced-cohort sizing and independence, and
+whole-dataset determinism — not expected values; it is not an audited TPC-H implementation, and its output is
+not comparable to any published TPC-H result.
+
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent *direct storage access* to a shared root remains unsupported — Phase 16 above adds only local, same-host IPC forwarding for a second process, not a second storage writer),
@@ -432,7 +467,7 @@ executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spilla
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), semi-join rewrites of IN/EXISTS, broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
-a TPC-H data generator, bulk loader, refresh functions, power/throughput test drivers, and compliance/deviations disclosure document (Batch B checkpoint 1 delivered only the schema/query-text/scale-factor/correctness-fixture foundation — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
+a TPC-H bulk loader, refresh functions, independent oracle, power/throughput test drivers, and compliance/deviations disclosure document (task B2 added a from-specification row generator; the schema/query-text/scale-factor/correctness-fixture/row-generator foundation is otherwise all Batch B has delivered so far — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),
