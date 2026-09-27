@@ -8,6 +8,8 @@ pub enum ScaleFactorError {
     InvalidScaleFactor,
     /// The scaled count cannot be represented as an unsigned 64-bit integer.
     Overflow,
+    /// The scale factor produces duplicate supplier keys for a PARTSUPP part.
+    DuplicatePartsuppSupplierKeys,
 }
 
 impl fmt::Display for ScaleFactorError {
@@ -20,6 +22,10 @@ impl fmt::Display for ScaleFactorError {
                 )
             }
             Self::Overflow => write!(formatter, "scaled row count exceeds u64"),
+            Self::DuplicatePartsuppSupplierKeys => write!(
+                formatter,
+                "scale factor produces duplicate PARTSUPP supplier keys for a part"
+            ),
         }
     }
 }

@@ -727,6 +727,7 @@ name = "htap-tpch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "csv",
  "htap-catalog",
  "htap-common",
  "htap-movement",

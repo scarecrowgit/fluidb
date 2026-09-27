@@ -337,7 +337,7 @@ defined in `crates/htap-common/src/types.rs`:
   `test_decimal_comparisons_below_representable_range`,
   `test_decimal_comparisons_at_representable_boundary`).
 
-### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2)
+### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3)
 
 **Status: `in progress`.** Phase 17 continues past A6a/A6b (`DECIMAL`, above) into a TPC-H-derived workload
 kit. Batch A (complete) closed three prerequisites the kit depends on, with no on-disk format change: movement's
@@ -354,9 +354,10 @@ needed no code change either, verified by `test_all_22_queries_bind_and_execute`
 smaller scale, `test_cte_referenced_twice_with_column_list`; and reproduced specification query text now
 carries the TPC copyright/permission notice.
 
-Batch B checkpoint 1 adds a new crate, `crates/htap-tpch` — the foundation for the rest of Batch B (a bulk
-loader, refresh functions, an independent oracle, and power/throughput drivers are not yet built; task B2
-below adds the data generator): the eight-table schema (`schema::ddl_statements`, foreign keys represented as
+Batch B checkpoint 1 adds a new crate, `crates/htap-tpch` — the foundation for the rest of Batch B (at this
+checkpoint, a bulk loader, refresh functions, an independent oracle, and power/throughput drivers all still
+remained to be built; task B2 below adds the data generator, and task B3 further below adds the bulk loader):
+the eight-table schema (`schema::ddl_statements`, foreign keys represented as
 plain columns, never enforced as engine constraints), all 22 published query texts with the specification's
 published validation-default parameters
 (`queries::query`, `params::fixed_parameters` — these document the published defaults, not the official
@@ -455,6 +456,33 @@ exhaustive referential closure, domain membership, date bounds, forced-cohort si
 whole-dataset determinism — not expected values; it is not an audited TPC-H implementation, and its output is
 not comparable to any published TPC-H result.
 
+Task B3 adds a bulk loader, `load_dataset` (`crates/htap-tpch/src/load.rs`), streaming a generated `Dataset`
+into a fresh database table by table through the existing `LocalServer::copy_from_csv_reader` movement path —
+no new import mechanism — via a pull-based `Read` implementation (`CsvRowsReader`) that encodes rows on demand
+and never materializes more than about 64 KiB of CSV text at once, so peak memory does not scale with table
+size. It refuses to load into a database where any TPC-H table already exists, before issuing any DDL
+(`crates/htap-tpch/tests/load.rs::second_load_rejection`), then checks every table's returned `CopyReport`
+against the dataset's own row count. `row_counts_copy_reports_and_round_trip_values` loads a full SF 0.01
+dataset and round-trips sample decimal, `l_quantity`, and date/timestamp values back out through SQL. Building
+this loader also found a generator gap task B2's own SF-0.01-only tests had not caught: Clause 4.2.3's
+`PS_SUPPKEY` formula gives some scale factors (SF 0.001, for 40 of its 200 parts) a part with a repeated
+supplier, which `generate::generate` now rejects as `ScaleFactorError::DuplicatePartsuppSupplierKeys` rather
+than silently generating a `PARTSUPP` row an upsert-based loader would drop; SF 0.01, 0.1, and 1 are
+unaffected. A release-mode SF 0.01 load-then-run-all-22-queries pass (`all_22_queries`, ignored by default)
+gives the first query-executor performance measurement at any TPC-H scale: load takes about 7.8 seconds, and
+16 of the 22 queries return in under 1.2 seconds, but Query 4 and Query 21 exceed a 120-second timeout, Query
+19 takes about 61 seconds, Query 17 about 22, Query 20 about 20, and Query 22 about 9.7 — all six depend on a
+correlated `EXISTS`/scalar subquery re-run per outer row (the semi-join rewrite of `IN`/`EXISTS` already listed
+deferred below), and Query 19 additionally nests its join equality inside an `OR`. This changes no query's
+result — all 22 stay correctness-validated at hand-authored fixture scale above — only how long six of them
+take once a dataset is large enough for the per-row cost to matter; see `docs/LIMITATIONS.md`'s matching
+section for the full disclosure, including that batches commit independently (no whole-table rollback), a
+retry after dropping and recreating the TPC-H tables fails loudly with a movement-job `Conflict` rather than
+reloading cleanly, the post-load `CopyReport` check counts attempted upserts rather than distinct stored rows
+(so primary-key collisions are instead covered by the generator's own key-uniqueness tests), and CSV quoting
+is proven only by a synthetic unit test. No new ADR: this task reuses the existing movement CSV import path
+unchanged, with no on-disk format, wire protocol, or durability-path change.
+
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent *direct storage access* to a shared root remains unsupported — Phase 16 above adds only local, same-host IPC forwarding for a second process, not a second storage writer),
@@ -467,7 +495,7 @@ executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spilla
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), semi-join rewrites of IN/EXISTS, broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
-a TPC-H bulk loader, refresh functions, independent oracle, power/throughput test drivers, and compliance/deviations disclosure document (task B2 added a from-specification row generator; the schema/query-text/scale-factor/correctness-fixture/row-generator foundation is otherwise all Batch B has delivered so far — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
+TPC-H refresh functions, an independent oracle, power/throughput test drivers, and a compliance/deviations disclosure document (task B2 added a from-specification row generator and task B3 a bulk loader; the schema/query-text/scale-factor/correctness-fixture/row-generator/bulk-loader foundation is otherwise all Batch B has delivered so far — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),

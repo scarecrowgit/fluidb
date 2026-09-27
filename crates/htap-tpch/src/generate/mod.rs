@@ -138,6 +138,22 @@ pub(super) fn supplier_key(partkey: u64, supplier_offset: u64, supplier_count: u
         + 1
 }
 
+fn partsupp_supplier_keys_are_distinct(part_count: u64, supplier_count: u64) -> bool {
+    for partkey in 1..=part_count {
+        let mut supplier_keys = [0; 4];
+
+        for supplier_offset in 0..4 {
+            let supplier_key = supplier_key(partkey, supplier_offset, supplier_count);
+            if supplier_keys[..supplier_offset as usize].contains(&supplier_key) {
+                return false;
+            }
+            supplier_keys[supplier_offset as usize] = supplier_key;
+        }
+    }
+
+    true
+}
+
 /// Generates a deterministic TPC-H dataset for `scale_factor` and `seed`.
 pub fn generate(scale_factor_text: &str, seed: u64) -> Result<Dataset, ScaleFactorError> {
     // This order follows foreign-key dependencies. It matters because later
@@ -148,6 +164,10 @@ pub fn generate(scale_factor_text: &str, seed: u64) -> Result<Dataset, ScaleFact
     let _customer_count = scale_factor(scale_factor_text, 150_000)?;
     let _orders_count = scale_factor(scale_factor_text, 1_500_000)?;
     let _lineitem_count = scale_factor(scale_factor_text, 6_000_000)?;
+
+    if !partsupp_supplier_keys_are_distinct(part_count, supplier_count) {
+        return Err(ScaleFactorError::DuplicatePartsuppSupplierKeys);
+    }
 
     let mut rng = RandomState::new(seed);
 
@@ -253,6 +273,7 @@ mod tests {
     };
 
     use super::{generate, rng::RandomState, supplier, Dataset};
+    use crate::scale_factor::ScaleFactorError;
 
     pub(super) fn shared_dataset_at_0_01() -> &'static Dataset {
         static DATASET: OnceLock<Dataset> = OnceLock::new();
@@ -262,6 +283,14 @@ mod tests {
     #[test]
     fn generation_is_deterministic() {
         assert_eq!(generate("0.01", 42), generate("0.01", 42));
+    }
+
+    #[test]
+    fn rejects_scale_factors_with_duplicate_partsupp_supplier_keys() {
+        assert_eq!(
+            generate("0.001", 42),
+            Err(ScaleFactorError::DuplicatePartsuppSupplierKeys)
+        );
     }
 
     #[test]
@@ -357,10 +386,12 @@ mod tests {
         let supplier_keys: BTreeSet<i64> =
             dataset.supplier.iter().map(|row| row.s_suppkey).collect();
         let mut suppliers_by_part = BTreeMap::<i64, BTreeSet<i64>>::new();
+        let mut partsupp_pairs = BTreeSet::new();
 
         for row in &dataset.partsupp {
             assert!(part_keys.contains(&row.ps_partkey));
             assert!(supplier_keys.contains(&row.ps_suppkey));
+            assert!(partsupp_pairs.insert((row.ps_partkey, row.ps_suppkey)));
             suppliers_by_part
                 .entry(row.ps_partkey)
                 .or_default()

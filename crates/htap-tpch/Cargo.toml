@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+csv = { workspace = true }
 htap-common = { path = "../htap-common" }
 htap-sql = { path = "../htap-sql" }
 htap-catalog = { path = "../htap-catalog" }
