@@ -469,19 +469,45 @@ this loader also found a generator gap task B2's own SF-0.01-only tests had not 
 supplier, which `generate::generate` now rejects as `ScaleFactorError::DuplicatePartsuppSupplierKeys` rather
 than silently generating a `PARTSUPP` row an upsert-based loader would drop; SF 0.01, 0.1, and 1 are
 unaffected. A release-mode SF 0.01 load-then-run-all-22-queries pass (`all_22_queries`, ignored by default)
-gives the first query-executor performance measurement at any TPC-H scale: load takes about 7.8 seconds, and
-16 of the 22 queries return in under 1.2 seconds, but Query 4 and Query 21 exceed a 120-second timeout, Query
-19 takes about 61 seconds, Query 17 about 22, Query 20 about 20, and Query 22 about 9.7 — all six depend on a
-correlated `EXISTS`/scalar subquery re-run per outer row (the semi-join rewrite of `IN`/`EXISTS` already listed
-deferred below), and Query 19 additionally nests its join equality inside an `OR`. This changes no query's
-result — all 22 stay correctness-validated at hand-authored fixture scale above — only how long six of them
-take once a dataset is large enough for the per-row cost to matter; see `docs/LIMITATIONS.md`'s matching
-section for the full disclosure, including that batches commit independently (no whole-table rollback), a
-retry after dropping and recreating the TPC-H tables fails loudly with a movement-job `Conflict` rather than
-reloading cleanly, the post-load `CopyReport` check counts attempted upserts rather than distinct stored rows
-(so primary-key collisions are instead covered by the generator's own key-uniqueness tests), and CSV quoting
-is proven only by a synthetic unit test. No new ADR: this task reuses the existing movement CSV import path
-unchanged, with no on-disk format, wire protocol, or durability-path change.
+gave the first query-executor performance measurement at any TPC-H scale: load takes about 7.8 seconds, and
+16 of the 22 queries returned in under 1.2 seconds, but Query 4 and Query 21 exceeded a 120-second timeout,
+Query 19 took about 61 seconds, Query 17 about 22, Query 20 about 20, and Query 22 about 9.7 — all six depended
+on a correlated `EXISTS`/scalar subquery re-run per outer row, and Query 19 additionally nested its join
+equality inside an `OR`. Task F6, described next, closed this gap; see `docs/LIMITATIONS.md`'s matching section
+for the rest of B3's own disclosure (independent batch commits with no whole-table rollback, a movement-job
+`Conflict` on a reload after drop-and-recreate, the post-load `CopyReport` counting attempted upserts rather
+than distinct stored rows, and CSV quoting proven only by a synthetic unit test). No new ADR for B3 itself: it
+reuses the existing movement CSV import path unchanged, with no on-disk format, wire protocol, or
+durability-path change.
+
+**Task F6 — correlated-subquery decorrelation and `OR` common-conjunct factoring, closing the TPC-H
+performance gap task B3 exposed.** `Status: implemented (local MVP)`, a narrow slice (`crates/htap-sql/src/
+optimize.rs`; new `crates/htap-server/src/decorrelate.rs`, `htap-server::query_exec`). Two independent,
+general SQL-layer changes, neither gated to TPC-H query text. First, a repeated conjunct across every branch of
+an `OR` chain is factored out before predicate extraction (`optimize.rs::factor_or_common_conjuncts`) — only a
+plain comparison between two columns, or a column and a literal, is eligible — turning a join equality nested
+inside every bracket of a disjunction (Query 19's shape) into an ordinary equi-join key instead of an
+unbudgeted nested loop. Second, a new statement-scoped decorrelation stage in `query_exec.rs`/`decorrelate.rs`
+answers an eligible correlated `EXISTS`/`NOT EXISTS` (at least one key equality, plus optional residual
+correlated conjuncts) or an eligible correlated ungrouped scalar-aggregate subquery (at least one key equality,
+no residual) from a hash lookup built once per statement — via the ordinary `run_query_with_budget`
+execution and the existing equi-join key-normalization helpers — instead of re-running the subquery's whole
+physical plan for every outer row; an ineligible shape, a build-query error, or a failed memory-budget
+reservation keeps today's unmodified per-row path. This deliberately does not add a `Semi`/`Anti` `JoinKind`:
+the outer query's `JoinTree`/`JoinSpec`/row-width invariants are untouched, and the lookup is purely a
+subquery-preparation-layer optimization — see ADR-028. A defensive-only fix landed alongside these: a
+reordered `INNER` join with no attached `ON` predicate used to get the placeholder `Literal(Int64(1))`, while
+predicate evaluation only accepts `Value::Bool(true)`; no reachable path was found where the executor evaluates
+that placeholder (a join is only marked `Inner` when a spanning predicate already exists), so this was not a
+reproduced wrong-result bug, but the placeholder is now `Literal(Bool(true))` so the two can never disagree,
+guarded by a regression test. With these changes, the same release-mode SF 0.01 `all_22_queries` run finishes
+all 22 queries in about 10.3 seconds total: Query 4 timeout → 0.29s, Query 21 timeout → 0.89s, Query 19 61s →
+0.28s, Query 17 22s → 0.67s, Query 20 20s → 0.48s, Query 22 9.7s → 0.07s, and every other query between 0.03s
+and 1.0s. Still deferred: rewriting correlated `IN`/`NOT IN`, scalar-aggregate decorrelation with a residual,
+`OR` factoring beyond the plain-comparison allowlist, and the uncorrelated `IN`/`EXISTS` membership scan (still
+O(n) per row) — see `docs/LIMITATIONS.md`'s "Completed local MVP — correlated-subquery decorrelation and OR
+factoring (Phase 17, task F6)" for the full eligibility contract and test citations, and ADR-028 for the design
+rationale.
 
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
@@ -494,7 +520,7 @@ vectorized/pipelined execution, worker-pool parallelism for `LEFT`/`RIGHT`/`FULL
 executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spillable as of Phase 14 — see above),
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
-physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), semi-join rewrites of IN/EXISTS, broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
+physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), a general semi-join rewrite of IN/EXISTS (a narrow slice — key-equality correlated EXISTS/NOT EXISTS and key-equality correlated scalar-aggregate subqueries answered from a statement-scoped hash lookup, with no new Semi/Anti JoinKind — is implemented as of Phase 17 task F6, see above and ADR-028; correlated IN/NOT IN rewriting and residual-bearing scalar-aggregate decorrelation remain deferred), broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
 TPC-H refresh functions, an independent oracle, power/throughput test drivers, and a compliance/deviations disclosure document (task B2 added a from-specification row generator and task B3 a bulk loader; the schema/query-text/scale-factor/correctness-fixture/row-generator/bulk-loader foundation is otherwise all Batch B has delivered so far — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
@@ -2318,7 +2344,10 @@ whose module doc is the source of truth for this contract. Summary:
   (the same fallback rules as `Route::OlapScan`). Execution then runs as separate, sequential stages over
   those materialized rows: (1) uncorrelated subqueries, executed once, and correlated subqueries (Phase 13,
   depth-1 only), executed per outer row via the `SubqueryRunner` callback against the statement's single
-  pinned snapshot; (2) per-slot column projection, partition pruning, and single-leaf predicate pushdown
+  pinned snapshot — except an eligible correlated `EXISTS`/`NOT EXISTS` or ungrouped scalar-aggregate subquery
+  (Phase 17 task F6), which is instead answered from a statement-scoped hash lookup built once, not re-run per
+  row; see "TPC-H workload kit foundations" below and `docs/LIMITATIONS.md`'s matching section for the
+  eligibility contract; (2) per-slot column projection, partition pruning, and single-leaf predicate pushdown
   derived from that slot's own `WHERE` conjuncts; (3) joins — since Phase 14, every join shape (flat left-deep
   or an explicitly nested/parenthesized `query::JoinTree`) is synthesized into the same tree shape at bind
   time (`left_deep_join_tree` for the flat form) and executed by the single `evaluate_join_tree` evaluator

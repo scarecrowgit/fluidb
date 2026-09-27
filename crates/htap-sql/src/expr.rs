@@ -412,6 +412,14 @@ pub trait SubqueryRunner {
     /// Executes correlated subquery `index` using `outer_row` from its immediately enclosing
     /// query and returns its result rows.
     fn run(&self, index: usize, outer_row: &[Value]) -> Result<Vec<Row>>;
+
+    /// Whether this subquery is satisfied by a statement-scoped cached lookup.
+    ///
+    /// Cached lookups still participate in nesting-depth accounting, but do not consume the
+    /// per-statement correlated-subquery invocation allowance.
+    fn is_cached(&self, _index: usize) -> bool {
+        false
+    }
 }
 
 /// Shared limits for correlated-subquery execution within one statement.
@@ -454,6 +462,22 @@ impl SubqueryBudget {
             )));
         }
         self.invocations.set(invocations + 1);
+        self.depth.set(depth + 1);
+        Ok(())
+    }
+
+    /// Enters a cached correlated-subquery lookup.
+    ///
+    /// Cached lookups are bounded by nesting depth but do not consume the ordinary invocation
+    /// cap because their relation was materialized once for the statement.
+    pub fn enter_cached(&self) -> Result<()> {
+        let depth = self.depth.get();
+        if depth >= self.depth_cap {
+            return Err(HtapError::InvalidArgument(format!(
+                "correlated subquery nesting-depth cap ({}) exceeded",
+                self.depth_cap
+            )));
+        }
         self.depth.set(depth + 1);
         Ok(())
     }
@@ -1166,7 +1190,11 @@ fn subquery_result_rows(ctx: &EvalContext<'_>, index: usize, correlated: bool) -
         ))
     })?;
 
-    budget.enter()?;
+    if runner.is_cached(index) {
+        budget.enter_cached()?;
+    } else {
+        budget.enter()?;
+    }
     let result = runner.run(index, ctx.row);
     budget.exit();
     result

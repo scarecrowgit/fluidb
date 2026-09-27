@@ -877,11 +877,20 @@ flat-lowering/differential-test design).
   `FULL` joins, and memory-bounded spilling for non-equi/`CROSS` joins (evaluated by an in-memory nested loop
   with no memory budget check at all — genuinely deferred, unlike `LEFT`/`RIGHT`/`FULL` equi-hash joins, whose
   spill code path exists but is only covered by a test for `INNER`), statistics histograms and
-  per-partition statistics, automatic statistics staleness detection, semi-join rewrites of `IN`/`EXISTS`,
-  broader string/date function coverage beyond the narrow slice below, views, and MySQL's implicit
-  string<->number coercion (a comparison between incompatible types is a bind error here, not an implicit
-  cast). `DECIMAL` is supported as of Phase 17 — see "`DECIMAL` type (Phase 17) scope and deferred features"
-  below.
+  per-partition statistics, automatic statistics staleness detection, broader string/date function coverage
+  beyond the narrow slice below, views, and MySQL's implicit string<->number coercion (a comparison between
+  incompatible types is a bind error here, not an implicit cast). `DECIMAL` is supported as of Phase 17 — see
+  "`DECIMAL` type (Phase 17) scope and deferred features" below. **A narrow slice of semi-join-shaped rewriting
+  is implemented as of Phase 17 task F6, not a general one:** a statement-scoped hash lookup, built once and
+  probed per outer row rather than re-executing the subquery's whole plan per row, now answers a correlated
+  `EXISTS`/`NOT EXISTS` with at least one key equality (optionally plus residual correlated conjuncts) and a
+  correlated ungrouped scalar-aggregate subquery with at least one key equality and no residual — see
+  "Completed local MVP — correlated-subquery decorrelation and OR factoring (Phase 17, task F6)" below for the
+  full eligibility contract. There is still no `Semi`/`Anti` `JoinKind` and no rewrite into the outer query's
+  own join tree (ADR-028). Still deferred: rewriting correlated `IN`/`NOT IN` into any join or lookup form,
+  scalar-aggregate decorrelation when a residual correlated predicate is present, `OR` common-conjunct
+  factoring beyond a plain comparison (`= < <= > >= <>`) between two columns or a column and a literal, and the
+  uncorrelated `IN`/`EXISTS` membership scan, which remains an O(n)-per-row check.
   - **`DATE`/`EXTRACT`/`INTERVAL`/`SUBSTRING` are supported, as a narrow local slice, not full MySQL
     date/string function coverage.** A `DATE` column, a `DATE 'yyyy-mm-dd'` literal, and (as of Phase 17 Batch
     A/B checkpoint 1) the `DATE(string)` function form are all recorded as `Timestamp`
@@ -940,6 +949,91 @@ three are general SQL-layer features, not gated to TPC-H query text in any way.
   produce the identical `Timestamp` value, share the same invalid-date error, and can be mixed in one query
   (e.g. one side of a comparison as a literal, the other as a function call). Covered by
   `crates/htap-server/tests/tpch_sql_prerequisites.rs::{test_date_function_produces_same_result_as_literal, test_date_function_invalid_date_rejected, test_date_function_and_literal_mixed_in_query}`.
+
+### Completed local MVP — correlated-subquery decorrelation and OR factoring (Phase 17, task F6)
+
+**Status: `implemented (local MVP)`, a narrow slice — not a general semi-join rewrite.** Motivated by the
+per-row correlated-subquery cost the TPC-H workload kit's first performance run exposed (see "TPC-H workload
+kit scope and deferred features" below), task F6 added two independent, general SQL-layer optimizations —
+neither gated to TPC-H query text.
+
+- **A defensive consistency fix, not a reproduced wrong-result bug.** `optimize.rs`'s `attach_join_predicates`
+  used to give a reordered `INNER` join with no attached `ON` predicate the placeholder `Literal(Int64(1))`,
+  while predicate evaluation (`eval_predicate`) only accepts `Value::Bool(true)` as true. No reachable path was
+  found where the executor evaluates that placeholder as a predicate (a join is only marked `Inner` when a
+  spanning predicate already exists), so this was not reproducible as a wrong result, but the placeholder is
+  now `Literal(Bool(true))` so the two never disagree. Guarded by
+  `crates/htap-server/tests/query_exec.rs::test_reordered_inner_join_predicate_placeholders_are_boolean_true`
+  (one-sided `ON` predicates pushed to a scan filter, a constant `ON 1 = 1`, a connected three-table reorder,
+  and two disconnected equality components needing a predicate-free edge).
+- **`OR` common-conjunct factoring** (`optimize.rs::factor_or_common_conjuncts`, run before predicate
+  extraction in `optimize_select`): a conjunct repeated in every branch of an `OR` chain is factored out —
+  `(a AND b) OR (a AND c)` becomes `a AND (b OR c)`, collapsing to just the shared conjunct if any branch's
+  remainder is empty — so a join equality repeated inside every bracket of a disjunction (TPC-H Query 19's
+  shape) becomes a normal equi-join key instead of an unbudgeted nested loop. Only a plain comparison
+  (`= < <= > >= <>`) between two `ColumnRef`s, or a `ColumnRef` and a `Literal`, is eligible; a shared position
+  holding a subquery, aggregate, window reference, variable, cast, or scalar function is left alone, and the
+  pass recurses into nested `AND`/`OR`. **A multiset intersection, not a set one:** a conjunct repeated *within*
+  one branch is factored out only as many times as its minimum occurrence count across every branch (an
+  external-review fix) — `(x=1 AND x=1) OR (x=1 AND y=2)` factors `x=1` out exactly once, not twice, leaving
+  `x=1 AND ((x=1) OR (y=2))`; the original set-membership check instead tried to remove a second occurrence
+  that was not there and panicked. Covered by `crates/htap-sql/src/optimize.rs`'s
+  `optimize::tests::{factors_shared_equality_from_two_and_three_branch_ors, factoring_collapses_when_a_branch_is_only_the_shared_conjunct, factoring_is_a_no_op_without_a_shared_conjunct, factoring_does_not_move_function_or_subquery_conjuncts, factors_or_nested_inside_and, test_or_factoring_duplicate_within_one_branch, test_or_factoring_duplicate_in_multiple_branches, test_or_factoring_duplicate_in_one_branch_single_in_other}`
+  unit tests and
+  `crates/htap-server/tests/query_exec.rs::test_q19_shaped_or_predicates_return_hand_computed_revenue`.
+- **Statement-scoped decorrelation lookups** (new `crates/htap-server/src/decorrelate.rs`; `query_exec.rs`'s
+  `PreparedCorrelatedQuery` becomes an enum of `PerRow`/`ExistsLookup`/`ScalarAggregateLookup`): eligible
+  correlated `EXISTS`/`NOT EXISTS` and correlated ungrouped scalar-aggregate subqueries are answered from a
+  hash lookup built once per statement instead of re-executing the subquery's whole physical plan for every
+  outer row. The outer query's `JoinTree`/`JoinSpec`/row-width invariants are untouched — this is not a new
+  `Semi`/`Anti` `JoinKind` (see ADR-028). Eligibility (plain `SELECT` body only): every WHERE conjunct
+  classifies as a **key** equality (`CorrelatedColumnRef = local-only expr`, either order), a **local-only**
+  filter, or (`EXISTS` only) a **residual** correlated predicate that is not a key equality; every entry in the
+  subquery's `correlated_outer_refs` must be accounted for by a key or residual conjunct (a correlated
+  reference anywhere else — `ON`, projection, `HAVING`, a nested subquery — falls back); at least one key
+  conjunct is required; `EXISTS`/`NOT EXISTS` additionally reject aggregates and `GROUP BY` (`EXISTS(SELECT
+  COUNT(*) ...)` is always true, so it always falls back rather than being answered from a lookup); the scalar
+  aggregate shape additionally requires exactly one aggregate reference in a single projection, no residual,
+  and no `HAVING`/`DISTINCT`/window/`LIMIT`/`OFFSET`/`ORDER BY`. The build query reuses the ordinary
+  `run_query_with_budget` execution and the existing equi-join key-normalization helpers
+  (`join_equi_key_types`/`normalize_key`/`normalized_join_key`), so an `Int32`/`Int64`/`Decimal`/`Float64`/
+  `Timestamp` key hashes identically across types and a NULL key component on either the build or probe side
+  never matches — `EXISTS` residuals are rebased onto the narrowed build row through an explicit
+  column-offset map and evaluated with the unmodified `eval_predicate`; a residual that cannot be rebased falls
+  back. **Empty-group default (scalar aggregate miss or NULL probe key):** the same ungrouped projection is
+  evaluated once over a guaranteed-empty input (an added literal-`false` conjunct) through the unmodified
+  evaluator, so `COUNT(*)` gives `0`, `SUM`/`AVG` give `NULL`, and `COALESCE(SUM(x), 7)`/`SUM(x) IS NULL` are
+  correct without any per-aggregate special case. A new `SubqueryBudget::enter_cached()` still enforces the
+  nesting-depth cap but does not consume the 10,000-invocation cap, since a lookup hit or miss is a probe
+  against an already-materialized relation, not a fresh subquery execution; every fallback (ineligible shape,
+  a build-query error, or a failed `MemoryBudget` reservation for the built rows) keeps the ordinary `enter()`
+  per-row path and never turns a slow success into an error. Telemetry (test-only, not a supported monitoring
+  API, following the existing `last_query_optimizer_invocations` convention):
+  `LocalServer::{last_query_decorrelated_exists_count, last_query_decorrelated_exists_fallback_count, last_query_decorrelated_scalar_aggregate_count, last_query_decorrelated_scalar_aggregate_fallback_count}`.
+  Covered by `crates/htap-server/tests/query_exec.rs`'s
+  `{test_key_only_correlated_exists_is_decorrelated_once_per_statement, test_decorrelated_exists_single_and_composite_keys, test_decorrelated_exists_with_q21_shaped_residual, test_decorrelated_exists_residual_null_does_not_match, test_decorrelated_exists_residual_edge_cases, test_decorrelated_exists_without_key_conjunct_falls_back, test_decorrelated_exists_normalizes_numeric_key_types, test_decorrelated_exists_aggregate_and_residual_fall_back, test_decorrelated_exists_build_error_triggers_fallback, test_decorrelated_exists_probed_over_invocation_cap_succeeds, test_decorrelated_exists_outer_between_distinct_inner_columns, test_decorrelated_exists_scalar_subquery_residual_falls_back, test_decorrelated_scalar_aggregate_q17_shape_missing_group, test_decorrelated_scalar_aggregate_miss_values, test_decorrelated_scalar_aggregate_composite_key_missing_group, test_decorrelated_scalar_aggregate_null_composite_key_components_miss, test_decorrelated_scalar_aggregate_normalizes_numeric_keys, test_decorrelated_scalar_aggregate_local_filter_decorates, test_decorrelated_scalar_aggregate_correlated_residual_falls_back}`,
+  and the pre-existing `test_correlated_subquery_is_optimized_once_per_statement`/
+  `test_correlated_subquery_caps_fire_during_execution`/`test_correlated_subquery_through_window_spec`, which
+  still pass unchanged against the new eligibility gate. See ADR-028 for the design rationale (why no
+  `Semi`/`Anti` `JoinKind`), and "TPC-H workload kit scope and deferred features" below for the resulting
+  release-mode timings.
+- **Mixed-type numeric key overflow is now a non-match, not a statement-failing error (an external-review
+  fix, applying to the decorrelation lookups above *and* to the pre-existing ordinary hash join).** When two
+  equi-key sides have different numeric types, the canonical key type is a decimal with the larger of the two
+  precisions and scales (`query_exec.rs::normalize_key`); a side's actual value can still be too large to fit
+  that canonical decimal (e.g. a `BIGINT` key of `1000` against a `DECIMAL(3,2)` column). `normalize_key` used
+  to propagate the cast failure as a hard error, failing the whole statement even though such a value provably
+  cannot equal anything representable on the other side. It now catches that one cast-failure shape (matched
+  by the error text containing `"cannot cast"` and `" to decimal"` — a disclosed fragility, since it depends on
+  `cast_value`'s wording rather than a distinct error variant) and represents the value as a `NULL` key
+  instead, which the existing NULL-never-matches key logic then turns into a normal non-match for both a hash
+  join probe and a decorrelation lookup probe or build row. Covered by
+  `crates/htap-server/tests/query_exec.rs::{test_correlated_exists_with_mixed_numeric_types_bigint_too_large, test_scalar_aggregate_with_mixed_numeric_types_bigint_too_large, test_decimal_precision_cast_error_becomes_non_match, test_hash_join_with_mixed_numeric_types_overflow}`.
+- **Not eligible for a lookup, and unchanged by this task:** correlated `IN`/`NOT IN` (no TPC-H query needs
+  one, and none is rewritten), a scalar aggregate with a residual correlated predicate, `DISTINCT`/`LIMIT`/
+  `ORDER BY`/`HAVING`/windows/`GROUP BY` on the subquery, a correlated reference outside `WHERE`, and a nested
+  subquery inside a residual or a local-only filter — all of these keep the pre-existing per-row execution
+  path exactly as before.
 
 ### Verification and test coverage
 
@@ -1672,17 +1766,24 @@ generator's own module documentation instead.
   dataset it cannot faithfully load — SF 0.01, 0.1, and 1 are unaffected, and the `PS_SUPPKEY` formula itself
   is unchanged.
 
-  **First query-executor performance measurement at any TPC-H scale.** A release-mode SF 0.01 run of
-  `crates/htap-tpch/tests/load.rs::all_22_queries` (`#[ignore]`d by default — loads SF 0.01, then runs all 22
-  queries with per-query timing; run with `--ignored`, scoped via `TPCH_QUERIES=<comma-separated numbers>`)
-  measured load at about 7.8 seconds and 16 of the 22 queries returning in under 1.2 seconds, but Query 4 and
-  Query 21 exceeded a 120-second timeout, Query 19 took about 61 seconds, Query 17 about 22, Query 20 about
-  20, and Query 22 about 9.7. All six depend on a correlated `EXISTS`/scalar subquery re-run per outer row —
-  the semi-join rewrite of `IN`/`EXISTS` already listed deferred in "General query executor scope and
-  deferred features" above — and Query 19 additionally nests its join equality inside an `OR`. This is a
-  performance finding only: all 22 queries stay correctness-validated above at hand-authored fixture scale,
-  and no query's result changes; only these six queries' running time at SF 0.01 and above is affected,
-  meaning a power/throughput run is not currently practical for them at that scale.
+  **First query-executor performance measurement at any TPC-H scale, and the fix that followed it (Phase 17
+  task F6).** A release-mode SF 0.01 run of `crates/htap-tpch/tests/load.rs::all_22_queries` (`#[ignore]`d by
+  default — loads SF 0.01, then runs all 22 queries with per-query timing; run with `--ignored`, scoped via
+  `TPCH_QUERIES=<comma-separated numbers>`) originally measured load at about 7.8 seconds and 16 of the 22
+  queries returning in under 1.2 seconds, but Query 4 and Query 21 exceeded a 120-second timeout, Query 19 took
+  about 61 seconds, Query 17 about 22, Query 20 about 20, and Query 22 about 9.7. All six depended on a
+  correlated `EXISTS`/scalar subquery re-run per outer row, and Query 19 additionally nested its join equality
+  inside an `OR`. Task F6 (see "Completed local MVP — correlated-subquery decorrelation and OR factoring" above
+  for the mechanism) closed this: the same release-mode SF 0.01 run now finishes all 22 queries in about 10.3
+  seconds total, with Query 4 timeout → 0.29s, Query 21 timeout → 0.89s, Query 19 61s → 0.28s, Query 17 22s →
+  0.67s, Query 20 20s → 0.48s, and Query 22 9.7s → 0.07s; every other query stays between 0.03s and 1.0s. This
+  remains a performance finding only, not a correctness one: no query's result changed, and all 22 queries stay
+  correctness-validated above at hand-authored fixture scale — the fix is verified against that same
+  fixture suite plus the dedicated decorrelation/OR-factoring tests cited above, not by this timing run alone.
+  A narrow slice of correlated-subquery decorrelation is now implemented, not the general semi-join rewrite
+  still listed deferred in "General query executor scope and deferred features" above: correlated `IN`/`NOT
+  IN` rewriting, scalar-aggregate decorrelation with a residual, and `OR` factoring outside the plain-comparison
+  allowlist remain deferred, and the uncorrelated `IN`/`EXISTS` membership scan is still O(n) per row.
 
   **Disclosed gaps.** Each table imports in independently committed batches
   (`LoadOptions::batch_rows` rows per commit); a failure partway through a table's import leaves its earlier

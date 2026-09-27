@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 mod analyze;
+mod decorrelate;
 mod explain;
 #[cfg(unix)]
 pub mod ipc;
@@ -776,6 +777,49 @@ impl LocalServer {
     pub fn last_query_optimizer_invocations(&self) -> usize {
         match &self.mode {
             ServerMode::Owner(runtime) => runtime.server.last_query_optimizer_invocations(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => 0,
+        }
+    }
+
+    /// Returns the number of correlated EXISTS lookups built for the most recent query.
+    pub fn last_query_decorrelated_exists_count(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime.server.last_query_decorrelated_exists_count(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => 0,
+        }
+    }
+
+    /// Returns the number of correlated EXISTS candidates that used per-row fallback execution.
+    pub fn last_query_decorrelated_exists_fallback_count(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .last_query_decorrelated_exists_fallback_count(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => 0,
+        }
+    }
+
+    /// Returns the number of correlated scalar-aggregate lookups built for the most recent query.
+    pub fn last_query_decorrelated_scalar_aggregate_count(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .last_query_decorrelated_scalar_aggregate_count(),
+            #[cfg(unix)]
+            ServerMode::Client { .. } => 0,
+        }
+    }
+
+    /// Returns the number of correlated scalar-aggregate candidates that used per-row fallback
+    /// execution.
+    pub fn last_query_decorrelated_scalar_aggregate_fallback_count(&self) -> usize {
+        match &self.mode {
+            ServerMode::Owner(runtime) => runtime
+                .server
+                .last_query_decorrelated_scalar_aggregate_fallback_count(),
             #[cfg(unix)]
             ServerMode::Client { .. } => 0,
         }

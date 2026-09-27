@@ -209,6 +209,142 @@ fn test_intersect_binds_tighter_than_union() {
 }
 
 #[test]
+fn test_reordered_inner_join_predicate_placeholders_are_boolean_true() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+
+    for table in [
+        "CREATE TABLE a (id INT PRIMARY KEY);",
+        "CREATE TABLE b (id INT PRIMARY KEY, v INT);",
+        "CREATE TABLE c (id INT PRIMARY KEY);",
+        "CREATE TABLE d (id INT PRIMARY KEY);",
+    ] {
+        server.execute(table).unwrap();
+    }
+    server
+        .execute("INSERT INTO a (id) VALUES (1), (2);")
+        .unwrap();
+    server
+        .execute("INSERT INTO b (id, v) VALUES (1, 10), (2, -10);")
+        .unwrap();
+    server
+        .execute("INSERT INTO c (id) VALUES (1), (2);")
+        .unwrap();
+    server
+        .execute("INSERT INTO d (id) VALUES (1), (2);")
+        .unwrap();
+
+    // The one-sided ON predicate is placed as a scan filter, leaving the reordered
+    // inner join edge without an attached predicate.
+    assert_eq!(
+        rows(&server, "SELECT COUNT(*) FROM a JOIN b ON b.v > 0;"),
+        vec![Row::new(vec![Value::Int64(2)])]
+    );
+
+    // A constant ON predicate is post-join-only, so the inner join still requires
+    // a true condition after predicate placement.
+    assert_eq!(
+        rows(&server, "SELECT COUNT(*) FROM a JOIN b ON 1 = 1;"),
+        vec![Row::new(vec![Value::Int64(4)])]
+    );
+
+    // The three-table connected shape preserves both equality predicates while
+    // reordering its initial comma joins.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT COUNT(*) FROM a, b, c \
+             WHERE a.id = c.id AND b.id = c.id;",
+        ),
+        vec![Row::new(vec![Value::Int64(2)])]
+    );
+
+    // Two disconnected equality components require a predicate-free inner edge
+    // between them after reordering.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT COUNT(*) FROM a, b, c, d \
+             WHERE a.id = c.id AND b.id = d.id;",
+        ),
+        vec![Row::new(vec![Value::Int64(4)])]
+    );
+}
+
+#[test]
+fn test_q19_shaped_or_predicates_return_hand_computed_revenue() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute(
+            "CREATE TABLE part ( \
+                 p_partkey BIGINT PRIMARY KEY, p_brand VARCHAR(16), \
+                 p_container VARCHAR(16), p_size INT \
+             );",
+        )
+        .unwrap();
+    server
+        .execute(
+            "CREATE TABLE lineitem ( \
+                 l_id BIGINT PRIMARY KEY, l_partkey BIGINT, l_quantity INT, \
+                 l_extendedprice DOUBLE, l_discount DOUBLE, \
+                 l_shipmode VARCHAR(16), l_shipinstruct VARCHAR(32) \
+             );",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO part (p_partkey, p_brand, p_container, p_size) VALUES \
+             (1, 'Brand#12', 'SM CASE', 3), \
+             (2, 'Brand#23', 'MED BOX', 5), \
+             (3, 'Brand#34', 'LG PACK', 10), \
+             (4, 'Brand#12', 'SM CASE', 9);",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO lineitem \
+             (l_id, l_partkey, l_quantity, l_extendedprice, l_discount, l_shipmode, l_shipinstruct) \
+             VALUES \
+             (1, 1, 5, 100.0, 0.1, 'AIR', 'DELIVER IN PERSON'), \
+             (2, 2, 15, 200.0, 0.2, 'AIR REG', 'DELIVER IN PERSON'), \
+             (3, 3, 25, 300.0, 0.1, 'AIR', 'DELIVER IN PERSON'), \
+             (4, 4, 5, 400.0, 0.1, 'AIR', 'DELIVER IN PERSON');",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT SUM(l_extendedprice * (1 - l_discount)) AS revenue \
+             FROM lineitem, part \
+             WHERE (p_partkey = l_partkey \
+                    AND p_brand = 'Brand#12' \
+                    AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') \
+                    AND l_quantity >= 1 AND l_quantity <= 11 \
+                    AND p_size BETWEEN 1 AND 5 \
+                    AND l_shipmode IN ('AIR', 'AIR REG') \
+                    AND l_shipinstruct = 'DELIVER IN PERSON') \
+                OR (p_partkey = l_partkey \
+                    AND p_brand = 'Brand#23' \
+                    AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') \
+                    AND l_quantity >= 10 AND l_quantity <= 20 \
+                    AND p_size BETWEEN 1 AND 10 \
+                    AND l_shipmode IN ('AIR', 'AIR REG') \
+                    AND l_shipinstruct = 'DELIVER IN PERSON') \
+                OR (p_partkey = l_partkey \
+                    AND p_brand = 'Brand#34' \
+                    AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') \
+                    AND l_quantity >= 20 AND l_quantity <= 30 \
+                    AND p_size BETWEEN 1 AND 15 \
+                    AND l_shipmode IN ('AIR', 'AIR REG') \
+                    AND l_shipinstruct = 'DELIVER IN PERSON');",
+        ),
+        vec![Row::new(vec![Value::Float64(520.0)])]
+    );
+}
+
+#[test]
 fn test_hash_join_preserves_large_integer_keys() {
     let dir = TempDir::new().unwrap();
     let server = LocalServer::open(dir.path()).unwrap();
@@ -3768,8 +3904,9 @@ fn test_correlated_subquery_caps_fire_during_execution() {
         .execute(&format!("INSERT INTO cap_inner (id) VALUES {values};"))
         .unwrap();
 
-    // Every outer row scans all 101 inner rows. The nested correlated EXISTS is
-    // always false, preventing short-circuiting and forcing more than 10,000 runs.
+    // Every outer row scans all 101 inner rows. The nested correlated EXISTS has only a
+    // residual predicate, so it is ineligible for decorrelation and remains per-row.
+    // It is always false, preventing short-circuiting and forcing more than 10,000 runs.
     let err = server
         .execute(
             "SELECT o.id FROM cap_outer o \
@@ -3777,8 +3914,7 @@ fn test_correlated_subquery_caps_fire_during_execution() {
                  SELECT 1 FROM cap_inner i \
                  WHERE i.id >= o.id - 1000 \
                    AND EXISTS ( \
-                       SELECT 1 FROM cap_leaf l \
-                       WHERE l.id = i.id AND l.id < 0 \
+                       SELECT 1 FROM cap_leaf l WHERE l.id <> i.id \
                    ) \
              );",
         )
@@ -4197,6 +4333,428 @@ fn test_recursive_cte_iteration_and_row_cap_bounded_time() {
 }
 
 #[test]
+fn test_decorrelated_exists_scalar_subquery_residual_falls_back() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE parents (id INT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE children (id INT PRIMARY KEY, parent_id INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE flags (id INT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute("INSERT INTO parents (id) VALUES (1), (2), (3);")
+        .unwrap();
+    server
+        .execute("INSERT INTO children (id, parent_id) VALUES (10, 1), (20, 2);")
+        .unwrap();
+    server
+        .execute("INSERT INTO flags (id) VALUES (1);")
+        .unwrap();
+
+    // The scalar subquery is a residual of the correlated EXISTS and cannot be
+    // represented by the lookup residual evaluator, so this must use fallback.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT p.id FROM parents p \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM children c \
+                 WHERE c.parent_id = p.id \
+                   AND (SELECT COUNT(*) FROM flags) > 0 \
+             ) ORDER BY p.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(2)]),
+        ]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 0);
+    assert!(
+        server.last_query_decorrelated_exists_fallback_count() > 0,
+        "scalar-subquery EXISTS residual should fall back"
+    );
+}
+
+#[test]
+fn test_decorrelated_exists_outer_between_distinct_inner_columns() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, grp INT, value INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, grp INT, low INT, high INT);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO outer_t (id, grp, value) VALUES \
+             (1, 10, 15), (2, 20, 25), (3, 30, 35);",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO inner_t (id, grp, low, high) VALUES \
+             (10, 10, 10, 20), \
+             (20, 20, 20, 30), \
+             (30, 30, 40, 50);",
+        )
+        .unwrap();
+
+    // Reversing low and high would reject rows 1 and 2, so this verifies that
+    // the lookup residual preserves BETWEEN's distinct lower and upper bindings.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM inner_t i \
+                 WHERE i.grp = o.grp AND o.value BETWEEN i.low AND i.high \
+             ) ORDER BY o.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(2)]),
+        ]
+    );
+    assert!(
+        server.last_query_decorrelated_exists_count() > 0,
+        "keyed EXISTS with a BETWEEN residual should use the lookup"
+    );
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+}
+
+#[test]
+fn test_decorrelated_scalar_aggregate_q17_shape_missing_group() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE parent (id INT PRIMARY KEY, name VARCHAR(8));")
+        .unwrap();
+    server
+        .execute("CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, amount INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO parent (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO child (id, parent_id, amount) VALUES \
+             (10, 1, 5), (11, 1, 9), (12, 2, 7);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT p.id, \
+                 (SELECT COUNT(*) FROM child c WHERE c.parent_id = p.id), \
+                 (SELECT SUM(c.amount) FROM child c WHERE c.parent_id = p.id), \
+                 (SELECT MAX(c.amount) FROM child c WHERE c.parent_id = p.id) \
+             FROM parent p ORDER BY p.id;",
+        ),
+        vec![
+            Row::new(vec![
+                Value::Int32(1),
+                Value::Int64(2),
+                Value::Int64(14),
+                Value::Int32(9),
+            ]),
+            Row::new(vec![
+                Value::Int32(2),
+                Value::Int64(1),
+                Value::Int64(7),
+                Value::Int32(7),
+            ]),
+            Row::new(vec![
+                Value::Int32(3),
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+            ]),
+        ]
+    );
+    assert!(server.last_query_decorrelated_scalar_aggregate_count() > 0);
+    assert_eq!(
+        server.last_query_decorrelated_scalar_aggregate_fallback_count(),
+        0
+    );
+}
+
+#[test]
+fn test_decorrelated_scalar_aggregate_miss_values() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE parent (id INT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, x INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO parent (id) VALUES (1);")
+        .unwrap();
+    server
+        .execute("INSERT INTO child (id, parent_id, x) VALUES (10, 2, 99);")
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT \
+                 (SELECT COUNT(*) FROM child c WHERE c.parent_id = p.id), \
+                 (SELECT COUNT(*) + 5 FROM child c WHERE c.parent_id = p.id), \
+                 (SELECT COALESCE(SUM(c.x), 7) FROM child c WHERE c.parent_id = p.id), \
+                 (SELECT SUM(c.x) IS NULL FROM child c WHERE c.parent_id = p.id), \
+                 (SELECT SUM(c.x) FROM child c WHERE c.parent_id = p.id) \
+             FROM parent p;",
+        ),
+        vec![Row::new(vec![
+            Value::Int64(0),
+            Value::Int64(5),
+            Value::Int64(7),
+            Value::Bool(true),
+            Value::Null,
+        ])]
+    );
+    assert!(server.last_query_decorrelated_scalar_aggregate_count() > 0);
+    assert_eq!(
+        server.last_query_decorrelated_scalar_aggregate_fallback_count(),
+        0
+    );
+}
+
+#[test]
+fn test_decorrelated_scalar_aggregate_composite_key_missing_group() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE parent (id INT PRIMARY KEY, tenant INT, sku INT);")
+        .unwrap();
+    server
+        .execute(
+            "CREATE TABLE child ( \
+                 id INT PRIMARY KEY, tenant INT, sku INT, quantity INT \
+             );",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO parent (id, tenant, sku) VALUES \
+             (1, 1, 100), (2, 1, 200), (3, 2, 100);",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO child (id, tenant, sku, quantity) VALUES \
+             (10, 1, 100, 4), (11, 1, 100, 6), (12, 2, 100, 8);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT p.id, \
+                 (SELECT COALESCE(SUM(c.quantity), 0) FROM child c \
+                  WHERE c.tenant = p.tenant AND c.sku = p.sku) \
+             FROM parent p ORDER BY p.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1), Value::Int64(10)]),
+            Row::new(vec![Value::Int32(2), Value::Int64(0)]),
+            Row::new(vec![Value::Int32(3), Value::Int64(8)]),
+        ]
+    );
+    assert!(server.last_query_decorrelated_scalar_aggregate_count() > 0);
+    assert_eq!(
+        server.last_query_decorrelated_scalar_aggregate_fallback_count(),
+        0
+    );
+}
+
+#[test]
+fn test_decorrelated_scalar_aggregate_null_composite_key_components_miss() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE parent (id INT PRIMARY KEY, k1 INT, k2 INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE child (id INT PRIMARY KEY, k1 INT, k2 INT, x INT);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO parent (id, k1, k2) VALUES \
+             (1, 1, NULL), (2, NULL, 2), (3, 1, 2);",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO child (id, k1, k2, x) VALUES \
+             (10, 1, NULL, 100), (11, NULL, 2, 200), (12, 1, 2, 300);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT p.id, \
+                 (SELECT COUNT(*) FROM child c \
+                  WHERE c.k1 = p.k1 AND c.k2 = p.k2) \
+             FROM parent p ORDER BY p.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1), Value::Int64(0)]),
+            Row::new(vec![Value::Int32(2), Value::Int64(0)]),
+            Row::new(vec![Value::Int32(3), Value::Int64(1)]),
+        ]
+    );
+    assert!(server.last_query_decorrelated_scalar_aggregate_count() > 0);
+    assert_eq!(
+        server.last_query_decorrelated_scalar_aggregate_fallback_count(),
+        0
+    );
+}
+
+#[test]
+fn test_decorrelated_scalar_aggregate_normalizes_numeric_keys() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute(
+            "CREATE TABLE parent ( \
+                 id INT PRIMARY KEY, int_key INT, decimal_key DECIMAL(10, 2) \
+             );",
+        )
+        .unwrap();
+    server
+        .execute(
+            "CREATE TABLE child ( \
+                 id INT PRIMARY KEY, bigint_key BIGINT, decimal_key DECIMAL(12, 2), x INT \
+             );",
+        )
+        .unwrap();
+    server
+        .execute("INSERT INTO parent (id, int_key, decimal_key) VALUES (1, 42, 12.50);")
+        .unwrap();
+    server
+        .execute("INSERT INTO child (id, bigint_key, decimal_key, x) VALUES (10, 42, 12.50, 9);")
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT \
+                 (SELECT COUNT(*) FROM child c WHERE c.bigint_key = p.int_key), \
+                 (SELECT SUM(c.x) FROM child c WHERE c.decimal_key = p.decimal_key) \
+             FROM parent p;",
+        ),
+        vec![Row::new(vec![Value::Int64(1), Value::Int64(9)])]
+    );
+    assert!(server.last_query_decorrelated_scalar_aggregate_count() > 0);
+    assert_eq!(
+        server.last_query_decorrelated_scalar_aggregate_fallback_count(),
+        0
+    );
+}
+
+#[test]
+fn test_decorrelated_scalar_aggregate_local_filter_decorates() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE parent (id INT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute(
+            "CREATE TABLE child ( \
+                 id INT PRIMARY KEY, parent_id INT, status VARCHAR(8), amount INT \
+             );",
+        )
+        .unwrap();
+    server
+        .execute("INSERT INTO parent (id) VALUES (1), (2), (3);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO child (id, parent_id, status, amount) VALUES \
+             (10, 1, 'active', 5), (11, 1, 'inactive', 9), \
+             (12, 2, 'inactive', 7);",
+        )
+        .unwrap();
+
+    // The status predicate is an inner local filter, so the decorated build query
+    // applies it before constructing the keyed scalar-aggregate lookup.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT p.id, \
+                 (SELECT COUNT(*) FROM child c \
+                  WHERE c.parent_id = p.id AND c.status = 'active') \
+             FROM parent p ORDER BY p.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1), Value::Int64(1)]),
+            Row::new(vec![Value::Int32(2), Value::Int64(0)]),
+            Row::new(vec![Value::Int32(3), Value::Int64(0)]),
+        ]
+    );
+    assert!(server.last_query_decorrelated_scalar_aggregate_count() > 0);
+    assert_eq!(
+        server.last_query_decorrelated_scalar_aggregate_fallback_count(),
+        0
+    );
+}
+
+#[test]
+fn test_decorrelated_scalar_aggregate_correlated_residual_falls_back() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE parent (id INT PRIMARY KEY, threshold INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, amount INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO parent (id, threshold) VALUES (1, 5), (2, 10), (3, 0);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO child (id, parent_id, amount) VALUES \
+             (10, 1, 3), (11, 1, 8), \
+             (20, 2, 10), (21, 2, 12), \
+             (30, 3, 1);",
+        )
+        .unwrap();
+
+    // The equality identifies candidate child rows, while the correlated inequality
+    // must be applied per outer parent row. Ignoring it would count all child rows.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT p.id, \
+                 (SELECT COUNT(*) FROM child c \
+                  WHERE c.parent_id = p.id AND c.amount > p.threshold) \
+             FROM parent p ORDER BY p.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1), Value::Int64(1)]),
+            Row::new(vec![Value::Int32(2), Value::Int64(1)]),
+            Row::new(vec![Value::Int32(3), Value::Int64(1)]),
+        ]
+    );
+    assert_eq!(server.last_query_decorrelated_scalar_aggregate_count(), 0);
+    assert!(
+        server.last_query_decorrelated_scalar_aggregate_fallback_count() > 0,
+        "correlated non-equality residual should fall back"
+    );
+}
+
+#[test]
 fn test_recursive_cte_large_working_set() {
     let dir = TempDir::new().unwrap();
     let server = LocalServer::open(dir.path()).unwrap();
@@ -4561,6 +5119,592 @@ fn test_correlated_subquery_through_window_spec() {
             "SELECT p.id, (SELECT ROW_NUMBER() OVER (ORDER BY p.x) FROM ch) FROM p;",
         ),
         vec![Row::new(vec![Value::Int64(1), Value::Int64(1)])]
+    );
+}
+
+#[test]
+fn test_key_only_correlated_exists_is_decorrelated_once_per_statement() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_rows (id INT PRIMARY KEY, value INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_rows (id INT PRIMARY KEY, value INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_rows (id, value) VALUES (1, 10), (2, 20), (3, 30), (4, 40);")
+        .unwrap();
+    server
+        .execute("INSERT INTO inner_rows (id, value) VALUES (10, 10), (20, 30);")
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_rows o \
+             WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.value = o.value) \
+             ORDER BY o.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(3)]),
+        ]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 1);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_rows o \
+             WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.value > o.value) \
+             ORDER BY o.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(2)]),
+        ]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 0);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 1);
+}
+
+#[test]
+fn test_decorrelated_exists_single_and_composite_keys() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, value INT, v1 INT, v2 INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, key_col INT, v1 INT, v2 INT);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO outer_t (id, value, v1, v2) VALUES \
+             (1, 10, 10, 20), (2, 30, 10, NULL), (3, NULL, NULL, 20);",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO inner_t (id, key_col, v1, v2) VALUES \
+             (10, 10, 10, 20), (11, 99, 10, NULL);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.key_col = o.value) \
+             ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE NOT EXISTS (SELECT 1 FROM inner_t i WHERE i.key_col = o.value) \
+             ORDER BY o.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(2)]),
+            Row::new(vec![Value::Int32(3)]),
+        ]
+    );
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM inner_t i WHERE i.v1 = o.v1 AND i.v2 = o.v2 \
+             ) ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM inner_t i WHERE i.v1 = o.v1 AND i.v2 = o.v2 \
+             ) ORDER BY o.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(2)]),
+            Row::new(vec![Value::Int32(3)]),
+        ]
+    );
+}
+
+#[test]
+fn test_decorrelated_exists_with_q21_shaped_residual() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE line1 (id INT PRIMARY KEY, orderkey INT, supplier INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE line2 (id INT PRIMARY KEY, orderkey INT, supplier INT);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO line1 (id, orderkey, supplier) VALUES \
+             (1, 100, 10), (2, 200, 20), (3, 300, 30);",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO line2 (id, orderkey, supplier) VALUES \
+             (10, 100, 10), (11, 100, 11), (12, 200, 20);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT l1.id FROM line1 l1 WHERE EXISTS ( \
+                 SELECT 1 FROM line2 l2 \
+                 WHERE l2.orderkey = l1.orderkey AND l2.supplier <> l1.supplier \
+             ) ORDER BY l1.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 1);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT l1.id FROM line1 l1 WHERE NOT EXISTS ( \
+                 SELECT 1 FROM line2 l2 \
+                 WHERE l2.orderkey = l1.orderkey AND l2.supplier <> l1.supplier \
+             ) ORDER BY l1.id;",
+        ),
+        vec![
+            Row::new(vec![Value::Int32(2)]),
+            Row::new(vec![Value::Int32(3)]),
+        ]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 1);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+}
+
+#[test]
+fn test_decorrelated_exists_residual_null_does_not_match() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, orderkey INT, supplier INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, orderkey INT, supplier INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_t (id, orderkey, supplier) VALUES (1, 100, 10), (2, 200, 20);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO inner_t (id, orderkey, supplier) VALUES (10, 100, NULL), (11, 200, 21);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o WHERE EXISTS ( \
+                 SELECT 1 FROM inner_t i \
+                 WHERE i.orderkey = o.orderkey AND i.supplier <> o.supplier \
+             ) ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(2)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 1);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o WHERE NOT EXISTS ( \
+                 SELECT 1 FROM inner_t i \
+                 WHERE i.orderkey = o.orderkey AND i.supplier <> o.supplier \
+             ) ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 1);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+}
+
+#[test]
+fn test_decorrelated_exists_residual_edge_cases() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, low INT, high INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, outer_id INT, x INT, y INT);")
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO outer_t (id, low, high) VALUES \
+             (1, 10, 20), (2, 20, 30);",
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO inner_t (id, outer_id, x, y) VALUES \
+             (10, 1, 15, 20), (20, 2, 10, 30);",
+        )
+        .unwrap();
+
+    // Reusing x in both comparisons must preserve both residual bindings.
+    // Only row 1 has low < x < high: 10 < 15 < 20.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o WHERE EXISTS ( \
+                 SELECT 1 FROM inner_t i \
+                 WHERE i.outer_id = o.id AND i.x > o.low AND i.x < o.high \
+             ) ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 1);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+
+    // BETWEEN uses distinct lower and upper residual columns.
+    // Only row 1 has x between low and high.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o WHERE EXISTS ( \
+                 SELECT 1 FROM inner_t i \
+                 WHERE i.outer_id = o.id AND i.x BETWEEN o.low AND o.high \
+             ) ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 1);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+
+    // CASE uses x and y in order-sensitive positions. Row 1 takes y = high;
+    // row 2 takes x, which does not equal high.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o WHERE EXISTS ( \
+                 SELECT 1 FROM inner_t i \
+                 WHERE i.outer_id = o.id \
+                   AND CASE WHEN i.x > o.low THEN i.y ELSE i.x END = o.high \
+             ) ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 1);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 0);
+}
+
+#[test]
+fn test_decorrelated_exists_without_key_conjunct_falls_back() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, val INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, val INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_t (id, val) VALUES (1, 10), (2, 20);")
+        .unwrap();
+    server
+        .execute("INSERT INTO inner_t (id, val) VALUES (10, 15);")
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.val > o.val) \
+             ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 0);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 1);
+}
+
+#[test]
+fn test_decorrelated_exists_normalizes_numeric_key_types() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute(
+            "CREATE TABLE outer_t ( \
+                 id INT PRIMARY KEY, int_key INT, decimal_key DECIMAL(10, 2) \
+             );",
+        )
+        .unwrap();
+    server
+        .execute(
+            "CREATE TABLE inner_t ( \
+                 id INT PRIMARY KEY, bigint_key BIGINT, decimal_key DECIMAL(12, 2) \
+             );",
+        )
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_t (id, int_key, decimal_key) VALUES (1, 100, 12.50);")
+        .unwrap();
+    server
+        .execute("INSERT INTO inner_t (id, bigint_key, decimal_key) VALUES (1, 100, 12.50);")
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.bigint_key = o.int_key);",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.decimal_key = o.decimal_key);",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+}
+
+#[test]
+fn test_decorrelated_exists_aggregate_and_residual_fall_back() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, key_col INT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, key_col INT, value INT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_t (id, key_col) VALUES (1, 1), (2, 2), (3, 3);")
+        .unwrap();
+    server
+        .execute("INSERT INTO inner_t (id, key_col, value) VALUES (10, 1, 5), (11, 2, 20);")
+        .unwrap();
+
+    // The correlation is in HAVING rather than a lookup-key equality predicate, so
+    // this aggregate EXISTS must use the per-row fallback evaluator.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS ( \
+                 SELECT COUNT(*) FROM inner_t i HAVING COUNT(*) > o.key_col \
+             ) ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 0);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 1);
+
+    // A non-equality correlated predicate is likewise ineligible for lookup
+    // decorrelation, even with an ordinary inner-only filter.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM inner_t i \
+                 WHERE i.key_col > o.key_col AND i.value > 10 \
+             ) ORDER BY o.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 0);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 1);
+}
+
+#[test]
+fn test_decorrelated_exists_build_error_triggers_fallback() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, val BIGINT);")
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_t (id) VALUES (1);")
+        .unwrap();
+    server
+        .execute("INSERT INTO inner_t (id, val) VALUES (1, 0), (2, 1);")
+        .unwrap();
+
+    // Lookup construction evaluates every inner row and overflows on id=2. The fallback
+    // evaluates the key equality first, so the non-matching overflowing row is short-circuited.
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT o.id FROM outer_t o \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM inner_t i \
+                 WHERE i.id = o.id AND i.val + 9223372036854775807 > 1 \
+             );",
+        ),
+        vec![Row::new(vec![Value::Int32(1)])]
+    );
+    assert_eq!(server.last_query_decorrelated_exists_count(), 0);
+    assert_eq!(server.last_query_decorrelated_exists_fallback_count(), 1);
+}
+
+#[test]
+fn test_decorrelated_exists_probed_over_invocation_cap_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE cap_outer (id INT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE cap_inner (id INT PRIMARY KEY);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE cap_leaf (id INT PRIMARY KEY);")
+        .unwrap();
+
+    let values = (1..=101)
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    server
+        .execute(&format!("INSERT INTO cap_outer (id) VALUES {values};"))
+        .unwrap();
+    server
+        .execute(&format!("INSERT INTO cap_inner (id) VALUES {values};"))
+        .unwrap();
+
+    // The innermost cached lookup is probed 101 * 101 = 10,201 times without consuming
+    // the correlated-subquery invocation budget.
+    assert!(rows(
+        &server,
+        "SELECT o.id FROM cap_outer o \
+         WHERE EXISTS ( \
+             SELECT 1 FROM cap_inner i WHERE i.id >= o.id - 1000 \
+             AND EXISTS (SELECT 1 FROM cap_leaf l WHERE l.id = i.id AND l.id < 0) \
+         ) ORDER BY o.id;",
+    )
+    .is_empty());
+    assert!(server.last_query_decorrelated_exists_count() >= 1);
+}
+
+#[test]
+fn test_correlated_exists_with_mixed_numeric_types_bigint_too_large() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, key_col BIGINT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, key_col DECIMAL(3, 2));")
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_t (id, key_col) VALUES (1, 1000);")
+        .unwrap();
+    server
+        .execute("INSERT INTO inner_t (id, key_col) VALUES (10, 1.00);")
+        .unwrap();
+
+    assert!(rows(
+        &server,
+        "SELECT o.id FROM outer_t o \
+         WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.key_col = o.key_col);",
+    )
+    .is_empty());
+}
+
+#[test]
+fn test_scalar_aggregate_with_mixed_numeric_types_bigint_too_large() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, key_col BIGINT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, key_col DECIMAL(3, 2));")
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_t (id, key_col) VALUES (1, 1000);")
+        .unwrap();
+    server
+        .execute("INSERT INTO inner_t (id, key_col) VALUES (10, 1.00);")
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT (SELECT COUNT(*) FROM inner_t i WHERE i.key_col = o.key_col) \
+             FROM outer_t o;",
+        ),
+        vec![Row::new(vec![Value::Int64(0)])]
+    );
+}
+
+#[test]
+fn test_decimal_precision_cast_error_becomes_non_match() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE outer_t (id INT PRIMARY KEY, key_col DECIMAL(5, 0));")
+        .unwrap();
+    server
+        .execute("CREATE TABLE inner_t (id INT PRIMARY KEY, key_col DECIMAL(3, 2));")
+        .unwrap();
+    server
+        .execute("INSERT INTO outer_t (id, key_col) VALUES (1, 1000);")
+        .unwrap();
+    server
+        .execute("INSERT INTO inner_t (id, key_col) VALUES (10, 1.00);")
+        .unwrap();
+
+    assert!(rows(
+        &server,
+        "SELECT o.id FROM outer_t o \
+         WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.key_col = o.key_col);",
+    )
+    .is_empty());
+}
+
+#[test]
+fn test_hash_join_with_mixed_numeric_types_overflow() {
+    let dir = TempDir::new().unwrap();
+    let server = LocalServer::open(dir.path()).unwrap();
+    server
+        .execute("CREATE TABLE left_t (id INT PRIMARY KEY, key_col BIGINT);")
+        .unwrap();
+    server
+        .execute("CREATE TABLE right_t (id INT PRIMARY KEY, key_col DECIMAL(3, 2));")
+        .unwrap();
+    server
+        .execute("INSERT INTO left_t (id, key_col) VALUES (1, 1000), (2, 1);")
+        .unwrap();
+    server
+        .execute("INSERT INTO right_t (id, key_col) VALUES (10, 1.00);")
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &server,
+            "SELECT l.id, r.id FROM left_t l \
+             JOIN right_t r ON l.key_col = r.key_col ORDER BY l.id;",
+        ),
+        vec![Row::new(vec![Value::Int32(2), Value::Int32(10)])]
     );
 }
 

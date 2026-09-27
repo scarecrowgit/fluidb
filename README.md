@@ -62,13 +62,20 @@ components are **deliberately not implemented** and are out of scope for this lo
   implementation, does not reproduce any other implementation's random sequence (the specification names no
   PRNG algorithm for row data), and its output is not comparable to any published result; its tests establish
   invariants (counts, referential closure, domain membership, date bounds, determinism), not expected values.
-  A release-mode SF 0.01 load-then-run-all-22-queries pass found 6 of the 22 queries — needing the
-  already-deferred semi-join rewrite of `IN`/`EXISTS`, Query 19 also nesting a join equality inside an `OR` —
-  too slow at that scale for a power/throughput run (Queries 4/21 exceed a 120-second timeout; 17/19/20/22
-  take 9.7-61 seconds), a performance finding only, not a correctness one. Refresh functions, an independent
-  oracle, and power/throughput test drivers are not yet built, and no compliance, comparability, or
-  benchmark-metric claim is made; a TPC compliance/deviations disclosure document is a later deliverable and
-  is not written yet. These correctness fixtures run at no particular scale factor and are not performance or
+  A release-mode SF 0.01 load-then-run-all-22-queries pass originally found 6 of the 22 queries — needing a
+  correlated `EXISTS`/scalar subquery re-run per outer row, Query 19 also nesting a join equality inside an
+  `OR` — too slow at that scale for a power/throughput run (Queries 4/21 exceeded a 120-second timeout;
+  17/19/20/22 took 9.7-61 seconds), a performance finding only, not a correctness one. Task F6 then added a
+  narrow slice of correlated-subquery decorrelation (statement-scoped hash lookups for eligible correlated
+  `EXISTS`/`NOT EXISTS` and scalar-aggregate subqueries, no new `Semi`/`Anti` join kind — see ADR-028) and `OR`
+  common-conjunct factoring: the same pass now finishes all 22 queries in about 10.3 seconds total (Query 4
+  timeout → 0.29s, Query 21 timeout → 0.89s, Query 19 61s → 0.28s, Query 17 22s → 0.67s, Query 20 20s → 0.48s,
+  Query 22 9.7s → 0.07s). Correlated `IN`/`NOT IN` rewriting, scalar-aggregate decorrelation with a residual
+  predicate, and `OR` factoring beyond a plain-comparison allowlist remain deferred — see
+  `docs/LIMITATIONS.md`'s "Completed local MVP — correlated-subquery decorrelation and OR factoring" section.
+  Refresh functions, an independent oracle, and power/throughput test drivers are not yet built, and no
+  compliance, comparability, or benchmark-metric claim is made; a TPC compliance/deviations disclosure document
+  is a later deliverable and is not written yet. These correctness fixtures run at no particular scale factor and are not performance or
   specification-compliance evidence; the row-limiting mechanism the fixtures never exercise is separately
   covered by `crates/htap-server/tests/limit_truncation.rs` over a synthetic table. Microbenchmarks (see
   `docs/BENCHMARKS.md`) still evaluate isolated internal
@@ -688,7 +695,7 @@ Direct `SegmentReader` pushdown optimization is implemented for the compact base
   merge/order are implemented locally; local disk spilling for the general query path is implemented as of
   Phase 14 — see below — distributed spill/fanout is not).
 - DataFusion and Apache Arrow integration.
-- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here), semi-join rewrites of `IN`/`EXISTS`, and broader string/date/view functions beyond a narrow slice (`DATE` — as both a `DATE 'yyyy-mm-dd'` literal and, as of Phase 17 Batch A/B checkpoint 1, a `DATE(string)` function form producing the identical value —, `EXTRACT`/`INTERVAL` for `YEAR`/`MONTH`/`DAY` only, and three-argument `SUBSTRING` are supported as of the TPC-H prerequisite work — see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"; `DECIMAL` is supported end to end as of Phase 17 — see "Important Scope Exclusions" above and `docs/PROGRESS.md`'s Phase 17 row). (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
+- Full MySQL dialect breadth (incl. implicit string<->number coercion — comparisons between incompatible types are bind errors here); a general semi-join rewrite of `IN`/`EXISTS` (a narrow slice — key-equality correlated `EXISTS`/`NOT EXISTS` and key-equality correlated scalar-aggregate subqueries answered from a statement-scoped hash lookup, no new `Semi`/`Anti` join kind — is implemented as of Phase 17 task F6; correlated `IN`/`NOT IN` rewriting and residual-bearing scalar-aggregate decorrelation remain deferred; see `docs/LIMITATIONS.md`'s "Completed local MVP — correlated-subquery decorrelation and OR factoring" section and ADR-028); and broader string/date/view functions beyond a narrow slice (`DATE` — as both a `DATE 'yyyy-mm-dd'` literal and, as of Phase 17 Batch A/B checkpoint 1, a `DATE(string)` function form producing the identical value —, `EXTRACT`/`INTERVAL` for `YEAR`/`MONTH`/`DAY` only, and three-argument `SUBSTRING` are supported as of the TPC-H prerequisite work — see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"; `DECIMAL` is supported end to end as of Phase 17 — see "Important Scope Exclusions" above and `docs/PROGRESS.md`'s Phase 17 row). (Sessions and explicit transactions — `BEGIN`, `COMMIT`, `ROLLBACK` — are implemented; see "Sessions and explicit transactions" below.)
 - **MySQL Partition DDL & Partition Lifecycle Boundary:**
   - Supported SQL partitioning: MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` (including `VALUES LESS THAN MAXVALUE` on the final partition) are supported via vendored `sqlparser` and bound to validated catalog partition models.
   - Supported SQL lifecycle DDL: `ALTER TABLE <table> ADD PARTITION`, `DROP PARTITION`, and `REORGANIZE PARTITION` for strict finite range and list forms and final `MAXVALUE` where supported, gated by empty-source rowstore checks before catalog mutation.

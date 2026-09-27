@@ -470,15 +470,194 @@ pub fn optimize(query: &BoundQuery, stats_lookup: &dyn StatsLookup) -> PhysicalQ
     optimize_select(select, stats_lookup)
 }
 
-fn optimize_select(select: &SelectBody, stats_lookup: &dyn StatsLookup) -> PhysicalQuery {
-    let atoms = extract_predicate_atoms(select);
-    let reordered = reorder_joins_unchecked(select, stats_lookup, &atoms);
+fn factor_or_common_conjuncts(expr: &Expr) -> Expr {
+    match expr {
+        Expr::BinaryOp {
+            op: BinOp::And,
+            left,
+            right,
+        } => Expr::BinaryOp {
+            op: BinOp::And,
+            left: Box::new(factor_or_common_conjuncts(left)),
+            right: Box::new(factor_or_common_conjuncts(right)),
+        },
+        Expr::BinaryOp { op: BinOp::Or, .. } => {
+            let mut branch_refs = Vec::new();
+            collect_or_branches(expr, &mut branch_refs);
+            let mut branches = branch_refs
+                .into_iter()
+                .map(factor_or_common_conjuncts)
+                .map(split_owned_conjuncts)
+                .collect::<Vec<_>>();
 
-    if validate_predicate_conservation(select, &atoms, &reordered).is_err() {
+            let mut shared = Vec::new();
+            for conjunct in &branches[0] {
+                if !factorable_common_conjunct(conjunct) {
+                    continue;
+                }
+
+                let already_shared = shared
+                    .iter()
+                    .filter(|candidate| *candidate == conjunct)
+                    .count();
+                let minimum_count = branches
+                    .iter()
+                    .map(|branch| {
+                        branch
+                            .iter()
+                            .filter(|candidate| *candidate == conjunct)
+                            .count()
+                    })
+                    .min()
+                    .unwrap_or(0);
+
+                if already_shared < minimum_count {
+                    shared.push(conjunct.clone());
+                }
+            }
+
+            if shared.is_empty() {
+                return or_exprs(
+                    branches
+                        .into_iter()
+                        .filter_map(and_exprs)
+                        .collect::<Vec<_>>(),
+                )
+                .expect("an OR chain has at least two branches");
+            }
+
+            for branch in &mut branches {
+                for conjunct in &shared {
+                    if let Some(position) =
+                        branch.iter().position(|candidate| candidate == conjunct)
+                    {
+                        branch.remove(position);
+                    }
+                }
+            }
+
+            let shared_expr =
+                and_exprs(shared).expect("a non-empty shared conjunct list builds an expression");
+            if branches.iter().any(Vec::is_empty) {
+                return shared_expr;
+            }
+
+            let remainder = or_exprs(
+                branches
+                    .into_iter()
+                    .map(|branch| {
+                        and_exprs(branch)
+                            .expect("non-empty OR branch remainder builds an expression")
+                    })
+                    .collect(),
+            )
+            .expect("an OR chain has at least two branches");
+
+            Expr::BinaryOp {
+                op: BinOp::And,
+                left: Box::new(shared_expr),
+                right: Box::new(remainder),
+            }
+        }
+        _ => expr.clone(),
+    }
+}
+
+fn collect_or_branches<'a>(expr: &'a Expr, output: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryOp {
+        op: BinOp::Or,
+        left,
+        right,
+    } = expr
+    {
+        collect_or_branches(left, output);
+        collect_or_branches(right, output);
+    } else {
+        output.push(expr);
+    }
+}
+
+fn split_owned_conjuncts(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            op: BinOp::And,
+            left,
+            right,
+        } => {
+            let mut conjuncts = split_owned_conjuncts(*left);
+            conjuncts.extend(split_owned_conjuncts(*right));
+            conjuncts
+        }
+        expr => vec![expr],
+    }
+}
+
+fn or_exprs(mut expressions: Vec<Expr>) -> Option<Expr> {
+    let first = expressions.first()?.clone();
+    expressions.remove(0);
+    Some(
+        expressions
+            .into_iter()
+            .fold(first, |left, right| Expr::BinaryOp {
+                op: BinOp::Or,
+                left: Box::new(left),
+                right: Box::new(right),
+            }),
+    )
+}
+
+fn factorable_common_conjunct(expr: &Expr) -> bool {
+    let Expr::BinaryOp { op, left, right } = expr else {
+        return false;
+    };
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte
+    ) {
+        return false;
+    }
+
+    let operands_are_supported = matches!(
+        (left.as_ref(), right.as_ref()),
+        (Expr::ColumnRef { .. }, Expr::ColumnRef { .. })
+            | (Expr::ColumnRef { .. }, Expr::Literal(_))
+            | (Expr::Literal(_), Expr::ColumnRef { .. })
+    );
+    if !operands_are_supported {
+        return false;
+    }
+
+    let mut unsupported = false;
+    expr.walk(&mut |node| {
+        if matches!(
+            node,
+            Expr::ScalarSubquery { .. }
+                | Expr::InSubquery { .. }
+                | Expr::Exists { .. }
+                | Expr::AggregateRef { .. }
+                | Expr::WindowRef { .. }
+                | Expr::Variable { .. }
+                | Expr::Cast { .. }
+                | Expr::ScalarFunction { .. }
+        ) {
+            unsupported = true;
+        }
+    });
+    !unsupported
+}
+
+fn optimize_select(select: &SelectBody, stats_lookup: &dyn StatsLookup) -> PhysicalQuery {
+    let mut factored = select.clone();
+    factored.filter = factored.filter.as_ref().map(factor_or_common_conjuncts);
+
+    let atoms = extract_predicate_atoms(&factored);
+    let reordered = reorder_joins_unchecked(&factored, stats_lookup, &atoms);
+
+    if validate_predicate_conservation(&factored, &atoms, &reordered).is_err() {
         return identity_physical_query(select, stats_lookup, true);
     }
 
-    let mut optimized = select.clone();
+    let mut optimized = factored.clone();
     if materialize_predicate_placements(&mut optimized, &atoms, &reordered).is_err() {
         return identity_physical_query(select, stats_lookup, true);
     }
@@ -543,10 +722,10 @@ fn attach_join_predicates(
         *kind = JoinKind::Inner;
     }
 
-    // Every reordered inner join gets an executable ON expression. TRUE is represented
-    // by a non-zero integer predicate for a predicate-free cross-product edge.
+    // Every reordered inner join gets an executable ON expression. Predicate evaluation
+    // accepts only Boolean TRUE, so predicate-free edges use a Boolean literal.
     if expressions.is_empty() && matches!(*kind, JoinKind::Inner) {
-        expressions.push(Expr::Literal(htap_common::Value::Int64(1)));
+        expressions.push(Expr::Literal(htap_common::Value::Bool(true)));
     }
     *on = and_exprs(expressions);
 }
@@ -1948,6 +2127,142 @@ mod tests {
     }
 
     #[test]
+    fn factors_shared_equality_from_two_and_three_branch_ors() {
+        let shared = eq(column(0, 0, "a.id"), column(1, 0, "b.a_id"));
+        let two_branch = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(and(shared.clone(), eq(column(0, 1, "a.kind"), int(1)))),
+            right: Box::new(and(shared.clone(), eq(column(1, 1, "b.kind"), int(2)))),
+        };
+        let expected_two_branch = and(
+            shared.clone(),
+            Expr::BinaryOp {
+                op: BinOp::Or,
+                left: Box::new(eq(column(0, 1, "a.kind"), int(1))),
+                right: Box::new(eq(column(1, 1, "b.kind"), int(2))),
+            },
+        );
+        assert_eq!(factor_or_common_conjuncts(&two_branch), expected_two_branch);
+
+        let three_branch = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(two_branch),
+            right: Box::new(and(shared.clone(), eq(column(2, 0, "c.kind"), int(3)))),
+        };
+        let expected_three_branch = and(
+            shared,
+            Expr::BinaryOp {
+                op: BinOp::Or,
+                left: Box::new(Expr::BinaryOp {
+                    op: BinOp::Or,
+                    left: Box::new(eq(column(0, 1, "a.kind"), int(1))),
+                    right: Box::new(eq(column(1, 1, "b.kind"), int(2))),
+                }),
+                right: Box::new(eq(column(2, 0, "c.kind"), int(3))),
+            },
+        );
+        assert_eq!(
+            factor_or_common_conjuncts(&three_branch),
+            expected_three_branch
+        );
+    }
+
+    #[test]
+    fn factoring_collapses_when_a_branch_is_only_the_shared_conjunct() {
+        let shared = eq(column(0, 0, "a.id"), int(1));
+        let expr = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(shared.clone()),
+            right: Box::new(and(shared.clone(), eq(column(1, 0, "b.id"), int(2)))),
+        };
+
+        assert_eq!(factor_or_common_conjuncts(&expr), shared);
+    }
+
+    #[test]
+    fn factoring_is_a_no_op_without_a_shared_conjunct() {
+        let expr = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(and(
+                eq(column(0, 0, "a.id"), int(1)),
+                eq(column(0, 1, "a.kind"), int(2)),
+            )),
+            right: Box::new(and(
+                eq(column(1, 0, "b.id"), int(3)),
+                eq(column(1, 1, "b.kind"), int(4)),
+            )),
+        };
+
+        assert_eq!(factor_or_common_conjuncts(&expr), expr);
+    }
+
+    #[test]
+    fn factoring_does_not_move_function_or_subquery_conjuncts() {
+        let function_conjunct = eq(
+            Expr::ScalarFunction {
+                func: crate::expr::ScalarFn::Abs,
+                args: vec![column(0, 0, "a.id")],
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            int(1),
+        );
+        let function_expr = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(and(
+                function_conjunct.clone(),
+                eq(column(0, 1, "a.kind"), int(1)),
+            )),
+            right: Box::new(and(function_conjunct, eq(column(1, 1, "b.kind"), int(2)))),
+        };
+        assert_eq!(factor_or_common_conjuncts(&function_expr), function_expr);
+
+        let subquery_conjunct = eq(
+            column(0, 0, "a.id"),
+            Expr::ScalarSubquery {
+                index: 0,
+                data_type: DataType::Int64,
+                correlated: false,
+            },
+        );
+        let subquery_expr = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(and(
+                subquery_conjunct.clone(),
+                eq(column(0, 1, "a.kind"), int(1)),
+            )),
+            right: Box::new(and(subquery_conjunct, eq(column(1, 1, "b.kind"), int(2)))),
+        };
+        assert_eq!(factor_or_common_conjuncts(&subquery_expr), subquery_expr);
+    }
+
+    #[test]
+    fn factors_or_nested_inside_and() {
+        let shared = eq(column(0, 0, "a.id"), int(1));
+        let nested_or = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(and(shared.clone(), eq(column(0, 1, "a.kind"), int(2)))),
+            right: Box::new(and(shared.clone(), eq(column(1, 0, "b.id"), int(3)))),
+        };
+        let expr = and(eq(column(2, 0, "c.id"), int(4)), nested_or);
+
+        assert_eq!(
+            factor_or_common_conjuncts(&expr),
+            and(
+                eq(column(2, 0, "c.id"), int(4)),
+                and(
+                    shared,
+                    Expr::BinaryOp {
+                        op: BinOp::Or,
+                        left: Box::new(eq(column(0, 1, "a.kind"), int(2))),
+                        right: Box::new(eq(column(1, 0, "b.id"), int(3))),
+                    },
+                ),
+            )
+        );
+    }
+
+    #[test]
     fn estimates_row_count_from_statistics() {
         assert_eq!(
             estimate_row_count(&stats_lookup(), "orders").unwrap(),
@@ -2565,6 +2880,71 @@ mod tests {
         assert_eq!(
             without_stats.pushdown_selections.get(&0),
             Some(&Some(LeafCandidateId(0)))
+        );
+    }
+
+    #[test]
+    fn test_or_factoring_duplicate_within_one_branch() {
+        let shared = eq(column(0, 0, "x"), int(1));
+        let expression = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(and(shared.clone(), shared.clone())),
+            right: Box::new(and(shared.clone(), eq(column(1, 0, "y"), int(2)))),
+        };
+
+        assert_eq!(
+            factor_or_common_conjuncts(&expression),
+            and(
+                shared,
+                Expr::BinaryOp {
+                    op: BinOp::Or,
+                    left: Box::new(eq(column(0, 0, "x"), int(1))),
+                    right: Box::new(eq(column(1, 0, "y"), int(2))),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn test_or_factoring_duplicate_in_multiple_branches() {
+        let shared = eq(column(0, 0, "x"), int(1));
+        let expression = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(and(shared.clone(), shared.clone())),
+            right: Box::new(and(shared.clone(), shared.clone())),
+        };
+
+        assert_eq!(
+            factor_or_common_conjuncts(&expression),
+            and(eq(column(0, 0, "x"), int(1)), eq(column(0, 0, "x"), int(1)),)
+        );
+    }
+
+    #[test]
+    fn test_or_factoring_duplicate_in_one_branch_single_in_other() {
+        let shared = eq(column(0, 0, "x"), int(1));
+        let expression = Expr::BinaryOp {
+            op: BinOp::Or,
+            left: Box::new(and(
+                and(shared.clone(), shared.clone()),
+                eq(column(1, 0, "y"), int(2)),
+            )),
+            right: Box::new(and(shared.clone(), eq(column(2, 0, "z"), int(3)))),
+        };
+
+        assert_eq!(
+            factor_or_common_conjuncts(&expression),
+            and(
+                shared,
+                Expr::BinaryOp {
+                    op: BinOp::Or,
+                    left: Box::new(and(
+                        eq(column(0, 0, "x"), int(1)),
+                        eq(column(1, 0, "y"), int(2)),
+                    )),
+                    right: Box::new(eq(column(2, 0, "z"), int(3))),
+                },
+            )
         );
     }
 }

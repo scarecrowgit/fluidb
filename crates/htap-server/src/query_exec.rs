@@ -58,6 +58,7 @@ use htap_sql::query::{
 };
 use htap_sql::result::StatementResult;
 
+use crate::decorrelate::{self, ExistsLookupPlan};
 use crate::memory_budget::MemoryBudget;
 use crate::session::WriteSet;
 use crate::spill::{OperatorKind, SpillDir, SpillHeader, SpillKind, SpillReader, SpillWriter};
@@ -81,6 +82,15 @@ thread_local! {
     // Optimizer planning occurs on the statement thread before a query body is executed.
     // This lets regression tests distinguish prepared correlated subqueries from per-row plans.
     static LAST_QUERY_OPTIMIZER_INVOCATIONS: Cell<usize> = const { Cell::new(0) };
+    // Decorrelated correlated EXISTS lookups built for the most recent statement.
+    static LAST_QUERY_DECORRELATED_EXISTS_COUNT: Cell<usize> = const { Cell::new(0) };
+    // Correlated EXISTS candidates that retained the ordinary per-row execution path.
+    static LAST_QUERY_DECORRELATED_EXISTS_FALLBACK_COUNT: Cell<usize> = const { Cell::new(0) };
+    // Decorrelated correlated scalar-aggregate lookups built for the most recent statement.
+    static LAST_QUERY_DECORRELATED_SCALAR_AGGREGATE_COUNT: Cell<usize> = const { Cell::new(0) };
+    // Correlated scalar-aggregate candidates that retained ordinary per-row execution.
+    static LAST_QUERY_DECORRELATED_SCALAR_AGGREGATE_FALLBACK_COUNT: Cell<usize> =
+        const { Cell::new(0) };
 }
 
 impl OwnedServer {
@@ -156,6 +166,32 @@ impl OwnedServer {
         let _ = self;
         LAST_QUERY_OPTIMIZER_INVOCATIONS.with(Cell::get)
     }
+
+    /// Returns the number of correlated EXISTS lookups built for the most recent query.
+    pub fn last_query_decorrelated_exists_count(&self) -> usize {
+        let _ = self;
+        LAST_QUERY_DECORRELATED_EXISTS_COUNT.with(Cell::get)
+    }
+
+    /// Returns the number of correlated EXISTS candidates that fell back for the most recent
+    /// query.
+    pub fn last_query_decorrelated_exists_fallback_count(&self) -> usize {
+        let _ = self;
+        LAST_QUERY_DECORRELATED_EXISTS_FALLBACK_COUNT.with(Cell::get)
+    }
+
+    /// Returns the number of correlated scalar-aggregate lookups built for the most recent query.
+    pub fn last_query_decorrelated_scalar_aggregate_count(&self) -> usize {
+        let _ = self;
+        LAST_QUERY_DECORRELATED_SCALAR_AGGREGATE_COUNT.with(Cell::get)
+    }
+
+    /// Returns the number of correlated scalar-aggregate candidates that fell back for the most
+    /// recent query.
+    pub fn last_query_decorrelated_scalar_aggregate_fallback_count(&self) -> usize {
+        let _ = self;
+        LAST_QUERY_DECORRELATED_SCALAR_AGGREGATE_FALLBACK_COUNT.with(Cell::get)
+    }
 }
 
 fn reset_parallel_workers() {
@@ -193,6 +229,30 @@ fn reset_optimizer_invocations() {
 
 fn record_optimizer_invocation() {
     LAST_QUERY_OPTIMIZER_INVOCATIONS.with(|count| count.set(count.get() + 1));
+}
+
+fn reset_decorrelated_exists_counts() {
+    LAST_QUERY_DECORRELATED_EXISTS_COUNT.with(|count| count.set(0));
+    LAST_QUERY_DECORRELATED_EXISTS_FALLBACK_COUNT.with(|count| count.set(0));
+    LAST_QUERY_DECORRELATED_SCALAR_AGGREGATE_COUNT.with(|count| count.set(0));
+    LAST_QUERY_DECORRELATED_SCALAR_AGGREGATE_FALLBACK_COUNT.with(|count| count.set(0));
+}
+
+fn record_decorrelated_exists() {
+    LAST_QUERY_DECORRELATED_EXISTS_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+fn record_decorrelated_exists_fallback() {
+    LAST_QUERY_DECORRELATED_EXISTS_FALLBACK_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+fn record_decorrelated_scalar_aggregate() {
+    LAST_QUERY_DECORRELATED_SCALAR_AGGREGATE_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+fn record_decorrelated_scalar_aggregate_fallback() {
+    LAST_QUERY_DECORRELATED_SCALAR_AGGREGATE_FALLBACK_COUNT
+        .with(|count| count.set(count.get() + 1));
 }
 
 /// Per-statement execution context.
@@ -292,6 +352,7 @@ pub(crate) fn execute_query_with_mode(input: ExecuteQueryInput<'_>) -> Result<St
     reset_parallel_workers();
     reset_spill_count();
     reset_optimizer_invocations();
+    reset_decorrelated_exists_counts();
 
     let ExecuteQueryInput {
         server,
@@ -430,7 +491,13 @@ fn run_query_with_budget(
     run_query_with_outer(ctx, query, None, budget)
 }
 
-struct PreparedCorrelatedQuery {
+enum PreparedCorrelatedQuery {
+    PerRow(Box<PreparedPerRowQuery>),
+    ExistsLookup(decorrelate::ExistsLookup),
+    ScalarAggregateLookup(decorrelate::ScalarAggregateLookup),
+}
+
+struct PreparedPerRowQuery {
     query: BoundQuery,
     join_build_sides: Option<HashMap<usize, BuildSide>>,
 }
@@ -449,18 +516,32 @@ impl SubqueryRunner for CorrelatedRunner<'_> {
             .get(index)
             .ok_or_else(|| HtapError::Internal(format!("subquery {index} not available")))?;
         if let Some(prepared) = self.prepared.get(index).and_then(Option::as_ref) {
-            run_query_with_outer_prepared(
-                self.ctx,
-                &prepared.query,
-                Some(outer_row),
-                self.budget,
-                prepared.join_build_sides.as_ref(),
-            )
+            match prepared {
+                PreparedCorrelatedQuery::PerRow(prepared) => run_query_with_outer_prepared(
+                    self.ctx,
+                    &prepared.query,
+                    Some(outer_row),
+                    self.budget,
+                    prepared.join_build_sides.as_ref(),
+                ),
+                PreparedCorrelatedQuery::ExistsLookup(lookup) => lookup.run(outer_row),
+                PreparedCorrelatedQuery::ScalarAggregateLookup(lookup) => lookup.run(outer_row),
+            }
         } else if query.correlated {
             run_query_with_outer(self.ctx, query, Some(outer_row), self.budget)
         } else {
             run_query_with_budget(self.ctx, query, self.budget)
         }
+    }
+
+    fn is_cached(&self, index: usize) -> bool {
+        matches!(
+            self.prepared.get(index).and_then(Option::as_ref),
+            Some(
+                PreparedCorrelatedQuery::ExistsLookup(_)
+                    | PreparedCorrelatedQuery::ScalarAggregateLookup(_)
+            )
+        )
     }
 }
 
@@ -515,36 +596,66 @@ fn run_query_with_outer_prepared(
             }
         })
         .collect::<Result<_>>()?;
+    let exists_subqueries = correlated_exists_subqueries(query);
+    let scalar_aggregate_subqueries = correlated_scalar_aggregate_subqueries(query);
     let prepared_subqueries = query
         .subqueries
         .iter()
-        .map(|subquery| {
-            if !subquery.correlated {
-                return None;
-            }
-            let physical = (ctx.optimization_mode == OptimizationMode::Enabled).then(|| {
-                record_optimizer_invocation();
-                optimize(subquery, &CatalogStats(ctx.catalog))
-            });
-            let query = match physical.as_ref() {
-                Some(physical) => match (&subquery.body, physical.select.as_ref()) {
-                    (QueryBody::Select(_), Some(select)) => {
-                        let mut optimized = subquery.clone();
-                        optimized.body = QueryBody::Select(select.clone());
-                        optimized
+        .enumerate()
+        .map(
+            |(index, subquery)| -> Result<Option<PreparedCorrelatedQuery>> {
+                if !subquery.correlated {
+                    return Ok(None);
+                }
+
+                if exists_subqueries.contains(&index) {
+                    if let Some(plan) = decorrelate::plan_exists_lookup(subquery) {
+                        if let Some(lookup) = build_exists_lookup(ctx, plan, budget)? {
+                            record_decorrelated_exists();
+                            return Ok(Some(PreparedCorrelatedQuery::ExistsLookup(lookup)));
+                        }
                     }
-                    _ => subquery.clone(),
-                },
-                None => subquery.clone(),
-            };
-            Some(PreparedCorrelatedQuery {
-                query,
-                join_build_sides: physical
-                    .filter(|physical| !physical.fallback)
-                    .map(|physical| physical.join_build_sides),
-            })
-        })
-        .collect::<Vec<_>>();
+                    record_decorrelated_exists_fallback();
+                }
+
+                if scalar_aggregate_subqueries.contains(&index) {
+                    if let Some(plan) = decorrelate::plan_scalar_aggregate_lookup(subquery) {
+                        if let Some(lookup) = build_scalar_aggregate_lookup(ctx, plan, budget)? {
+                            record_decorrelated_scalar_aggregate();
+                            return Ok(Some(PreparedCorrelatedQuery::ScalarAggregateLookup(
+                                lookup,
+                            )));
+                        }
+                    }
+                    record_decorrelated_scalar_aggregate_fallback();
+                }
+
+                let physical = (ctx.optimization_mode == OptimizationMode::Enabled).then(|| {
+                    record_optimizer_invocation();
+                    optimize(subquery, &CatalogStats(ctx.catalog))
+                });
+                let query = match physical.as_ref() {
+                    Some(physical) => match (&subquery.body, physical.select.as_ref()) {
+                        (QueryBody::Select(_), Some(select)) => {
+                            let mut optimized = subquery.clone();
+                            optimized.body = QueryBody::Select(select.clone());
+                            optimized
+                        }
+                        _ => subquery.clone(),
+                    },
+                    None => subquery.clone(),
+                };
+                Ok(Some(PreparedCorrelatedQuery::PerRow(Box::new(
+                    PreparedPerRowQuery {
+                        query,
+                        join_build_sides: physical
+                            .filter(|physical| !physical.fallback)
+                            .map(|physical| physical.join_build_sides),
+                    },
+                ))))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
     let runner = CorrelatedRunner {
         ctx,
         subqueries: &query.subqueries,
@@ -751,6 +862,246 @@ fn run_query_with_outer_prepared(
         .map(|k| Row::new(k.output))
         .collect();
     Ok(rows)
+}
+
+fn correlated_exists_subqueries(query: &BoundQuery) -> BTreeSet<usize> {
+    let mut indexes = BTreeSet::new();
+    let mut note = |expr: &Expr| {
+        expr.walk(&mut |expr| {
+            if let Expr::Exists { index, .. } = expr {
+                indexes.insert(*index);
+            }
+        });
+    };
+
+    fn note_join_tree(tree: &JoinTree, note: &mut impl FnMut(&Expr)) {
+        match tree {
+            JoinTree::Leaf(_) => {}
+            JoinTree::Join {
+                left, right, on, ..
+            } => {
+                note_join_tree(left, note);
+                note_join_tree(right, note);
+                if let Some(on) = on {
+                    note(on);
+                }
+            }
+        }
+    }
+
+    match &query.body {
+        QueryBody::Select(select) => {
+            note_join_tree(&select.join_tree, &mut note);
+            if let Some(filter) = &select.filter {
+                note(filter);
+            }
+            for expr in &select.group_by {
+                note(expr);
+            }
+            for aggregate in &select.aggregates {
+                if let Some(arg) = &aggregate.arg {
+                    note(arg);
+                }
+            }
+            if let Some(having) = &select.having {
+                note(having);
+            }
+            for projection in &select.projection {
+                note(&projection.expr);
+            }
+            for window in &select.windows {
+                for expr in &window.partition_by {
+                    note(expr);
+                }
+                for item in &window.order_by {
+                    note(&item.expr);
+                }
+                for arg in &window.args {
+                    note(arg);
+                }
+                if let WindowFrame::ValueRange { start, end } = &window.frame {
+                    for bound in [start, end] {
+                        if let ValueFrameBound::Offset { value, .. } = bound {
+                            note(value);
+                        }
+                    }
+                }
+            }
+        }
+        QueryBody::SetOp { .. } | QueryBody::RecursiveQueryBody { .. } => {}
+    }
+    for item in &query.order_by {
+        note(&item.expr);
+    }
+
+    indexes
+}
+
+fn correlated_scalar_aggregate_subqueries(query: &BoundQuery) -> BTreeSet<usize> {
+    let mut indexes = BTreeSet::new();
+    let mut note = |expr: &Expr| {
+        expr.walk(&mut |expr| {
+            if let Expr::ScalarSubquery {
+                index,
+                correlated: true,
+                ..
+            } = expr
+            {
+                indexes.insert(*index);
+            }
+        });
+    };
+
+    fn note_join_tree(tree: &JoinTree, note: &mut impl FnMut(&Expr)) {
+        match tree {
+            JoinTree::Leaf(_) => {}
+            JoinTree::Join {
+                left, right, on, ..
+            } => {
+                note_join_tree(left, note);
+                note_join_tree(right, note);
+                if let Some(on) = on {
+                    note(on);
+                }
+            }
+        }
+    }
+
+    match &query.body {
+        QueryBody::Select(select) => {
+            note_join_tree(&select.join_tree, &mut note);
+            if let Some(filter) = &select.filter {
+                note(filter);
+            }
+            for expr in &select.group_by {
+                note(expr);
+            }
+            for aggregate in &select.aggregates {
+                if let Some(arg) = &aggregate.arg {
+                    note(arg);
+                }
+            }
+            if let Some(having) = &select.having {
+                note(having);
+            }
+            for projection in &select.projection {
+                note(&projection.expr);
+            }
+            for window in &select.windows {
+                for expr in &window.partition_by {
+                    note(expr);
+                }
+                for item in &window.order_by {
+                    note(&item.expr);
+                }
+                for arg in &window.args {
+                    note(arg);
+                }
+            }
+        }
+        QueryBody::SetOp { .. } | QueryBody::RecursiveQueryBody { .. } => {}
+    }
+    for item in &query.order_by {
+        note(&item.expr);
+    }
+
+    indexes
+}
+
+fn build_exists_lookup(
+    ctx: &ExecContext<'_>,
+    plan: ExistsLookupPlan,
+    budget: &SubqueryBudget,
+) -> Result<Option<decorrelate::ExistsLookup>> {
+    let build_lookup = || -> Result<decorrelate::ExistsLookup> {
+        let build_rows = run_query_with_budget(ctx, &plan.build_query, budget)?;
+        let mut rows = HashMap::new();
+        let mut reservations = Vec::new();
+
+        for row in build_rows {
+            let key =
+                decorrelate::normalized_lookup_key(row.values(), &plan.key_types, normalize_key)?;
+            let Some(key) = key else {
+                continue;
+            };
+
+            reservations.push(
+                ctx.memory_budget
+                    .try_reserve(estimate_values_bytes(row.values()))?,
+            );
+            rows.entry(key).or_insert_with(Vec::new).push(row);
+        }
+
+        Ok(decorrelate::ExistsLookup {
+            probe_keys: plan.probe_keys,
+            key_types: plan.key_types,
+            rows,
+            residual_exprs: plan.residual_exprs,
+            _reservations: reservations,
+        })
+    };
+
+    // Lookup construction is an optimization. Preserve ordinary correlated execution when its
+    // query, normalization, or memory reservation cannot be completed.
+    match build_lookup() {
+        Ok(lookup) => Ok(Some(lookup)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn build_scalar_aggregate_lookup(
+    ctx: &ExecContext<'_>,
+    plan: decorrelate::ScalarAggregateLookupPlan,
+    budget: &SubqueryBudget,
+) -> Result<Option<decorrelate::ScalarAggregateLookup>> {
+    let build_lookup = || -> Result<decorrelate::ScalarAggregateLookup> {
+        let default_rows = run_query_with_budget(ctx, &plan.default_query, budget)?;
+        let [default_row] = default_rows.as_slice() else {
+            return Err(HtapError::Internal(
+                "scalar aggregate empty-group query did not return one row".into(),
+            ));
+        };
+        let default = default_row
+            .get(0)
+            .cloned()
+            .ok_or_else(|| HtapError::Internal("scalar aggregate default row is empty".into()))?;
+
+        let build_rows = run_query_with_budget(ctx, &plan.build_query, budget)?;
+        let mut values = HashMap::new();
+        let mut reservations = Vec::new();
+        for row in build_rows {
+            let key_count = plan.key_types.len();
+            let (key_values, value) = row.values().split_at(key_count);
+            let [value] = value else {
+                return Err(HtapError::Internal(
+                    "scalar aggregate lookup row has an unexpected width".into(),
+                ));
+            };
+            let Some(key) =
+                decorrelate::normalized_lookup_key(key_values, &plan.key_types, normalize_key)?
+            else {
+                continue;
+            };
+            reservations.push(
+                ctx.memory_budget
+                    .try_reserve(estimate_values_bytes(row.values()))?,
+            );
+            values.insert(key, value.clone());
+        }
+
+        Ok(decorrelate::ScalarAggregateLookup {
+            probe_keys: plan.probe_keys,
+            key_types: plan.key_types,
+            values,
+            default,
+            _reservations: reservations,
+        })
+    };
+
+    match build_lookup() {
+        Ok(lookup) => Ok(Some(lookup)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn order_keys_from_output(
@@ -3398,7 +3749,11 @@ fn normalized_join_key(
         if value.is_null() {
             return Ok(None);
         }
-        key.push(normalize_key(value, *canonical_type)?);
+        let normalized = normalize_key(value, *canonical_type)?;
+        if normalized.is_null() {
+            return Ok(None);
+        }
+        key.push(normalized);
     }
     Ok(Some(key))
 }
@@ -4042,7 +4397,7 @@ fn join_rows_inner(input: JoinRowsInput<'_>, allow_spill: bool) -> Result<Vec<Ve
 }
 
 /// Normalizes both sides of an equi-join key to the binder-selected numeric type.
-fn normalize_key(value: Value, canonical_type: DataType) -> Result<Value> {
+pub(crate) fn normalize_key(value: Value, canonical_type: DataType) -> Result<Value> {
     match canonical_type {
         DataType::Int64 => match value {
             Value::Int32(value) => Ok(Value::Int64(value as i64)),
@@ -4059,7 +4414,17 @@ fn normalize_key(value: Value, canonical_type: DataType) -> Result<Value> {
             other => cast_value(other, DataType::Float64),
         },
         DataType::Decimal { precision, scale } => {
-            cast_value(value, DataType::Decimal { precision, scale })
+            match cast_value(value, DataType::Decimal { precision, scale }) {
+                Ok(value) => Ok(value),
+                Err(HtapError::InvalidArgument(message))
+                    if message.contains("cannot cast") && message.contains(" to decimal") =>
+                {
+                    // An out-of-range decimal key cannot equal a value representable by the
+                    // canonical type, so represent it as a non-matching NULL lookup key.
+                    Ok(Value::Null)
+                }
+                Err(error) => Err(error),
+            }
         }
         other => Err(HtapError::Internal(format!(
             "unsupported canonical join key type {}",

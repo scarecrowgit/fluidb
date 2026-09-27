@@ -4038,3 +4038,111 @@ query, `LIMIT` included, still binds and executes against the schema) and
 scope and deferred features" for the surrounding contract; the TPC compliance/deviations disclosure document
 that will formally record the row-limiting choice as a stated (not violating) conformance path is a later
 Batch B deliverable and is not written yet.
+
+## ADR-028: Statement-scoped hash lookups for eligible correlated subqueries, not a new Semi/Anti JoinKind
+
+`Status: Accepted`
+`Date: 2026-09-28`
+
+### Context
+
+Phase 17 task B3's first release-mode TPC-H timing (SF 0.01, all 22 queries) found six queries too slow for a
+power/throughput run: Query 4 and Query 21 exceeded a 120-second timeout, Query 19 took about 61 seconds, Query
+17 about 22, Query 20 about 20, and Query 22 about 9.7. All six depend on a correlated `EXISTS`/`NOT EXISTS` or
+scalar-aggregate subquery; the general query executor (Phase 13, ADR-022) executes a correlated subquery's
+whole physical plan once per outer row via the `SubqueryRunner` callback, with no memo keyed on the correlation
+value, so a subquery that could be answered from a small keyed relation was instead re-planned-and-scanned once
+per outer row. Query 19 additionally nests a join equality inside every branch of a three-way `OR`, which the
+optimizer's `conjuncts()` — an AND-only split — never turned into a join key, so it ran as an unbudgeted nested
+loop; that is a separate, independent fix (`optimize.rs::factor_or_common_conjuncts`) not covered by this ADR.
+
+The natural database-textbook fix for the correlated-subquery half of this is a semi-join/anti-join rewrite:
+turn the correlated `EXISTS`/`NOT EXISTS` into a `Semi`/`Anti` join node in the outer query's own join tree, so
+the existing hash-join machinery (build side, equi-key, spill) answers it directly. That would need a new
+`JoinKind::Semi`/`JoinKind::Anti` variant threaded through `query::JoinTree`, `JoinSpec`, `evaluate_join_tree`,
+its row-width and null-padding invariants (a semi/anti join's output row width differs from an inner/outer
+join's — it takes only the probe side's columns, never the build side's), the optimizer's join reordering and
+predicate-conservation validator, and the cost model — a genuine operator-hierarchy expansion, not a local
+change to subquery preparation.
+
+### Options considered
+
+- **(a) A new `Semi`/`Anti` `JoinKind` in the outer query's own join tree.** The textbook rewrite. Reuses the
+  existing hash-join spill/parallelism machinery once built, and would also make an eventual `IN`/`NOT IN`
+  rewrite (out of scope here) a smaller step later. Rejected for this task: it touches the row-width invariant
+  every join-tree consumer (evaluator, optimizer reordering, predicate-conservation validator, EXPLAIN) already
+  relies on, is a materially larger and riskier change than the measured bottleneck requires, and none of the
+  panel consulted for this task's plan (`reasoner`/`cx/gpt-6-astra`, `cx/gpt-5.6-sol`, `cx/gpt-5.5`) recommended
+  it as the right scope for this fix — see the plan's own "CONSULTED" section.
+- **(b) A statement-scoped lookup built once per statement in the subquery-preparation layer, keyed on the
+  correlation value(s), probed per outer row.** Narrower: the outer query's `JoinTree`/`JoinSpec`/row-width
+  invariants are completely untouched; only `query_exec.rs`'s existing `PreparedCorrelatedQuery` preparation
+  step (already run once per statement, not per row, since Phase 14's optimizer invocation) changes, becoming
+  an enum of `PerRow`/`ExistsLookup`/`ScalarAggregateLookup`. The lookup is built through the unmodified
+  ordinary query-execution path (`run_query_with_budget`) and the existing equi-join key-normalization helpers,
+  reusing tested code rather than adding a new join operator.
+- **(c) Do nothing structural; only add the `OR`-factoring fix and accept the six queries' running time.**
+  Rejected: the measured problem (two outright timeouts, four multi-second queries) is exactly what this task
+  was scoped to fix, and the panel's independent design work converged on a build-once/probe-per-row lookup as
+  tractable within the same task.
+
+### Decision
+
+Option **(b)**. A correlated `EXISTS`/`NOT EXISTS` with at least one key equality (`CorrelatedColumnRef =
+local-only expr`), optionally plus residual correlated conjuncts that are not key equalities, and a correlated
+ungrouped scalar-aggregate subquery with at least one key equality and no residual, are answered from a
+`HashMap`-backed lookup (`crates/htap-server/src/decorrelate.rs`) built once per statement and probed per outer
+row through the same `SubqueryRunner::run` entry point every other correlated subquery already uses. Every
+entry in the subquery's `correlated_outer_refs` must be accounted for by a key or residual conjunct (a
+correlated reference anywhere else — `ON`, projection, `HAVING`, a nested subquery — is ineligible), `EXISTS`
+additionally rejects aggregates/`GROUP BY` (an always-true `EXISTS(SELECT COUNT(*) ...)` must not be treated as
+key-filterable), and the scalar-aggregate shape additionally requires exactly one aggregate in a single
+projection with no `HAVING`/`DISTINCT`/window/`LIMIT`/`OFFSET`/`ORDER BY`. A key component that is `NULL` on
+either the build or probe side never matches, following SQL's own equality semantics; the scalar-aggregate
+miss/NULL-key case is answered by evaluating the same ungrouped projection once over a guaranteed-empty input
+through the unmodified evaluator, so `COUNT(*)` gives `0` and `SUM`/`AVG` give `NULL` without a per-aggregate
+special case. Every ineligible shape, a build-query error, or a failed `MemoryBudget` reservation for the built
+rows keeps the pre-existing per-row path unchanged — a slow success is never turned into an error. A new
+`SubqueryBudget::enter_cached()` still enforces the nesting-depth cap (a cached lookup can still nest inside
+another correlated subquery) but not the 10,000-invocation cap, because a lookup probe is not a fresh subquery
+execution against the statement's snapshot; it is a hash lookup against a relation already materialized once.
+
+### Consequences
+
+- No new `JoinKind` variant, so every existing join-tree consumer (evaluator, optimizer reordering and its
+  predicate-conservation validator, `EXPLAIN`, the row-width/null-padding invariants) is provably unaffected —
+  the outer query's own execution plan is byte-for-byte identical to before this task whether or not any of its
+  subqueries decorrelates.
+- The fix is confined to subquery preparation and a new module; `htap-sql::query`/`JoinTree`/`JoinSpec` gained
+  no new field or variant, and no on-disk format, wire protocol, or durability path changed (`storage-reviewer`:
+  n/a for this reason).
+- The scope is narrower than a semi-join rewrite would eventually be: a correlated `IN`/`NOT IN` is not
+  rewritten at all (no TPC-H query needed it, so it was out of scope), a scalar aggregate with a residual
+  correlated predicate still falls back to the per-row path (no known TPC-H query needs it either), and the
+  uncorrelated `IN`/`EXISTS` membership scan remains an unrelated, still-deferred O(n)-per-row check. See
+  `docs/LIMITATIONS.md`'s "Completed local MVP — correlated-subquery decorrelation and OR factoring (Phase 17,
+  task F6)" for the complete eligibility contract.
+- A future genuine semi-join rewrite (option (a)) remains open and is not foreclosed by this decision — this
+  ADR only records why it was not the right scope for the measured problem, not that it is wrong in general.
+
+### How to reverse it
+
+Delete `crates/htap-server/src/decorrelate.rs`, the `mod decorrelate` declaration, `PreparedCorrelatedQuery`'s
+`ExistsLookup`/`ScalarAggregateLookup` variants and their construction in `query_exec.rs` (falling back to
+`PerRow` unconditionally restores the exact pre-task-F6 execution path), and `SubqueryBudget::enter_cached()` in
+`htap-sql/src/expr.rs` (reverting `subquery_result_rows` to always call `enter()`). Nothing here is persisted,
+so a reversal carries no migration or format-version change.
+
+### Verification
+
+`crates/htap-server/tests/query_exec.rs`'s
+`{test_key_only_correlated_exists_is_decorrelated_once_per_statement, test_decorrelated_exists_single_and_composite_keys, test_decorrelated_exists_with_q21_shaped_residual, test_decorrelated_exists_residual_null_does_not_match, test_decorrelated_exists_residual_edge_cases, test_decorrelated_exists_without_key_conjunct_falls_back, test_decorrelated_exists_normalizes_numeric_key_types, test_decorrelated_exists_aggregate_and_residual_fall_back, test_decorrelated_exists_build_error_triggers_fallback, test_decorrelated_exists_probed_over_invocation_cap_succeeds, test_decorrelated_exists_outer_between_distinct_inner_columns, test_decorrelated_exists_scalar_subquery_residual_falls_back, test_decorrelated_scalar_aggregate_q17_shape_missing_group, test_decorrelated_scalar_aggregate_miss_values, test_decorrelated_scalar_aggregate_composite_key_missing_group, test_decorrelated_scalar_aggregate_null_composite_key_components_miss, test_decorrelated_scalar_aggregate_normalizes_numeric_keys, test_decorrelated_scalar_aggregate_local_filter_decorates, test_decorrelated_scalar_aggregate_correlated_residual_falls_back, test_q19_shaped_or_predicates_return_hand_computed_revenue, test_reordered_inner_join_predicate_placeholders_are_boolean_true}`,
+the pre-existing `test_correlated_subquery_is_optimized_once_per_statement`/
+`test_correlated_subquery_caps_fire_during_execution`/`test_correlated_subquery_through_window_spec` passing
+unchanged against the new eligibility gate, `crates/htap-sql/src/optimize.rs`'s
+`optimize::tests::{factors_shared_equality_from_two_and_three_branch_ors, factoring_collapses_when_a_branch_is_only_the_shared_conjunct, factoring_is_a_no_op_without_a_shared_conjunct, factoring_does_not_move_function_or_subquery_conjuncts, factors_or_nested_inside_and}`,
+and `crates/htap-tpch/tests/load.rs::all_22_queries` (release, `#[ignore]`d, `--ignored`), which measured all 22
+queries finishing in about 10.3 seconds total after this change (Query 4 timeout → 0.29s, Query 21 timeout →
+0.89s, Query 19 61s → 0.28s, Query 17 22s → 0.67s, Query 20 20s → 0.48s, Query 22 9.7s → 0.07s). See
+`docs/PROGRESS.md`'s Phase 17 (continued) row and `docs/LIMITATIONS.md`'s "Completed local MVP —
+correlated-subquery decorrelation and OR factoring (Phase 17, task F6)" for the surrounding contract.
