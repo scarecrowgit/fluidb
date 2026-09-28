@@ -337,7 +337,7 @@ defined in `crates/htap-common/src/types.rs`:
   `test_decimal_comparisons_below_representable_range`,
   `test_decimal_comparisons_at_representable_boundary`).
 
-### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3)
+### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6)
 
 **Status: `in progress`.** Phase 17 continues past A6a/A6b (`DECIMAL`, above) into a TPC-H-derived workload
 kit. Batch A (complete) closed three prerequisites the kit depends on, with no on-disk format change: movement's
@@ -509,6 +509,24 @@ O(n) per row) — see `docs/LIMITATIONS.md`'s "Completed local MVP — correlate
 factoring (Phase 17, task F6)" for the full eligibility contract and test citations, and ADR-028 for the design
 rationale.
 
+**Task B6 — independent re-aggregation oracle, test-only.** `Status: implemented (test-only)`. `crates/htap-tpch/tests/oracle/` computes each of the 22 queries' expected result directly from the generated
+`Dataset` in hand-written Rust, with no SQL engine, no `htap-sql` expression evaluation, and no reused engine
+decimal helper anywhere in the call path (a test-local fixed-point `Dec` type implements add/sub/mul/div/sum/avg
+to the documented `DECIMAL` result rules, verified at the .5 rounding boundary in both directions). A
+stack-scoped `load_at(sf, seed)` loader holds no static/`OnceLock` `TempDir`, so it cannot reintroduce the
+fixture-directory leak the Phase 17 test-only follow-up fixed above. `crates/htap-tpch/tests/fixtures/compare.rs`
+gained `compare_ordered_with_ties`, a tie-aware comparator for the five `LIMIT`-bearing queries whose `ORDER BY`
+is not a full key under truncation. Every one of the 22 per-query tests (`#[ignore]`-gated, plus one aggregate
+`tpch_oracle_all_22_queries`) compares the engine's output against the oracle's exactly — value, precision, and
+scale for decimals — and separately asserts a coverage condition computed from the dataset, which caught that
+Query 17 and Query 20 had previously "passed" at SF 0.01 only because both sides were `NULL` or both were empty;
+Q17 and Q18 now run at SF 0.03 and Q20 at SF 0.1 (all other queries stay at SF 0.01), seed 42 throughout. All 22
+queries match the engine exactly. No new ADR: test-only, no production code under `crates/*/src` touched. See
+`docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for what this does and does not
+establish (one seed, three scale factors total — 0.01 plus two overrides, 0.03 and 0.1 — no claim about the generator's own conformance to the
+specification's row-generation algorithm) and `docs/PROGRESS.md`'s Phase 17 (continued) row for the full test
+list.
+
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent *direct storage access* to a shared root remains unsupported — Phase 16 above adds only local, same-host IPC forwarding for a second process, not a second storage writer),
@@ -521,7 +539,7 @@ executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spilla
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), a general semi-join rewrite of IN/EXISTS (a narrow slice — key-equality correlated EXISTS/NOT EXISTS and key-equality correlated scalar-aggregate subqueries answered from a statement-scoped hash lookup, with no new Semi/Anti JoinKind — is implemented as of Phase 17 task F6, see above and ADR-028; correlated IN/NOT IN rewriting and residual-bearing scalar-aggregate decorrelation remain deferred), broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
-TPC-H refresh functions, an independent oracle, power/throughput test drivers, and a compliance/deviations disclosure document (task B2 added a from-specification row generator and task B3 a bulk loader; the schema/query-text/scale-factor/correctness-fixture/row-generator/bulk-loader foundation is otherwise all Batch B has delivered so far — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
+TPC-H refresh functions, power/throughput test drivers, and a compliance/deviations disclosure document (task B2 added a from-specification row generator, task B3 a bulk loader, and task B6 a test-only independent re-aggregation oracle for all 22 queries — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),

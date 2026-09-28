@@ -1,4 +1,5 @@
 pub mod anti_join;
+pub mod compare;
 pub mod correctness;
 pub mod customer_avg;
 pub mod join;
