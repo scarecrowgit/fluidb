@@ -643,6 +643,30 @@ See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
 
+### TPC-C workload kit (Phase 18, batch 1 of 4)
+
+**Status: `in progress`.** Batch 1 of `crates/htap-tpcc` is built: schema, population generator and bulk loader. Batches 2-4
+(the five transactions, the consistency oracle, isolation tests, the driver and the TPC-C disclosure document) are not
+built, so nothing here is a TPC-C benchmark or a compliance claim. No engine-crate, on-disk-format or wire change.
+
+- **Schema** (`schema::{TABLE_NAMES, ddl_statements}`): the nine tables. ORDER, ORDER-LINE and NEW-ORDER are named `orders`,
+  `order_line`, `new_order` (ORDER is reserved, hyphens are invalid in unquoted names, and double quotes are string literals in
+  this MySQL dialect). HISTORY gets an added surrogate primary key `h_id` because the engine requires a primary key; the
+  spec permits added attributes (Clause 1.4.7) and gives History an addressing exception (Clause 1.4.10). `history::build_h_id`
+  packs a 15-bit source and a 48-bit sequence into a positive BIGINT, so keys are unique by construction and `INSERT` upserts
+  never collide. Tests: `tests/schema_ddl.rs::ddl_creates_expected_catalog_schema`, `history::tests`.
+- **Scale:** the unit is the warehouse count (minimum 1, about 600k rows for one warehouse: 100k ITEM, 100k STOCK, 30k each of CUSTOMER, HISTORY and ORDER, about 300k ORDER-LINE, and 9k NEW-ORDER).
+- **Generator** (`generate::generate`): deterministic, following Clause 4.3.3.1, with its own SplitMix64 PRNG (the spec names
+  none), a fixed NURand `C`, and taxes and discounts at four decimal places. Tests: `generate::tests`, `generate::rng::tests`,
+  `generate::text::tests`.
+- **Loader** (`load::load_dataset`) mirrors the TPC-H loader: fresh-target check before any DDL, batched loads, per-table
+  checks. It has no whole-load rollback: a failure partway leaves the created tables, and a retry then fails the
+  fresh-target check. Tests: `tests/load.rs::{reject_load_when_tables_already_exist, reject_invalid_batch_size_before_ddl}`.
+- **Load tests:** the default `load_small_subset_with_referential_consistency` loads a referentially consistent subset; the full
+  one-warehouse `load_with_warehouse_count_1_and_verify_counts_and_values` is `#[ignore]`d (about 67 s in release).
+- **Fixed after external review in batch 1:** the delivered boundary (orders 1-2100 delivered, 2101-3000 in NEW-ORDER),
+  C_PHONE now 16 digits, and I_DATA/S_DATA lengths 26-50.
+
 ## Component diagram
 
 ### Target / Planned Architecture Diagram (Qualified Intended State)

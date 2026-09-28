@@ -723,6 +723,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "htap-tpcc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "csv",
+ "htap-catalog",
+ "htap-common",
+ "htap-movement",
+ "htap-server",
+ "htap-sql",
+ "tempfile",
+]
+
+[[package]]
 name = "htap-tpch"
 version = "0.1.0"
 dependencies = [

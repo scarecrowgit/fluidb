@@ -1963,7 +1963,27 @@ recorded as ADR-030.
   non-comparability statement, "Derived from TPC-H" naming, and the prohibition on the QphH/QppH/QthH metric
   names), is now written: see [`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md), which supersedes this bullet
   and the scattered per-task disclosures above as the canonical compliance/deviations record. The TPC-C
-  benchmark specification (Phase 18) has not been started.
+  benchmark kit (Phase 18) is `in progress`: batch 1 only, see "TPC-C workload kit scope and deferred features" below.
+
+---
+
+## TPC-C workload kit scope and deferred features (Phase 18, batch 1 of 4)
+
+**Status: `in progress`.** See `docs/ARCHITECTURE.md` "TPC-C workload kit (Phase 18, batch 1 of 4)".
+
+**Exists (batch 1, `crates/htap-tpcc`):** the nine-table schema, a deterministic from-spec population generator and a bulk loader,
+covered by `tests/schema_ddl.rs`, `tests/load.rs` and the crate's unit tests (ignored one-warehouse load: about 67 s in release).
+
+**Remains (batches 2-4, not built):** the five transactions, the consistency oracle, isolation tests, the driver, and the TPC-C
+disclosure document with its ADRs.
+
+**Disclosures:**
+- ORDER, ORDER-LINE and NEW-ORDER are named `orders`, `order_line`, `new_order`.
+- HISTORY has an added surrogate primary key `h_id` (Clauses 1.4.7 and 1.4.10); the engine requires a primary key.
+- The generator uses its own SplitMix64 PRNG and a fixed NURand `C`; it is not an audited TPC-C implementation.
+- The loader has no whole-load rollback: a failure partway leaves the created tables, and a retry fails the fresh-target check.
+- The default CI load test covers a referentially consistent subset only; the full one-warehouse load is `#[ignore]`d.
+- No TPC-C compliance or comparability claim; no metric is computed.
 
 ---
 

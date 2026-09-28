@@ -12,6 +12,7 @@ members = [
     "crates/htap-server",
     "crates/htap-movement",
     "crates/htap-tpch",
+    "crates/htap-tpcc",
     "crates/htap-bench",
     "crates/htap-client",
     "crates/htap-wire",
