@@ -147,7 +147,9 @@ No TPC-H Tools distribution source (QGen, DBGen, or the reference implementation
 machine-translated; `crates/htap-tpch::generate` is an independent, from-specification row generator (see
 `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"), and `crates/htap-tpch::drivers`
 computes no official TPC-H metric (see ADR-030 in `docs/DECISIONS.md`). This project makes no TPC-H compliance
-or comparability claim.
+or comparability claim. See [`docs/TPCH-DISCLOSURE.md`](./docs/TPCH-DISCLOSURE.md) for the full TPC Policies
+§8.1.5 disclaimer, the §8.3.2 deviations list, and the §8.3.3 non-comparability statement (task B9); this
+section remains the canonical record of what is reproduced verbatim and why.
 
 > TPC Benchmark(TM) H Standard Specification, Revision 3.0.1, 28 April 2022.
 > Copyright 1993-2022 Transaction Processing Performance Council. Copying is

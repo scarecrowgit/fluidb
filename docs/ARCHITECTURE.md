@@ -337,10 +337,13 @@ defined in `crates/htap-common/src/types.rs`:
   `test_decimal_comparisons_below_representable_range`,
   `test_decimal_comparisons_at_representable_boundary`).
 
-### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7/B8)
+### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7/B8/B9)
 
-**Status: `in progress`.** Phase 17 continues past A6a/A6b (`DECIMAL`, above) into a TPC-H-derived workload
-kit. Batch A (complete) closed three prerequisites the kit depends on, with no on-disk format change: movement's
+**Status: `implemented (narrow local slice)`.** Phase 17 continues past A6a/A6b (`DECIMAL`, above) into a
+TPC-H-derived workload kit; task B9 (below) closes out Batch B with the required compliance/deviations
+disclosure document, [`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md) — see that document for the full
+deviations list, conformance statements, and validation evidence, which this section does not repeat in
+full. Batch A (complete) closed three prerequisites the kit depends on, with no on-disk format change: movement's
 timestamp text import (`crates/htap-movement/src/codec.rs`) now accepts calendar date and datetime text in
 addition to raw integer microseconds (raw-microseconds parsing is still tried first, so nothing that worked
 before changes behavior; a datetime's time-of-day component requires exactly two digits per field, and an
@@ -419,8 +422,8 @@ scale, or specification compliance, and the five queries that carry a `LIMIT` ne
 enough to reach it in these fixtures (the truncation mechanism itself is covered separately, over a synthetic
 table, by `crates/htap-server/tests/limit_truncation.rs`). See `docs/PROGRESS.md`'s Phase 17 (continued) row
 for the full task-by-task test evidence, and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred
-features" for the disclosed gaps. A TPC-H compliance/deviations disclosure document remains a later Batch B
-deliverable and is not written yet.
+features" for the disclosed gaps. The TPC-H compliance/deviations disclosure document is task B9, below;
+see [`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md).
 
 Task B2 adds a new module, `crates/htap-tpch/src/generate`, the first Batch B task to add production code
 rather than tests — `generate::generate(scale_factor, seed) -> Result<Dataset, ScaleFactorError>` produces
@@ -602,8 +605,21 @@ run). `crates/htap-tpch/tests/correctness_generated.rs::test_refresh_rf1_rf2_str
 (`#[ignore]`d, release mode) extends the RF1/RF2-then-oracle check from Query 1/Query 6 alone to all 22 queries
 in `query_order(0)`, each at its own task-B6 scale factor, against the independent oracle over the mutated
 dataset. See ADR-030 in `docs/DECISIONS.md` for the full design rationale and `docs/LIMITATIONS.md`'s "TPC-H
-workload kit scope and deferred features" for the disclosed gaps. Not written yet: the TPC compliance/deviations
-disclosure document (task B9).
+workload kit scope and deferred features" for the disclosed gaps.
+
+**Task B9 — TPC compliance/deviations disclosure document.** `Status: implemented (documentation-only)`. A
+new document, [`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md), carries the TPC Policies §8.1.5 derived-work
+disclaimer and §8.3.3 non-comparability statement verbatim, the "Derived from TPC-H" naming convention
+(§8.1.4), the §8.3.2 deviations list (query 15's CTE substitution for a view, arbitrary/fractional scale
+factors, uncounted stream counts, fixed validation parameters, the from-specification generator's own PRNG
+and vocabulary, the Query 13 forced-comment mechanism, the refresh-function extensions and upsert behavior,
+the batched non-atomic loader, and the `execution_lock` concurrency limit), a separate list of conformance
+choices that are not deviations (the row-limiting mechanism, the specification's own acknowledged `'AIR REG'`
+quirk, Appendix A's verbatim reproduction, and the `DATE`-onto-`TIMESTAMP` mapping), and a validation-evidence
+section naming the exact fixture, oracle, refresh-oracle, and power-order-oracle tests this kit's correctness
+claims rest on. No code changed for this task; every deviation and conformance item cross-references the ADR,
+code, and test that already established it (ADR-027, ADR-028, ADR-029, ADR-030, and the tests cited
+throughout this section and `docs/LIMITATIONS.md`'s matching section) rather than asserting anything new.
 
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
@@ -617,7 +633,7 @@ executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spilla
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), a general semi-join rewrite of IN/EXISTS (a narrow slice — key-equality correlated EXISTS/NOT EXISTS and key-equality correlated scalar-aggregate subqueries answered from a statement-scoped hash lookup, with no new Semi/Anti JoinKind — is implemented as of Phase 17 task F6, see above and ADR-028; correlated IN/NOT IN rewriting and residual-bearing scalar-aggregate decorrelation remain deferred), broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
-a TPC-H compliance/deviations disclosure document (task B9; task B2 added a from-specification row generator, task B3 a bulk loader, task B6 a test-only independent re-aggregation oracle for all 22 queries, task B7 the RF1/RF2 refresh functions as per-order transactions, and task B8 the power/throughput test drivers described above — see "TPC-H workload kit foundations" above, ADR-029, ADR-030, and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features") and the TPC-C benchmark (Phase 18),
+the TPC-C benchmark (Phase 18; the TPC-H compliance/deviations disclosure document, task B9, is implemented — see [`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md) and "TPC-H workload kit foundations" above),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),

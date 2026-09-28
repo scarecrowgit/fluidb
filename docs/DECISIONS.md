@@ -4036,8 +4036,8 @@ query, `LIMIT` included, still binds and executes against the schema) and
 `crates/htap-tpch/src/scale_factor.rs::scale_factor::tests::{test_scale_factor_exact, test_scale_factor_fractional, test_scale_factor_rounding_boundary, test_scale_factor_floor, test_scale_factor_overflow, test_scale_factor_invalid_input, test_scale_factor_exact_vs_float_discrimination}`
 (7 tests). See `docs/PROGRESS.md`'s Phase 17 (continued) row and `docs/LIMITATIONS.md`'s "TPC-H workload kit
 scope and deferred features" for the surrounding contract; the TPC compliance/deviations disclosure document
-that will formally record the row-limiting choice as a stated (not violating) conformance path is a later
-Batch B deliverable and is not written yet.
+that formally records the row-limiting choice as a stated (not violating) conformance path is task B9,
+[`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md).
 
 ## ADR-028: Statement-scoped hash lookups for eligible correlated subqueries, not a new Semi/Anti JoinKind
 
