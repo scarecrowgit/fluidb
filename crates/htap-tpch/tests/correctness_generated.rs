@@ -227,6 +227,323 @@ fn test_refresh_rf1_rf2_stream_one_updates_q1_and_q6() {
 
 #[test]
 #[ignore]
+fn test_refresh_rf1_rf2_stream_one_all_queries() {
+    let scale_queries: [(&str, &[u8]); 3] = [
+        (
+            "0.01",
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 21, 22,
+            ],
+        ),
+        (Q17_SCALE_FACTOR, &[17, 18]),
+        (Q20_SCALE_FACTOR, &[20]),
+    ];
+    let mut failures = Vec::new();
+
+    macro_rules! check {
+        ($server:expr, $dataset:expr, $scale:expr, $query:expr, $coverage:path, $compare:expr) => {
+            match htap_tpch::query($query, $scale) {
+                Ok(sql) => match $server.execute(&sql) {
+                    Ok(StatementResult::Query(actual)) => {
+                        if let Err(error) = $coverage(&$dataset) {
+                            failures.push(format!("Q{}: oracle coverage failed: {error}", $query));
+                        }
+                        if let Err(error) = $compare(&actual, &$dataset) {
+                            failures.push(format!("Q{}: {error}", $query));
+                        }
+                    }
+                    Ok(other) => {
+                        failures.push(format!("Q{}: expected query result, got {other:?}", $query))
+                    }
+                    Err(error) => failures.push(format!("Q{}: execute failed: {error}", $query)),
+                },
+                Err(error) => failures.push(format!("Q{}: query unavailable: {error}", $query)),
+            }
+        };
+    }
+
+    for (scale_factor, expected_queries) in scale_queries {
+        let (_directory, server, dataset) = load_at(scale_factor, 42);
+        let mut session = server.open_session().expect("open session");
+
+        htap_tpch::rf1_new_sales(&mut session, scale_factor, 1, 42).expect("apply RF1 stream 1");
+        session.commit().expect("commit RF1 stream 1");
+        htap_tpch::rf2_old_sales(&mut session, scale_factor, 1).expect("apply RF2 stream 1");
+        session.commit().expect("commit RF2 stream 1");
+
+        let rf2_order_keys =
+            htap_tpch::generate_rf2_plan(scale_factor, 1).expect("generate RF2 plan");
+        let rf1_rows =
+            htap_tpch::generate_rf1_rows(scale_factor, 1, 42).expect("generate RF1 rows");
+        let mut mutated_dataset = dataset.clone();
+
+        mutated_dataset
+            .orders
+            .retain(|order| !rf2_order_keys.contains(&order.o_orderkey));
+        mutated_dataset
+            .lineitem
+            .retain(|lineitem| !rf2_order_keys.contains(&lineitem.l_orderkey));
+        mutated_dataset
+            .orders
+            .extend(rf1_rows.orders.iter().cloned());
+        mutated_dataset
+            .lineitem
+            .extend(rf1_rows.lineitems.iter().cloned());
+
+        for &query_number in htap_tpch::query_order(0)
+            .iter()
+            .filter(|query_number| expected_queries.contains(query_number))
+        {
+            match query_number {
+                1 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    1,
+                    oracle::q1::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q1::expected(dataset), true)
+                    }
+                ),
+                2 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    2,
+                    oracle::q2::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q2::expected(dataset), true)
+                    }
+                ),
+                3 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    3,
+                    oracle::q3::verify_coverage,
+                    |actual, dataset| {
+                        compare_ordered_with_ties(
+                            actual,
+                            &oracle::q3::expected(dataset),
+                            &[1, 2],
+                            10,
+                        )
+                    }
+                ),
+                4 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    4,
+                    oracle::q4::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q4::expected(dataset), true)
+                    }
+                ),
+                5 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    5,
+                    oracle::q5::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q5::expected(dataset), true)
+                    }
+                ),
+                6 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    6,
+                    oracle::q6::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q6::expected(dataset), true)
+                    }
+                ),
+                7 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    7,
+                    oracle::q7::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q7::expected(dataset), true)
+                    }
+                ),
+                8 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    8,
+                    oracle::q8::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q8::expected(dataset), true)
+                    }
+                ),
+                9 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    9,
+                    oracle::q9::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q9::expected(dataset), true)
+                    }
+                ),
+                10 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    10,
+                    oracle::q10::verify_coverage,
+                    |actual, dataset| {
+                        compare_ordered_with_ties(actual, &oracle::q10::expected(dataset), &[2], 20)
+                    }
+                ),
+                11 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    11,
+                    oracle::q11::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q11::expected(dataset), true)
+                    }
+                ),
+                12 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    12,
+                    oracle::q12::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q12::expected(dataset), true)
+                    }
+                ),
+                13 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    13,
+                    oracle::q13::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q13::expected(dataset), true)
+                    }
+                ),
+                14 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    14,
+                    oracle::q14::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q14::expected(dataset), true)
+                    }
+                ),
+                15 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    15,
+                    oracle::q15::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q15::expected(dataset), true)
+                    }
+                ),
+                16 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    16,
+                    oracle::q16::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q16::expected(dataset), true)
+                    }
+                ),
+                17 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    17,
+                    oracle::q17::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q17::expected(dataset), true)
+                    }
+                ),
+                18 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    18,
+                    oracle::q18::verify_coverage,
+                    |actual, dataset| {
+                        compare_ordered_with_ties(
+                            actual,
+                            &oracle::q18::expected(dataset),
+                            &[4, 3],
+                            100,
+                        )
+                    }
+                ),
+                19 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    19,
+                    oracle::q19::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q19::expected(dataset), true)
+                    }
+                ),
+                20 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    20,
+                    oracle::q20::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q20::expected(dataset), true)
+                    }
+                ),
+                21 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    21,
+                    oracle::q21::verify_coverage,
+                    |actual, dataset| {
+                        compare_ordered_with_ties(
+                            actual,
+                            &oracle::q21::expected(dataset),
+                            &[1, 0],
+                            100,
+                        )
+                    }
+                ),
+                22 => check!(
+                    server,
+                    mutated_dataset,
+                    scale_factor,
+                    22,
+                    oracle::q22::verify_coverage,
+                    |actual, dataset| {
+                        compare_results(actual, &oracle::q22::expected(dataset), true)
+                    }
+                ),
+                _ => unreachable!("Appendix A contains only TPC-H queries"),
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "TPC-H refreshed oracle failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+#[ignore]
 fn test_q1_pilot() {
     let (_directory, server, dataset) = load_at("0.01", 42);
     oracle::q1::verify_coverage(&dataset).expect("Q1 oracle coverage");
@@ -459,7 +776,7 @@ fn tpch_oracle_all_22_queries() {
     macro_rules! check {
         ($server:expr, $dataset:expr, $scale:expr, $query:expr, skip_coverage, $compare:expr) => {
             match htap_tpch::query($query, $scale) {
-                Some(sql) => match $server.execute(&sql) {
+                Ok(sql) => match $server.execute(&sql) {
                     Ok(StatementResult::Query(actual)) => {
                         if let Err(error) = $compare(&actual, &$dataset) {
                             failures.push(format!("Q{}: {error}", $query));
@@ -470,12 +787,12 @@ fn tpch_oracle_all_22_queries() {
                     }
                     Err(error) => failures.push(format!("Q{}: execute failed: {error}", $query)),
                 },
-                None => failures.push(format!("Q{}: query unavailable", $query)),
+                Err(error) => failures.push(format!("Q{}: query unavailable: {error}", $query)),
             }
         };
         ($server:expr, $dataset:expr, $scale:expr, $query:expr, $coverage:path, $compare:expr) => {
             match htap_tpch::query($query, $scale) {
-                Some(sql) => match $server.execute(&sql) {
+                Ok(sql) => match $server.execute(&sql) {
                     Ok(StatementResult::Query(actual)) => {
                         if let Err(error) = $coverage(&$dataset) {
                             failures.push(format!("Q{}: oracle coverage failed: {error}", $query));
@@ -489,7 +806,7 @@ fn tpch_oracle_all_22_queries() {
                     }
                     Err(error) => failures.push(format!("Q{}: execute failed: {error}", $query)),
                 },
-                None => failures.push(format!("Q{}: query unavailable", $query)),
+                Err(error) => failures.push(format!("Q{}: query unavailable: {error}", $query)),
             }
         };
     }

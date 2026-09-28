@@ -337,7 +337,7 @@ defined in `crates/htap-common/src/types.rs`:
   `test_decimal_comparisons_below_representable_range`,
   `test_decimal_comparisons_at_representable_boundary`).
 
-### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7)
+### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7/B8)
 
 **Status: `in progress`.** Phase 17 continues past A6a/A6b (`DECIMAL`, above) into a TPC-H-derived workload
 kit. Batch A (complete) closed three prerequisites the kit depends on, with no on-disk format change: movement's
@@ -549,7 +549,7 @@ Query 13 forced-comment phrase (refresh text generation is ordinary, not the loa
 whole-function-in-one-transaction design was ruled out independently: at SF 1 it would exceed the ~4 MiB
 effective 2PC transaction payload cap (`docs/LIMITATIONS.md`'s "Effective 2PC transaction payload cap"), which
 is one reason (alongside Clause 2.5.2's own example) for the per-order granularity. `queries::query`'s panic on
-an invalid scale factor (`docs/PROBLEMS.md` F3) is unrelated and left for task B8. Covered by
+an invalid scale factor (tracked as F3) is unrelated to this task and is closed by task B8, below. Covered by
 `crates/htap-tpch/src/refresh.rs`'s own unit tests
 (`refresh::tests::{rf1_counts_and_generation_are_deterministic, rf1_streams_use_the_expected_sparse_slices, out_of_range_streams_are_rejected, rf2_stream_one_keys_match_the_load_order_key_range}`),
 `crates/htap-tpch/tests/refresh.rs`
@@ -559,6 +559,51 @@ which applies RF1+RF2 through the engine, mutates a cloned `Dataset` the same wa
 Query 6 against the independent oracle over the mutated dataset (also asserting at least one RF1-inserted
 lineitem passes Query 1's own date filter, so the check is not vacuous). See ADR-029 in `docs/DECISIONS.md` and
 `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for the full disclosure.
+
+**Task B8 — power/throughput test drivers, and F3 closure.** `Status: implemented (narrow local slice)`. First,
+F3: `queries::query` no longer panics on an invalid Query 11 scale factor or returns `None` for an unknown query
+number; it returns `Result<String, QueryError>` (`QueryError::UnknownQuery(u8)` / `QueryError::ScaleFactor
+(ScaleFactorError)`), and every existing caller (the correctness fixtures, the independent oracle, the drivers
+below) was updated to match — `queries::tests::test_query_11_and_query_23_error_handling`. Second, a new module,
+`crates/htap-tpch::drivers`, adds `power_test`/`throughput_test` (`Session`-based, taking `&Arc<LocalServer>`),
+plus supporting constants and helpers: `query_order(id)` reproduces TPC-H Specification Appendix A's 41-row
+query-order permutation table verbatim (id wraps modulo 41, Clause 5.3.5.4), attributed in the module doc to
+Moses & Oakford, *Tables of Random Permutations*, 1963, pp. 52-53 — the same reproduction category as the
+already-shipped query texts, under the same TPC copying-by-permission notice (ADR-030); `table_11_stream_count
+(sf)` reproduces Table 11's informational stream-count values (exact match on 1→2 through 100000→11, `None`
+otherwise); `POWER_METRIC_LABEL`/`THROUGHPUT_METRIC_LABEL` are the only summary text either report exposes, and
+`test_labels_do_not_contain_official_metrics` asserts neither contains `qphh`/`qpph`/`qthh`/`price`/
+`performance`/`composite`/`query-per-hour`, case-insensitive. **No official TPC-H metric is computed anywhere**
+(`Power@Size`, `Throughput@Size`, `QphH`, `QppH`, `QthH`, or `$/QphH`) — a deliberate policy decision, not an
+oversight, since this project is unaudited and not TPC-H compliant — see ADR-030. `power_test` opens two
+sessions, times RF1 then all 22 queries in `query_order(0)` then RF2, and reports each query's submission
+interval (`QI`: this submission to the next, or to its own completion for the last query) plus
+`rounded_interval_geomean_seconds`, the geometric mean of the 24 rounded intervals (each rounded to the nearest
+0.01s with a 0.01s floor, Clause 5.3.7.5). `throughput_test` validates `stream_count`/the refresh key-stream
+range with checked arithmetic before spawning any thread, runs every query stream plus one refresh thread
+(RF1 fully committed before RF2 per Clause 5.3.7.8) behind a shared `Barrier`, always joins every handle (a
+worker panic becomes `DriverError::WorkerPanicked`, never a silent drop), and reports `measurement_interval` as
+the earliest submission to the latest completion across every stream and the refresh thread (Clause 5.3.6.1),
+rounded up (`test_round_up_centisecond_worked_example` reproduces Clause 5.3.6.2's own 923.741s → 923.75s
+worked example). Both drivers use the specification's fixed validation-default parameters for every stream, a
+disclosed deviation from Clause 2.1.3.3's per-stream random substitution parameters, with no QGen-equivalent
+generator; the refresh key-stream number is an explicit caller-supplied parameter, never computed internally;
+and neither driver retries on `HtapError::Conflict` (single-writer precondition, documented on the report
+types). **Critical disclosure, stated in the module doc, the report types' doc comments, and ADR-030:**
+`htap-server::LocalServer` holds one process-wide `execution_lock` for the whole duration of every
+`execute`/`commit` call (`crates/htap-server/src/lib.rs`, lines 199, 443, 455, 1210), so `throughput_test`'s
+concurrency is submission- and session-level only — statements from different streams never execute inside the
+engine in parallel, unlike a real multi-user TPC-H Throughput Test. Covered by 9 unit tests in
+`crates/htap-tpch/src/drivers.rs` (permutation-table coverage/wraparound, exact Table 11 values, label text,
+rounding boundaries, input validation) and, `#[ignore]`d in release mode,
+`crates/htap-tpch/tests/drivers.rs::{power_driver_runs_all_queries_and_refreshes,
+throughput_driver_runs_query_and_refresh_streams}` (a real SF 0.01 power run and a real 2-stream throughput
+run). `crates/htap-tpch/tests/correctness_generated.rs::test_refresh_rf1_rf2_stream_one_all_queries`
+(`#[ignore]`d, release mode) extends the RF1/RF2-then-oracle check from Query 1/Query 6 alone to all 22 queries
+in `query_order(0)`, each at its own task-B6 scale factor, against the independent oracle over the mutated
+dataset. See ADR-030 in `docs/DECISIONS.md` for the full design rationale and `docs/LIMITATIONS.md`'s "TPC-H
+workload kit scope and deferred features" for the disclosed gaps. Not written yet: the TPC compliance/deviations
+disclosure document (task B9).
 
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
@@ -572,7 +617,7 @@ executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spilla
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), a general semi-join rewrite of IN/EXISTS (a narrow slice — key-equality correlated EXISTS/NOT EXISTS and key-equality correlated scalar-aggregate subqueries answered from a statement-scoped hash lookup, with no new Semi/Anti JoinKind — is implemented as of Phase 17 task F6, see above and ADR-028; correlated IN/NOT IN rewriting and residual-bearing scalar-aggregate decorrelation remain deferred), broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
-TPC-H power/throughput test drivers and a compliance/deviations disclosure document (task B2 added a from-specification row generator, task B3 a bulk loader, task B6 a test-only independent re-aggregation oracle for all 22 queries, and task B7 the RF1/RF2 refresh functions as per-order transactions — see "TPC-H workload kit foundations" above, ADR-029, and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
+a TPC-H compliance/deviations disclosure document (task B9; task B2 added a from-specification row generator, task B3 a bulk loader, task B6 a test-only independent re-aggregation oracle for all 22 queries, task B7 the RF1/RF2 refresh functions as per-order transactions, and task B8 the power/throughput test drivers described above — see "TPC-H workload kit foundations" above, ADR-029, ADR-030, and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features") and the TPC-C benchmark (Phase 18),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),

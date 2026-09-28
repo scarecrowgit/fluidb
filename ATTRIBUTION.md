@@ -135,6 +135,29 @@ licensed under Apache-2.0.
 
 ---
 
+## Transaction Processing Performance Council (TPC-H)
+
+`crates/htap-tpch` reproduces two pieces of the TPC Benchmark(TM) H Standard Specification (Revision 3.0.1, 28
+April 2022) verbatim, under the specification's own copying-by-permission notice: all 22 published query texts
+(`queries::query`, shipped in Phase 17 Batch B checkpoint 1) and, as of Phase 17 task B8, Appendix A's 41-row
+query-order permutation table (`drivers::QUERY_ORDER`, used by `drivers::query_order`). Both carry the notice
+below in their module documentation. The specification itself attributes Appendix A's origin to Moses &
+Oakford; that attribution is carried alongside the TPC notice in `crates/htap-tpch/src/drivers.rs`'s module doc.
+No TPC-H Tools distribution source (QGen, DBGen, or the reference implementation) was vendored, copied, or
+machine-translated; `crates/htap-tpch::generate` is an independent, from-specification row generator (see
+`docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"), and `crates/htap-tpch::drivers`
+computes no official TPC-H metric (see ADR-030 in `docs/DECISIONS.md`). This project makes no TPC-H compliance
+or comparability claim.
+
+> TPC Benchmark(TM) H Standard Specification, Revision 3.0.1, 28 April 2022.
+> Copyright 1993-2022 Transaction Processing Performance Council. Copying is
+> by permission of the Transaction Processing Performance Council.
+
+> Appendix A's query-order permutation table is derived by the TPC from:
+> F. Moses and O. Oakford, *Tables of Random Permutations*, Stanford University Press, 1963, pp. 52-53.
+
+---
+
 ## Statement
 
 No StarRocks, Apache Kudu, or Apache ZooKeeper source file was vendored,

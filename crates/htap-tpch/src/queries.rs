@@ -1,15 +1,57 @@
-//! TPC-H query texts with the published query-validation default parameters.
+#![doc = "TPC-H query texts with the published query-validation default parameters."]
 //!
 //! TPC Benchmark(TM) H Standard Specification, Revision 3.0.1, 28 April 2022.
 //! Copyright 1993-2022 Transaction Processing Performance Council. Copying is
 //! by permission of the Transaction Processing Performance Council.
+
+use std::error::Error;
+use std::fmt;
+
+use crate::scale_factor::ScaleFactorError;
+
+/// Errors produced while retrieving a TPC-H query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryError {
+    /// The requested query number is not defined by TPC-H.
+    UnknownQuery(u8),
+    /// Query 11 received an invalid scale factor.
+    ScaleFactor(ScaleFactorError),
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownQuery(query_number) => {
+                write!(formatter, "unknown TPC-H query {query_number}")
+            }
+            Self::ScaleFactor(error) => {
+                write!(formatter, "invalid scale factor for Query 11: {error}")
+            }
+        }
+    }
+}
+
+impl Error for QueryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::UnknownQuery(_) => None,
+            Self::ScaleFactor(error) => Some(error),
+        }
+    }
+}
+
+impl From<ScaleFactorError> for QueryError {
+    fn from(error: ScaleFactorError) -> Self {
+        Self::ScaleFactor(error)
+    }
+}
 
 /// Returns a TPC-H query with its validation-default substitution parameters.
 ///
 /// `scale_factor` is used only by Query 11, whose FRACTION parameter is
 /// `0.0001 / SF`. The returned expression preserves that exact SQL formula
 /// rather than converting the supplied scale factor through floating point.
-pub fn query(query_number: u8, scale_factor: &str) -> Option<String> {
+pub fn query(query_number: u8, scale_factor: &str) -> Result<String, QueryError> {
     let query = match query_number {
         1 => r#"select l_returnflag,l_linestatus,sum(l_quantity) as sum_qty,sum(l_extendedprice) as sum_base_price,sum(l_extendedprice*(1-l_discount)) as sum_disc_price,sum(l_extendedprice*(1-l_discount)*(1+l_tax)) as sum_charge,avg(l_quantity) as avg_qty,avg(l_extendedprice) as avg_price,avg(l_discount) as avg_disc,count(*) as count_order from lineitem where l_shipdate <= date '1998-12-01' - interval '90' day (3) group by l_returnflag,l_linestatus order by l_returnflag,l_linestatus"#.to_owned(),
         2 => r#"select s_acctbal,s_name,n_name,p_partkey,p_mfgr,s_address,s_phone,s_comment from part,supplier,partsupp,nation,region where p_partkey=ps_partkey and s_suppkey=ps_suppkey and p_size=15 and p_type like '%BRASS' and s_nationkey=n_nationkey and n_regionkey=r_regionkey and r_name='EUROPE' and ps_supplycost=(select min(ps_supplycost) from partsupp,supplier,nation,region where p_partkey=ps_partkey and s_suppkey=ps_suppkey and s_nationkey=n_nationkey and n_regionkey=r_regionkey and r_name='EUROPE') order by s_acctbal desc,n_name,s_name,p_partkey limit 100"#.to_owned(),
@@ -22,9 +64,7 @@ pub fn query(query_number: u8, scale_factor: &str) -> Option<String> {
         9 => r#"select nation,o_year,sum(amount) as sum_profit from (select n_name as nation,extract(year from o_orderdate) as o_year,l_extendedprice*(1-l_discount)-ps_supplycost*l_quantity as amount from part,supplier,lineitem,partsupp,orders,nation where s_suppkey=l_suppkey and ps_suppkey=l_suppkey and ps_partkey=l_partkey and p_partkey=l_partkey and o_orderkey=l_orderkey and s_nationkey=n_nationkey and p_name like '%green%') as profit group by nation,o_year order by nation,o_year desc"#.to_owned(),
         10 => r#"select c_custkey,c_name,sum(l_extendedprice*(1-l_discount)) as revenue,c_acctbal,n_name,c_address,c_phone,c_comment from customer,orders,lineitem,nation where c_custkey=o_custkey and l_orderkey=o_orderkey and o_orderdate >= date '1993-10-01' and o_orderdate < date '1993-10-01' + interval '3' month and l_returnflag='R' and c_nationkey=n_nationkey group by c_custkey,c_name,c_acctbal,c_phone,n_name,c_address,c_comment order by revenue desc limit 20"#.to_owned(),
         11 => {
-            crate::scale_factor::scale_factor(scale_factor, 1).unwrap_or_else(|error| {
-                panic!("invalid scale factor for Query 11: {error}");
-            });
+            crate::scale_factor::scale_factor(scale_factor, 1).map_err(QueryError::from)?;
 
             format!(r#"select ps_partkey,sum(ps_supplycost*ps_availqty) as value from partsupp,supplier,nation where ps_suppkey=s_suppkey and s_nationkey=n_nationkey and n_name='GERMANY' group by ps_partkey having sum(ps_supplycost*ps_availqty) > (select sum(ps_supplycost*ps_availqty)*(0.0001 / {scale_factor}) from partsupp,supplier,nation where ps_suppkey=s_suppkey and s_nationkey=n_nationkey and n_name='GERMANY') order by value desc"#)
         }
@@ -39,22 +79,27 @@ pub fn query(query_number: u8, scale_factor: &str) -> Option<String> {
         20 => r#"select s_name,s_address from supplier,nation where s_suppkey in (select ps_suppkey from partsupp where ps_partkey in (select p_partkey from part where p_name like 'forest%') and ps_availqty > (select 0.5*sum(l_quantity) from lineitem where l_partkey=ps_partkey and l_suppkey=ps_suppkey and l_shipdate >= date('1994-01-01') and l_shipdate < date('1994-01-01') + interval '1' year)) and s_nationkey=n_nationkey and n_name='CANADA' order by s_name"#.to_owned(),
         21 => r#"select s_name,count(*) as numwait from supplier,lineitem l1,orders,nation where s_suppkey=l1.l_suppkey and o_orderkey=l1.l_orderkey and o_orderstatus='F' and l1.l_receiptdate>l1.l_commitdate and exists (select * from lineitem l2 where l2.l_orderkey=l1.l_orderkey and l2.l_suppkey<>l1.l_suppkey) and not exists (select * from lineitem l3 where l3.l_orderkey=l1.l_orderkey and l3.l_suppkey<>l1.l_suppkey and l3.l_receiptdate>l3.l_commitdate) and s_nationkey=n_nationkey and n_name='SAUDI ARABIA' group by s_name order by numwait desc,s_name limit 100"#.to_owned(),
         22 => r#"select cntrycode,count(*) as numcust,sum(c_acctbal) as totacctbal from (select substring(c_phone from 1 for 2) as cntrycode,c_acctbal from customer where substring(c_phone from 1 for 2) in ('13','31','23','29','30','18','17') and c_acctbal > (select avg(c_acctbal) from customer where c_acctbal>0.00 and substring(c_phone from 1 for 2) in ('13','31','23','29','30','18','17')) and not exists (select * from orders where o_custkey=c_custkey)) as custsale group by cntrycode order by cntrycode"#.to_owned(),
-        _ => return None,
+        _ => return Err(QueryError::UnknownQuery(query_number)),
     };
 
-    Some(query)
+    Ok(query)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::query;
+    use super::{query, QueryError};
     use crate::schema;
     use htap_server::LocalServer;
 
     #[test]
-    #[should_panic(expected = "invalid scale factor for Query 11")]
-    fn test_query_11_rejects_zero_scale_factor() {
-        query(11, "0");
+    fn test_query_11_and_query_23_error_handling() {
+        assert_eq!(
+            query(11, "0"),
+            Err(QueryError::ScaleFactor(
+                crate::scale_factor::ScaleFactorError::InvalidScaleFactor
+            ))
+        );
+        assert_eq!(query(23, "1"), Err(QueryError::UnknownQuery(23)));
     }
 
     #[test]
@@ -71,11 +116,11 @@ mod tests {
 
         for query_number in 1..=22 {
             let result = match query(query_number, scale_factor) {
-                Some(sql) => server
+                Ok(sql) => server
                     .execute(&sql)
                     .map(|_| ())
                     .map_err(|error| error.to_string()),
-                None => Err("query definition not found".to_owned()),
+                Err(error) => Err(error.to_string()),
             };
 
             match &result {

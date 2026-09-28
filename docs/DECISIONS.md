@@ -4243,8 +4243,8 @@ loader actually produced (`rf2_stream_one_keys_match_the_load_order_key_range`),
 - **Refresh-inserted orders do not carry the load-time Query 13 forced-comment phrase.** `generate_rf1_rows`
   reuses ordinary text generation for `O_COMMENT`; the forced phrase the load-time generator adds for Query 13
   is not reproduced for refresh rows.
-- **`queries::query`'s panic on an invalid scale factor (`docs/PROBLEMS.md` F3) is untouched by this task** and
-  remains open for task B8.
+- **`queries::query`'s panic on an invalid scale factor (tracked as F3) is untouched by this task**;
+  closed by task B8 (ADR-030), which changes `queries::query` to return `Result<String, QueryError>`.
 - Nothing here touches any on-disk format, WAL, or durability invariant: both functions are ordinary SQL
   executed through the existing public `Session` API (`begin`/`execute`/`commit`/`rollback`), so no format
   version bump and no storage review were needed for this task.
@@ -4269,3 +4269,228 @@ and (ignored, `--ignored`) `crates/htap-tpch/tests/correctness_generated.rs::tes
 which mutates a loaded `Dataset` by the same RF1+RF2 stream applied through the engine and checks Query 1 and
 Query 6 against the independent oracle over the mutated dataset. See `docs/PROGRESS.md`'s Phase 17 (continued)
 row and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for the surrounding contract.
+
+---
+
+## ADR-030: TPC-H Power/Throughput driver diagnostics — no official metric, fixed validation parameters, caller-supplied refresh key stream, and the `execution_lock` concurrency disclosure
+
+`Status: Accepted`
+`Date: 2026-09-28`
+
+### Context
+
+Phase 17 Batch B task B8 adds `power_test`/`throughput_test` to `crates/htap-tpch::drivers`, the last piece of
+the query-kit foundation before a TPC compliance/deviations disclosure document (task B9). The TPC-H
+specification's Power Test (Clause 5.3.4) and Throughput Test (Clause 5.3.5) define exact procedures — a single
+query stream interleaved with one refresh stream for Power, `S` concurrent query streams plus one refresh
+stream running `S` refresh-function pairs for Throughput — and exact metric formulas (`QppH@Size`, `QthH@Size`,
+composed into `QphH@Size` and `$/QphH@Size`) that only an audited, full-compliance implementation may report
+under those names. This project is not audited and is not TPC-H compliant (`docs/LIMITATIONS.md`'s "No TPC-H
+compliance or comparability claim"), so four questions had to be settled before any driver code was written,
+each one a decision that would be costly to reverse once a caller depended on the resulting API or on a
+published number: whether to compute the official metrics at all (even unpublished, for internal use); whether
+to implement Clause 2.1.3.3's per-stream random substitution-parameter generation; who supplies a refresh
+function's key-stream number; and how to define and disclose "concurrency" given `htap-server`'s existing
+concurrency model.
+
+**The `execution_lock` finding.** `LocalServer::execute`, `Session::execute`, and `Session::commit`
+(`crates/htap-server/src/lib.rs`, lines 199, 443, 455, 1210) each hold one process-wide `Mutex<()>` for the
+entire duration of the call. This was already true before this task (see the safe multi-thread pattern in
+`crates/htap-server/tests/session_concurrency.rs`) and is unrelated to this task's own design choices, but it
+directly determines what a "throughput" driver can honestly claim: no two statements from different sessions
+ever execute inside the engine at the same instant, regardless of how many threads submit them.
+
+### Options considered — official metric
+
+1. **Compute and report `QppH@Size`/`QthH@Size`/`QphH@Size`/`$/QphH@Size`,** clearly labeled as unaudited/
+   unofficial (e.g. "unofficial QphH-shaped estimate"). Rejected by all three consulted models: the TPC's own
+   policy (Clause 0.3 / the Fair Use policy referenced throughout the specification) restricts these composite
+   metric names to results that have gone through the full disclosure and audit process; even a clearly
+   "unofficial" label risks the number being quoted out of context later, and nothing about this project's scope
+   requires the composite formula to exist at all.
+2. **Report no official metric under any name; report only neutral diagnostics in seconds.** **Chosen.**
+   `PowerTestReport`/`ThroughputTestReport` carry `Vec<QueryTiming>`/`Vec<RefreshTiming>` (raw durations) plus
+   exactly one summary number each: `rounded_interval_geomean_seconds` (Power) and `measurement_interval`
+   (Throughput), both plain seconds with no query-per-hour conversion. Two `pub const` labels,
+   `POWER_METRIC_LABEL` and `THROUGHPUT_METRIC_LABEL`, exist so a caller printing a report has fixed, reviewed
+   text rather than composing its own label that might drift toward a forbidden name; a unit test
+   (`test_labels_do_not_contain_official_metrics`) asserts both labels contain none of `qphh`, `qpph`, `qthh`,
+   `price`, `performance`, `composite`, or `query-per-hour`, case-insensitive.
+
+### Decision — official metric
+
+Option 2. No `QppH`/`QthH`/`QphH`/`$/QphH` (or any renamed equivalent) is computed anywhere in
+`crates/htap-tpch`. `power_test`/`throughput_test` report rounded-interval and measurement-interval diagnostics
+in seconds only.
+
+### Options considered — Clause 2.1.3.3 substitution parameters
+
+1. **Implement the specification's random substitution-parameter generation** (a per-stream seeded draw from
+   each query's parameter domain, Clause 2.1.3.3), i.e. a minimal QGen-equivalent. Rejected: this is a
+   substantial, spec-precise random-generation subsystem in its own right — comparable in scope to task B2's row
+   generator — and no part of this task's brief calls for it; building it as a side effect of the driver task
+   would blur B8's own scope and duplicate B2's already-disclosed "no PRNG algorithm is specified, so no sequence
+   is spec-derivable" reasoning for a different generation problem.
+2. **Use the specification's own fixed validation-default parameters (`params::fixed_parameters`) for every
+   stream.** **Chosen.** Every query in every stream, power or throughput, binds through the same
+   `queries::query(query_number, scale_factor)` the correctness fixtures and the independent oracle already use,
+   with the validation defaults task B2's checkpoint-1 work already ships. This is a disclosed deviation from
+   Clause 2.1.3.3, not silently substituted: `crates/htap-tpch/src/drivers.rs`'s module doc, `docs/LIMITATIONS.md`,
+   and this ADR all state it, and there is no QGen-equivalent parameter generator anywhere in this crate.
+
+### Decision — Clause 2.1.3.3 substitution parameters
+
+Option 2. `power_test`/`throughput_test` never draw per-stream parameters; every query binds with the fixed
+validation-default parameters, for every stream, every time.
+
+### Options considered — refresh key-stream number
+
+1. **Compute the refresh key-stream number internally** (e.g. derive it from the driver's own stream index).
+   Rejected: it hides the mapping between a query stream and the refresh keys it consumes behind an internal
+   convention a caller cannot see or override, and the specification itself treats the refresh key stream as an
+   input the test sponsor supplies, not something the driver infers.
+2. **Take the refresh key-stream number as an explicit caller-supplied parameter.** **Chosen.** `power_test`
+   takes `refresh_key_stream: u32` directly; `throughput_test` takes `first_refresh_key_stream: u32` and assigns
+   `first..first + stream_count - 1` to its `stream_count` refresh pairs, validated with checked arithmetic
+   against the `1..=1000` RF2 range (ADR-029) before any thread is spawned. The convention used in this crate's
+   own tests — power at key stream 1, throughput starting at key stream 2 — is a test-only convention, not part
+   of the public contract.
+
+### Decision — refresh key-stream number
+
+Option 2. Both driver entry points require the caller to supply the refresh key-stream number(s) explicitly.
+
+### Timing definitions (recorded here since they have no single unambiguous spec reading)
+
+- **QI (query interval).** Submission-to-next-submission, not call latency: `QueryTiming::submission_interval`
+  for query *i* is `submission[i+1] - submission[i]`; the last query in a stream uses its own
+  `completion - submission` instead, since there is no next submission to measure against. This matches Clause
+  5.3.2's own definition of `QI` as a submission-to-submission gap, not an `execute()` return-time measurement,
+  which would instead measure engine-internal latency.
+- **Power Test summary.** `rounded_interval_geomean_seconds` is `exp(mean(ln(rounded_seconds)))` over exactly 24
+  intervals — RF1's duration, all 22 `QI`s in `query_order(0)`, and RF2's duration — each individually rounded to
+  the nearest 0.01s with a 0.01s floor (Clause 5.3.7.5: an interval that rounds to zero is reported as 0.01s, never
+  0s, so the geometric mean is always well-defined and positive).
+- **Throughput Test summary.** `measurement_interval` runs from the single earliest submission across every
+  query stream and the refresh thread to the single latest completion across all of them (Clause 5.3.6.1), rounded
+  up rather than to the nearest value (Clause 5.3.6.2's own worked example, 923.741s → 923.75s, is reproduced as a
+  test, `test_round_up_centisecond_worked_example`) — a measurement interval must never under-report elapsed wall
+  time.
+- **Thread lifecycle.** Every spawned thread — every query stream and the refresh thread — is always joined,
+  including on the failure path; a panicked thread's join failure becomes `DriverError::WorkerPanicked` rather
+  than being ignored or left detached. All query-stream threads and the refresh thread wait on one shared
+  `Barrier` before submitting their first statement, so no stream gets a submission-time head start from opening
+  its session or computing its query order.
+- **No retry on conflict.** Neither driver retries `HtapError::Conflict`. Both require a single-writer
+  precondition — no external writer touches `server` while a driver run is active — documented on
+  `PowerTestReport`/`ThroughputTestReport` themselves; a conflict is returned to the caller directly, exactly
+  once, and never silently retried.
+
+### The `execution_lock` concurrency disclosure
+
+**This is the most consequential fact this ADR records, not a footnote.** `htap-server::LocalServer` serializes
+every `execute`/`commit` call through one process-wide `Mutex<()>` held for the call's whole duration. This means
+`throughput_test`'s "concurrency" is real only at the *submission* level (multiple threads race to submit their
+next statement) and the *session* level (each stream keeps its own `Session`, so cross-stream state never leaks)
+— it is never real at the *execution* level: two statements from two different streams never run inside the
+engine simultaneously. A conforming TPC-H Throughput Test's whole premise is genuinely concurrent multi-user
+execution; this driver cannot honestly claim that, and does not. This is disclosed in three places so it cannot
+be read past: the `crates/htap-tpch/src/drivers.rs` module doc, the doc comments on `ThroughputTestReport` and
+`StreamReport`, and here. `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" restates it
+for anyone reading limitations rather than source or ADRs.
+
+### Appendix A reproduction
+
+The 41-row query-order permutation table (`QUERY_ORDER` in `crates/htap-tpch/src/drivers.rs`) is TPC-H
+Specification Appendix A, reproduced verbatim; the specification itself attributes that table's origin to F.
+Moses and O. Oakford, *Tables of Random Permutations*, 1963, pp. 52-53, and `drivers.rs`'s module doc carries
+that attribution alongside the existing TPC copyright/permission notice `queries.rs` already carries for the
+published query texts (see `ATTRIBUTION.md`). This is the same category of reproduction as the query texts
+already shipped in Batch B checkpoint 1 — a verbatim table the specification itself publishes and permits
+copying, under the same TPC permission notice, not a new attribution question. One external model raised a
+caution about reproduction permission during the plan-gate panel; the coordinator's reading, on the same basis
+as the already-shipped query texts, is that Appendix A is in scope for verbatim reproduction under the
+specification's existing copying-by-permission notice.
+
+### Consequences
+
+- No caller of this crate can ever be quoted a `QppH`/`QthH`/`QphH`/`$/QphH` number, official or unofficial,
+  because none is ever computed.
+- Every stream in every run uses the same fixed query parameters; a caller wanting genuine per-stream parameter
+  variation (closer to a real Throughput Test) would need to build a QGen-equivalent generator first — not part
+  of this crate today.
+- Callers must track their own refresh key-stream bookkeeping; nothing in this crate infers or reuses a key
+  stream across calls.
+- A driver-reported "throughput" number reflects submission-and-session-level scheduling under one process-wide
+  lock, not genuinely parallel query execution; this must be repeated wherever a driver report is discussed, not
+  assumed to be self-evident from the function name.
+- `DriverError` (`QueryError`/`RefreshError`/`HtapError`/`InvalidStreamCount`/`InvalidRefreshKeyRange`/
+  `WorkerPanicked`) is a new public error type with `std::error::Error`/`From` impls for its three wrapped
+  variants, following the same shape as `QueryError` and `RefreshError`.
+- Nothing here touches any on-disk format, WAL, or durability invariant: both functions issue ordinary SQL and
+  session calls through the existing public `Session`/`LocalServer` API, so no format version bump and no
+  storage review were needed for this task.
+
+### How to reverse it
+
+Official-metric policy: nothing here is structurally hard to reverse — a caller-facing `QphH`-shaped
+computation could be added later as a clearly separate, explicitly unofficial function once the TPC's naming
+restrictions are re-reviewed; today's `DriverError`/report types would not need to change to add it. Fixed
+validation parameters: replacing them with a real QGen-equivalent generator is additive (a new parameter-draw
+function called instead of `params::fixed_parameters`), not a breaking change to `power_test`/`throughput_test`'s
+signatures. Refresh key-stream number: could be made optional with an internal default derivation later without
+breaking existing callers that already pass one explicitly, since Rust has no optional-parameter overload
+ambiguity here — a new `_with_default` entry point would be additive.
+
+### Post-review fixes
+
+An external review of the B8 diff found four more defects, all fixed in `crates/htap-tpch/src/drivers.rs`:
+
+1. **`power_test` validated the scale factor but not the refresh key stream before calling RF1.** An
+   out-of-range `refresh_key_stream` would have let RF1 commit its inserted orders/lineitems before any
+   validation failed, and there would then be no way to ask RF2 to delete them (RF2 requires the same
+   `1..=1000` range). `power_test` now checks `(1..=1_000).contains(&refresh_key_stream)` first, before opening
+   either session or calling RF1, so an invalid stream is rejected with zero committed changes. Test:
+   `crates/htap-tpch/tests/drivers.rs::power_driver_rejects_invalid_refresh_key_stream_without_changes`
+   (`#[ignore]`d, release mode), which asserts the order count is unchanged after rejecting both `0` and
+   `1_001`.
+2. **`throughput_test` validated `stream_count` and the upper end of the refresh key-stream range, but not a
+   zero `first_refresh_key_stream`.** `throughput_test` now also rejects `first_refresh_key_stream == 0` up
+   front, alongside the existing checks, before any thread is spawned. Test:
+   `drivers::tests::test_throughput_rejects_invalid_inputs_before_workers` (extended, not renamed, to cover
+   all three rejection cases: zero stream count, zero first refresh key stream, and an out-of-range key-stream
+   window).
+3. **A panic during a worker thread's pre-barrier setup could deadlock every other thread.** Each query-stream
+   thread and the refresh thread do some work (opening a session, computing a query order) before calling
+   `barrier.wait()`; a panic during that setup used to leave the panicking thread never reaching the barrier,
+   which would hang every other thread waiting on it forever. That pre-barrier work is now wrapped in
+   `std::panic::catch_unwind(std::panic::AssertUnwindSafe(..))` (`crates/htap-tpch/src/drivers.rs` lines 444
+   and 488), converting a panic into `Err(DriverError::WorkerPanicked)` that still reaches the barrier normally,
+   so every spawned thread calls `barrier.wait()` exactly once regardless of a setup-time panic. Verified by
+   code read-through only: this crate has no seam to inject a mid-`open_session` panic, matching the
+   read-through-only precedent already set for unseamed fixes elsewhere in this project (see `docs/PROBLEMS.md`'s
+   Phase 16 batch D/E/F entries for the same pattern).
+4. **The rounding helpers wrapped instead of saturating on an out-of-range duration.** `round_to_nearest_centisecond`
+   and `round_up_centisecond` used to cast their `i128` intermediate result to `u64` with `as u64`, which wraps
+   silently for a value above `u64::MAX` rather than erroring or saturating. Both now go through
+   `u64::try_from(rounded).unwrap_or(u64::MAX)`, so an out-of-range duration saturates at `u64::MAX` instead of
+   wrapping to a small, wrong value. Test: `drivers::tests::test_rounding_saturates_at_u64_max`.
+
+None of the four changes any on-disk format, WAL, or durability invariant, so no additional storage review was
+needed.
+
+### Verification
+
+`crates/htap-tpch/src/drivers.rs`'s own unit tests (`drivers::tests::{test_rounded_interval_geomean,
+test_throughput_rejects_invalid_inputs_before_workers, test_query_order_wraparound,
+test_table_11_stream_count_exact_values, test_labels_do_not_contain_official_metrics,
+test_rounding_boundaries, test_round_up_centisecond_worked_example, test_rounding_saturates_at_u64_max,
+test_permutation_row_coverage, test_every_row_is_permutation}`, 10 tests),
+`crates/htap-tpch/tests/drivers.rs` (`power_driver_runs_all_queries_and_refreshes`,
+`power_driver_rejects_invalid_refresh_key_stream_without_changes`,
+`throughput_driver_runs_query_and_refresh_streams`, 3 tests, all `#[ignore]`d, release mode), and
+`crates/htap-tpch/tests/correctness_generated.rs::test_refresh_rf1_rf2_stream_one_all_queries` (`#[ignore]`d,
+release mode), which runs all 22 queries in `query_order(0)` against the independent oracle over a mutated
+dataset after RF1+RF2. F3's closure is verified by `crates/htap-tpch/src/queries.rs::queries::tests::
+test_query_11_and_query_23_error_handling`. See `docs/PROGRESS.md`'s Phase 17 (continued) row (task B8) and
+`docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for the surrounding contract.
