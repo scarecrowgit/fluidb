@@ -169,6 +169,64 @@ fn test_ties_reject_row_after_boundary() {
 
 #[test]
 #[ignore]
+fn test_refresh_rf1_rf2_stream_one_updates_q1_and_q6() {
+    let (_directory, server, dataset) = load_at("0.01", 42);
+    let mut session = server.open_session().expect("open session");
+
+    htap_tpch::rf1_new_sales(&mut session, "0.01", 1, 42).expect("apply RF1 stream 1");
+    htap_tpch::rf2_old_sales(&mut session, "0.01", 1).expect("apply RF2 stream 1");
+
+    let rf2_order_keys = htap_tpch::generate_rf2_plan("0.01", 1).expect("generate RF2 plan");
+    let rf1_rows = htap_tpch::generate_rf1_rows("0.01", 1, 42).expect("generate RF1 rows");
+    let mut mutated_dataset = dataset.clone();
+
+    mutated_dataset
+        .orders
+        .retain(|order| !rf2_order_keys.contains(&order.o_orderkey));
+    mutated_dataset
+        .lineitem
+        .retain(|lineitem| !rf2_order_keys.contains(&lineitem.l_orderkey));
+    mutated_dataset
+        .orders
+        .extend(rf1_rows.orders.iter().cloned());
+    mutated_dataset
+        .lineitem
+        .extend(rf1_rows.lineitems.iter().cloned());
+
+    assert_eq!(mutated_dataset.orders.len(), dataset.orders.len());
+    assert!(rf1_rows.orders.iter().all(|rf1_order| {
+        mutated_dataset
+            .orders
+            .iter()
+            .any(|order| order.o_orderkey == rf1_order.o_orderkey)
+    }));
+    assert!(rf2_order_keys.iter().all(|rf2_order_key| {
+        mutated_dataset
+            .orders
+            .iter()
+            .all(|order| order.o_orderkey != *rf2_order_key)
+    }));
+    assert!(
+        rf1_rows
+            .lineitems
+            .iter()
+            .any(|lineitem| lineitem.l_shipdate.as_str() <= oracle::dates::Q1_SHIPDATE_CUTOFF),
+        "RF1 stream 1 must include a Q1-eligible lineitem"
+    );
+
+    oracle::q1::verify_coverage(&mutated_dataset).expect("Q1 oracle coverage");
+    let actual_q1 = execute(&server, 1);
+    compare_results(&actual_q1, &oracle::q1::expected(&mutated_dataset), true)
+        .expect("Q1 engine result matches refreshed independent oracle");
+
+    oracle::q6::verify_coverage(&mutated_dataset).expect("Q6 oracle coverage");
+    let actual_q6 = execute(&server, 6);
+    compare_results(&actual_q6, &oracle::q6::expected(&mutated_dataset), true)
+        .expect("Q6 engine result matches refreshed independent oracle");
+}
+
+#[test]
+#[ignore]
 fn test_q1_pilot() {
     let (_directory, server, dataset) = load_at("0.01", 42);
     oracle::q1::verify_coverage(&dataset).expect("Q1 oracle coverage");

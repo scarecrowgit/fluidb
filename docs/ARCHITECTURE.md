@@ -337,7 +337,7 @@ defined in `crates/htap-common/src/types.rs`:
   `test_decimal_comparisons_below_representable_range`,
   `test_decimal_comparisons_at_representable_boundary`).
 
-### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6)
+### TPC-H workload kit foundations (Phase 17, Batch A / Batch B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7)
 
 **Status: `in progress`.** Phase 17 continues past A6a/A6b (`DECIMAL`, above) into a TPC-H-derived workload
 kit. Batch A (complete) closed three prerequisites the kit depends on, with no on-disk format change: movement's
@@ -527,6 +527,39 @@ establish (one seed, three scale factors total — 0.01 plus two overrides, 0.03
 specification's row-generation algorithm) and `docs/PROGRESS.md`'s Phase 17 (continued) row for the full test
 list.
 
+**Task B7 — refresh functions RF1/RF2.** `Status: implemented (narrow local slice).` `crates/htap-tpch::refresh`
+adds `rf1_new_sales`/`rf2_old_sales` (`Session`-based, public) plus their pure-generation halves
+(`generate_rf1_rows`, `generate_rf2_plan`, `refresh_range`) and per-order apply primitives
+(`apply_one_order_insert`, `apply_one_order_delete`). Each order (its `ORDERS` row plus 1-7 `LINEITEM` rows) is
+applied in its own transaction — TPC-H Clause 2.5.2 explicitly permits decomposing a refresh function into many
+transactions and gives exactly this per-order shape as its own example, so this is a spec-permitted choice, not
+a deviation; see ADR-029. Disclosed consequence: a crash or error partway through a refresh call leaves a
+committed prefix of orders, with each order still all-or-nothing. Keys follow Clause 4.2.4: RF1 streams 1-1000
+insert into slice 1 (the second eighth of each 32-key block); this crate additionally accepts RF1 streams
+1001-3000, continuing into slices 2 and 3 (an extension beyond the clause's own 1-1000 pairing, not part of its
+text); RF2 streams 1-1000 delete from slice 0, the original load's keys. The full 4,000-pair cycle reusing all
+four quarters (Clause 4.2.4.3) is not implemented; a stream number outside `1..=3000` (RF1) or `1..=1000` (RF2)
+returns a typed `RefreshError::StreamOutOfRange` rather than a panic or silent wraparound. RF2 performs seven
+full-primary-key point deletes of `lineitem` (line numbers 1-7; a missing line is a no-op) plus one of `orders`
+per order, so it never scans a table; its keys are recomputed from `(scale_factor, stream)` alone via the same
+sparse-key formula the loader uses, independent of any generated `Dataset` — see ADR-029. Re-running the same
+RF1 stream without an intervening RF2 upserts byte-identical rows, since the engine's `INSERT` performs no
+primary-key-existence check; this is disclosed, not guarded. Refresh-inserted orders do not carry the load-time
+Query 13 forced-comment phrase (refresh text generation is ordinary, not the load-time forced-phrase path). A
+whole-function-in-one-transaction design was ruled out independently: at SF 1 it would exceed the ~4 MiB
+effective 2PC transaction payload cap (`docs/LIMITATIONS.md`'s "Effective 2PC transaction payload cap"), which
+is one reason (alongside Clause 2.5.2's own example) for the per-order granularity. `queries::query`'s panic on
+an invalid scale factor (`docs/PROBLEMS.md` F3) is unrelated and left for task B8. Covered by
+`crates/htap-tpch/src/refresh.rs`'s own unit tests
+(`refresh::tests::{rf1_counts_and_generation_are_deterministic, rf1_streams_use_the_expected_sparse_slices, out_of_range_streams_are_rejected, rf2_stream_one_keys_match_the_load_order_key_range}`),
+`crates/htap-tpch/tests/refresh.rs`
+(`test_rf1_inserts_orders_and_lineitems_with_correct_counts, test_rf2_deletes_orders_and_makes_rows_gone, test_rf1_then_rf2_restores_counts_with_quarter_shift, test_partial_failure_rolls_back_without_committing_half_order, test_out_of_range_streams_are_rejected`),
+and (ignored, release-mode) `crates/htap-tpch/tests/correctness_generated.rs::test_refresh_rf1_rf2_stream_one_updates_q1_and_q6`,
+which applies RF1+RF2 through the engine, mutates a cloned `Dataset` the same way, and checks Query 1 and
+Query 6 against the independent oracle over the mutated dataset (also asserting at least one RF1-inserted
+lineitem passes Query 1's own date filter, so the check is not vacuous). See ADR-029 in `docs/DECISIONS.md` and
+`docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for the full disclosure.
+
 Later components described below remain `planned` or `deferred` (explicitly deferred:
 direct CatalogStore CAS and older movement repair APIs bypass coordinator fence; no Raft/`openraft`,
 ZooKeeper backend, watches/locks/KV semantics, distributed consensus, concurrent shared-root writers / distributed coordination (concurrent *direct storage access* to a shared root remains unsupported — Phase 16 above adds only local, same-host IPC forwarding for a second process, not a second storage writer),
@@ -539,7 +572,7 @@ executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spilla
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), a general semi-join rewrite of IN/EXISTS (a narrow slice — key-equality correlated EXISTS/NOT EXISTS and key-equality correlated scalar-aggregate subqueries answered from a statement-scoped hash lookup, with no new Semi/Anti JoinKind — is implemented as of Phase 17 task F6, see above and ADR-028; correlated IN/NOT IN rewriting and residual-bearing scalar-aggregate decorrelation remain deferred), broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
-TPC-H refresh functions, power/throughput test drivers, and a compliance/deviations disclosure document (task B2 added a from-specification row generator, task B3 a bulk loader, and task B6 a test-only independent re-aggregation oracle for all 22 queries — see "TPC-H workload kit foundations" above and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
+TPC-H power/throughput test drivers and a compliance/deviations disclosure document (task B2 added a from-specification row generator, task B3 a bulk loader, task B6 a test-only independent re-aggregation oracle for all 22 queries, and task B7 the RF1/RF2 refresh functions as per-order transactions — see "TPC-H workload kit foundations" above, ADR-029, and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features"),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),

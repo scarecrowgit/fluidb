@@ -36,6 +36,40 @@ pub const QUERY_13_WORD2: [&str; 4] = ["packages", "requests", "accounts", "depo
 /// not a rate prescribed by the TPC-H specification.
 const FORCED_COMMENT_DIVISOR: u64 = 10;
 
+/// Returns customer keys eligible to receive ORDERS rows.
+///
+/// Customer keys divisible by three are excluded structurally, so they receive
+/// exactly zero orders.
+pub(crate) fn eligible_customers(customer_count: u64) -> Vec<u64> {
+    (1..=customer_count)
+        .filter(|custkey| custkey % 3 != 0)
+        .collect()
+}
+
+/// Assembles an ORDERS shell while preserving the generator's field draw order.
+pub(crate) fn assemble_order_shell(
+    rng: &mut RandomState,
+    scale_factor_text: &str,
+    orderkey: u64,
+    custkey: u64,
+    comment: String,
+) -> Result<OrderShell, ScaleFactorError> {
+    Ok(OrderShell {
+        o_orderkey: orderkey as i64,
+        o_custkey: custkey as i64,
+        o_orderdate: order_date(rng),
+        o_orderpriority: ORDER_PRIORITIES
+            [rng.structural_bounded(ORDER_PRIORITIES.len() as u64) as usize]
+            .to_owned(),
+        o_clerk: format!(
+            "Clerk#{:09}",
+            rng.structural_bounded(scale_factor(scale_factor_text, 1_000)?) + 1
+        ),
+        o_shippriority: 0,
+        o_comment: comment,
+    })
+}
+
 /// Generates incomplete ORDERS shells for the requested scale factor.
 ///
 /// There are ten orders for every CUSTOMER row. Customer keys divisible by
@@ -49,9 +83,7 @@ pub fn generate(
     let forced_comment_count = order_count / FORCED_COMMENT_DIVISOR;
     let forced_comment_keys = select_forced_comment_keys(rng, order_count, forced_comment_count);
 
-    let eligible_customers: Vec<u64> = (1..=customer_count)
-        .filter(|custkey| custkey % 3 != 0)
-        .collect();
+    let eligible_customers = eligible_customers(customer_count);
     assert!(
         !eligible_customers.is_empty(),
         "at least one customer must be eligible for orders"
@@ -70,20 +102,13 @@ pub fn generate(
             generate_text(rng, 19, 78)
         };
 
-        orders.push(OrderShell {
-            o_orderkey: orderkey as i64,
-            o_custkey: custkey as i64,
-            o_orderdate: order_date(rng),
-            o_orderpriority: ORDER_PRIORITIES
-                [rng.structural_bounded(ORDER_PRIORITIES.len() as u64) as usize]
-                .to_owned(),
-            o_clerk: format!(
-                "Clerk#{:09}",
-                rng.structural_bounded(scale_factor(scale_factor_text, 1_000)?) + 1
-            ),
-            o_shippriority: 0,
-            o_comment: comment,
-        });
+        orders.push(assemble_order_shell(
+            rng,
+            scale_factor_text,
+            orderkey,
+            custkey,
+            comment,
+        )?);
     }
 
     Ok(orders)
@@ -109,10 +134,15 @@ fn select_forced_comment_keys(
         .collect()
 }
 
+/// Maps a dense zero-based row index into one of four sparse key slices.
+pub(crate) fn sparse_order_key_in_slice(order_index: u64, slice: u64) -> u64 {
+    (order_index / 8) * 32 + (order_index % 8) + 1 + 8 * slice
+}
+
 /// Maps a dense zero-based row index to the sparse key space required by
 /// Clause 4.2.3:3991-3996: only keys 1 through 8 of each group of 32 are used.
 fn sparse_order_key(order_index: u64) -> u64 {
-    (order_index / 8) * 32 + (order_index % 8) + 1
+    sparse_order_key_in_slice(order_index, 0)
 }
 
 /// Returns a date uniformly chosen from STARTDATE through ENDDATE - 151 days.
@@ -165,8 +195,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        civil_from_days, days_from_civil, generate, order_date, OrderShell, QUERY_13_WORD1,
-        QUERY_13_WORD2,
+        civil_from_days, days_from_civil, generate, order_date, sparse_order_key,
+        sparse_order_key_in_slice, OrderShell, QUERY_13_WORD1, QUERY_13_WORD2,
     };
     use crate::generate::rng::RandomState;
 
@@ -314,6 +344,33 @@ mod tests {
         assert!(forced_customer_keys.len() > 1);
         assert!(forced_customer_keys.iter().any(|key| key % 2 == 0));
         assert!(forced_customer_keys.iter().any(|key| key % 2 != 0));
+    }
+
+    #[test]
+    fn sparse_slice_zero_matches_existing_sparse_key_mapping() {
+        for index in 0..1_000 {
+            assert_eq!(sparse_order_key_in_slice(index, 0), sparse_order_key(index));
+        }
+    }
+
+    #[test]
+    fn sparse_order_key_slices_do_not_collide_for_the_same_index() {
+        for index in 0..1_000 {
+            let keys: BTreeSet<_> = (0..4)
+                .map(|slice| sparse_order_key_in_slice(index, slice))
+                .collect();
+            assert_eq!(keys.len(), 4);
+        }
+    }
+
+    #[test]
+    fn distinct_indices_do_not_collide_within_a_sparse_slice() {
+        for slice in [0, 1, 2, 3] {
+            let keys: BTreeSet<_> = (0..1_000)
+                .map(|index| sparse_order_key_in_slice(index, slice))
+                .collect();
+            assert_eq!(keys.len(), 1_000);
+        }
     }
 
     #[test]

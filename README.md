@@ -49,7 +49,7 @@ components are **deliberately not implemented** and are out of scope for this lo
   kept as text and bound as a numeric literal (a `DECIMAL` result column also works over the wire, up to the
   engine's own 18-digit bound — no arbitrary-precision decimal wire type — see the bullet above); `TIME`-typed
   parameters are rejected. See "Prepared statements" below.
-- **No TPC-C compliance; TPC-H compliance not yet claimed (Phase 17 Batch A/B checkpoint 1 + tasks B5b-B5c/B2/B3/B6,
+- **No TPC-C compliance; TPC-H compliance not yet claimed (Phase 17 Batch A/B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7,
   `in progress`):** The system does not implement the TPC-C benchmark specification. A TPC-H-derived workload
   kit (`crates/htap-tpch`) is under construction: the eight-table schema, all 22 published query texts with
   validation-default parameters, an exact-integer scale-factor helper, hand-derived correctness fixtures
@@ -73,9 +73,21 @@ components are **deliberately not implemented** and are out of scope for this lo
   Query 22 9.7s → 0.07s). Correlated `IN`/`NOT IN` rewriting, scalar-aggregate decorrelation with a residual
   predicate, and `OR` factoring beyond a plain-comparison allowlist remain deferred — see
   `docs/LIMITATIONS.md`'s "Completed local MVP — correlated-subquery decorrelation and OR factoring" section.
-  Refresh functions and power/throughput test drivers are not yet built, and no compliance, comparability, or
-  benchmark-metric claim is made; a TPC compliance/deviations disclosure document is a later deliverable and is
-  not written yet. Task B6 (test-only) added an independent re-aggregation oracle
+  Task B7 then added the `RF1`/`RF2` refresh functions (`crates/htap-tpch::refresh`): new-sales inserts and
+  old-sales deletes, each order (its `ORDERS` row plus 1-7 `LINEITEM` rows) applied in its own transaction —
+  TPC-H Clause 2.5.2 explicitly permits decomposing a refresh function into many transactions and gives exactly
+  this per-order shape as its own worked example, so this is spec-permitted, not a deviation (a whole-stream
+  transaction would also exceed the ~4 MiB effective transaction payload cap at SF 1; see ADR-029). RF1 streams
+  1-1000 and RF2 streams 1-1000 follow Clause 4.2.4's sparse key slices; this crate additionally accepts RF1
+  streams 1001-3000, continuing into slices 2 and 3, an extension beyond the clause's own text. Clause 4.2.4.3's
+  full 4,000-pair quarter-reuse cycle is not implemented, and an out-of-range stream is a typed error, not a panic. Disclosed:
+  a crash mid-call leaves a committed prefix of orders (each order still all-or-nothing); RF2's keys are
+  recomputed from `(scale_factor, stream)` alone, with no scan of `lineitem`/`orders`; re-running an RF1 stream
+  without RF2 upserts byte-identical rows, since `INSERT` performs no primary-key check; and refresh-inserted
+  orders lack the load-time Query 13 forced-comment phrase. See `docs/LIMITATIONS.md`'s "TPC-H workload kit
+  scope and deferred features" and ADR-029 for the full disclosure. Power/throughput test drivers are not yet
+  built, and no compliance, comparability, or benchmark-metric claim is made; a TPC compliance/deviations
+  disclosure document is a later deliverable and is not written yet. Task B6 (test-only) added an independent re-aggregation oracle
   (`crates/htap-tpch/tests/oracle/`) that re-derives each of the 22 queries' expected result directly from the
   generated `Dataset`, with no SQL engine involved, and confirmed the engine matches it exactly on all 22 at
   seed 42 (SF 0.01, except Q17/Q18 at SF 0.03 and Q20 at SF 0.1 — the published parameters give `NULL`/empty
@@ -488,7 +500,7 @@ The workspace consists of 15 modular crates (plus the vendored `vendor/sqlparser
 | `crates/htap-coord` | Local coordination and placement engine (`LocalCoordinator`, `HTAPCRD1` state envelope, monotonic fencing tokens, and deterministic placement planner). |
 | `crates/htap-sql` | SQL front-end using `sqlparser` (MySQL dialect): strict narrow catalog binder (typed `PointSelect`/`AnalyticSelect`), a general query binder (`query`/`expr`/`binder_query`: joins, expressions, subqueries, `UPDATE`/`DROP TABLE`/`SHOW`), and structural query router (`Route::RowstorePointRead`, `Route::OlapScan`, `Route::Query`, `Route::RowstoreUpdate`, `Route::CatalogRead`). |
 | `crates/htap-server` | Durable synchronous in-process engine façade (`LocalServer`) integrating catalog, rowstore, transactions, data movement, narrow analytical scan execution (`<root>/colstore`), and the general query executor (`query_exec`: joins, expressions, subqueries, `UNION`, `UPDATE`, `DROP TABLE`, `SHOW`). |
-| `crates/htap-tpch` | TPC-H-derived schema, query-text, workload-parameter, row-generation, bulk-load, and correctness-oracle support crate (`in progress`, Phase 17 Batch A/B checkpoint 1 + tasks B5b-B5c/B2/B3/B6): the eight-table schema DDL, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper, hand-derived correctness fixtures for all 22 of the 22 queries, a from-specification data generator (`generate::generate`) producing all eight tables as typed in-memory rows deterministically from a scale factor and seed (not an audited implementation, no comparability claim), a bulk loader (`load_dataset`) streaming a generated dataset into a fresh database through the existing CSV movement path, and (test-only) an independent re-aggregation oracle (`tests/oracle/`) that matches the engine's output for all 22 queries against a from-`Dataset` re-derivation with no SQL engine involved; refresh functions and power/throughput drivers remain to be built — see `docs/PROGRESS.md`'s Phase 17 (continued) row. |
+| `crates/htap-tpch` | TPC-H-derived schema, query-text, workload-parameter, row-generation, bulk-load, refresh-function, and correctness-oracle support crate (`in progress`, Phase 17 Batch A/B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7): the eight-table schema DDL, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper, hand-derived correctness fixtures for all 22 of the 22 queries, a from-specification data generator (`generate::generate`) producing all eight tables as typed in-memory rows deterministically from a scale factor and seed (not an audited implementation, no comparability claim), a bulk loader (`load_dataset`) streaming a generated dataset into a fresh database through the existing CSV movement path, `RF1`/`RF2` refresh functions (`refresh::{rf1_new_sales, rf2_old_sales}`) applying one transaction per order (spec-permitted per Clause 2.5.2, see ADR-029; RF1 streams 1-3000, RF2 streams 1-1000, the full Clause 4.2.4.3 quarter-reuse cycle not implemented), and (test-only) an independent re-aggregation oracle (`tests/oracle/`) that matches the engine's output for all 22 queries against a from-`Dataset` re-derivation with no SQL engine involved; power/throughput drivers remain to be built — see `docs/PROGRESS.md`'s Phase 17 (continued) row. |
 | `crates/htap-client` | Synchronous in-process embedded client (`EmbeddedClient`) and network client (`RemoteClient`) providing an ergonomic SQL execution interface over `LocalServer`, in-process or over TCP. |
 | `crates/htap-wire` | Hand-written, synchronous MySQL text- and binary-protocol server (`WireServer`) exposing `LocalServer` over TCP, including prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/`SEND_LONG_DATA`), `COM_RESET_CONNECTION`/`COM_CHANGE_USER`, and the `WireClient` used by `RemoteClient`. |
 | `crates/htapd` | Network daemon binary: opens a `LocalServer` root and serves it via `htap-wire::WireServer`. |

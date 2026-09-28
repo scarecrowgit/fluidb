@@ -114,7 +114,7 @@ pub fn format_decimal(scaled_value: i64) -> String {
     format!("{}{}.{:02}", sign, absolute / 100, absolute % 100)
 }
 
-fn format_quantity(quantity: i64) -> String {
+pub(crate) fn format_quantity(quantity: i64) -> String {
     format!("{quantity}.00")
 }
 

@@ -4146,3 +4146,126 @@ queries finishing in about 10.3 seconds total after this change (Query 4 timeout
 0.89s, Query 19 61s → 0.28s, Query 17 22s → 0.67s, Query 20 20s → 0.48s, Query 22 9.7s → 0.07s). See
 `docs/PROGRESS.md`'s Phase 17 (continued) row and `docs/LIMITATIONS.md`'s "Completed local MVP —
 correlated-subquery decorrelation and OR factoring (Phase 17, task F6)" for the surrounding contract.
+
+## ADR-029: TPC-H refresh functions (RF1/RF2) as per-order transactions; RF2 keyed independently of the generated `Dataset`
+
+`Status: Accepted`
+`Date: 2026-09-28`
+
+### Context
+
+Phase 17 Batch B task B7 adds `RF1` (new-sales) and `RF2` (old-sales) to `crates/htap-tpch`. Both functions
+insert or delete a whole scale-factor-sized batch of orders (`SF * 1500` per stream set) plus each order's 1-7
+lineitems. Two questions have no single obviously-correct answer and each commits the crate to a shape that
+would be expensive to unwind once callers depend on it, so both are recorded here together.
+
+**Transaction granularity.** TPC-H Clause 2.5.2 states a refresh function "can be decomposed into any number of
+database transactions," as long as each is atomic and leaves the database logically consistent, and gives
+exactly this project's shape as its own example: adding or deleting an order modifies LINEITEM and ORDERS in
+the same transaction. Separately, `htap-server::Session`'s buffered `WriteSet` commits as a single durable
+request with an effective payload cap of about 4 MiB (`docs/LIMITATIONS.md`'s "Effective 2PC transaction
+payload cap"); a whole RF1 stream at SF 1 (1,500 orders, up to 7 lineitems each) serializes to roughly 4.5-5 MB,
+over that cap on its own, independent of the spec question.
+
+**RF2's key source.** RF2 must delete the same order keys RF1's *load-time* generation originally inserted at
+the corresponding sparse slot (Clause 4.2.4). Those keys could be recomputed on demand from `(scale_factor,
+stream)` alone, using the same sparse-key formula the loader uses, or `rf2_old_sales` could require the
+caller to pass in the original loaded `Dataset` (or a `Vec` of its order keys) so RF2 deletes exactly what was
+actually inserted, rather than trusting a recomputation to agree with it.
+
+### Options considered — transaction granularity
+
+1. **One transaction per refresh-function call**, covering every order and lineitem in the stream.
+   Rejected: it exceeds the ~4 MiB effective payload cap at SF 1 on its own; a fallback that tried the whole
+   transaction first and only split on `HtapError::InvalidArgument` was also rejected in panel review, since
+   that error variant is too broad — a fallback keyed on it could turn an unrelated real bug (a malformed date,
+   a duplicate key) into a silent partial-then-full-retry sequence instead of surfacing the bug.
+2. **One transaction per order** (the order row plus all of its lineitems), stopping at the first failing
+   order and leaving every earlier order's transaction committed. **Chosen.** Matches Clause 2.5.2's own
+   worked example exactly, stays well under the payload cap at any scale factor this crate supports, and keeps
+   each order's own atomicity (all lineitems or none) exactly as strong as a single whole-function transaction
+   would have given it — only *cross-order* atomicity within one call is given up, and Clause 2.5.2 explicitly
+   permits that.
+3. **One transaction per lineitem.** Rejected: strictly weaker than option 2 for no cap-driven reason (a single
+   order's lineitems fit the payload cap trivially), and it would let a crash leave an order with only some of
+   its lineitems committed — the one thing Clause 2.5.2's own example transaction boundary exists to prevent.
+
+### Decision — transaction granularity
+
+Option 2. `apply_one_order_insert`/`apply_one_order_delete` each open, execute, and commit (or roll back) one
+order's transaction; `rf1_new_sales`/`rf2_old_sales` loop over their stream's orders calling these, stopping and
+returning the first error without attempting the remaining orders.
+
+### Options considered — RF2's key source
+
+1. **Recompute keys from `(scale_factor, stream)` alone**, using the same `sparse_order_key_in_slice` formula
+   (slice 0) the loader used, deleting each candidate key via `DELETE ... WHERE o_orderkey = <key>` (and the
+   matching lineitem deletes) whether or not a row with that key is actually present. **Chosen.** RF2 needs no
+   dependency on a generated `Dataset` at all — a caller that only ever loaded through some other path (or lost
+   the in-memory `Dataset`) can still run RF2 correctly, since `Mutation::Delete` is an unconditional tombstone
+   and deleting an absent key is a no-op; this was also the unanimous recommendation across the three external
+   models consulted at the plan gate.
+2. **Require the caller to pass the original `Dataset` (or its order keys)** and delete exactly those rows.
+   Rejected: it ties RF2's signature to a specific in-memory representation of the loaded data that a caller
+   using the bulk loader once and then discarding the `Dataset` would no longer have, is unnecessary since the
+   sparse-key formula is already the single source of truth both the loader and RF1 use, and would silently
+   diverge from real TPC-H tooling, where a refresh stream is driven by scale factor and stream number, not by
+   a copy of the previously generated rows.
+
+### Decision — RF2's key source
+
+Option 1. `generate_rf2_plan(scale_factor_text, stream)` derives its candidate order keys purely from the scale
+factor and stream number via `sparse_order_key_in_slice(_, 0)`, the same formula `generate::orders` uses at load
+time; the crate's tests use a `Dataset` only to cross-check that these recomputed keys agree with what the
+loader actually produced (`rf2_stream_one_keys_match_the_load_order_key_range`), not as a runtime dependency of
+`rf2_old_sales` itself.
+
+### Consequences
+
+- **Atomicity is per order, not per call.** A crash or a mid-stream error during `rf1_new_sales`/`rf2_old_sales`
+  leaves a committed prefix of orders and stops there; no order is ever left half-inserted or half-deleted, but
+  the caller must treat a failing refresh call as "some orders applied, then it stopped," not as fully
+  all-or-nothing. This is exactly what Clause 2.5.2 permits and disclosed in `docs/LIMITATIONS.md`.
+- **RF1 is a plain `INSERT`, so it upserts on retry.** The engine's `INSERT` performs no primary-key-existence
+  check; running the same RF1 stream a second time (with the same seed) writes byte-identical rows again rather
+  than failing or being rejected as a duplicate. Not guarded by this task; disclosed in
+  `docs/LIMITATIONS.md`.
+- **RF2 never scans a table.** Each order's transaction issues exactly seven full-primary-key point deletes of
+  `lineitem` (`l_orderkey`, `l_linenumber` 1..=7 — a missing line number is a harmless no-op) plus one
+  full-primary-key point delete of `orders`, so RF2's cost is proportional to orders processed, not table size.
+- **Keys follow Clause 4.2.4's asymmetric stream caps, not its full reuse cycle.** RF1 streams 1-1000 write
+  into slice 1 (the second eighth of each block of 32 keys, as Clause 4.2.4 specifies); this crate additionally
+  accepts RF1 streams 1001-3000, continuing into slices 2 and 3, so up to three refresh cycles of new sales can
+  run before a key slice repeats. RF2 streams 1-1000 delete only from slice 0 (the original load's keys).
+  Clause 4.2.4.3's full 4,000-pair cycle that reuses all four quarters together is not implemented; a stream
+  number outside `1..=3000` (RF1) or `1..=1000` (RF2) returns a typed `RefreshError::StreamOutOfRange` rather
+  than a silent wraparound or panic.
+- **Refresh-inserted orders do not carry the load-time Query 13 forced-comment phrase.** `generate_rf1_rows`
+  reuses ordinary text generation for `O_COMMENT`; the forced phrase the load-time generator adds for Query 13
+  is not reproduced for refresh rows.
+- **`queries::query`'s panic on an invalid scale factor (`docs/PROBLEMS.md` F3) is untouched by this task** and
+  remains open for task B8.
+- Nothing here touches any on-disk format, WAL, or durability invariant: both functions are ordinary SQL
+  executed through the existing public `Session` API (`begin`/`execute`/`commit`/`rollback`), so no format
+  version bump and no storage review were needed for this task.
+
+### How to reverse it
+
+Transaction granularity: replace the per-order loop in `rf1_new_sales`/`rf2_old_sales` with a single
+`session.begin()`/many `execute()` calls/`session.commit()` spanning the whole stream; this reintroduces the
+~4 MiB payload-cap failure at SF 1 and above, so it is not a safe reversal without first raising or chunking
+around that cap.
+RF2's key source: change `generate_rf2_plan`'s signature to take a `&Dataset` (or `&[i64]`) instead of deriving
+keys from `sparse_order_key_in_slice`, and delete exactly the keys passed in; no persisted state depends on the
+current signature, so this is a pure API change with no migration.
+
+### Verification
+
+`crates/htap-tpch/src/refresh.rs`'s own unit tests
+(`refresh::tests::{rf1_counts_and_generation_are_deterministic, rf1_streams_use_the_expected_sparse_slices, out_of_range_streams_are_rejected, rf2_stream_one_keys_match_the_load_order_key_range}`),
+`crates/htap-tpch/tests/refresh.rs`
+(`test_rf1_inserts_orders_and_lineitems_with_correct_counts, test_rf2_deletes_orders_and_makes_rows_gone, test_rf1_then_rf2_restores_counts_with_quarter_shift, test_partial_failure_rolls_back_without_committing_half_order, test_out_of_range_streams_are_rejected`),
+and (ignored, `--ignored`) `crates/htap-tpch/tests/correctness_generated.rs::test_refresh_rf1_rf2_stream_one_updates_q1_and_q6`,
+which mutates a loaded `Dataset` by the same RF1+RF2 stream applied through the engine and checks Query 1 and
+Query 6 against the independent oracle over the mutated dataset. See `docs/PROGRESS.md`'s Phase 17 (continued)
+row and `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for the surrounding contract.

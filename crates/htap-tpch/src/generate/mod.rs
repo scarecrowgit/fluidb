@@ -138,6 +138,30 @@ pub(super) fn supplier_key(partkey: u64, supplier_offset: u64, supplier_count: u
         + 1
 }
 
+/// Computes the lineitem-derived total price and status for an order.
+pub(crate) fn assemble_order(lineitems: &[&Lineitem]) -> (i64, String) {
+    // Tax and discount are hundredths; round the final fixed-point total once.
+    let total_numerator: i128 = lineitems
+        .iter()
+        .map(|line| {
+            i128::from(line.l_extendedprice)
+                * (100 + i128::from(line.l_tax))
+                * (100 - i128::from(line.l_discount))
+        })
+        .sum();
+    let o_totalprice = ((total_numerator + 5_000) / 10_000) as i64;
+
+    let o_orderstatus = if lineitems.iter().all(|line| line.l_linestatus == "F") {
+        "F"
+    } else if lineitems.iter().all(|line| line.l_linestatus == "O") {
+        "O"
+    } else {
+        "P"
+    };
+
+    (o_totalprice, o_orderstatus.to_owned())
+}
+
 fn partsupp_supplier_keys_are_distinct(part_count: u64, supplier_count: u64) -> bool {
     for partkey in 1..=part_count {
         let mut supplier_keys = [0; 4];
@@ -219,24 +243,7 @@ pub fn generate(scale_factor_text: &str, seed: u64) -> Result<Dataset, ScaleFact
                 .get(&shell.o_orderkey)
                 .expect("every generated order must have lineitems");
 
-            // Tax and discount are hundredths; round the final fixed-point total once.
-            let total_numerator: i128 = lines
-                .iter()
-                .map(|line| {
-                    i128::from(line.l_extendedprice)
-                        * (100 + i128::from(line.l_tax))
-                        * (100 - i128::from(line.l_discount))
-                })
-                .sum();
-            let o_totalprice = ((total_numerator + 5_000) / 10_000) as i64;
-
-            let o_orderstatus = if lines.iter().all(|line| line.l_linestatus == "F") {
-                "F"
-            } else if lines.iter().all(|line| line.l_linestatus == "O") {
-                "O"
-            } else {
-                "P"
-            };
+            let (o_totalprice, o_orderstatus) = assemble_order(lines);
 
             Orders {
                 o_orderkey: shell.o_orderkey,
@@ -278,6 +285,41 @@ mod tests {
     pub(super) fn shared_dataset_at_0_01() -> &'static Dataset {
         static DATASET: OnceLock<Dataset> = OnceLock::new();
         DATASET.get_or_init(|| generate("0.01", 42).unwrap())
+    }
+
+    #[test]
+    fn assemble_order_computes_total_price_and_pending_status() {
+        let finished = super::Lineitem {
+            l_orderkey: 1,
+            l_linenumber: 1,
+            l_partkey: 1,
+            l_suppkey: 1,
+            l_quantity: 1,
+            l_extendedprice: 10_000,
+            l_discount: 10,
+            l_tax: 8,
+            l_returnflag: "N".to_owned(),
+            l_linestatus: "F".to_owned(),
+            l_shipdate: "1995-01-01".to_owned(),
+            l_commitdate: "1995-01-01".to_owned(),
+            l_receiptdate: "1995-01-01".to_owned(),
+            l_shipinstruct: "NONE".to_owned(),
+            l_shipmode: "MAIL".to_owned(),
+            l_comment: "comment".to_owned(),
+        };
+        let open = super::Lineitem {
+            l_linenumber: 2,
+            l_extendedprice: 20_000,
+            l_discount: 0,
+            l_tax: 0,
+            l_linestatus: "O".to_owned(),
+            ..finished.clone()
+        };
+
+        let (totalprice, status) = super::assemble_order(&[&finished, &open]);
+
+        assert_eq!(totalprice, 29_720);
+        assert_eq!(status, "P");
     }
 
     #[test]
