@@ -24,7 +24,7 @@ fn dataset_lengths(dataset: &Dataset) -> [usize; 9] {
 }
 
 #[test]
-#[ignore = "loads full one-warehouse dataset (~430k rows); use --release mode and --ignored flag"]
+#[ignore = "loads full one-warehouse dataset (~600k rows); use --release mode and --ignored flag"]
 fn load_with_warehouse_count_1_and_verify_counts_and_values() {
     let dir = TempDir::new().expect("create temporary directory");
     let server = LocalServer::open(dir.path()).expect("open local server");

@@ -643,11 +643,11 @@ See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
 
-### TPC-C workload kit (Phase 18, batch 1 of 4)
+### TPC-C workload kit (Phase 18, batches 1-2 of 4)
 
-**Status: `in progress`.** Batch 1 of `crates/htap-tpcc` is built: schema, population generator and bulk loader. Batches 2-4
-(the five transactions, the consistency oracle, isolation tests, the driver and the TPC-C disclosure document) are not
-built, so nothing here is a TPC-C benchmark or a compliance claim. No engine-crate, on-disk-format or wire change.
+**Status: `in progress`.** Batches 1-2 of `crates/htap-tpcc` are built: schema, population generator, bulk loader, the five
+transactions and the 12-condition consistency checker. Batches 3-4 (isolation tests, the driver and the TPC-C disclosure
+document) are not built, so nothing here is a TPC-C benchmark or a compliance claim. No engine-crate, on-disk-format or wire change.
 
 - **Schema** (`schema::{TABLE_NAMES, ddl_statements}`): the nine tables. ORDER, ORDER-LINE and NEW-ORDER are named `orders`,
   `order_line`, `new_order` (ORDER is reserved, hyphens are invalid in unquoted names, and double quotes are string literals in
@@ -664,6 +664,18 @@ built, so nothing here is a TPC-C benchmark or a compliance claim. No engine-cra
   fresh-target check. Tests: `tests/load.rs::{reject_load_when_tables_already_exist, reject_invalid_batch_size_before_ddl}`.
 - **Load tests:** the default `load_small_subset_with_referential_consistency` loads a referentially consistent subset; the full
   one-warehouse `load_with_warehouse_count_1_and_verify_counts_and_values` is `#[ignore]`d (about 67 s in release).
+- **Transactions** (`transactions::`, batch 2): New-Order, Payment, Order-Status, Delivery and Stock-Level use the public
+  Session API, one transaction each (Delivery uses one per district order). `TransactionError` separates an engine
+  `Conflict` (retry the whole transaction) from the spec's expected 1% New-Order rollback (`ExpectedRollback`); every error
+  path rolls back. Timestamps (O_ENTRY_D, H_DATE, OL_DELIVERY_D) are caller-supplied integer epoch microseconds, because
+  `INSERT` into a TIMESTAMP column accepts a date string, a DATE literal or integer microseconds but not a date-and-time
+  string literal (`crates/htap-sql/src/binder.rs`). Delivery runs synchronously; the spec's deferred execution mode
+  (Clause 2.7.2) is not implemented. Payment's HISTORY `h_id` uses a caller-supplied terminal number (1..=32767; 0 is
+  reserved for population) plus a sequence.
+- **Consistency checker** (`consistency::check_consistency`): all 12 Clause 3.3.2 conditions. Observation about the spec
+  text: condition 11 (count(ORDER) - count(NEW-ORDER) = 2100 per district) holds only for the initial population, since each
+  Delivery raises the difference by one; after transactions the tests assert the derived invariant 2100 + delivered
+  (`tests/consistency.rs::transactions_preserve_derived_condition_11`, ignored). Full test list in `docs/PROGRESS.md`.
 - **Fixed after external review in batch 1:** the delivered boundary (orders 1-2100 delivered, 2101-3000 in NEW-ORDER),
   C_PHONE now 16 digits, and I_DATA/S_DATA lengths 26-50.
 
