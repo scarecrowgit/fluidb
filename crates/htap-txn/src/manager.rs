@@ -16,6 +16,9 @@ use crate::participant::{
     CommittedTransaction, ParticipantId, ParticipantWork, TransactionId, TransactionRequest,
     TxnParticipant,
 };
+use crate::serializable::{
+    PinnedSnapshotRegistry, ReadFootprint, RecentWrites, SerializableTicket, ValidationFailure,
+};
 
 /// Lifecycle state of a local transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +49,13 @@ impl TxnState {
     }
 }
 
+#[derive(Debug)]
+struct SerializableContext {
+    // Keeps the snapshot pin alive for the transaction's lifetime.
+    ticket: SerializableTicket,
+    footprint: ReadFootprint,
+}
+
 /// A transaction handle managed by [`TransactionManager`].
 #[derive(Debug)]
 pub struct Transaction {
@@ -54,6 +64,7 @@ pub struct Transaction {
     commit_version: Option<Version>,
     participants: Vec<ParticipantWork>,
     state: TxnState,
+    serializable: Option<SerializableContext>,
 }
 
 impl Transaction {
@@ -65,7 +76,28 @@ impl Transaction {
             commit_version: None,
             participants: Vec::new(),
             state: TxnState::Active,
+            serializable: None,
         }
+    }
+
+    /// Creates a transaction validated against the snapshot pinned by `ticket`.
+    ///
+    /// The transaction takes ownership of the ticket and keeps it alive for its lifetime. This
+    /// constructor only binds the ticket; `TransactionManager::commit` verifies its origin.
+    pub fn new_serializable(
+        id: TransactionId,
+        ticket: SerializableTicket,
+        footprint: ReadFootprint,
+    ) -> Result<Self> {
+        let read_version = ticket.snapshot();
+        Ok(Self {
+            id,
+            read_version,
+            commit_version: None,
+            participants: Vec::new(),
+            state: TxnState::Active,
+            serializable: Some(SerializableContext { ticket, footprint }),
+        })
     }
 
     /// Return the unique transaction identifier.
@@ -126,6 +158,15 @@ impl Transaction {
 pub struct CheckpointReport {
     /// Whether journal records were compacted.
     pub compacted: bool,
+}
+
+/// Serializable-validation counters maintained by a transaction manager.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SerializableStats {
+    /// Transactions aborted because a newer retained write conflicted with their reads.
+    pub validation_aborts: u64,
+    /// Transactions aborted because the retained-write validation window was incomplete.
+    pub floor_aborts: u64,
 }
 
 /// Report returned following journal crash recovery.
@@ -198,6 +239,8 @@ struct FoldResult {
 ///
 /// Orchestrates 2PC across local participants using deterministic ID ordering
 /// to prevent deadlocks and guarantees durability via CRC32C journal logging.
+static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct TransactionManager {
     decision_lock: Mutex<()>,
     intent_append_hook: Mutex<Option<JournalHook>>,
@@ -218,6 +261,9 @@ pub struct TransactionManager {
     next_txn_id: AtomicU64,
     next_version: Mutex<Version>,
     visible_version: Mutex<Version>,
+    serializable_registry: Mutex<PinnedSnapshotRegistry>,
+    recent_writes: Mutex<RecentWrites>,
+    serializable_stats: Mutex<SerializableStats>,
     recovery_completed: AtomicBool,
     /// Set by [`Self::commit`] whenever it returns `DurablePending`; see [`RecoveryLatch`].
     recovery_required: Mutex<Option<RecoveryLatch>>,
@@ -226,6 +272,7 @@ pub struct TransactionManager {
 impl TransactionManager {
     /// Create a new transaction manager using the provided [`Journal`].
     pub fn new(journal: Journal) -> Self {
+        let serializable_manager_id = NEXT_MANAGER_ID.fetch_add(1, Ordering::SeqCst);
         Self {
             decision_lock: Mutex::new(()),
             intent_append_hook: Mutex::new(None),
@@ -246,6 +293,9 @@ impl TransactionManager {
             next_txn_id: AtomicU64::new(1),
             next_version: Mutex::new(Version::new(2)),
             visible_version: Mutex::new(Version::INITIAL),
+            serializable_registry: Mutex::new(PinnedSnapshotRegistry::new(serializable_manager_id)),
+            recent_writes: Mutex::new(RecentWrites::new()),
+            serializable_stats: Mutex::new(SerializableStats::default()),
             recovery_completed: AtomicBool::new(false),
             recovery_required: Mutex::new(None),
         }
@@ -459,6 +509,57 @@ impl TransactionManager {
         *self.next_version.lock()
     }
 
+    /// Pins the current visible snapshot for a serializable transaction.
+    pub fn pin_serializable(&self) -> Result<SerializableTicket> {
+        let _decision_guard = self.decision_lock.lock();
+        if !self.recovery_completed.load(Ordering::Acquire) {
+            return Err(HtapError::Conflict(
+                "pinning a serializable snapshot requires successful recovery first".to_string(),
+            ));
+        }
+        let snapshot = *self.visible_version.lock();
+        Ok(self.serializable_registry.lock().pin(snapshot))
+    }
+
+    /// Returns the number of currently pinned serializable snapshots.
+    pub fn serializable_pinned_count(&self) -> usize {
+        self.serializable_registry.lock().pinned_count()
+    }
+
+    /// Returns serializable validation counters.
+    pub fn serializable_stats(&self) -> SerializableStats {
+        *self.serializable_stats.lock()
+    }
+
+    /// Records one successfully applied participant's writes while holding `decision_lock`.
+    fn record_serializable_writes(
+        &self,
+        participant: &dyn TxnParticipant,
+        payload: &[u8],
+        version: Version,
+    ) {
+        let oldest_pinned = {
+            let registry = self.serializable_registry.lock();
+            if registry.pinned_count() == 0 {
+                None
+            } else {
+                registry.oldest_pinned()
+            }
+        };
+
+        let mut writes = self.recent_writes.lock();
+        let Some(oldest_pinned) = oldest_pinned else {
+            writes.clear();
+            return;
+        };
+
+        match participant.written_keys(payload) {
+            Ok(Some(keys)) => writes.record_batch(&keys, version),
+            Ok(None) | Err(_) => writes.set_global_floor(version),
+        }
+        writes.prune(oldest_pinned);
+    }
+
     /// Return this manager's journal's configured maximum frame payload size.
     ///
     /// Fix-pass round 3, item 3(d): a cheap (single uncontended lock, no I/O) way for callers
@@ -507,6 +608,16 @@ impl TransactionManager {
                 "transaction {} cannot commit in state {:?}",
                 txn.id, txn.state
             )));
+        }
+
+        if let Some(context) = txn.serializable.as_ref() {
+            if !self.serializable_registry.lock().owns(&context.ticket) {
+                return Err(HtapError::InvalidArgument(
+                    "serializable transaction ticket belongs to a different transaction manager"
+                        .to_string(),
+                ));
+            }
+            debug_assert_eq!(context.ticket.snapshot(), txn.read_version);
         }
 
         // 1. Validate request
@@ -573,6 +684,32 @@ impl TransactionManager {
         }
 
         txn.state = TxnState::Prepared;
+
+        if let Some(context) = txn.serializable.as_ref() {
+            if !context.footprint.is_empty() {
+                let writes = self.recent_writes.lock();
+                if let Err(failure) = writes.validate_detailed(txn.read_version, &context.footprint)
+                {
+                    drop(writes);
+                    for prep in prepared.iter().rev() {
+                        let _ = prep.abort(txn.id);
+                    }
+                    txn.state = TxnState::Aborted;
+                    let mut stats = self.serializable_stats.lock();
+                    let err = match failure {
+                        ValidationFailure::Floor(err) => {
+                            stats.floor_aborts += 1;
+                            err
+                        }
+                        ValidationFailure::Dependency(err) => {
+                            stats.validation_aborts += 1;
+                            err
+                        }
+                    };
+                    return Err(err);
+                }
+            }
+        }
 
         // Check that commit version successor can be allocated before durable decision / mutations
         {
@@ -714,6 +851,7 @@ impl TransactionManager {
                     RecoveryCause::ParticipantIo,
                 ));
             }
+            self.record_serializable_writes(p.as_ref(), &work.payload, version);
         }
 
         // 7. Publish visibility in deterministic sorted order
@@ -1232,6 +1370,7 @@ impl TransactionManager {
                         )),
                         other => other,
                     })?;
+                self.record_serializable_writes(p.as_ref(), &work.payload, commit_version);
             }
 
             // Publish in sorted order (no registry lock held)
@@ -2113,5 +2252,40 @@ mod tests {
             HtapError::Corruption(message)
                 if message.contains("does not match transaction journal max_version")
         ));
+    }
+
+    #[test]
+    fn forged_ticket_from_other_registry_is_rejected_before_prepare() {
+        let temp = NamedTempFile::new().unwrap();
+        let manager = TransactionManager::open(temp.path()).unwrap();
+        manager.recover().unwrap();
+
+        let store = Arc::new(MockStore::new(ParticipantId::new(1)));
+        manager.register_participant(store.clone());
+
+        let legitimate_ticket = manager.pin_serializable().unwrap();
+        let manager_id = legitimate_ticket.manager_id();
+        drop(legitimate_ticket);
+
+        let mut forged_registry = PinnedSnapshotRegistry::new(manager_id);
+        let forged_ticket = forged_registry.pin(manager.visible_version());
+        let mut txn = Transaction::new_serializable(
+            manager.next_txn_id().unwrap(),
+            forged_ticket,
+            ReadFootprint::default(),
+        )
+        .unwrap();
+        txn.add_participant(1, b"payload");
+
+        let err = manager.commit(&mut txn).unwrap_err();
+        assert!(matches!(
+            err,
+            HtapError::InvalidArgument(message)
+                if message.contains("different transaction manager")
+        ));
+        assert!(
+            store.events().is_empty(),
+            "forged ticket must be rejected before participant prepare"
+        );
     }
 }

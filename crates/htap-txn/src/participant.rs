@@ -7,6 +7,8 @@ use std::sync::Arc;
 use htap_common::{HtapError, Result, Version};
 use serde::{Deserialize, Serialize};
 
+use crate::serializable::WriteKey;
+
 /// Maximum payload size per participant or transaction request (16 MiB).
 pub const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
@@ -242,6 +244,17 @@ pub trait TxnParticipant: Send + Sync {
     fn publish(&self, txn_id: TransactionId, version: Version) -> Result<()> {
         let _ = (txn_id, version);
         Ok(())
+    }
+
+    /// Returns the primary keys written by `payload`, when they can be determined.
+    ///
+    /// Returning `Ok(None)` means the participant cannot report its write set. Serializable
+    /// validation treats that outcome conservatively and fences older snapshots globally.
+    ///
+    /// This callback runs while the transaction manager holds its decision lock and must not call
+    /// back into that manager.
+    fn written_keys(&self, _payload: &[u8]) -> Result<Option<Vec<WriteKey>>> {
+        Ok(None)
     }
 
     /// This participant's own highest durably applied commit version, if it tracks one.

@@ -9,15 +9,17 @@ pub mod journal;
 pub mod manager;
 pub mod participant;
 pub mod rowstore;
+pub mod serializable;
 
 pub use journal::{
     decode_frame_slice, encode_frame, intent_frame_size_bound, FrameStatus, Journal,
     JournalOptions, JournalRecord, JournalScan, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_JOURNAL_SIZE,
     HEADER_SIZE,
 };
-pub use manager::{RecoveryReport, Transaction, TransactionManager, TxnState};
+pub use manager::{RecoveryReport, SerializableStats, Transaction, TransactionManager, TxnState};
 pub use participant::{
     order_arc_participants, order_participants, CommittedTransaction, ParticipantId,
     ParticipantWork, TransactionId, TransactionRequest, TxnId, TxnParticipant, MAX_PAYLOAD_SIZE,
 };
 pub use rowstore::RowstoreParticipant;
+pub use serializable::{ReadFootprint, SerializableTicket, WriteKey};

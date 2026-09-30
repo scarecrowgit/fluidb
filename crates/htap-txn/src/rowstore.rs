@@ -6,6 +6,7 @@ use htap_common::{HtapError, Mutation, Result, Version};
 use htap_rowstore::{Engine, Snapshot};
 
 use crate::participant::{ParticipantId, TransactionId, TxnParticipant, MAX_PAYLOAD_SIZE};
+use crate::serializable::WriteKey;
 
 /// Transaction participant adapter wrapping an LSM [`Engine`].
 ///
@@ -83,6 +84,20 @@ impl TxnParticipant for RowstoreParticipant {
     fn publish(&self, _txn_id: TransactionId, version: Version) -> Result<()> {
         self.engine.publish(version)?;
         Ok(())
+    }
+
+    fn written_keys(&self, payload: &[u8]) -> Result<Option<Vec<WriteKey>>> {
+        let mutations = Self::decode_payload(payload)?;
+        let writes = mutations
+            .into_iter()
+            .map(|mutation| match mutation {
+                Mutation::Put {
+                    partition_id, key, ..
+                }
+                | Mutation::Delete { partition_id, key } => WriteKey::new(partition_id, key),
+            })
+            .collect();
+        Ok(Some(writes))
     }
 
     fn committed_version(&self) -> Option<Version> {
