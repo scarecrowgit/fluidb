@@ -49,8 +49,15 @@ components are **deliberately not implemented** and are out of scope for this lo
   kept as text and bound as a numeric literal (a `DECIMAL` result column also works over the wire, up to the
   engine's own 18-digit bound — no arbitrary-precision decimal wire type — see the bullet above); `TIME`-typed
   parameters are rejected. See "Prepared statements" below.
-- **No TPC-C compliance; TPC-H compliance not claimed (Phase 17 Batch A/B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7/B8/B9,
-  `implemented (narrow local slice)`):** The system does not implement the TPC-C benchmark specification. A
+- **No TPC-C or TPC-H compliance claimed; no official TPC metric computed. A derived, unaudited TPC-C kit exists
+  (Phase 18, `implemented (local MVP)`, `crates/htap-tpcc`):** the kit is a narrow local diagnostic slice — schema,
+  population generator and bulk loader, the five transactions, the 12-condition consistency checker, OCC-adapted
+  Clause 3.4.2 isolation tests and a workload driver — with **no compliance or comparability claim, no RTE/keying/
+  think times, no `tpmC`, price/performance or any other official metric, and no serializability claim** (isolation
+  is claimed only as far as the tests show; see the disclosure). Only one warehouse is exercised. See
+  [`docs/TPCC-DISCLOSURE.md`](./docs/TPCC-DISCLOSURE.md) for the required disclaimer, the full deviations list and
+  validation evidence, and ADR-031/ADR-032 in `docs/DECISIONS.md`. **TPC-H** (Phase 17 Batch A/B checkpoint 1 +
+  tasks B5b-B5c/B2/B3/F6/B6/B7/B8/B9, `implemented (narrow local slice)`): a
   TPC-H-derived workload kit (`crates/htap-tpch`) is built as a narrow, unaudited local diagnostic kit — no
   TPC-H compliance or comparability claim is made. See [`docs/TPCH-DISCLOSURE.md`](./docs/TPCH-DISCLOSURE.md)
   for the required disclaimer, the full deviations list, and validation evidence; this bullet summarizes it.
@@ -498,7 +505,7 @@ numeric literal (no arbitrary-precision decimal type); `TIME`-typed parameters a
 
 ## Workspace Architecture
 
-The workspace consists of 15 modular crates (plus the vendored `vendor/sqlparser`) separated by architectural boundaries:
+The workspace consists of 16 modular crates (plus the vendored `vendor/sqlparser`) separated by architectural boundaries:
 
 | Crate | Role & Status |
 | ----- | ------------- |
@@ -513,6 +520,7 @@ The workspace consists of 15 modular crates (plus the vendored `vendor/sqlparser
 | `crates/htap-sql` | SQL front-end using `sqlparser` (MySQL dialect): strict narrow catalog binder (typed `PointSelect`/`AnalyticSelect`), a general query binder (`query`/`expr`/`binder_query`: joins, expressions, subqueries, `UPDATE`/`DROP TABLE`/`SHOW`), and structural query router (`Route::RowstorePointRead`, `Route::OlapScan`, `Route::Query`, `Route::RowstoreUpdate`, `Route::CatalogRead`). |
 | `crates/htap-server` | Durable synchronous in-process engine façade (`LocalServer`) integrating catalog, rowstore, transactions, data movement, narrow analytical scan execution (`<root>/colstore`), and the general query executor (`query_exec`: joins, expressions, subqueries, `UNION`, `UPDATE`, `DROP TABLE`, `SHOW`). |
 | `crates/htap-tpch` | TPC-H-derived schema, query-text, workload-parameter, row-generation, bulk-load, refresh-function, correctness-oracle, and driver support crate (`implemented (narrow local slice)`, Phase 17 Batch A/B checkpoint 1 + tasks B5b-B5c/B2/B3/F6/B6/B7/B8/B9): the eight-table schema DDL, all 22 published query texts with validation-default parameters (`queries::query`, returning `Result<String, QueryError>` — no panic on an invalid scale factor), an exact-integer scale-factor helper, hand-derived correctness fixtures for all 22 of the 22 queries, a from-specification data generator (`generate::generate`) producing all eight tables as typed in-memory rows deterministically from a scale factor and seed (not an audited implementation, no comparability claim), a bulk loader (`load_dataset`) streaming a generated dataset into a fresh database through the existing CSV movement path, `RF1`/`RF2` refresh functions (`refresh::{rf1_new_sales, rf2_old_sales}`) applying one transaction per order (spec-permitted per Clause 2.5.2, see ADR-029; RF1 streams 1-3000, RF2 streams 1-1000, the full Clause 4.2.4.3 quarter-reuse cycle not implemented), (test-only) an independent re-aggregation oracle (`tests/oracle/`) that matches the engine's output for all 22 queries against a from-`Dataset` re-derivation with no SQL engine involved, and `power_test`/`throughput_test` diagnostic drivers (`drivers::{power_test, throughput_test, query_order, table_11_stream_count}`, ADR-030 — no official TPC-H metric computed, fixed validation parameters for every stream, caller-supplied refresh key stream, and `throughput_test`'s concurrency is submission/session-level only under `htap-server`'s process-wide execution lock); and the required TPC compliance/deviations disclosure document (task B9, [`docs/TPCH-DISCLOSURE.md`](./docs/TPCH-DISCLOSURE.md)) — see `docs/PROGRESS.md`'s Phase 17 (continued) row. |
+| `crates/htap-tpcc` | TPC-C-derived schema, population-generator, bulk-load, transaction, consistency-checker, isolation-test and workload-driver support crate (`implemented (local MVP)`, Phase 18; unaudited, no compliance claim, no official metric; see [`docs/TPCC-DISCLOSURE.md`](./docs/TPCC-DISCLOSURE.md)). |
 | `crates/htap-client` | Synchronous in-process embedded client (`EmbeddedClient`) and network client (`RemoteClient`) providing an ergonomic SQL execution interface over `LocalServer`, in-process or over TCP. |
 | `crates/htap-wire` | Hand-written, synchronous MySQL text- and binary-protocol server (`WireServer`) exposing `LocalServer` over TCP, including prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/`SEND_LONG_DATA`), `COM_RESET_CONNECTION`/`COM_CHANGE_USER`, and the `WireClient` used by `RemoteClient`. |
 | `crates/htapd` | Network daemon binary: opens a `LocalServer` root and serves it via `htap-wire::WireServer`. |

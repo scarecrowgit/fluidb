@@ -141,8 +141,8 @@ dedicated stage.
 | **done** | **Phase 14 — CBO, spill, parallelism** | P2 (partial — see above; leaf-helper convergence still open), P4 where touched |
 | **done** | **Phase 15 — DROP reclaim, rowstore compaction/GC, journal checkpoint** | P4 where touched (uses R's helpers): `htap-catalog/src/model.rs::validate` (already on the P4 list, 702 lines) gained the `pending_reclaim` overlap/duplicate checks and was not split — still open, unchanged severity. No other P4-listed function was touched (`htap-convert`, `htap-sql`'s `bind_create_table`/`bind_select_body` were not part of this diff). |
 | **done** | **Phase 16 — multiprocess owner + IPC** | P3 (fixed, see above). No P4-listed function was touched by this diff. |
-| **next** | Phases 17–18 — TPC-H, TPC-C | — |
-| then | SERIALIZABLE isolation (serializable snapshot isolation) | — |
+| **done** | **Phases 17–18 — TPC-H, TPC-C workload kits** (unaudited, no compliance claim; see `docs/TPCH-DISCLOSURE.md`, `docs/TPCC-DISCLOSURE.md`) | — |
+| **next** | SERIALIZABLE isolation (serializable snapshot isolation) | — |
 | then | Power-loss safety | audits R's single implementation |
 | then | Docker | — |
 

@@ -11,7 +11,7 @@ This document specifies the microbenchmarks implemented in `crates/htap-bench/be
 >
 > - They **must not** be interpreted as end-to-end database management system (DBMS) comparisons.
 > - They **do not** make production performance, latency, or throughput claims.
-> - They **do not** implement or comply with standardized database benchmarks such as **TPC-C** or **TPC-H**.
+> - They **do not** implement or comply with standardized database benchmarks such as **TPC-C** or **TPC-H**. (The separate, unaudited TPC-derived workload kits `crates/htap-tpch` and `crates/htap-tpcc` are diagnostic kits with no compliance claim and no official metric; see [`TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md) and [`TPCC-DISCLOSURE.md`](./TPCC-DISCLOSURE.md). Nothing in them is a benchmark result recorded here.)
 > - They **do not** exercise distributed network protocols, client wire protocols, concurrent connection contention, or multi-tenant workloads.
 
 ---

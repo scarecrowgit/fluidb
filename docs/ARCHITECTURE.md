@@ -633,7 +633,7 @@ executor's `GROUP BY` and `INNER`/`CROSS` hash joins are parallelized and spilla
 statistics histograms, per-partition (rather than table-level) statistics, automatic statistics staleness
 detection, and recursive-CTE recursive terms as a permanent optimizer/parallelism barrier (by design, not a gap),
 physical reclamation of demoted column files (`Column -> Row` demotion clears catalog metadata but leaves column segment files on disk; see below), a general semi-join rewrite of IN/EXISTS (a narrow slice — key-equality correlated EXISTS/NOT EXISTS and key-equality correlated scalar-aggregate subqueries answered from a statement-scoped hash lookup, with no new Semi/Anti JoinKind — is implemented as of Phase 17 task F6, see above and ADR-028; correlated IN/NOT IN rewriting and residual-bearing scalar-aggregate decorrelation remain deferred), broader string/date function coverage beyond the narrow `DATE`/`EXTRACT`/`INTERVAL` (year/month/day only)/three-argument-`SUBSTRING` slice implemented as of the TPC-H prerequisite work (see `docs/LIMITATIONS.md`'s "General query executor scope and deferred features"),
-the TPC-C benchmark (Phase 18; the TPC-H compliance/deviations disclosure document, task B9, is implemented — see [`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md) and "TPC-H workload kit foundations" above),
+a compliant or audited TPC-C or TPC-H benchmark (only the derived, unaudited, no-compliance-claim workload kits exist: the TPC-H compliance/deviations disclosure document, task B9, is implemented — see [`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md) and "TPC-H workload kit foundations" above — and the TPC-C kit of Phase 18 is `implemented (local MVP)` — see [`docs/TPCC-DISCLOSURE.md`](./TPCC-DISCLOSURE.md) and "TPC-C workload kit (Phase 18)" below),
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),
@@ -643,22 +643,29 @@ See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
 
-### TPC-C workload kit (Phase 18, batches 1-3 of 4)
+### TPC-C workload kit (Phase 18)
 
-**Status: `in progress`.** Batches 1-3 of `crates/htap-tpcc` are built: schema, population generator, bulk loader, the five
-transactions, the 12-condition consistency checker, the isolation tests and the workload driver. Batch 4 (the TPC-C
-disclosure document and its ADRs) is not built, so nothing here is a TPC-C benchmark or a compliance claim. No engine-crate, on-disk-format or wire change.
+**Status: `implemented (local MVP)`.** `crates/htap-tpcc` is built: schema, population generator, bulk loader, the five
+transactions, the 12-condition consistency checker, the isolation tests and the workload driver. It is a narrow, unaudited
+local diagnostic kit, not a TPC-C benchmark: it makes no compliance or comparability claim and computes no official metric.
+The required disclaimer, the full deviations list and the validation evidence are in
+[`docs/TPCC-DISCLOSURE.md`](./TPCC-DISCLOSURE.md); the design decisions are ADR-031 (population and loading) and
+ADR-032 (transactions, isolation adaptation and driver) in [`docs/DECISIONS.md`](./DECISIONS.md), whose isolation-claim
+paragraph was reviewed by the `reasoner` model (the architect model was unreachable). Only one warehouse is exercised by tests. No engine-crate, on-disk-format or wire change.
 
 - **Schema** (`schema::{TABLE_NAMES, ddl_statements}`): the nine tables. ORDER, ORDER-LINE and NEW-ORDER are named `orders`,
   `order_line`, `new_order` (ORDER is reserved, hyphens are invalid in unquoted names, and double quotes are string literals in
   this MySQL dialect). HISTORY gets an added surrogate primary key `h_id` because the engine requires a primary key; the
   spec permits added attributes (Clause 1.4.7) and gives History an addressing exception (Clause 1.4.10). `history::build_h_id`
-  packs a 15-bit source and a 48-bit sequence into a positive BIGINT, so keys are unique by construction and `INSERT` upserts
+  packs a 15-bit source and a 48-bit sequence into a non-negative BIGINT, so keys are unique by construction and `INSERT` upserts
   never collide. Tests: `tests/schema_ddl.rs::ddl_creates_expected_catalog_schema`, `history::tests`.
 - **Scale:** the unit is the warehouse count (minimum 1, about 600k rows for one warehouse: 100k ITEM, 100k STOCK, 30k each of CUSTOMER, HISTORY and ORDER, about 300k ORDER-LINE, and 9k NEW-ORDER).
 - **Generator** (`generate::generate`): deterministic, following Clause 4.3.3.1, with its own SplitMix64 PRNG (the spec names
-  none), a fixed NURand `C`, and taxes and discounts at four decimal places. Tests: `generate::tests`, `generate::rng::tests`,
-  `generate::text::tests`.
+  none), a fixed NURand `C` (157 rather than a randomly chosen constant; it is also used for every run, so the `C_LAST` `C-Delta` is 0 rather than the Clause 2.1.6.1 range of 65 to 119), and taxes and
+  discounts at four decimal places. Population `C_SINCE`, `H_DATE`, `O_ENTRY_D` and the delivered orders' `OL_DELIVERY_D` are
+  the fixed string `2000-01-01 00:00:00` (parsed by the `COPY` path), not the load-time clock; `a_string` draws from a
+  95-character printable-ASCII alphabet including punctuation. See `docs/TPCC-DISCLOSURE.md` §3 items 4, 7 and 20. Tests:
+  `generate::tests`, `generate::rng::tests`, `generate::text::tests`.
 - **Loader** (`load::load_dataset`) mirrors the TPC-H loader: fresh-target check before any DDL, batched loads, per-table
   checks. It has no whole-load rollback: a failure partway leaves the created tables, and a retry then fails the
   fresh-target check. Tests: `tests/load.rs::{reject_load_when_tables_already_exist, reject_invalid_batch_size_before_ddl}`.
@@ -680,16 +687,17 @@ disclosure document and its ADRs) is not built, so nothing here is a TPC-C bench
 - **Isolation tests** (`tests/isolation.rs`, batch 3, 16 default tests): `isolation_test_1..9` adapt the TPC-C Clause 3.4.2
   tests 1-9 to the engine's optimistic concurrency control (the spec permits non-locking schemes; a conflicting transaction
   fails its commit with `Conflict` and is retried from BEGIN). Tests 1-6 hand-stage the uncommitted half of the scenario as
-  raw SQL inside an explicit transaction (the transaction functions commit internally); tests 4 and 6 are deterministic on
-  one thread (T1 staged and open, T2 runs one full transaction, then T1 rolls back; no sleeps). Test 1: Order-Status while a
+  raw SQL inside an explicit transaction (the transaction functions commit internally); tests 1-9 all run on one thread with
+  no sleeps, and in tests 1-6 T1 is staged and open while T2 runs one full transaction (tests 4 and 6 then roll T1 back;
+  test 7 is different and uses three sessions, see below). Test 1: Order-Status while a
   New-Order is uncommitted sees the prior order, then the new one after commit. Test 2: a rolled-back New-Order is invisible.
   Test 3: two New-Orders read the same `d_next_o_id`; a concurrent New-Order commits first, the open transaction's commit
   fails with `Conflict` (first committer wins), and its retry gets the next consecutive ID. Test 4: a rolled-back New-Order
-  consumes no order ID (it detects read-uncommitted and abort-leak models, not conflict detection). Test 5: a Payment commits while a Delivery is open; the Delivery commit fails with `Conflict`, and a
+  consumes no order ID (it detects dirty-write and abort-leak models, not conflict detection). Test 5: a Payment commits while a Delivery is open; the Delivery commit fails with `Conflict`, and a
   fresh Delivery afterwards leaves both effects in the customer row. Test 6: a rolled-back Delivery has no effect and only
-  the Payment persists. Test 7: a transaction begun before a price update still reads all five old prices (plain reads in an
-  explicit transaction, not a full New-Order). Tests 8 and 9 are snapshot-isolation fixed-snapshot outcomes (no new NEW-ORDER
-  row and no newer ORDER within the transaction's snapshot), not serializability tests. Tests 1-7 each name in a comment the
+  the Payment persists. Test 7 (three sessions): T1 and T2 begin and read prices, T3 commits a price update, and T2 still reads all five old prices
+  (explicit plain reads; it does not execute a complete New-Order across the change). Tests 8 and 9 are snapshot-read outcomes
+  (no new NEW-ORDER row and no newer ORDER within the transaction's snapshot); tests 7-9 are not serializability tests. Tests 1-7 each name in a comment the
   weaker model they would fail under (read-uncommitted, no conflict detection, read-committed). The other 7 are engine-level:
   4 concurrency smoke/stress tests (`two_concurrent_new_orders_same_district`, `concurrent_payments_same_customer`,
   `two_concurrent_deliveries_same_warehouse`, `concurrent_new_orders_same_stock_decrement`: each asserts no duplicate O_ID, no
@@ -699,14 +707,22 @@ disclosure document and its ADRs) is not built, so nothing here is a TPC-C bench
   of the same absent primary key: exactly one commits; an insert over a committed key is an upsert, disclosed), and
   `delivery_one_district_does_not_redeliver_a_completed_district` (a second `delivery_one_district` call on a delivered
   district returns `Skipped`). **Isolation
-  claim (narrow, conditional on these tests passing):** for the scenarios exercised, no dirty reads, no dirty writes, no lost
-  updates (first committer wins) and a fixed snapshot per transaction are demonstrated. Broad P2/P3 and A5B write skew are
-  not established, and no Level 3 or serializability claim is made.
+  claim (reviewed; full paragraph in ADR-032; narrow, conditional on all 16 tests in `tests/isolation.rs` passing for the build
+  under review):** the suite is nine scenarios derived from Clause 3.4.2 plus seven engine-level tests; Clause 3.4.2 permits
+  alternative validation for non-locking schemes provided full details are disclosed, which does not by itself establish that
+  each adaptation meets every original test objective. For the exercised schedules the tests demonstrate exclusion of
+  uncommitted reads (tests 1, 2, 4, 6), rejection of conflicting commits (first committer wins; tests 3 and 5), rollback
+  non-interference on the asserted state (tests 4 and 6) and fixed-snapshot reads (tests 7-9). Prevention of the broad P2/P3
+  phenomena (Berenson et al.) and of A5B write skew is not claimed, nor is ANSI Level 3 or serializability; no serializable mode
+  exists. Transactions interleave statement by statement. The results rely on atomic commit/rollback, logical-key write-conflict
+  detection including absent-key inserts, and retries at the actual transaction boundary (whole transaction for New-Order,
+  Payment, Order-Status and Stock-Level; per district for Delivery). `INSERT` has upsert semantics and does not reject duplicate
+  keys.
 - **Driver** (`drivers::run`, batch 3): a shuffled 23-card deck (10 New-Order, 10 Payment, 1 each Order-Status, Delivery,
   Stock-Level; it meets the Clause 5.2.3 minimums, but the mix is guaranteed only per completed deck, so a transaction limit
   may stop partway through a deck; the limit is a shared counter across terminals, so `tests/drivers.rs::assert_report` keeps
   1 percentage point of slack and the observed mix excludes expected rollbacks), one thread and session per terminal, spec input generation with a fixed NURand `C`
-  (disclosed), `DriverScale` (spec ranges by default; smaller scales are test-only), Payment amounts 1.00 to 5000.00, and a
+  (disclosed: `C_LAST` `C-Delta` 0, `C` not randomly chosen), `DriverScale` (spec ranges by default; smaller scales are test-only), Payment amounts 1.00 to 5000.00, and a
   Stock-Level district fixed per terminal (reused cyclically when terminals outnumber warehouse-district pairs). Each
   terminal seeds its HISTORY sequence from the largest existing `h_id` for its terminal source, so consecutive runs on one
   database keep their history rows. Sessions and the sequence are set up before the start barrier (a setup error no longer skips the

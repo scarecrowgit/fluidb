@@ -4494,3 +4494,268 @@ release mode), which runs all 22 queries in `query_order(0)` against the indepen
 dataset after RF1+RF2. F3's closure is verified by `crates/htap-tpch/src/queries.rs::queries::tests::
 test_query_11_and_query_23_error_handling`. See `docs/PROGRESS.md`'s Phase 17 (continued) row (task B8) and
 `docs/LIMITATIONS.md`'s "TPC-H workload kit scope and deferred features" for the surrounding contract.
+
+---
+
+## ADR-031: TPC-C population and loading — schema mapping, surrogate `h_id`, decimal scales, timestamps, and generator conformance
+
+`Status: Accepted`
+`Date: 2026-09-30`
+
+### Context
+
+Phase 18 adds `crates/htap-tpcc`, a local, unaudited kit derived from the TPC Benchmark C Standard
+Specification, Revision 5.11. Batch 1 (commit `2465c2f`) built the schema, the population generator and the bulk
+loader. Five points had to be settled before the transaction code (ADR-032) could be written, each of which is
+costly to reverse once transactions and tests depend on it: how the specification's nine tables map onto this
+engine's DDL; how to give `HISTORY` a primary key, since the engine requires one and the specification's table
+has none; which engine types carry the specification's numeric and date columns; how timestamps enter the
+database; and how faithfully the generator follows Clause 4.3.3.1. The engine facts that drive these points:
+`INSERT` into a `TIMESTAMP` column accepts a date string, a `DATE` literal or an integer, but not a
+date-and-time string literal (`crates/htap-sql/src/binder.rs`, the `CommonDataType::Timestamp` branch, lines
+1884-1927); `DECIMAL` is a signed 64-bit unscaled integer with at most 18 digits (ADR-026); `INSERT` performs no
+primary-key-existence check; and the bulk `COPY` path parses date-and-time strings (`crates/htap-movement/src/codec.rs::parse_timestamp_text`).
+
+### Options considered — table names
+
+1. **Quote the specification's names** (`"ORDER"`, `"ORDER-LINE"`, `"NEW-ORDER"`). Rejected: in this MySQL
+   dialect double quotes delimit string literals, not identifiers, and `ORDER` is reserved.
+2. **Rename to `orders`, `order_line`, `new_order`.** **Chosen.** Every other table and column keeps its
+   specification name in lower case.
+
+### Options considered — `HISTORY` primary key
+
+1. **A natural composite key** (for example the customer key plus `H_DATE`). Rejected: the specification does not
+   make any such tuple unique, and two payments by one customer in the same instant would collide silently
+   because `INSERT` upserts instead of rejecting a duplicate.
+2. **An added surrogate `h_id BIGINT PRIMARY KEY` built from a 15-bit source and a 48-bit sequence
+   (`history::build_h_id`).** **Chosen.** Source 0 is the initial population (sequence = row index); runtime
+   callers pass a terminal number 1..=32767 and their own sequence, so distinct (source, sequence) pairs never
+   collide by construction and the value always fits a non-negative signed `BIGINT`. The driver caps
+   `terminal_count` at 32767, and each terminal seeds its sequence from the largest existing `h_id` of its source
+   so consecutive runs on one database keep their history rows. Clause 1.4.7 permits added attributes provided
+   they do not improve performance (this kit makes no performance claim) and Clause 1.4.10 exempts `HISTORY` from
+   the relative-addressing rule.
+
+### Options considered — types
+
+Numeric columns map to `DECIMAL(p, s)` with the specification's own precision and scale (Clause 1.3.1: taxes and
+the customer discount at four decimal places, money at two); the specification's date-and-time columns map to
+`TIMESTAMP`; keys and counters map to `INTEGER`/`BIGINT`; `O_CARRIER_ID` and `OL_DELIVERY_D` are nullable (they
+are `NULL` for undelivered orders). Money is not stored as `Float64`, because the consistency
+conditions are exact-equality checks and ADR-026 settled exact decimals for this project.
+
+### Options considered — timestamps
+
+1. **Send date-and-time string literals through `INSERT`.** Not possible: the binder rejects them (see Context).
+   Extending the binder was out of scope for a workload kit.
+2. **Integer epoch microseconds for everything written by a transaction; the fixed string
+   `2000-01-01 00:00:00` for the population, loaded through the `COPY` path, which does parse it.** **Chosen.**
+   The transaction request structs carry each timestamp as a caller-supplied `..._micros` field. The consequence is two disclosed departures: transactions do not stamp the current system date and
+   time (Clauses 2.4.1.6, 2.7.1.3), and every population row carries one constant timestamp instead of the load
+   time (Clause 4.3.3.1) — deterministic, but not what the specification says.
+
+### Options considered — generator
+
+Own SplitMix64 PRNG (the specification names none and permits pregenerated random numbers for the population),
+implementing Clause 4.3.3.1 rule by rule: the delivered boundary at order 2100, `O_C_ID` from a random
+permutation, the first 1,000 `C_LAST` values iterating 0..999 and the rest NURand(255,0,999), population
+`OL_I_ID` uniform, 16-digit `C_PHONE`, `I_DATA`/`S_DATA` of 26-50 characters with `ORIGINAL` in about 10% of
+rows, `C_CREDIT = 'BC'` in about 10%, taxes/discounts at four decimal places. One NURand constant (157) serves
+the population and every run. One `C` per field shared by all terminals is what Clause 2.1.6 asks, but the `C_LAST`
+`C-Delta` (Clause 2.1.6.1, which applies to `C_LAST` only) is then 0 instead of 65 to 119, and `C` is a fixed constant
+rather than randomly chosen within [0..A] (both disclosed). `a_string` draws
+from a 95-character printable-ASCII alphabet including punctuation, wider than the specification's
+alphanumerics; the punctuation was kept because it exercises the SQL-literal escaping that the full-warehouse
+driver run found to be broken (ADR-032). Fixes made after the batch 1 external review: the delivered boundary,
+`C_PHONE` at 16 digits, `I_DATA`/`S_DATA` lengths.
+
+### Decision
+
+The schema, `history::build_h_id`, the `DECIMAL`/`TIMESTAMP` mapping, the timestamp handling and the generator
+choices above, as implemented in `crates/htap-tpcc/src/{schema,history,generate,load}`. The loader mirrors
+`crates/htap-tpch/src/load.rs`: a fresh-target check before any DDL, batched independently committed `COPY`
+loads, post-load count checks, and no whole-load rollback.
+
+### Consequences
+
+- `HISTORY` keys are unique by construction, so the engine's upsert `INSERT` cannot silently overwrite a history
+  row; the price is a key space that a caller must respect (`terminal_count` <= 32767).
+- Timestamps in transaction-written rows are only as meaningful as the microsecond values the caller supplies;
+  the population's timestamps are identical.
+- A failed load leaves created tables and committed batches behind; a retry fails the fresh-target check.
+- The kit's departures are listed, with tests, in [`docs/TPCC-DISCLOSURE.md`](./TPCC-DISCLOSURE.md) §3-§4.
+- No on-disk format, WAL or durability invariant is touched; the crate uses only the public `LocalServer`/
+  `Session` API and the existing CSV movement path, so no storage review was needed.
+
+### How to reverse it
+
+Renaming the three tables or replacing `h_id` with a natural key is a schema change that every transaction
+statement and the consistency checker would follow. Sending timestamps as date-and-time strings needs an engine
+binder change first; once it exists, the transactions can switch without changing the schema. The generator's
+alphabet, `C` constant and timestamps are local to `generate/` and can be tightened independently.
+
+### Verification
+
+`crates/htap-tpcc/tests/schema_ddl.rs::ddl_creates_expected_catalog_schema`; `history::tests::{
+distinct_source_sequence_pairs_produce_distinct_ids, rejects_out_of_range_values, accepts_boundary_values}`;
+`generate::tests::{population_is_deterministic_and_referentially_closed, order_customer_ids_are_permutations,
+taxes_and_discounts_use_four_decimal_precision, customer_bad_credit_rate_is_approximately_ten_percent,
+item_and_stock_original_rates_and_cardinalities}`; `generate::text::tests::customer_last_name_uses_required_syllables`;
+`crates/htap-tpcc/tests/load.rs::{load_small_subset_with_referential_consistency,
+reject_load_when_tables_already_exist, reject_invalid_batch_size_before_ddl}` and (ignored)
+`load_with_warehouse_count_1_and_verify_counts_and_values`.
+
+---
+
+## ADR-032: TPC-C transactions, isolation adaptation, and the workload driver — OCC retry, per-district Delivery, escalation, a 23-card deck, and no metrics
+
+`Status: Accepted`
+`Date: 2026-09-30`
+
+### Context
+
+Batches 2 and 3 of Phase 18 (commits `fd8d1ff`, `90beb05`) add the five TPC-C transactions, the 12-condition
+consistency checker, the Clause 3.4.2 isolation tests and a workload driver to `crates/htap-tpcc`. The engine
+provides snapshot reads with first-committer-wins write-write conflict detection at commit; it is optimistic and
+never blocks a writer. The specification's isolation requirements (Clause 3.4) assume a locking system in which
+a conflicting transaction waits, and its Delivery transaction is defined as deferred, queued work (Clause
+2.7.2). Points to settle: how a conflict is handled; how Delivery is executed and retried; what isolation
+statement is honest; how the transaction mix is regulated; how a starving transaction is kept live; and whether
+any official metric is computed. Engine facts: `execution_lock` (`crates/htap-server/src/lib.rs`) is held per
+`execute`/`commit` call, not across a transaction, so transactions from two sessions can interleave statement
+by statement but statements never run in parallel; `INSERT` is an upsert; `UPDATE` supports arithmetic `SET` on a
+primary-key equality path, and every TPC-C `UPDATE` targets a primary key or a primary-key prefix (Delivery's
+`order_line` update uses the three leading columns of the four-column key). No engine prerequisite work was
+needed (unlike TPC-H Batch A).
+
+### Options considered — conflicts
+
+1. **Retry inside the engine or hold locks.** Rejected: the engine has no lock manager and this phase adds none.
+2. **Surface `TransactionError::Conflict` and let the caller retry the whole transaction from `BEGIN`.**
+   **Chosen.** Every transaction function opens, runs and commits (or rolls back) its own database transaction
+   through the public `Session` API; `TransactionError` separates `Conflict` (retry) from `ExpectedRollback` (the
+   specification's 1% New-Order unused-item rollback), `InvalidInput` and `Htap` (other engine errors). Because
+   `INSERT` upserts, new order IDs come from a conflict-protected read-increment of `D_NEXT_O_ID` in the same
+   transaction, and two overlapping inserts of the same absent key must yield exactly one commit and one
+   `Conflict`; both are tested.
+
+### Options considered — Delivery
+
+1. **Implement Clause 2.7.2 deferred execution** (a queue and a result file). Rejected: it adds a subsystem that
+   validates nothing about the engine.
+2. **Run Delivery synchronously, one database transaction per district
+   (`transactions::delivery_one_district`; `transactions::delivery` loops over it), and let the driver retry only
+   the district that conflicted.** **Chosen.** Clause 2.7.4.1's comment permits up to 10 database transactions
+   per Delivery; retrying per district means a conflict on one district never redoes committed districts. Skip and
+   staleness detection use affected-row counts. The queue and result file are disclosed as not implemented.
+
+### Options considered — isolation statement
+
+The isolation tests of Clause 3.4.2 assume locking; the clause permits different validation techniques for
+non-locking schemes if fully disclosed. The nine tests are adapted to check the required outcomes under OCC
+(the second transaction never blocks, a conflicting commit fails with `Conflict` and is retried) and must check
+those outcomes, not merely accept an abort where a locking test would block. During the Phase 18 plan the wording
+of the claim was reviewed with `reasoner` (`cx/gpt-6-astra`), `cx/gpt-5.6-sol` and `cx/gpt-5.5`; all three
+recommended the narrow form below, and the phrasing "satisfies the literal P0-P3" is deliberately not used.
+Review history: the `architect` model was unreachable at plan time and on four attempts at the batch-4 gate
+(HTTP 503 and connection failures), so the final wording was reviewed by the `reasoner` model (`cx/gpt-6-astra`)
+instead, and the coordinator verified its points against `crates/htap-tpcc/tests/isolation.rs`.
+
+> **Isolation claim (reviewed).** This is the claim adopted for the kit; the Phase 18 sections of
+> `docs/ARCHITECTURE.md`, `docs/LIMITATIONS.md` and `docs/TPCC-DISCLOSURE.md` §3 item 8 condense it and keep every
+> qualifier.
+>
+> This assessment is conditional on all 16 tests in `crates/htap-tpcc/tests/isolation.rs` passing for the build
+> under review. The suite contains nine scenarios derived from TPC-C Clause 3.4.2 and seven engine-level tests;
+> Clause 3.4.2 permits alternative validation techniques for non-locking schemes provided full details are
+> disclosed, and that permission does not by itself establish that each adaptation meets every original test
+> objective. For the exercised schedules, the tests demonstrate exclusion of uncommitted reads (tests 1, 2, 4, 6),
+> rejection of conflicting commits (first committer wins; tests 3 and 5), rollback non-interference on the asserted
+> state (tests 4 and 6), and fixed-snapshot reads (tests 7-9). Deterministic lost-update evidence comes from tests
+> 3 (`D_NEXT_O_ID`) and 5 (customer balance); the four barrier-released concurrency tests are smoke tests and do
+> not guarantee transaction overlap. Tests 7-9 check snapshot reads, not serializability; test 7 checks explicit
+> price reads across a concurrent price update and does not execute a complete New-Order across the change.
+> Prevention of the broad P2/P3 phenomena (Berenson et al.) and of A5B write skew is not claimed, nor is ANSI
+> Level 3 or serializability; no serializable mode exists. Transactions interleave statement by statement. The
+> results rely on atomic commit/rollback, logical-key write-conflict detection including absent-key inserts, and
+> retries at the actual transaction boundary (whole transaction for New-Order, Payment, Order-Status and
+> Stock-Level; per district for Delivery). INSERT has upsert semantics and does not reject duplicate keys.
+
+### Options considered — transaction mix
+
+1. **Weighted random selection (Clause 5.2.4.1).** Rejected: it does not guarantee the minima over a short run.
+2. **A shuffled 23-card deck (Clause 5.2.4.2: 10 New-Order, 10 Payment, 1 each Order-Status, Delivery,
+   Stock-Level).** **Chosen.** Each terminal shuffles its own deck. The minima hold per completed deck; a
+   transaction limit is a counter shared across terminals and can stop a run mid-deck, so `assert_report` keeps
+   1 percentage point of slack, and the observed mix excludes expected rollbacks. The slack lowers the asserted
+   floors (42.48% and 3.35%) below the specification's 43.0% and 4.0%, so a full deck is what meets them.
+
+### Options considered — liveness
+
+Without think time, long New-Orders starved under first-committer-wins on the hot warehouse and district rows;
+the engine's conflict messages were diagnosed as genuine write-write conflicts, not an engine bug.
+1. **Add randomized backoff.** Not chosen: it changes timing without bounding starvation.
+2. **After 3 conflicts (`ESCALATION_CONFLICT_THRESHOLD`) run that transaction on the exclusive side of a
+   driver-level `RwLock`; after 10 retries (`MAX_CONFLICT_RETRIES`) fail the run.** **Chosen.** A driver liveness
+   mechanism, not an engine property; the engine stays optimistic. It is disclosed, and no test asserts
+   escalation specifically.
+
+### Options considered — metrics and pacing
+
+No keying time, think time or response-time gating; no `tpmC`, price/performance or any relabeled equivalent
+(TPC Policies §8.1.4), in the same spirit as ADR-030. The driver reports only neutral counts (completed,
+expected rollbacks, conflict retries, escalations, observed mix, elapsed). `WorkloadReport` carries only numeric
+fields and has no label text or `Display` implementation; the six label constants are free `pub const`s, and two
+tests scan the constants only for `tpmc`, `tpm-c`, `transactions per minute`, `performance` and `price`.
+
+### Decision
+
+The retry-from-`BEGIN` conflict model, synchronous per-district Delivery, the isolation adaptation with the
+claim above, the 23-card deck, the driver-level escalation and the no-metrics policy, as implemented in
+`crates/htap-tpcc/src/{transactions,consistency,drivers}` and `tests/`. The MySQL dialect treats a backslash as
+an escape, so `transactions::sql_literal` escapes `\` before `'`; the defect was found by the full-warehouse
+driver run, and the a-string alphabet of ADR-031 keeps exercising it.
+
+Consistency condition 11 (`count(ORDER) - count(NEW-ORDER) = 2100` per district, Clause 3.3.2.11) holds only for
+the initial population, because each Delivery raises the difference by one. This is an observation about the
+specification's text, not an engine defect. The checker implements the condition as written. The hand-driven
+tests (`tests/consistency.rs::transactions_preserve_derived_condition_11`) assert only `2100 + delivered` for
+district 1 and a violation set of exactly {11}; the three workload-driver tests assert the derived invariant
+`count(ORDER) - count(NEW-ORDER) = count(ORDER with O_CARRIER_ID)` and that condition 11 is reported if and only
+if the difference is not 2100, through `assert_condition_11_and_delivery_invariant` in `tests/drivers.rs`.
+
+### Consequences
+
+- The kit's isolation statement is deliberately weaker than Clause 3.4's Level 3 requirement; nothing here may be
+  quoted as serializable or as ACID-compliant. Serializable isolation is not built.
+- The specification's atomicity (3.2), consistency-test (3.3.3) and durability (3.5) tests are not run as
+  specified; what exists is the consistency checker plus the engine's own recovery tests elsewhere.
+- Terminal concurrency is submission-level only because of the process-wide `execution_lock` (see ADR-030).
+- Full-warehouse tests need about 20.7 GiB (a full load plus the checker) and are `#[ignore]`d; the observed
+  full-warehouse driver run (load 60 s, 400 transactions over 2 terminals in 851 s) is an observation, not a
+  metric, and engine memory follow-up F7 is pending.
+- No on-disk format, WAL or durability invariant is touched; only the public `Session` API is used, so no storage
+  review was needed. The validator re-checks that reasoning at the diff gate.
+
+### How to reverse it
+
+Deferred Delivery, a pacing/RTE layer, a serializable mode or an SSI implementation can each be added without
+changing transaction signatures; the isolation claim would then be re-derived, not widened in place. The
+escalation policy is one constant pair in `drivers.rs`. Replacing the deck with weighted selection is local to
+the driver's selection function.
+
+### Verification
+
+`crates/htap-tpcc/tests/isolation.rs::{isolation_test_1_new_order_then_order_status ..
+isolation_test_9_order_status_snapshot_has_no_order_phantom, two_concurrent_new_orders_same_district,
+concurrent_payments_same_customer, two_concurrent_deliveries_same_warehouse,
+concurrent_new_orders_same_stock_decrement, two_inserts_same_absent_pk, insert_over_committed_key_is_upsert,
+delivery_one_district_does_not_redeliver_a_completed_district}`; the transaction fixture tests
+(`tests/{new_order,payment,order_status,delivery,stock_level}.rs`); `tests/consistency_small.rs` and the ignored
+`tests/consistency.rs`; `drivers::tests::{deck_has_required_composition_and_minimum_mix,
+generated_default_inputs_obey_ranges_and_rates, report_labels_do_not_contain_official_metrics}`;
+`crates/htap-tpcc/tests/drivers.rs::{run_small_consistent_dataset, report_labels_do_not_claim_official_tpcc_metrics}`
+and the ignored `consecutive_runs_preserve_history_rows` and `run_full_warehouse_load_ignored`;
+`crates/htap-tpcc/tests/payment.rs::bad_credit_data_with_backslashes_and_quotes_round_trips` and
+`tests/string_escaping.rs`. See `docs/TPCC-DISCLOSURE.md` for the full deviations list.

@@ -160,6 +160,35 @@ section remains the canonical record of what is reproduced verbatim and why.
 
 ---
 
+## Transaction Processing Performance Council (TPC-C)
+
+`crates/htap-tpcc` is an independent, from-specification workload kit derived from the TPC Benchmark(TM) C
+Standard Specification (Revision 5.11, February 2010): the nine-table schema, the population rules of Clause
+4.3.3.1, the five transaction profiles, the twelve consistency conditions of Clause 3.3.2, the isolation tests
+of Clause 3.4.2 (adapted to optimistic concurrency control) and the transaction-mix rules of Clause 5.2. It
+reproduces no text of the specification in the source tree: only specification-defined data values (the ten `C_LAST` syllables and
+the two worked examples of Clause 4.3.2.3, and numeric constants such as the population cardinalities and the
+23-card deck composition) appear in code, and clauses are cited by number. No TPC-C sample program (Appendix A of the
+specification), TPC-provided software or other implementation's source was vendored, copied, or
+machine-translated. The kit computes no official TPC-C metric (`tpmC`, price/performance, availability date; see
+ADR-032 in `docs/DECISIONS.md`), is not audited, and this project makes no TPC-C compliance or comparability
+claim. See [`docs/TPCC-DISCLOSURE.md`](./docs/TPCC-DISCLOSURE.md) for the TPC Policies §8.1.5 disclaimer, the
+§8.3.2 deviations list and the §8.3.3 non-comparability statement; this section remains the canonical record of
+what is drawn from the specification and under which notice. The specification's copying-by-permission notice
+(page 4) is carried here for the title and date, since no specification text is reproduced in the source tree.
+The publication cited is TPC Benchmark(TM) C Standard Specification, Revision 5.11, February 2010, Copyright 2010
+Transaction Processing Performance Council. The notice reads:
+
+> TPC Benchmark(TM), TPC-C, and tpmC are trademarks of the Transaction Processing Performance Council.
+> Permission to copy without fee all or part of this material is granted provided that the TPC copyright notice,
+> the title of the publication, and its date appear, and notice is given that copying is by permission of the
+> Transaction Processing Performance Council. To copy otherwise requires specific permission.
+
+The TPC Policies (v6.20, November 2024) govern derived work: §8.1.4 (the "Derived from" prefix; no Primary or
+Optional Metric use), §8.1.5 (the disclaimer), §8.3.2 and §8.3.3.
+
+---
+
 ## Statement
 
 No StarRocks, Apache Kudu, or Apache ZooKeeper source file was vendored,

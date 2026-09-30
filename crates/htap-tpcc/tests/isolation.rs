@@ -13,6 +13,8 @@ use htap_tpcc::transactions::{
 };
 use tempfile::TempDir;
 
+const MAX_RETRY_ATTEMPTS: usize = 100;
+
 fn setup() -> Result<(TempDir, Arc<LocalServer>), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let server = Arc::new(LocalServer::open(directory.path())?);
@@ -155,23 +157,25 @@ fn retry_new_order(
     session: &mut Session,
     request: &NewOrderRequest,
 ) -> htap_tpcc::transactions::NewOrderResult {
-    loop {
+    for _ in 0..MAX_RETRY_ATTEMPTS {
         match new_order(session, request) {
             Ok(result) => return result,
             Err(TransactionError::Conflict) => continue,
             Err(error) => panic!("unexpected New-Order error: {error}"),
         }
     }
+    panic!("New-Order exhausted {MAX_RETRY_ATTEMPTS} attempts due to conflicts");
 }
 
 fn retry_payment(session: &mut Session, request: &PaymentRequest) {
-    loop {
+    for _ in 0..MAX_RETRY_ATTEMPTS {
         match payment(session, request) {
             Ok(_) => return,
             Err(TransactionError::Conflict) => continue,
             Err(error) => panic!("unexpected Payment error: {error}"),
         }
     }
+    panic!("Payment exhausted {MAX_RETRY_ATTEMPTS} attempts due to conflicts");
 }
 
 fn insert_delivery_order(
@@ -786,6 +790,19 @@ fn two_concurrent_deliveries_same_warehouse() -> Result<(), Box<dyn Error>> {
     let mut seed = server.open_session()?;
     insert_delivery_order(&mut seed, 1, 3001, 1)?;
     insert_delivery_order(&mut seed, 2, 3001, 2)?;
+    let initial_balances = [(1, 1), (2, 2)]
+        .into_iter()
+        .map(|(district_id, customer_id)| {
+            query_i64(
+                &mut seed,
+                &format!(
+                    "SELECT c_balance FROM customer \
+                     WHERE c_w_id = 1 AND c_d_id = {district_id} AND c_id = {customer_id}"
+                ),
+            )
+            .map(|balance| (district_id, customer_id, balance))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let barrier = Arc::new(std::sync::Barrier::new(2));
 
     let handles: Vec<_> = (0..2)
@@ -795,7 +812,7 @@ fn two_concurrent_deliveries_same_warehouse() -> Result<(), Box<dyn Error>> {
             std::thread::spawn(move || {
                 let mut session = server.open_session().unwrap();
                 barrier.wait();
-                loop {
+                for _ in 0..MAX_RETRY_ATTEMPTS {
                     match delivery(
                         &mut session,
                         &DeliveryRequest {
@@ -809,6 +826,7 @@ fn two_concurrent_deliveries_same_warehouse() -> Result<(), Box<dyn Error>> {
                         Err(error) => panic!("unexpected Delivery error: {error}"),
                     }
                 }
+                panic!("Delivery exhausted {MAX_RETRY_ATTEMPTS} attempts due to conflicts");
             })
         })
         .collect();
@@ -825,6 +843,59 @@ fn two_concurrent_deliveries_same_warehouse() -> Result<(), Box<dyn Error>> {
         2
     );
     assert_eq!(query_i64(&mut seed, "SELECT COUNT(*) FROM new_order")?, 0);
+
+    for (district_id, customer_id, initial_balance) in initial_balances {
+        // Each seeded order has exactly one order line, so avoid SUM over Decimal.
+        let order_total = query_i64(
+            &mut seed,
+            &format!(
+                "SELECT ol_amount FROM order_line \
+                 WHERE ol_w_id = 1 AND ol_d_id = {district_id} AND ol_o_id = 3001"
+            ),
+        )?;
+
+        assert_eq!(
+            query_i64(
+                &mut seed,
+                &format!(
+                    "SELECT c_delivery_cnt FROM customer \
+                     WHERE c_w_id = 1 AND c_d_id = {district_id} AND c_id = {customer_id}"
+                ),
+            )?,
+            1
+        );
+        assert_eq!(
+            query_i64(
+                &mut seed,
+                &format!(
+                    "SELECT c_balance FROM customer \
+                     WHERE c_w_id = 1 AND c_d_id = {district_id} AND c_id = {customer_id}"
+                ),
+            )?,
+            initial_balance + order_total
+        );
+        assert_eq!(
+            query_i64(
+                &mut seed,
+                &format!(
+                    "SELECT o_carrier_id FROM orders \
+                     WHERE o_w_id = 1 AND o_d_id = {district_id} AND o_id = 3001"
+                ),
+            )?,
+            7
+        );
+        assert_eq!(
+            query_i64(
+                &mut seed,
+                &format!(
+                    "SELECT COUNT(*) FROM order_line \
+                     WHERE ol_w_id = 1 AND ol_d_id = {district_id} AND ol_o_id = 3001 \
+                     AND ol_delivery_d = 1"
+                ),
+            )?,
+            1
+        );
+    }
     Ok(())
 }
 
