@@ -81,6 +81,10 @@ struct CustomerData<'a> {
     data: &'a str,
 }
 
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
 fn insert_customer(
     session: &mut Session,
     customer: &CustomerData<'_>,
@@ -92,18 +96,18 @@ fn insert_customer(
              (c_id, c_d_id, c_w_id, c_first, c_middle, c_last, c_street_1, c_street_2, \
               c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, \
               c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, c_data) \
-             VALUES ({}, {}, {}, '{}', 'OE', '{}', 'customer street 1', \
+             VALUES ({}, {}, {}, {}, 'OE', {}, 'customer street 1', \
                      'customer street 2', 'customer city', 'CS', '555556666', \
                      '9876543210987654', \
                      DATE '2000-01-01', \
-                     '{}', 50000.00, 0.0000, 100.00, 10.00, 1, 0, '{}')",
+                     {}, 50000.00, 0.0000, 100.00, 10.00, 1, 0, {})",
             customer.c_id,
             customer.c_d_id,
             customer.c_w_id,
-            customer.first,
-            customer.last,
-            customer.credit,
-            customer.data,
+            sql_literal(customer.first),
+            sql_literal(customer.last),
+            sql_literal(customer.credit),
+            sql_literal(customer.data),
         ),
     )
 }
@@ -439,6 +443,39 @@ fn remote_customer() -> Result<(), Box<dyn Error>> {
             "SELECT h_date FROM history WHERE h_id = 281474976710657"
         )?,
         1_715_880_331_111_111
+    );
+    Ok(())
+}
+
+#[test]
+fn bad_credit_data_with_backslashes_and_quotes_round_trips() -> Result<(), Box<dyn Error>> {
+    let (_directory, server) = setup()?;
+    let mut session = server.open_session()?;
+    insert_warehouse(&mut session, 1)?;
+    insert_district(&mut session, 1, 1)?;
+
+    let existing_data = r#"old\'two''quotes"#;
+    insert_customer(
+        &mut session,
+        &CustomerData {
+            c_id: 1,
+            c_w_id: 1,
+            c_d_id: 1,
+            first: "Backslash",
+            last: "Quote",
+            credit: "BC",
+            data: existing_data,
+        },
+    )?;
+
+    payment(
+        &mut session,
+        &request(CustomerSelector::Id(1), 1, 1_716_000_000_000_000),
+    )?;
+
+    assert_eq!(
+        query_string(&mut session, "SELECT c_data FROM customer WHERE c_id = 1")?,
+        format!("1 1 1 1 1 12.34|{existing_data}")
     );
     Ok(())
 }

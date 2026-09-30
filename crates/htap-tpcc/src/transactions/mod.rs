@@ -12,7 +12,7 @@ use crate::load::format_decimal;
 
 #[derive(Debug)]
 pub enum TransactionError {
-    /// A write-write conflict. Retry the complete transaction from `BEGIN`.
+    /// A write-write conflict. Retry the failed atomic transaction from `BEGIN`.
     Conflict,
     /// The TPC-C New-Order transaction's expected invalid-item rollback.
     ExpectedRollback,
@@ -145,21 +145,24 @@ pub struct PaymentResult {
 }
 
 fn sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 fn query(session: &mut Session, sql: &str) -> Result<htap_sql::result::QueryResult> {
-    match session.execute(sql).map_err(TransactionError::from)? {
-        StatementResult::Query(result) => Ok(result),
-        result => Err(TransactionError::InvalidInput(format!(
+    match session.execute(sql) {
+        Ok(StatementResult::Query(result)) => Ok(result),
+        Ok(result) => Err(TransactionError::InvalidInput(format!(
             "expected query result for '{sql}', got {result:?}"
         ))),
+        Err(error) => Err(TransactionError::from(error)),
     }
 }
 
 fn execute(session: &mut Session, sql: &str) -> Result<()> {
-    session.execute(sql).map_err(TransactionError::from)?;
-    Ok(())
+    match session.execute(sql) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(TransactionError::from(error)),
+    }
 }
 
 fn int(row: &htap_common::types::Row, index: usize) -> Result<i64> {
@@ -974,24 +977,41 @@ fn delivery_district(
     })
 }
 
-/// Runs the TPC-C Delivery transaction, using one transaction for each district.
-pub fn delivery(session: &mut Session, request: &DeliveryRequest) -> Result<DeliveryResult> {
+/// Runs one TPC-C Delivery district atomically.
+///
+/// A conflict retries only this district's transaction, not districts that have
+/// already committed for the same Delivery input.
+pub fn delivery_one_district(
+    session: &mut Session,
+    request: &DeliveryRequest,
+    district_id: i64,
+) -> Result<DeliveryDistrictResult> {
     if request.w_id <= 0 || request.carrier_id <= 0 {
         return Err(TransactionError::InvalidInput(
             "warehouse and carrier IDs must be positive".into(),
         ));
     }
+    if !(1..=10).contains(&district_id) {
+        return Err(TransactionError::InvalidInput(
+            "district ID must be from 1 through 10".into(),
+        ));
+    }
 
+    session.begin().map_err(TransactionError::from)?;
+    match delivery_district(session, request, district_id) {
+        Ok(result) => match session.commit() {
+            Ok(()) => Ok(result),
+            Err(error) => rollback_after(session, TransactionError::from(error)),
+        },
+        Err(error) => rollback_after(session, error),
+    }
+}
+
+/// Runs the TPC-C Delivery transaction, using one transaction for each district.
+pub fn delivery(session: &mut Session, request: &DeliveryRequest) -> Result<DeliveryResult> {
     let mut per_district = Vec::with_capacity(10);
     for district_id in 1..=10 {
-        session.begin().map_err(TransactionError::from)?;
-        match delivery_district(session, request, district_id) {
-            Ok(result) => match session.commit() {
-                Ok(()) => per_district.push(result),
-                Err(error) => return rollback_after(session, TransactionError::from(error)),
-            },
-            Err(error) => return rollback_after(session, error),
-        }
+        per_district.push(delivery_one_district(session, request, district_id)?);
     }
     Ok(DeliveryResult { per_district })
 }

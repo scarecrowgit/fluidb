@@ -1,6 +1,7 @@
 //! A non-audited TPC-C-derived schema and workload support crate.
 
 pub mod consistency;
+pub mod drivers;
 pub mod generate;
 pub mod history;
 pub mod load;

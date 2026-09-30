@@ -63,6 +63,10 @@ fn query_i64(session: &mut Session, sql: &str) -> Result<i64, Box<dyn Error>> {
     }
 }
 
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
 fn insert_customer(
     session: &mut Session,
     customer: CustomerData<'_>,
@@ -74,10 +78,13 @@ fn insert_customer(
              (c_id, c_d_id, c_w_id, c_first, c_middle, c_last, c_street_1, c_street_2, \
               c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, \
               c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, c_data) \
-             VALUES ({}, 1, 1, '{}', 'OE', '{}', 'street', 'suite', \
+             VALUES ({}, 1, 1, {}, 'OE', {}, 'street', 'suite', \
                      'city', 'ST', '123456789', '1234567890123456', DATE '2000-01-01', \
-                     'GC', 50000.00, 0.0000, {}, 0.00, 0, 0, 'customer data')",
-            customer.customer_id, customer.first, customer.last, customer.balance
+             'GC', 50000.00, 0.0000, {}, 0.00, 0, 0, 'customer data')",
+            customer.customer_id,
+            sql_literal(customer.first),
+            sql_literal(customer.last),
+            customer.balance
         ),
     )
 }

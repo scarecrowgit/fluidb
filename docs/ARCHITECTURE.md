@@ -643,11 +643,11 @@ See [`PROGRESS.md`](./PROGRESS.md).
 
 ---
 
-### TPC-C workload kit (Phase 18, batches 1-2 of 4)
+### TPC-C workload kit (Phase 18, batches 1-3 of 4)
 
-**Status: `in progress`.** Batches 1-2 of `crates/htap-tpcc` are built: schema, population generator, bulk loader, the five
-transactions and the 12-condition consistency checker. Batches 3-4 (isolation tests, the driver and the TPC-C disclosure
-document) are not built, so nothing here is a TPC-C benchmark or a compliance claim. No engine-crate, on-disk-format or wire change.
+**Status: `in progress`.** Batches 1-3 of `crates/htap-tpcc` are built: schema, population generator, bulk loader, the five
+transactions, the 12-condition consistency checker, the isolation tests and the workload driver. Batch 4 (the TPC-C
+disclosure document and its ADRs) is not built, so nothing here is a TPC-C benchmark or a compliance claim. No engine-crate, on-disk-format or wire change.
 
 - **Schema** (`schema::{TABLE_NAMES, ddl_statements}`): the nine tables. ORDER, ORDER-LINE and NEW-ORDER are named `orders`,
   `order_line`, `new_order` (ORDER is reserved, hyphens are invalid in unquoted names, and double quotes are string literals in
@@ -665,7 +665,8 @@ document) are not built, so nothing here is a TPC-C benchmark or a compliance cl
 - **Load tests:** the default `load_small_subset_with_referential_consistency` loads a referentially consistent subset; the full
   one-warehouse `load_with_warehouse_count_1_and_verify_counts_and_values` is `#[ignore]`d (about 67 s in release).
 - **Transactions** (`transactions::`, batch 2): New-Order, Payment, Order-Status, Delivery and Stock-Level use the public
-  Session API, one transaction each (Delivery uses one per district order). `TransactionError` separates an engine
+  Session API, one transaction each (Delivery uses one per district order: `transactions::delivery_one_district` runs one
+  district as its own transaction and `transactions::delivery` loops over it). `TransactionError` separates an engine
   `Conflict` (retry the whole transaction) from the spec's expected 1% New-Order rollback (`ExpectedRollback`); every error
   path rolls back. Timestamps (O_ENTRY_D, H_DATE, OL_DELIVERY_D) are caller-supplied integer epoch microseconds, because
   `INSERT` into a TIMESTAMP column accepts a date string, a DATE literal or integer microseconds but not a date-and-time
@@ -676,6 +677,65 @@ document) are not built, so nothing here is a TPC-C benchmark or a compliance cl
   text: condition 11 (count(ORDER) - count(NEW-ORDER) = 2100 per district) holds only for the initial population, since each
   Delivery raises the difference by one; after transactions the tests assert the derived invariant 2100 + delivered
   (`tests/consistency.rs::transactions_preserve_derived_condition_11`, ignored). Full test list in `docs/PROGRESS.md`.
+- **Isolation tests** (`tests/isolation.rs`, batch 3, 16 default tests): `isolation_test_1..9` adapt the TPC-C Clause 3.4.2
+  tests 1-9 to the engine's optimistic concurrency control (the spec permits non-locking schemes; a conflicting transaction
+  fails its commit with `Conflict` and is retried from BEGIN). Tests 1-6 hand-stage the uncommitted half of the scenario as
+  raw SQL inside an explicit transaction (the transaction functions commit internally); tests 4 and 6 are deterministic on
+  one thread (T1 staged and open, T2 runs one full transaction, then T1 rolls back; no sleeps). Test 1: Order-Status while a
+  New-Order is uncommitted sees the prior order, then the new one after commit. Test 2: a rolled-back New-Order is invisible.
+  Test 3: two New-Orders read the same `d_next_o_id`; a concurrent New-Order commits first, the open transaction's commit
+  fails with `Conflict` (first committer wins), and its retry gets the next consecutive ID. Test 4: a rolled-back New-Order
+  consumes no order ID (it detects read-uncommitted and abort-leak models, not conflict detection). Test 5: a Payment commits while a Delivery is open; the Delivery commit fails with `Conflict`, and a
+  fresh Delivery afterwards leaves both effects in the customer row. Test 6: a rolled-back Delivery has no effect and only
+  the Payment persists. Test 7: a transaction begun before a price update still reads all five old prices (plain reads in an
+  explicit transaction, not a full New-Order). Tests 8 and 9 are snapshot-isolation fixed-snapshot outcomes (no new NEW-ORDER
+  row and no newer ORDER within the transaction's snapshot), not serializability tests. Tests 1-7 each name in a comment the
+  weaker model they would fail under (read-uncommitted, no conflict detection, read-committed). The other 7 are engine-level:
+  4 concurrency smoke/stress tests (`two_concurrent_new_orders_same_district`, `concurrent_payments_same_customer`,
+  `two_concurrent_deliveries_same_warehouse`, `concurrent_new_orders_same_stock_decrement`: each asserts no duplicate O_ID, no
+  lost Payment update, no double delivery or no lost stock decrement after retrying on `Conflict`, but they only release
+  threads from a barrier and nothing forces the snapshots to overlap, so they are not deterministic evidence of no lost
+  updates; that evidence is isolation tests 3 (`D_NEXT_O_ID`) and 5 (customer balance)), 2 insert tests (concurrent inserts
+  of the same absent primary key: exactly one commits; an insert over a committed key is an upsert, disclosed), and
+  `delivery_one_district_does_not_redeliver_a_completed_district` (a second `delivery_one_district` call on a delivered
+  district returns `Skipped`). **Isolation
+  claim (narrow, conditional on these tests passing):** for the scenarios exercised, no dirty reads, no dirty writes, no lost
+  updates (first committer wins) and a fixed snapshot per transaction are demonstrated. Broad P2/P3 and A5B write skew are
+  not established, and no Level 3 or serializability claim is made.
+- **Driver** (`drivers::run`, batch 3): a shuffled 23-card deck (10 New-Order, 10 Payment, 1 each Order-Status, Delivery,
+  Stock-Level; it meets the Clause 5.2.3 minimums, but the mix is guaranteed only per completed deck, so a transaction limit
+  may stop partway through a deck; the limit is a shared counter across terminals, so `tests/drivers.rs::assert_report` keeps
+  1 percentage point of slack and the observed mix excludes expected rollbacks), one thread and session per terminal, spec input generation with a fixed NURand `C`
+  (disclosed), `DriverScale` (spec ranges by default; smaller scales are test-only), Payment amounts 1.00 to 5000.00, and a
+  Stock-Level district fixed per terminal (reused cyclically when terminals outnumber warehouse-district pairs). Each
+  terminal seeds its HISTORY sequence from the largest existing `h_id` for its terminal source, so consecutive runs on one
+  database keep their history rows. Sessions and the sequence are set up before the start barrier (a setup error no longer skips the
+  barrier; it cancels the run); the run clock and duration limits start after it. `terminal_count` is capped at
+  32767 (the 15-bit HISTORY source, `history::build_h_id`). Report labels are neutral (never tpmC), a `Conflict` is retried
+  from BEGIN, and a Delivery card runs district by district through `delivery_one_district`: the driver retries only the
+  district that conflicted (same escalation and max-retry policy), never re-runs districts already committed, and counts one
+  completed Delivery per card. Delivery dispatch and a non-query history-sequence result return typed `DriverError`s
+  instead of panicking. There is no keying time, think time or response-time gating (disclosed). Starvation escalation: without
+  think time, long New-Orders starved under first-committer-wins on the hot warehouse and district rows (genuine write-write
+  conflicts, not an engine bug), so after 3 conflicts the driver runs that transaction under an exclusive driver-level
+  `RwLock`; a transaction that still conflicts after 10 retries fails the run. This is a driver liveness mechanism, not an
+  engine property: the engine stays optimistic, and the server's process-wide execution lock still limits terminal
+  concurrency to submission level. Tests: `tests/drivers.rs` (fast `run_small_consistent_dataset`; ignored
+  `consecutive_runs_preserve_history_rows` and `run_full_warehouse_load_ignored`) and `drivers::tests`. The three driver tests that run
+  the workload share `assert_condition_11_and_delivery_invariant` (only condition 11 may be violated; per district
+  count(ORDER) - count(NEW-ORDER) equals count(ORDER with O_CARRIER_ID); condition 11 is reported if and only if that
+  difference is not 2100). `consecutive_runs_preserve_history_rows` passes (about 36 s in debug; ignored for time).
+  `run_full_warehouse_load_ignored` passed on 2026-09-30 with the per-district Delivery retry (release, 24G cap; load
+  60 s, 400 transactions over 2 terminals in 851 s, total 1020 s; see `docs/PROGRESS.md`). Not
+  separately tested: the driver's per-district Delivery resume behaviour (only `delivery_one_district` is tested, by
+  `tests/isolation.rs::delivery_one_district_does_not_redeliver_a_completed_district`), escalation itself (the fast test only
+  asserts that conflict retries or escalations occurred), the terminal-count boundary at 32767, and setup-before-barrier ordering.
+- **SQL literal escaping** (batch 3): the MySQL dialect treats a backslash as an escape, so the transactions' literal helper
+  now escapes backslashes before quotes (found by the full-warehouse driver run). Evidence:
+  `tests/payment.rs::bad_credit_data_with_backslashes_and_quotes_round_trips` exercises the crate helper through Payment's
+  C_DATA update; `tests/string_escaping.rs` checks the escaping scheme against the engine using its own copy of the helper,
+  not the crate function. Its `unescaped_backslash_quote_is_reinterpreted_by_parser` shows that unescaped input
+  `backslash\'quote` is accepted and silently stored as `backslash'quote`, which motivates escaping backslashes.
 - **Fixed after external review in batch 1:** the delivered boundary (orders 1-2100 delivered, 2101-3000 in NEW-ORDER),
   C_PHONE now 16 digits, and I_DATA/S_DATA lengths 26-50.
 
