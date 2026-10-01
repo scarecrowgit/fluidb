@@ -5,9 +5,11 @@ The driver runs fixed-deck transaction-mix selection (Clause 5.2.4.2) over N ter
 
 The default scale is the TPC-C specification scale: 10 districts per warehouse, 3,000 customers per district, and 100,000 items. Non-default scales exist only to support small functional tests; they are not TPC-C compliant benchmark configurations.
 
+The driver uses snapshot isolation by default and can optionally configure each terminal session to use SERIALIZABLE isolation.
+
 The underlying engine is optimistic and uses first-committer-wins conflict detection. The driver implements a liveness mechanism, not the engine: after several conflicts, a transaction escalates to exclusive driver execution. This prevents long transactions from starving when there is no think time. The escalation is disclosed among the deviations in docs/TPCC-DISCLOSURE.md. The underlying server still holds a process-wide execution lock for complete execute and commit calls, so driver-level concurrent submissions and sessions do not make statements execute in parallel.
 
-No keying, think-time pacing, randomized conflict backoff, or response-time percentile gating is implemented (analogous to ADR-030). The fixed 23-card deck guarantees the Clause 5.2.3 minimum transaction mix percentages only per completed deck pass; a transaction limit may stop a run partway through a deck. Per-transaction NURand input ranges are implemented. Observed mix percentages include committed transactions only and exclude expected New-Order rollbacks. This module reports transaction counts, conflict retries, escalation attempts, and observed mix percentages but computes no official TPC metric (no tpmC, throughput rate, or price/performance).
+No keying, think-time pacing, randomized conflict backoff, or response-time percentile gating is implemented (analogous to ADR-030). The fixed 23-card deck guarantees the Clause 5.2.3 minimum transaction mix percentages only per completed deck pass; a transaction limit may stop a run partway through a deck. Per-transaction NURand input ranges are implemented. Observed mix percentages include committed transactions only and exclude expected New-Order rollbacks. This module reports transaction counts, conflict retries, escalation attempts, and observed mix percentages but computes no official TPC metric (no tpmC, throughput rate, or price/performance); conflict retries include serialization failures when SERIALIZABLE isolation is selected.
 "#]
 
 use std::error::Error;
@@ -183,6 +185,16 @@ impl DriverScale {
     fn last_name_count(self) -> u64 {
         u64::from(self.customers_per_district.min(1_000))
     }
+}
+
+/// Selects the transaction isolation level used by each driver terminal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DriverIsolation {
+    /// Uses the engine's default snapshot isolation, reported as REPEATABLE READ.
+    #[default]
+    SnapshotIsolation,
+    /// Configures each terminal session to use SERIALIZABLE isolation.
+    Serializable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,6 +549,7 @@ struct TerminalRun {
     limit: TransactionLimitOrDuration,
     scale: DriverScale,
     seed: u64,
+    isolation: DriverIsolation,
     barrier: Arc<Barrier>,
     cancel: Arc<AtomicBool>,
     submitted: Arc<AtomicU64>,
@@ -551,6 +564,7 @@ fn run_terminal(config: TerminalRun) -> Result<[TransactionCounts; 5], DriverErr
         limit,
         scale,
         seed,
+        isolation,
         barrier,
         cancel,
         submitted,
@@ -568,6 +582,9 @@ fn run_terminal(config: TerminalRun) -> Result<[TransactionCounts; 5], DriverErr
         let terminal_source =
             u16::try_from(terminal_id + 1).map_err(|_| DriverError::InvalidTerminalCount)?;
         let mut session = server.open_session()?;
+        if isolation == DriverIsolation::Serializable {
+            session.execute("SET SESSION transaction_isolation = 'SERIALIZABLE'")?;
+        }
         let history_sequence = history_sequence(&mut session, terminal_source)?;
         Ok::<_, DriverError>((session, history_sequence, terminal_source))
     })();
@@ -719,6 +736,30 @@ pub fn run(
     scale: DriverScale,
     seed: u64,
 ) -> Result<WorkloadReport, DriverError> {
+    run_with_isolation(
+        server,
+        warehouse_count,
+        terminal_count,
+        limit,
+        scale,
+        seed,
+        DriverIsolation::default(),
+    )
+}
+
+/// Runs a fixed-deck TPC-C transaction workload with the selected isolation level.
+///
+/// Each terminal configures its isolation during setup before the common start
+/// barrier. Conflict retries include serialization validation failures.
+pub fn run_with_isolation(
+    server: &Arc<LocalServer>,
+    warehouse_count: u32,
+    terminal_count: u32,
+    limit: TransactionLimitOrDuration,
+    scale: DriverScale,
+    seed: u64,
+    isolation: DriverIsolation,
+) -> Result<WorkloadReport, DriverError> {
     if warehouse_count == 0 {
         return Err(DriverError::InvalidWarehouseCount);
     }
@@ -746,6 +787,7 @@ pub fn run(
             limit,
             scale,
             seed,
+            isolation,
             barrier: Arc::clone(&barrier),
             cancel: Arc::clone(&cancel),
             submitted: Arc::clone(&submitted),
