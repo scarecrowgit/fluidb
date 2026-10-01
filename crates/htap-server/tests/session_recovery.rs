@@ -503,3 +503,173 @@ fn test_double_values_round_trip_bit_identically_after_reopen() {
         );
     }
 }
+
+#[test]
+fn test_open_serializable_txn_lost_on_reopen_then_write_skew_still_prevented() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+        server
+            .execute("CREATE TABLE doctors (id INT PRIMARY KEY, on_call INT NOT NULL);")
+            .unwrap();
+        server
+            .execute("INSERT INTO doctors (id, on_call) VALUES (1, 1), (2, 1);")
+            .unwrap();
+
+        let mut session = server.open_session().unwrap();
+        session
+            .execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+            .unwrap();
+        assert_eq!(
+            as_rows(
+                session
+                    .execute("SELECT id, on_call FROM doctors ORDER BY id;")
+                    .unwrap()
+            ),
+            vec![
+                Row::new(vec![Value::Int32(1), Value::Int32(1)]),
+                Row::new(vec![Value::Int32(2), Value::Int32(1)]),
+            ]
+        );
+        session
+            .execute("UPDATE doctors SET on_call = 0 WHERE id = 1;")
+            .unwrap();
+
+        // `session` and `server` drop without committing the serializable transaction.
+    }
+
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    assert_eq!(
+        as_rows(
+            server
+                .execute("SELECT id, on_call FROM doctors ORDER BY id;")
+                .unwrap()
+        ),
+        vec![
+            Row::new(vec![Value::Int32(1), Value::Int32(1)]),
+            Row::new(vec![Value::Int32(2), Value::Int32(1)]),
+        ],
+        "the uncommitted serializable update must not survive a reopen"
+    );
+
+    let mut first = server.open_session().unwrap();
+    let mut second = server.open_session().unwrap();
+    first
+        .execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+        .unwrap();
+    second
+        .execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+        .unwrap();
+
+    let expected = vec![
+        Row::new(vec![Value::Int32(1), Value::Int32(1)]),
+        Row::new(vec![Value::Int32(2), Value::Int32(1)]),
+    ];
+    assert_eq!(
+        as_rows(
+            first
+                .execute("SELECT id, on_call FROM doctors ORDER BY id;")
+                .unwrap()
+        ),
+        expected
+    );
+    assert_eq!(
+        as_rows(
+            second
+                .execute("SELECT id, on_call FROM doctors ORDER BY id;")
+                .unwrap()
+        ),
+        expected
+    );
+
+    first
+        .execute("UPDATE doctors SET on_call = 0 WHERE id = 1;")
+        .unwrap();
+    second
+        .execute("UPDATE doctors SET on_call = 0 WHERE id = 2;")
+        .unwrap();
+
+    first.commit().unwrap();
+    let err = second.commit().unwrap_err();
+    assert!(
+        err.to_string().contains("serialization failure"),
+        "expected serialization failure, got {err}"
+    );
+
+    let rows = as_rows(
+        server
+            .execute("SELECT on_call FROM doctors ORDER BY id;")
+            .unwrap(),
+    );
+    assert!(
+        rows.iter().any(|row| row.get(0) == Some(&Value::Int32(1))),
+        "at least one doctor must remain on call, got {rows:?}"
+    );
+}
+
+#[test]
+fn test_durable_pending_commit_outcome_is_seen_by_new_serializable_txn() {
+    let dir = TempDir::new().unwrap();
+    {
+        let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+        server
+            .execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v INT);")
+            .unwrap();
+        server
+            .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20);")
+            .unwrap();
+
+        let mut session = server.open_session().unwrap();
+        session.begin().unwrap();
+        session
+            .execute("UPDATE t SET v = 11 WHERE id = 1;")
+            .unwrap();
+
+        server
+            .txn_manager()
+            .expect("transaction manager is available")
+            .set_commit_sync_hook(|_journal| {
+                Err(HtapError::Io(std::io::Error::other(
+                    "simulated fsync failure after the commit record was already appended",
+                )))
+            });
+
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.is_durable_pending(),
+            "expected DurablePending, got {err:?}"
+        );
+
+        // `session` and `server` drop without learning whether the commit landed.
+    }
+
+    let server = Arc::new(LocalServer::open(dir.path()).unwrap());
+    let resolved_rows = as_rows(server.execute("SELECT v FROM t WHERE id = 1;").unwrap());
+    assert_eq!(resolved_rows.len(), 1);
+    let resolved_value = match resolved_rows[0].get(0) {
+        Some(Value::Int32(value @ (10 | 11))) => *value,
+        other => panic!("expected recovered value 10 or 11, got {other:?}"),
+    };
+
+    let mut session = server.open_session().unwrap();
+    session
+        .execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+        .unwrap();
+    assert_eq!(
+        as_rows(session.execute("SELECT v FROM t WHERE id = 1;").unwrap()),
+        vec![Row::new(vec![Value::Int32(resolved_value)])],
+        "the new serializable transaction must observe the recovered outcome"
+    );
+    session
+        .execute("UPDATE t SET v = 21 WHERE id = 2;")
+        .unwrap();
+    session.commit().unwrap();
+
+    assert_eq!(
+        as_rows(server.execute("SELECT id, v FROM t ORDER BY id;").unwrap()),
+        vec![
+            Row::new(vec![Value::Int64(1), Value::Int32(resolved_value),]),
+            Row::new(vec![Value::Int64(2), Value::Int32(21)]),
+        ]
+    );
+}
