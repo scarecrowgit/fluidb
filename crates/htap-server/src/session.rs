@@ -47,7 +47,7 @@
 //! `ROLLBACK` included, with the original `DurablePending` error (never `Conflict`; see
 //! [`outcome_pending_error`] — storage-reviewer finding F1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -65,12 +65,12 @@ use htap_sql::ast::BoundStatement;
 use htap_sql::expr::VariableLookup;
 use htap_sql::result::StatementResult;
 use htap_sql::{
-    classify_set_target, parse_autocommit_value, system_variable_value, validate_isolation_level,
-    QueryBody, SessionVarsView, SetClass, SetScope, DEFAULT_MAX_ALLOWED_PACKET,
+    classify_set_target, parse_autocommit_value, parse_isolation_level, system_variable_value,
+    IsolationLevel, QueryBody, SessionVarsView, SetClass, SetScope, DEFAULT_MAX_ALLOWED_PACKET,
 };
 use htap_txn::{
-    intent_frame_size_bound, ParticipantId, ParticipantWork, RowstoreParticipant, Transaction,
-    TransactionRequest, MAX_PAYLOAD_SIZE,
+    intent_frame_size_bound, ParticipantId, ParticipantWork, RowstoreParticipant,
+    SerializableTicket, Transaction, TransactionRequest, MAX_PAYLOAD_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
@@ -84,7 +84,7 @@ use crate::ipc::WireError;
 use crate::ipc::{IpcConnection, IpcRequest, ResponsePayload, SessionStatus};
 use crate::{
     privilege::check_statement_visible, CatalogSnapshot, ExecMode, LocalServer, OwnedServer,
-    PartitionId, ServerMode, TableId,
+    PartitionId, ReadTracker, ReadsMode, ServerMode, TableId,
 };
 use htap_catalog::AccountId;
 
@@ -452,6 +452,12 @@ pub(crate) struct OpenTxn {
     pub read_only: bool,
     /// Mutations buffered by statements executed so far in this transaction.
     pub write_set: WriteSet,
+    /// Isolation level selected when this transaction was opened.
+    isolation: IsolationLevel,
+    /// Serializable snapshot ticket for a read-write serializable transaction.
+    serializable_ticket: Option<SerializableTicket>,
+    /// Read dependencies collected for serializable validation.
+    read_tracker: Option<Arc<ReadTracker>>,
     /// Set once a statement inside this transaction hits a [`HtapError::Conflict`] (write-write
     /// conflict surfaced only at `COMMIT`, or the stale-snapshot-vs-columnar-base conflict
     /// surfaced by a read); once poisoned every further statement except `ROLLBACK` fails with
@@ -633,6 +639,12 @@ pub struct Session {
     /// itself) for the *next* transaction only; consumed and cleared by the next explicit or
     /// implicit `BEGIN`.
     next_txn_read_only: Option<bool>,
+    /// Persistent isolation level used when no one-shot override is pending.
+    isolation: IsolationLevel,
+    /// One-shot isolation level consumed by the next explicit transaction, implicit transaction,
+    /// or autocommit statement. Autocommit execution resolves and consumes this exactly once so
+    /// the level reported before execution is also the level used for serialization validation.
+    next_txn_isolation: Option<IsolationLevel>,
     /// Configured `@@max_allowed_packet` (Phase 11 plan task 8), reported dynamically via
     /// [`SessionVarsView::max_allowed_packet`]. Set once by `htap_wire::server` right after
     /// [`LocalServer::open_session`] to the wire server's configured value; embedded sessions
@@ -653,6 +665,8 @@ impl Session {
             user_vars: BTreeMap::new(),
             autocommit: true,
             next_txn_read_only: None,
+            isolation: IsolationLevel::RepeatableRead,
+            next_txn_isolation: None,
             max_allowed_packet: DEFAULT_MAX_ALLOWED_PACKET,
         }
     }
@@ -985,8 +999,22 @@ impl Session {
     }
 
     /// Opens a new [`OpenTxn`] pinning the current visible MVCC version as the read snapshot.
-    fn open_new_txn(&mut self, read_only: bool) {
-        let snapshot = Snapshot::new(self.backend.server().txn_manager.visible_version());
+    fn open_new_txn(&mut self, read_only: bool, isolation: IsolationLevel) -> Result<()> {
+        let (snapshot, serializable_ticket, read_tracker) =
+            if isolation == IsolationLevel::Serializable && !read_only {
+                let ticket = self.backend.server().txn_manager.pin_serializable()?;
+                (
+                    Snapshot::new(ticket.snapshot()),
+                    Some(ticket),
+                    Some(Arc::new(ReadTracker::default())),
+                )
+            } else {
+                (
+                    Snapshot::new(self.backend.server().txn_manager.visible_version()),
+                    None,
+                    None,
+                )
+            };
         self.backend
             .server()
             .register_pinned_snapshot(self.id, snapshot.version);
@@ -994,8 +1022,12 @@ impl Session {
             snapshot,
             read_only,
             write_set: WriteSet::new(),
+            isolation,
+            serializable_ticket,
+            read_tracker,
             poisoned: None,
         });
+        Ok(())
     }
 
     /// Starts an explicit transaction, pinning the current visible MVCC version as the read
@@ -1045,7 +1077,11 @@ impl Session {
         }
 
         self.begin_guarded_prelude()?;
-        self.pin_new_txn_locked(false);
+        // Preserve the one-shot override if pinning a serializable transaction fails so a retry
+        // uses the same requested isolation level.
+        let isolation = self.next_txn_isolation.unwrap_or(self.isolation);
+        self.pin_new_txn_locked(false, isolation)?;
+        self.next_txn_isolation = None;
         Ok(())
     }
 
@@ -1073,17 +1109,21 @@ impl Session {
     /// Pins a new transaction's snapshot under `LocalServer.execution_lock`, exactly like every
     /// other snapshot read in this server, via a cloned `Arc<LocalServer>` handle so the guard
     /// does not borrow `self`.
-    fn pin_new_txn_locked(&mut self, read_only: bool) {
+    fn pin_new_txn_locked(&mut self, read_only: bool, isolation: IsolationLevel) -> Result<()> {
         let server = Arc::clone(self.backend.server());
         let _guard = server.execution_lock.lock();
-        self.open_new_txn(read_only);
+        self.open_new_txn(read_only, isolation)
     }
 
-    /// Opens an implicit transaction (autocommit off) consuming any pending `next_txn_read_only`
-    /// default.
-    fn begin_implicit(&mut self) {
-        let read_only = self.next_txn_read_only.take().unwrap_or(false);
-        self.open_new_txn(read_only);
+    /// Opens an implicit transaction (autocommit off), consuming pending transaction defaults
+    /// only after the transaction and any required serializable ticket are opened successfully.
+    fn begin_implicit(&mut self) -> Result<()> {
+        let read_only = self.next_txn_read_only.unwrap_or(false);
+        let isolation = self.next_txn_isolation.unwrap_or(self.isolation);
+        self.open_new_txn(read_only, isolation)?;
+        self.next_txn_read_only = None;
+        self.next_txn_isolation = None;
+        Ok(())
     }
 
     /// Parses `sql` into a single statement and executes it via [`Session::execute_statement`].
@@ -1224,25 +1264,61 @@ impl Session {
         }
 
         if matches!(self.state, SessionState::Idle) && !self.autocommit {
-            self.begin_implicit();
+            self.begin_implicit()?;
         }
 
         let read_only_ctx = matches!(&self.state, SessionState::InTxn(t) if t.read_only);
+        // Resolve an autocommit statement's effective isolation level once for both variable
+        // reporting and execution-mode selection. The one-shot override is consumed only after
+        // the autocommit transaction, including any serializable ticket pin, starts successfully.
+        let isolation = match &self.state {
+            SessionState::InTxn(open_txn) => open_txn.isolation,
+            SessionState::Idle => self.next_txn_isolation.unwrap_or(self.isolation),
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. }
+            | SessionState::RemoteDisconnected { .. } => {
+                unreachable!("terminal state was rejected")
+            }
+        };
         let vars = SessionVariables {
             user_vars: &self.user_vars,
             autocommit: self.autocommit,
             read_only: read_only_ctx,
+            isolation,
             max_allowed_packet: self.max_allowed_packet,
         };
 
         let outcome = match &mut self.state {
-            SessionState::Idle => self.backend.server().dispatch_bound(
-                bound,
-                &catalog,
-                ExecMode::Autocommit,
-                &vars,
-                &self.principal,
-            ),
+            SessionState::Idle => {
+                if isolation == IsolationLevel::Serializable && is_write(execution_target) {
+                    let ticket = self.backend.server().txn_manager.pin_serializable()?;
+                    self.next_txn_isolation = None;
+                    let tracker = Arc::new(ReadTracker::default());
+                    self.backend.server().dispatch_bound(
+                        bound,
+                        &catalog,
+                        ExecMode::Autocommit {
+                            tracker: Some(Arc::clone(&tracker)),
+                            // `commit_or_buffer` consumes the ticket during the commit path.
+                            serializable_ticket: Some(ticket),
+                        },
+                        &vars,
+                        &self.principal,
+                    )
+                } else {
+                    self.next_txn_isolation = None;
+                    self.backend.server().dispatch_bound(
+                        bound,
+                        &catalog,
+                        ExecMode::Autocommit {
+                            tracker: None,
+                            serializable_ticket: None,
+                        },
+                        &vars,
+                        &self.principal,
+                    )
+                }
+            }
             SessionState::InTxn(open_txn) => {
                 if let Some(reason) = &open_txn.poisoned {
                     return Err(HtapError::Conflict(reason.clone()));
@@ -1254,9 +1330,20 @@ impl Session {
                             .into(),
                     ));
                 }
+                debug_assert!(
+                    open_txn.isolation != IsolationLevel::Serializable
+                        || open_txn.read_only
+                        || open_txn.read_tracker.is_some(),
+                    "serializable read-write transaction must have a read tracker"
+                );
+                let reads_mode = match open_txn.read_tracker.as_deref() {
+                    Some(tracker) => ReadsMode::Tracked(tracker),
+                    None => ReadsMode::Untracked,
+                };
                 let mode = ExecMode::Txn {
                     snapshot: open_txn.snapshot,
                     write_set: &mut open_txn.write_set,
+                    reads_mode,
                 };
                 self.backend
                     .server()
@@ -1303,10 +1390,11 @@ impl Session {
         self.begin_guarded_prelude()?;
 
         let mut explicit_read_only: Option<bool> = None;
+        let mut explicit_isolation = None;
         for mode in modes {
             match mode {
                 TransactionMode::IsolationLevel(level) => {
-                    validate_isolation_level(&level.to_string())?;
+                    explicit_isolation = Some(parse_isolation_level(&level.to_string())?);
                 }
                 TransactionMode::AccessMode(TransactionAccessMode::ReadOnly) => {
                     explicit_read_only = Some(true);
@@ -1316,19 +1404,23 @@ impl Session {
                 }
             }
         }
-        let read_only = match explicit_read_only {
-            Some(read_only) => {
-                self.next_txn_read_only = None;
-                read_only
-            }
-            None => self.next_txn_read_only.take().unwrap_or(false),
-        };
+        let read_only = explicit_read_only
+            .or(self.next_txn_read_only)
+            .unwrap_or(false);
 
         // Pin the new snapshot under `execution_lock` (see `Session::pin_new_txn_locked`).
         // `self.begin_guarded_prelude()` above has already released its own lock by this point
         // (it calls `self.commit()`, which takes and releases `execution_lock` itself), so this
         // does not nest.
-        self.pin_new_txn_locked(read_only);
+        // Every successful transaction start consumes the one-shot overrides, even when modes
+        // written directly on START TRANSACTION take precedence. Failed serializable pinning
+        // preserves them so retrying the start uses the same requested defaults.
+        let isolation = explicit_isolation
+            .or(self.next_txn_isolation)
+            .unwrap_or(self.isolation);
+        self.pin_new_txn_locked(read_only, isolation)?;
+        self.next_txn_read_only = None;
+        self.next_txn_isolation = None;
 
         Ok(StatementResult::ddl(0))
     }
@@ -1363,14 +1455,17 @@ impl Session {
             }
             Set::SetNames { .. } | Set::SetNamesDefault {} => Ok(StatementResult::ddl(0)),
             Set::SetTransaction {
-                modes, snapshot, ..
+                modes,
+                snapshot,
+                session,
+                ..
             } => {
                 if snapshot.is_some() {
                     return Err(HtapError::Unsupported(
                         "SET TRANSACTION SNAPSHOT is not supported".into(),
                     ));
                 }
-                self.apply_transaction_modes(modes)?;
+                self.apply_transaction_modes(modes, *session)?;
                 Ok(StatementResult::ddl(0))
             }
             other => Err(HtapError::Unsupported(format!(
@@ -1382,10 +1477,15 @@ impl Session {
     /// Applies the modes of a `SET [SESSION] TRANSACTION ...` statement: validates every
     /// isolation level first (so a request with an invalid level changes nothing), then records
     /// any access mode as the pending default for the *next* `BEGIN`/`START TRANSACTION`.
-    fn apply_transaction_modes(&mut self, modes: &[TransactionMode]) -> Result<()> {
+    fn apply_transaction_modes(
+        &mut self,
+        modes: &[TransactionMode],
+        persistent: bool,
+    ) -> Result<()> {
+        let mut isolation = None;
         for mode in modes {
             if let TransactionMode::IsolationLevel(level) = mode {
-                validate_isolation_level(&level.to_string())?;
+                isolation = Some(parse_isolation_level(&level.to_string())?);
             }
         }
         for mode in modes {
@@ -1397,6 +1497,14 @@ impl Session {
                     self.next_txn_read_only = Some(false);
                 }
                 TransactionMode::IsolationLevel(_) => {}
+            }
+        }
+        if let Some(isolation) = isolation {
+            if persistent {
+                self.isolation = isolation;
+                self.next_txn_isolation = None;
+            } else {
+                self.next_txn_isolation = Some(isolation);
             }
         }
         Ok(())
@@ -1415,18 +1523,31 @@ impl Session {
                 self.user_vars.insert(var_name, value);
                 Ok(())
             }
-            SetTarget::SystemVar { scope, name } => match classify_set_target(scope, &name)? {
+            SetTarget::SystemVar {
+                scope,
+                name,
+                next_transaction,
+            } => match classify_set_target(scope, &name)? {
                 // Amendment A2: MySQL connectors send these unconditionally on connect; accepted
                 // as a no-op without evaluating or validating the right-hand side.
                 SetClass::ReadOnlyNoOp => Ok(()),
-                SetClass::Dynamic => self.apply_dynamic_variable(&name, value),
+                SetClass::Dynamic => self.apply_dynamic_variable(&name, value, next_transaction),
             },
         }
     }
 
     /// Applies an assignment to one of the three dynamic system variables (`autocommit`,
     /// `transaction_isolation`/`tx_isolation`, `transaction_read_only`/`tx_read_only`).
-    fn apply_dynamic_variable(&mut self, name: &str, value_expr: &SqlExpr) -> Result<()> {
+    ///
+    /// `next_transaction` distinguishes MySQL's unscoped `@@transaction_isolation` assignment
+    /// from bare or explicitly session-scoped assignments: the former changes only the next
+    /// transaction, while the latter change the persistent session default.
+    fn apply_dynamic_variable(
+        &mut self,
+        name: &str,
+        value_expr: &SqlExpr,
+        next_transaction: bool,
+    ) -> Result<()> {
         match name.to_ascii_lowercase().as_str() {
             "autocommit" => {
                 let value = self.eval_scalar_expr(value_expr)?;
@@ -1435,10 +1556,13 @@ impl Session {
             }
             "transaction_isolation" | "tx_isolation" => {
                 let value = self.eval_scalar_expr(value_expr)?;
-                // Only one isolation level is ever valid; `transaction_isolation` always
-                // reports it (see `SessionVarsView::transaction_isolation`), so a validated
-                // assignment has nothing further to apply.
-                validate_isolation_level(&value.to_string())?;
+                let isolation = parse_isolation_level(&value.to_string())?;
+                if next_transaction {
+                    self.next_txn_isolation = Some(isolation);
+                } else {
+                    self.isolation = isolation;
+                    self.next_txn_isolation = None;
+                }
                 Ok(())
             }
             "transaction_read_only" | "tx_read_only" => {
@@ -1520,10 +1644,20 @@ impl Session {
             ));
         }
         let read_only = matches!(&self.state, SessionState::InTxn(t) if t.read_only);
+        let isolation = match &self.state {
+            SessionState::InTxn(open_txn) => open_txn.isolation,
+            SessionState::Idle => self.next_txn_isolation.unwrap_or(self.isolation),
+            SessionState::AmbiguousOutcomePending { .. }
+            | SessionState::CommitOutcomePending { .. }
+            | SessionState::RemoteDisconnected { .. } => {
+                unreachable!("terminal state was rejected")
+            }
+        };
         let vars = SessionVariables {
             user_vars: &self.user_vars,
             autocommit: self.autocommit,
             read_only,
+            isolation,
             max_allowed_packet: self.max_allowed_packet,
         };
         let eval_ctx = htap_sql::eval_context! {
@@ -1666,6 +1800,49 @@ impl Session {
             }
         }
 
+        let serializable_state = match &open_txn.read_tracker {
+            Some(tracker) => {
+                if tracker.table_partition_change_observed() {
+                    self.state = SessionState::Idle;
+                    self.backend.server().unregister_pinned_snapshot(self.id);
+                    return Err(HtapError::Conflict(
+                        "serialization failure (catalog changed): table partition topology \
+                         changed during transaction"
+                            .into(),
+                    ));
+                }
+
+                let footprint = tracker.clone_footprint();
+                let table_partitions = tracker.clone_table_partitions();
+                for (table_id, expected_partitions) in &table_partitions {
+                    let Some(table) = catalog.table(TableId::new(*table_id)) else {
+                        self.state = SessionState::Idle;
+                        self.backend.server().unregister_pinned_snapshot(self.id);
+                        return Err(HtapError::Conflict(format!(
+                            "serialization failure (catalog changed): table {table_id} was dropped"
+                        )));
+                    };
+                    let mut current_partitions = table
+                        .partitions
+                        .iter()
+                        .map(|partition_id| partition_id.as_u64())
+                        .collect::<Vec<_>>();
+                    current_partitions.sort_unstable();
+                    current_partitions.dedup();
+                    if current_partitions != *expected_partitions {
+                        self.state = SessionState::Idle;
+                        self.backend.server().unregister_pinned_snapshot(self.id);
+                        return Err(HtapError::Conflict(format!(
+                            "serialization failure (catalog changed): table {table_id} partition \
+                             topology changed"
+                        )));
+                    }
+                }
+                Some((footprint, table_partitions))
+            }
+            None => None,
+        };
+
         let mutations = open_txn.write_set.all_mutations();
         // `encode_payload`/`next_txn_id` failures are infrastructure (payload size was already
         // enforced incrementally by `WriteSet::try_merge`; `next_txn_id` only fails on `u64`
@@ -1696,14 +1873,34 @@ impl Session {
 
         // Decision point: every pre-decision step above succeeded, so the open transaction is
         // now committed to this one attempt and removed from session state.
-        let open_txn = match std::mem::replace(&mut self.state, SessionState::Idle) {
+        let mut open_txn = match std::mem::replace(&mut self.state, SessionState::Idle) {
             SessionState::InTxn(open_txn) => open_txn,
             _ => unreachable!(
                 "self.state was InTxn just above and execution_lock excludes concurrent access"
             ),
         };
 
-        let mut txn = Transaction::new(txn_id, open_txn.snapshot.version);
+        let mut txn = match serializable_state {
+            Some((footprint, _)) => {
+                let ticket = match open_txn.serializable_ticket.take() {
+                    Some(ticket) => ticket,
+                    None => {
+                        self.backend.server().unregister_pinned_snapshot(self.id);
+                        return Err(HtapError::Internal(
+                            "serializable transaction is missing its snapshot ticket".into(),
+                        ));
+                    }
+                };
+                match Transaction::new_serializable(txn_id, ticket, footprint) {
+                    Ok(txn) => txn,
+                    Err(error) => {
+                        self.backend.server().unregister_pinned_snapshot(self.id);
+                        return Err(error);
+                    }
+                }
+            }
+            None => Transaction::new(txn_id, open_txn.snapshot.version),
+        };
         txn.set_request(request);
         match self.backend.server().txn_manager.commit(&mut txn) {
             Ok(_) => {
@@ -1739,6 +1936,9 @@ impl Session {
                 blocking_txn,
                 reason,
             }) => {
+                if let Some((ticket, _footprint)) = txn.take_serializable_context() {
+                    open_txn.serializable_ticket = Some(ticket);
+                }
                 self.state = SessionState::InTxn(open_txn);
                 Err(HtapError::RecoveryRequired {
                     blocking_txn,
@@ -1862,7 +2062,29 @@ impl Session {
         self.user_vars.clear();
         self.autocommit = true;
         self.next_txn_read_only = None;
+        self.isolation = IsolationLevel::RepeatableRead;
+        self.next_txn_isolation = None;
         Ok(())
+    }
+
+    /// Returns a summary of the open transaction's tracked read footprint.
+    #[doc(hidden)]
+    pub fn open_transaction_read_footprint(&self) -> Option<crate::ReadFootprintSummary> {
+        match &self.state {
+            SessionState::InTxn(open_txn) => match &open_txn.read_tracker {
+                Some(tracker) => Some(tracker.summary()),
+                None => Some(crate::ReadFootprintSummary {
+                    point_key_counts: BTreeMap::new(),
+                    whole_partitions: BTreeSet::new(),
+                    table_partitions: BTreeMap::new(),
+                }),
+            },
+            _ => Some(crate::ReadFootprintSummary {
+                point_key_counts: BTreeMap::new(),
+                whole_partitions: BTreeSet::new(),
+                table_partitions: BTreeMap::new(),
+            }),
+        }
     }
 }
 
@@ -1886,6 +2108,7 @@ struct SessionVariables<'a> {
     user_vars: &'a BTreeMap<String, Value>,
     autocommit: bool,
     read_only: bool,
+    isolation: IsolationLevel,
     max_allowed_packet: u64,
 }
 
@@ -1901,6 +2124,10 @@ impl VariableLookup for SessionVariables<'_> {
 impl SessionVarsView for SessionVariables<'_> {
     fn autocommit(&self) -> bool {
         self.autocommit
+    }
+
+    fn transaction_isolation(&self) -> IsolationLevel {
+        self.isolation
     }
 
     fn transaction_read_only(&self) -> bool {
@@ -1932,6 +2159,10 @@ impl SessionVarsView for DefaultVariables {
         true
     }
 
+    fn transaction_isolation(&self) -> IsolationLevel {
+        IsolationLevel::RepeatableRead
+    }
+
     fn transaction_read_only(&self) -> bool {
         false
     }
@@ -1942,8 +2173,14 @@ enum SetTarget {
     /// `@name` (user variable).
     UserVar(String),
     /// A system variable: `name` (bare, scope from `SET [SESSION|GLOBAL]`), `@@name`
-    /// (session-scoped), or `@@session.name`/`@@global.name`.
-    SystemVar { scope: SetScope, name: String },
+    /// (next-transaction isolation scope), or `@@session.name`/`@@global.name`.
+    SystemVar {
+        scope: SetScope,
+        name: String,
+        /// Whether an unscoped `@@transaction_isolation` assignment applies only to the next
+        /// transaction. Bare names and explicit `SESSION`/`LOCAL` scopes remain persistent.
+        next_transaction: bool,
+    },
 }
 
 /// Classifies a `SET` assignment target from its raw scope modifier (`SET SESSION x = ...`) and
@@ -1961,6 +2198,7 @@ fn classify_object_name(scope: Option<ContextModifier>, name: &ObjectName) -> Re
             Ok(SetTarget::SystemVar {
                 scope: scope_from_context_modifier(scope)?,
                 name: rest.to_string(),
+                next_transaction: scope.is_none(),
             })
         }
         [one] if one.starts_with('@') => {
@@ -1986,11 +2224,13 @@ fn classify_object_name(scope: Option<ContextModifier>, name: &ObjectName) -> Re
             Ok(SetTarget::SystemVar {
                 scope: resolved_scope,
                 name: name_part.clone(),
+                next_transaction: false,
             })
         }
         [one] => Ok(SetTarget::SystemVar {
             scope: scope_from_context_modifier(scope)?,
             name: one.clone(),
+            next_transaction: false,
         }),
         _ => Err(HtapError::Unsupported(format!(
             "unsupported SET target '{name}'"
@@ -2082,6 +2322,8 @@ impl OwnedServer {
             user_vars: BTreeMap::new(),
             autocommit: true,
             next_txn_read_only: None,
+            isolation: IsolationLevel::RepeatableRead,
+            next_txn_isolation: None,
             max_allowed_packet: DEFAULT_MAX_ALLOWED_PACKET,
         }
     }

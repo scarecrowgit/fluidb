@@ -125,6 +125,13 @@ impl Transaction {
         &self.participants
     }
 
+    /// Takes the serializable ticket and read footprint, if this is a serializable transaction.
+    pub fn take_serializable_context(&mut self) -> Option<(SerializableTicket, ReadFootprint)> {
+        self.serializable
+            .take()
+            .map(|context| (context.ticket, context.footprint))
+    }
+
     /// Register a participant with its opaque mutation payload.
     pub fn add_participant(
         &mut self,

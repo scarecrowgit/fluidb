@@ -1616,7 +1616,7 @@ fn test_set_transaction_isolation_level_rejects_unsupported_level() {
         .unwrap();
 
     let err2 = session
-        .execute("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+        .execute("BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;")
         .unwrap_err();
     assert!(matches!(err2, HtapError::Unsupported(_)));
     assert!(!session.in_transaction());

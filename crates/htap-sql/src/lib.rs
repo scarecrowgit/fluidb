@@ -45,6 +45,7 @@ pub use query::{
 pub use result::{CommandResult, QueryResult, StatementResult};
 pub use route::{classify_route, Route};
 pub use variables::{
-    classify_set_target, parse_autocommit_value, system_variable_value, validate_isolation_level,
-    SessionVarsView, SetClass, SetScope, DEFAULT_MAX_ALLOWED_PACKET, REPORTED_VERSION,
+    classify_set_target, parse_autocommit_value, parse_isolation_level, system_variable_value,
+    validate_isolation_level, IsolationLevel, SessionVarsView, SetClass, SetScope,
+    DEFAULT_MAX_ALLOWED_PACKET, REPORTED_VERSION,
 };

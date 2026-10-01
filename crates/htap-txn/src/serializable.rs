@@ -111,6 +111,22 @@ impl ReadFootprint {
         self.partitions.is_empty()
     }
 
+    /// Summarizes point-key counts and whole-partition reads by partition.
+    pub fn summarize(&self) -> (BTreeMap<u64, usize>, BTreeSet<u64>) {
+        let mut point_counts = BTreeMap::new();
+        let mut whole_partitions = BTreeSet::new();
+
+        for (&partition_id, footprint) in &self.partitions {
+            if footprint.partition {
+                whole_partitions.insert(partition_id);
+            } else {
+                point_counts.insert(partition_id, footprint.points.len());
+            }
+        }
+
+        (point_counts, whole_partitions)
+    }
+
     fn promote_if_needed(&mut self, partition_id: u64) {
         let entry = self
             .partitions

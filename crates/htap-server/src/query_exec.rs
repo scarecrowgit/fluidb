@@ -263,6 +263,8 @@ pub(crate) struct ExecContext<'a> {
     /// Open transaction's buffered write set to overlay below relational operators, or `None`
     /// in autocommit mode (byte-for-byte the pre-Phase-10 read path).
     pub write_set: Option<&'a WriteSet>,
+    /// Optional serializable read tracker shared by all storage reads in this statement.
+    pub tracker: Option<&'a crate::ReadTracker>,
     /// Source of values for `@name`/`@@name` expressions (Phase 10 task 7): the session's user
     /// variables and live state, or [`crate::session::DefaultVariables`] when there is no
     /// session (`LocalServer::execute`).
@@ -315,6 +317,8 @@ pub(crate) struct ExecuteQueryInput<'a> {
     pub snapshot: Snapshot,
     /// Optional transactional writes to overlay on query reads.
     pub write_set: Option<&'a WriteSet>,
+    /// Optional serializable read tracker shared by all storage reads in this statement.
+    pub tracker: Option<&'a crate::ReadTracker>,
     /// Optional session variable lookup for expression evaluation.
     pub variables: Option<&'a dyn VariableLookup>,
     /// Selects whether the optimizer is applied before execution.
@@ -332,6 +336,7 @@ pub(crate) fn execute_query(
     catalog: &CatalogSnapshot,
     snapshot: Snapshot,
     write_set: Option<&WriteSet>,
+    tracker: Option<&crate::ReadTracker>,
     variables: Option<&dyn VariableLookup>,
 ) -> Result<StatementResult> {
     execute_query_with_mode(ExecuteQueryInput {
@@ -340,6 +345,7 @@ pub(crate) fn execute_query(
         catalog,
         snapshot,
         write_set,
+        tracker,
         variables,
         optimization_mode: OptimizationMode::default(),
         memory_budget: server.query_memory_budget.load(Ordering::Relaxed),
@@ -360,6 +366,7 @@ pub(crate) fn execute_query_with_mode(input: ExecuteQueryInput<'_>) -> Result<St
         catalog,
         snapshot,
         write_set,
+        tracker,
         variables,
         optimization_mode,
         memory_budget,
@@ -370,6 +377,7 @@ pub(crate) fn execute_query_with_mode(input: ExecuteQueryInput<'_>) -> Result<St
         catalog,
         snapshot,
         write_set,
+        tracker,
         variables,
         working_rows: None,
         working_width: 0,
@@ -797,6 +805,7 @@ fn run_query_with_outer_prepared(
                     catalog: ctx.catalog,
                     snapshot: ctx.snapshot,
                     write_set: ctx.write_set,
+                    tracker: ctx.tracker,
                     variables: ctx.variables,
                     working_rows: Some(&working),
                     working_width: output_columns.len(),
@@ -3423,9 +3432,9 @@ pub(crate) fn scan_base_table(
     slot: usize,
     conjuncts: &[&Expr],
 ) -> Result<Vec<Vec<Value>>> {
-    let (table_desc, partitions) = ctx
-        .server
-        .resolve_table_and_all_partitions(table, ctx.catalog)?;
+    let (table_desc, partitions) =
+        ctx.server
+            .resolve_table_and_all_partitions(table, ctx.catalog, ctx.tracker)?;
     let width = table_desc.schema.len();
     let mut source_columns: BTreeSet<usize> = needed.clone();
     source_columns.extend(table_desc.primary_key.iter().copied());
@@ -3448,6 +3457,7 @@ pub(crate) fn scan_base_table(
             &table_desc.primary_key,
             pushdown.as_ref(),
             ctx.write_set,
+            ctx.tracker,
         )?;
         for row in rows {
             let mut full = vec![Value::Null; width];

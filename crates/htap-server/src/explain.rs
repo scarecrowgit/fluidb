@@ -110,13 +110,23 @@ pub(super) fn execute_explain(
 
 fn mode_for_nested<'a>(mode: &'a mut ExecMode<'_>) -> ExecMode<'a> {
     match mode {
-        ExecMode::Autocommit => ExecMode::Autocommit,
+        ExecMode::Autocommit {
+            tracker,
+            serializable_ticket,
+        } => ExecMode::Autocommit {
+            tracker: tracker.clone(),
+            // EXPLAIN ANALYZE is the statement execution, so move its ticket into the nested mode
+            // to keep tracked reads and the eventual serializable commit on the same snapshot.
+            serializable_ticket: serializable_ticket.take(),
+        },
         ExecMode::Txn {
             snapshot,
             write_set,
+            reads_mode,
         } => ExecMode::Txn {
             snapshot: *snapshot,
             write_set,
+            reads_mode: *reads_mode,
         },
     }
 }

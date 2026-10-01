@@ -15441,19 +15441,29 @@ impl<'a> Parser<'a> {
             }
             .into());
         } else if self.parse_keyword(Keyword::TRANSACTION) {
+            let session_scope = match scope {
+                Some(ContextModifier::Local | ContextModifier::Session) => true,
+                Some(ContextModifier::Global) => {
+                    return self.expected_at(
+                        "SET GLOBAL TRANSACTION is not supported",
+                        self.get_current_index(),
+                    )
+                }
+                None => false,
+            };
             if self.parse_keyword(Keyword::SNAPSHOT) {
                 let snapshot_id = self.parse_value()?;
                 return Ok(Set::SetTransaction {
                     modes: vec![],
                     snapshot: Some(snapshot_id),
-                    session: false,
+                    session: session_scope,
                 }
                 .into());
             }
             return Ok(Set::SetTransaction {
                 modes: self.parse_transaction_modes()?,
                 snapshot: None,
-                session: false,
+                session: session_scope,
             }
             .into());
         } else if self.parse_keyword(Keyword::AUTHORIZATION) {

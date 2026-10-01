@@ -227,21 +227,33 @@ fn constant_value(canonical: &str) -> Value {
     }
 }
 
+/// SQL transaction isolation levels supported by this engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// Snapshot isolation, reported with MySQL's `REPEATABLE-READ` spelling.
+    RepeatableRead,
+    /// Serializable snapshot isolation with read-dependency validation.
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// Returns the MySQL system-variable spelling for this level.
+    pub const fn as_system_variable(self) -> &'static str {
+        match self {
+            Self::RepeatableRead => "REPEATABLE-READ",
+            Self::Serializable => "SERIALIZABLE",
+        }
+    }
+}
+
 /// Live per-session state needed to answer dynamic system variables.
 ///
 /// Implemented by `htap_server::Session` (Phase 10, task 7).
 pub trait SessionVarsView {
     /// Current `autocommit` setting.
     fn autocommit(&self) -> bool;
-    /// Isolation level reported for `transaction_isolation` / `tx_isolation`. Always
-    /// `"REPEATABLE-READ"` today: this engine offers snapshot isolation and rejects any other
-    /// requested level (see [`validate_isolation_level`]) rather than silently downgrading, so
-    /// there is never another value to report. Exposed through the trait, rather than
-    /// hard-coded in [`system_variable_value`], so a future isolation level does not need a
-    /// registry change.
-    fn transaction_isolation(&self) -> &'static str {
-        "REPEATABLE-READ"
-    }
+    /// Isolation level currently reported for `transaction_isolation` / `tx_isolation`.
+    fn transaction_isolation(&self) -> IsolationLevel;
     /// Whether the current/next transaction is read-only (`transaction_read_only` /
     /// `tx_read_only`).
     fn transaction_read_only(&self) -> bool;
@@ -258,7 +270,9 @@ pub trait SessionVarsView {
 fn dynamic_value(canonical: &str, session: &dyn SessionVarsView) -> Value {
     match canonical {
         "autocommit" => Value::Int64(session.autocommit() as i64),
-        "transaction_isolation" => Value::String(session.transaction_isolation().to_string()),
+        "transaction_isolation" => {
+            Value::String(session.transaction_isolation().as_system_variable().into())
+        }
         "transaction_read_only" => Value::Int64(session.transaction_read_only() as i64),
         "max_allowed_packet" => Value::Int64(session.max_allowed_packet() as i64),
         other => unreachable!("dynamic_value called for non-dynamic variable '{other}'"),
@@ -327,21 +341,42 @@ pub fn classify_set_target(scope: SetScope, name: &str) -> Result<SetClass> {
     })
 }
 
-/// Validates a `[SESSION] TRANSACTION ISOLATION LEVEL <level>` request (`BEGIN`/`SET`).
+/// Parses a `[SESSION] TRANSACTION ISOLATION LEVEL <level>` request (`BEGIN`/`SET`).
 ///
-/// Only `REPEATABLE READ` is accepted (case-insensitive, `-` or ` ` as the separator word):
-/// this engine offers snapshot isolation and reports it as `REPEATABLE READ`; weaker or
-/// stronger levels are rejected rather than silently downgraded or upgraded.
-pub fn validate_isolation_level(level: &str) -> Result<()> {
-    let normalized = level.trim().to_ascii_uppercase().replace('-', " ");
-    if normalized == "REPEATABLE READ" {
-        Ok(())
-    } else {
-        Err(HtapError::Unsupported(format!(
-            "isolation level '{}' is not supported; this engine offers snapshot isolation, reported as REPEATABLE READ",
-            level.trim()
-        )))
+/// Accepted names are case-insensitive. `REPEATABLE READ` also accepts `_` and `-` separators,
+/// and either level may be enclosed in single or double quotes. Unsupported levels are rejected
+/// rather than silently upgraded or downgraded.
+pub fn parse_isolation_level(level: &str) -> Result<IsolationLevel> {
+    let trimmed = level.trim();
+    let unquoted = trimmed
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(trimmed);
+    let normalized = unquoted
+        .trim()
+        .to_ascii_uppercase()
+        .replace(['-', '_'], " ");
+
+    match normalized.as_str() {
+        "REPEATABLE READ" => Ok(IsolationLevel::RepeatableRead),
+        "SERIALIZABLE" => Ok(IsolationLevel::Serializable),
+        _ => Err(HtapError::Unsupported(format!(
+            "isolation level '{}' is not supported; supported levels are REPEATABLE READ and SERIALIZABLE",
+            trimmed
+        ))),
     }
+}
+
+/// Validates a transaction isolation level.
+///
+/// Retained as a compatibility wrapper; new callers should use [`parse_isolation_level`].
+pub fn validate_isolation_level(level: &str) -> Result<()> {
+    parse_isolation_level(level).map(|_| ())
 }
 
 fn invalid_autocommit(value: &Value) -> HtapError {
@@ -382,6 +417,10 @@ mod tests {
         fn autocommit(&self) -> bool {
             self.autocommit
         }
+        fn transaction_isolation(&self) -> IsolationLevel {
+            IsolationLevel::RepeatableRead
+        }
+
         fn transaction_read_only(&self) -> bool {
             self.read_only
         }
@@ -462,6 +501,9 @@ mod tests {
             fn autocommit(&self) -> bool {
                 true
             }
+            fn transaction_isolation(&self) -> IsolationLevel {
+                IsolationLevel::RepeatableRead
+            }
             fn transaction_read_only(&self) -> bool {
                 false
             }
@@ -516,14 +558,27 @@ mod tests {
 
     #[test]
     fn isolation_level_validation() {
-        assert!(validate_isolation_level("REPEATABLE READ").is_ok());
-        assert!(validate_isolation_level("repeatable-read").is_ok());
-        assert!(validate_isolation_level("  Repeatable Read  ").is_ok());
-        let err = validate_isolation_level("READ COMMITTED").unwrap_err();
+        assert!(parse_isolation_level("REPEATABLE READ").is_ok());
+        assert!(parse_isolation_level("repeatable-read").is_ok());
+        assert!(parse_isolation_level("  Repeatable Read  ").is_ok());
+        let err = parse_isolation_level("READ COMMITTED").unwrap_err();
         assert!(matches!(err, HtapError::Unsupported(_)));
-        assert!(err.to_string().contains("snapshot isolation"));
-        assert!(validate_isolation_level("SERIALIZABLE").is_err());
-        assert!(validate_isolation_level("READ UNCOMMITTED").is_err());
+        assert!(err
+            .to_string()
+            .contains("supported levels are REPEATABLE READ and SERIALIZABLE"));
+        assert!(parse_isolation_level("READ UNCOMMITTED").is_err());
+    }
+
+    #[test]
+    fn parse_isolation_level_accepts_serializable_and_repeatable_read_only() {
+        assert_eq!(
+            parse_isolation_level("SERIALIZABLE").unwrap(),
+            IsolationLevel::Serializable
+        );
+        assert_eq!(
+            parse_isolation_level("REPEATABLE READ").unwrap(),
+            IsolationLevel::RepeatableRead
+        );
     }
 
     #[test]

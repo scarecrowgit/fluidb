@@ -62,8 +62,8 @@ use htap_sql::expr::VariableLookup;
 use htap_sql::result::StatementResult;
 use htap_sql::route::{classify_route, Route};
 use htap_txn::{
-    ParticipantId, ParticipantWork, RowstoreParticipant, Transaction, TransactionManager,
-    TransactionRequest,
+    ParticipantId, ParticipantWork, ReadFootprint, RowstoreParticipant, SerializableTicket,
+    Transaction, TransactionManager, TransactionRequest,
 };
 use parking_lot::Mutex;
 pub use query_exec::OptimizationMode;
@@ -277,37 +277,172 @@ impl std::fmt::Debug for LocalServer {
     }
 }
 
-/// Read/write context for [`LocalServer::dispatch_bound`]: either an autocommit statement, where
-/// each write commits its own 2PC transaction immediately exactly as before Phase 10, or one
-/// statement inside an open [`Session`] transaction, where reads observe a pinned snapshot
-/// overlaid with the session's buffered write set and writes are buffered into it rather than
-/// committed.
+/// Summary of serializable read dependencies recorded for an open transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadFootprintSummary {
+    /// Number of distinct point-read keys recorded for each partition.
+    pub point_key_counts: std::collections::BTreeMap<u64, usize>,
+    /// Partitions read in their entirety.
+    pub whole_partitions: std::collections::BTreeSet<u64>,
+    /// Partition sets resolved for each logical table.
+    pub table_partitions: std::collections::BTreeMap<u64, Vec<u64>>,
+}
+
+/// Serializable-read metadata accumulated for one transaction.
+///
+/// The footprint records the physical reads used by validation. The table map preserves the
+/// partition set resolved for each logical table before pruning so topology changes can be
+/// validated separately at commit time.
+#[derive(Debug, Default)]
+pub(crate) struct ReadTracker {
+    footprint: Mutex<ReadFootprint>,
+    table_partitions: Mutex<std::collections::BTreeMap<u64, Vec<u64>>>,
+    table_partition_change_observed: Mutex<bool>,
+}
+
+impl ReadTracker {
+    /// Records a point read, including an absent key and a key satisfied by a write-set overlay.
+    pub(crate) fn record_point(&self, partition_id: u64, key: &[u8]) {
+        self.footprint
+            .lock()
+            .record_point(partition_id, key.to_vec());
+    }
+
+    /// Records a whole-partition read before storage and write-set overlay processing.
+    pub(crate) fn record_partition(&self, partition_id: u64) {
+        self.footprint.lock().record_partition(partition_id);
+    }
+
+    /// Records the first sorted partition set resolved for a logical table.
+    ///
+    /// A later differing set is not allowed to overwrite the original; instead, the tracker
+    /// remembers that a catalog topology change was observed for commit-time validation.
+    pub(crate) fn record_table_partitions(&self, table_id: u64, mut partition_ids: Vec<u64>) {
+        partition_ids.sort_unstable();
+        partition_ids.dedup();
+
+        let changed = {
+            let mut table_partitions = self.table_partitions.lock();
+            match table_partitions.entry(table_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(partition_ids);
+                    false
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    entry.get() != &partition_ids
+                }
+            }
+        };
+        if changed {
+            *self.table_partition_change_observed.lock() = true;
+        }
+    }
+
+    /// Returns whether differing partition sets were observed for the same logical table.
+    pub(crate) fn table_partition_change_observed(&self) -> bool {
+        *self.table_partition_change_observed.lock()
+    }
+
+    /// Returns a summary of the current validation footprint and resolved table partition sets
+    /// without consuming the recorded reads.
+    pub fn summary(&self) -> ReadFootprintSummary {
+        let footprint = self.footprint.lock();
+        let table_partitions = self.table_partitions.lock();
+        let (point_key_counts, whole_partitions) = footprint.summarize();
+        ReadFootprintSummary {
+            point_key_counts,
+            whole_partitions,
+            table_partitions: table_partitions.clone(),
+        }
+    }
+
+    /// Returns a clone of the current validation footprint without consuming recorded reads.
+    pub fn clone_footprint(&self) -> ReadFootprint {
+        self.footprint.lock().clone()
+    }
+
+    /// Returns a clone of the resolved table partition sets without consuming them.
+    pub fn clone_table_partitions(&self) -> std::collections::BTreeMap<u64, Vec<u64>> {
+        self.table_partitions.lock().clone()
+    }
+
+    /// Extracts the current validation footprint and resolved table partition sets.
+    pub fn extract(&self) -> (ReadFootprint, std::collections::BTreeMap<u64, Vec<u64>>) {
+        (
+            std::mem::take(&mut *self.footprint.lock()),
+            std::mem::take(&mut *self.table_partitions.lock()),
+        )
+    }
+}
+
+/// Read-side state supplied to storage primitives.
+pub(crate) struct ReadView<'a> {
+    pub(crate) snapshot: Snapshot,
+    pub(crate) write_set: Option<&'a WriteSet>,
+    pub(crate) tracker: Option<&'a ReadTracker>,
+}
+
+/// Selects whether an open transaction records serializable read dependencies.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadsMode<'a> {
+    /// Snapshot-isolation and read-only transactions retain no serializable read metadata.
+    Untracked,
+    /// Serializable read/write transaction with dependency tracking enabled.
+    Tracked(&'a ReadTracker),
+}
+
+/// Read/write context for [`LocalServer::dispatch_bound`].
 ///
 /// Always constructed and consumed with `LocalServer::execution_lock` already held by the caller
 /// (Phase 10 plan amendment A1); [`LocalServer::dispatch_bound`] never re-locks.
 enum ExecMode<'a> {
     /// Every write commits immediately through `TransactionManager::commit_request`.
-    Autocommit,
+    Autocommit {
+        /// Optional tracker for an explicitly tracked serializable autocommit execution.
+        tracker: Option<Arc<ReadTracker>>,
+        /// Serializable snapshot ticket acquired before statement reads begin.
+        ///
+        /// This is present exactly when `tracker` is present.
+        serializable_ticket: Option<SerializableTicket>,
+    },
     /// Part of an open session transaction.
     Txn {
         /// MVCC snapshot pinned when the transaction began.
         snapshot: Snapshot,
         /// The transaction's accumulated write set; writes merge into it instead of committing.
         write_set: &'a mut WriteSet,
+        /// Explicitly selects whether this transaction records serializable reads.
+        reads_mode: ReadsMode<'a>,
     },
 }
 
 impl ExecMode<'_> {
-    /// Read-side view: the MVCC snapshot to read at, and the write set to overlay below
-    /// relational operators (`None` in autocommit mode, which is byte-for-byte the pre-Phase-10
-    /// read path).
-    fn read_view(&self, server: &OwnedServer) -> (Snapshot, Option<&WriteSet>) {
+    /// Returns the MVCC snapshot, write-set overlay, and optional serializable read tracker.
+    fn read_view(&self, server: &OwnedServer) -> ReadView<'_> {
         match self {
-            ExecMode::Autocommit => (Snapshot::new(server.txn_manager.visible_version()), None),
+            ExecMode::Autocommit {
+                tracker,
+                serializable_ticket,
+            } => ReadView {
+                snapshot: Snapshot::new(serializable_ticket.as_ref().map_or_else(
+                    || server.txn_manager.visible_version(),
+                    SerializableTicket::snapshot,
+                )),
+                write_set: None,
+                tracker: tracker.as_deref(),
+            },
             ExecMode::Txn {
                 snapshot,
                 write_set,
-            } => (*snapshot, Some(&**write_set)),
+                reads_mode,
+            } => ReadView {
+                snapshot: *snapshot,
+                write_set: Some(&**write_set),
+                tracker: match reads_mode {
+                    ReadsMode::Untracked => None,
+                    ReadsMode::Tracked(tracker) => Some(*tracker),
+                },
+            },
         }
     }
 }
@@ -1709,7 +1844,10 @@ impl OwnedServer {
         self.dispatch_bound(
             bound,
             &catalog,
-            ExecMode::Autocommit,
+            ExecMode::Autocommit {
+                tracker: None,
+                serializable_ticket: None,
+            },
             &DefaultVariables,
             &Principal::Superuser,
         )
@@ -1763,6 +1901,7 @@ impl OwnedServer {
             catalog: &catalog,
             snapshot: Snapshot::new(self.txn_manager.visible_version()),
             write_set: None,
+            tracker: None,
             variables: Some(&DefaultVariables),
             optimization_mode,
             memory_budget,
@@ -1787,7 +1926,8 @@ impl OwnedServer {
         table_name: &str,
         catalog: &CatalogSnapshot,
     ) -> Result<StatementResult> {
-        let (table, partitions) = self.resolve_table_and_all_partitions(table_name, catalog)?;
+        let (table, partitions) =
+            self.resolve_table_and_all_partitions(table_name, catalog, None)?;
         let table_id = table.id;
         let snapshot = Snapshot::new(self.txn_manager.visible_version());
         let source_columns: Vec<usize> = (0..table.schema.len()).collect();
@@ -1809,6 +1949,7 @@ impl OwnedServer {
                 snapshot,
                 &source_columns,
                 &table.primary_key,
+                None,
                 None,
                 None,
             )?;
@@ -1900,7 +2041,7 @@ impl OwnedServer {
                 if let InsertSource::Query { query, .. } = &insert.source {
                     for slot in Self::general_base_tables(query.as_ref())? {
                         let (_, partitions) =
-                            self.resolve_table_and_all_partitions(&slot, catalog)?;
+                            self.resolve_table_and_all_partitions(&slot, catalog, None)?;
                         for partition in partitions {
                             let _route = classify_route(
                                 &BoundStatement::Query(query.clone()),
@@ -1929,6 +2070,16 @@ impl OwnedServer {
                 let table_desc = self.resolve_table(&delete.table, catalog)?;
                 match &delete.target {
                     DeleteTarget::PrimaryKey(key_values) => {
+                        if let Some(tracker) = mode.read_view(self).tracker {
+                            tracker.record_table_partitions(
+                                table_desc.id.as_u64(),
+                                table_desc
+                                    .partitions
+                                    .iter()
+                                    .map(|partition_id| partition_id.as_u64())
+                                    .collect(),
+                            );
+                        }
                         let partition_id =
                             self.route_pk_to_partition(table_desc, key_values, catalog)?;
                         let partition =
@@ -1950,8 +2101,12 @@ impl OwnedServer {
                         )
                     }
                     DeleteTarget::Filter(filter) => {
-                        let (_, partitions) =
-                            self.resolve_table_and_all_partitions(&delete.table, catalog)?;
+                        let read_view = mode.read_view(self);
+                        let (_, partitions) = self.resolve_table_and_all_partitions(
+                            &delete.table,
+                            catalog,
+                            read_view.tracker,
+                        )?;
                         for partition in &partitions {
                             let _route = classify_route(
                                 &BoundStatement::Delete(delete.clone()),
@@ -1971,6 +2126,16 @@ impl OwnedServer {
             }
             BoundStatement::Select(select) => {
                 let table_desc = self.resolve_table(&select.table, catalog)?;
+                if let Some(tracker) = mode.read_view(self).tracker {
+                    tracker.record_table_partitions(
+                        table_desc.id.as_u64(),
+                        table_desc
+                            .partitions
+                            .iter()
+                            .map(|partition_id| partition_id.as_u64())
+                            .collect(),
+                    );
+                }
                 let partition_id = self.route_pk_to_partition(table_desc, &select.key, catalog)?;
                 let partition = self.validate_partition(table_desc, partition_id, catalog)?;
                 let route =
@@ -1982,8 +2147,12 @@ impl OwnedServer {
                 self.execute_select(select, table_desc, partition.id, key, &mode)
             }
             BoundStatement::AnalyticSelect(select) => {
-                let (table_desc, partitions) =
-                    self.resolve_table_and_all_partitions(&select.table, catalog)?;
+                let read_view = mode.read_view(self);
+                let (table_desc, partitions) = self.resolve_table_and_all_partitions(
+                    &select.table,
+                    catalog,
+                    read_view.tracker,
+                )?;
                 for partition in &partitions {
                     let _route = classify_route(
                         &BoundStatement::AnalyticSelect(select.clone()),
@@ -2002,8 +2171,10 @@ impl OwnedServer {
             BoundStatement::Query(query) => {
                 // Every base slot must be a known table; storage descriptors of all
                 // partitions are accepted (rowstore, columnar, converting).
+                let read_view = mode.read_view(self);
                 for slot in Self::general_base_tables(query.as_ref())? {
-                    let (_, partitions) = self.resolve_table_and_all_partitions(&slot, catalog)?;
+                    let (_, partitions) =
+                        self.resolve_table_and_all_partitions(&slot, catalog, read_view.tracker)?;
                     for partition in partitions {
                         let _route = classify_route(
                             &BoundStatement::Query(query.clone()),
@@ -2011,13 +2182,13 @@ impl OwnedServer {
                         )?;
                     }
                 }
-                let (snapshot, write_set) = mode.read_view(self);
                 query_exec::execute_query(
                     self,
                     query.as_ref(),
                     catalog,
-                    snapshot,
-                    write_set,
+                    read_view.snapshot,
+                    read_view.write_set,
+                    read_view.tracker,
                     Some(variables),
                 )
             }
@@ -2025,6 +2196,16 @@ impl OwnedServer {
                 let table_desc = self.resolve_table(&update.table, catalog)?;
                 match &update.target {
                     UpdateTarget::PrimaryKey(key_values) => {
+                        if let Some(tracker) = mode.read_view(self).tracker {
+                            tracker.record_table_partitions(
+                                table_desc.id.as_u64(),
+                                table_desc
+                                    .partitions
+                                    .iter()
+                                    .map(|partition_id| partition_id.as_u64())
+                                    .collect(),
+                            );
+                        }
                         let partition_id =
                             self.route_pk_to_partition(table_desc, key_values, catalog)?;
                         let partition =
@@ -2047,8 +2228,12 @@ impl OwnedServer {
                         )
                     }
                     UpdateTarget::Filter(filter) => {
-                        let (_, partitions) =
-                            self.resolve_table_and_all_partitions(&update.table, catalog)?;
+                        let read_view = mode.read_view(self);
+                        let (_, partitions) = self.resolve_table_and_all_partitions(
+                            &update.table,
+                            catalog,
+                            read_view.tracker,
+                        )?;
                         for partition in &partitions {
                             let _route = classify_route(
                                 &BoundStatement::Update(update.clone()),
@@ -2763,6 +2948,7 @@ impl OwnedServer {
         &self,
         table_name: &str,
         catalog: &'a CatalogSnapshot,
+        tracker: Option<&ReadTracker>,
     ) -> Result<(&'a TableDescriptor, Vec<&'a PartitionDescriptor>)> {
         let table_desc = self.resolve_table(table_name, catalog)?;
         let partitions = table_desc
@@ -2770,6 +2956,16 @@ impl OwnedServer {
             .iter()
             .map(|&pid| self.validate_partition(table_desc, pid, catalog))
             .collect::<Result<Vec<_>>>()?;
+
+        if let Some(tracker) = tracker {
+            tracker.record_table_partitions(
+                table_desc.id.as_u64(),
+                partitions
+                    .iter()
+                    .map(|partition| partition.id.as_u64())
+                    .collect(),
+            );
+        }
         Ok((table_desc, partitions))
     }
 
@@ -2880,7 +3076,11 @@ impl OwnedServer {
         mode: &mut ExecMode,
         variables: &dyn VariableLookup,
     ) -> Result<StatementResult> {
-        let (statement_snapshot, write_set) = mode.read_view(self);
+        let ReadView {
+            snapshot: statement_snapshot,
+            write_set,
+            tracker,
+        } = mode.read_view(self);
         let rows = match insert.source {
             InsertSource::Values(rows) => rows,
             InsertSource::Query {
@@ -2893,6 +3093,7 @@ impl OwnedServer {
                     catalog,
                     statement_snapshot,
                     write_set,
+                    tracker,
                     Some(variables),
                 )?;
                 let StatementResult::Query(result) = result else {
@@ -3016,7 +3217,7 @@ impl OwnedServer {
 
         // See `execute_insert`: a blind `DELETE` never reads either, but still needs a statement
         // snapshot for autocommit's own commit (F4).
-        let (statement_snapshot, _) = mode.read_view(self);
+        let statement_snapshot = mode.read_view(self).snapshot;
         self.commit_or_buffer(table_id, vec![mutation], mode, statement_snapshot)
     }
 
@@ -3031,12 +3232,13 @@ impl OwnedServer {
         mode: &mut ExecMode,
         variables: &dyn VariableLookup,
     ) -> Result<StatementResult> {
-        let (snapshot, write_set) = mode.read_view(self);
+        let read_view = mode.read_view(self);
         let ctx = query_exec::ExecContext {
             server: self,
             catalog,
-            snapshot,
-            write_set,
+            snapshot: read_view.snapshot,
+            write_set: read_view.write_set,
+            tracker: read_view.tracker,
             variables: Some(variables),
             working_rows: None,
             working_width: 0,
@@ -3084,7 +3286,7 @@ impl OwnedServer {
             });
         }
 
-        self.commit_or_buffer(table_desc.id, mutations, mode, snapshot)
+        self.commit_or_buffer(table_desc.id, mutations, mode, read_view.snapshot)
     }
 
     /// `DROP TABLE`: removes the table and its partitions, tablets, and replicas from the
@@ -3361,12 +3563,32 @@ impl OwnedServer {
         }
         let affected = mutations.len() as u64;
         match mode {
-            ExecMode::Autocommit => {
+            ExecMode::Autocommit {
+                tracker,
+                serializable_ticket,
+            } => {
                 let payload = RowstoreParticipant::encode_payload(&mutations)?;
                 let work = ParticipantWork::new(ParticipantId::new(1), payload);
                 let request = TransactionRequest::new(vec![work])?;
-                let mut txn =
-                    Transaction::new(self.txn_manager.next_txn_id()?, statement_snapshot.version);
+                let txn_id = self.txn_manager.next_txn_id()?;
+
+                let mut txn = match (tracker.take(), serializable_ticket.take()) {
+                    (Some(tracker), Some(ticket)) => {
+                        // Discarding the recorded table partition sets is safe for an autocommit
+                        // statement because its catalog load, reads, and commit all occur under
+                        // one `execution_lock` acquisition, and every table partition-topology
+                        // change also takes that lock. This becomes a validation hole if a
+                        // partition-topology change is ever allowed outside `execution_lock`.
+                        let (footprint, _) = tracker.extract();
+                        Transaction::new_serializable(txn_id, ticket, footprint)?
+                    }
+                    (None, None) => Transaction::new(txn_id, statement_snapshot.version),
+                    _ => {
+                        return Err(HtapError::Internal(
+                            "autocommit serializable tracker and ticket must be paired".into(),
+                        ));
+                    }
+                };
                 txn.set_request(request);
                 let committed = self.txn_manager.commit(&mut txn)?;
                 Ok(StatementResult::dml(affected, Some(committed.version)))
@@ -3391,7 +3613,11 @@ impl OwnedServer {
         key: &[u8],
         snapshot: Snapshot,
         write_set: Option<&WriteSet>,
+        tracker: Option<&ReadTracker>,
     ) -> Result<Option<Row>> {
+        if let Some(tracker) = tracker {
+            tracker.record_point(partition_id, key);
+        }
         if let Some(ws) = write_set {
             if let Some(buffered) = ws.get(partition_id, key) {
                 return Ok(match &buffered.mutation {
@@ -3415,8 +3641,14 @@ impl OwnedServer {
         mode: &mut ExecMode,
         variables: &dyn VariableLookup,
     ) -> Result<StatementResult> {
-        let (snapshot, write_set) = mode.read_view(self);
-        let Some(row) = self.read_with_overlay(partition_id.as_u64(), &key, snapshot, write_set)?
+        let read_view = mode.read_view(self);
+        let Some(row) = self.read_with_overlay(
+            partition_id.as_u64(),
+            &key,
+            read_view.snapshot,
+            read_view.write_set,
+            read_view.tracker,
+        )?
         else {
             return Ok(StatementResult::dml(0, None));
         };
@@ -3429,7 +3661,7 @@ impl OwnedServer {
                 row: updated,
             }],
             mode,
-            snapshot,
+            read_view.snapshot,
         )
     }
 
@@ -3445,12 +3677,13 @@ impl OwnedServer {
         variables: &dyn VariableLookup,
         mode: &mut ExecMode,
     ) -> Result<StatementResult> {
-        let (snapshot, write_set) = mode.read_view(self);
+        let read_view = mode.read_view(self);
         let ctx = query_exec::ExecContext {
             server: self,
             catalog,
-            snapshot,
-            write_set,
+            snapshot: read_view.snapshot,
+            write_set: read_view.write_set,
+            tracker: read_view.tracker,
             variables: Some(variables),
             working_rows: None,
             working_width: 0,
@@ -3498,7 +3731,7 @@ impl OwnedServer {
                 row: updated,
             });
         }
-        self.commit_or_buffer(table_desc.id, mutations, mode, snapshot)
+        self.commit_or_buffer(table_desc.id, mutations, mode, read_view.snapshot)
     }
 
     fn execute_select(
@@ -3522,8 +3755,14 @@ impl OwnedServer {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (snapshot, write_set) = mode.read_view(self);
-        let row_opt = self.read_with_overlay(partition_id.as_u64(), &key, snapshot, write_set)?;
+        let read_view = mode.read_view(self);
+        let row_opt = self.read_with_overlay(
+            partition_id.as_u64(),
+            &key,
+            read_view.snapshot,
+            read_view.write_set,
+            read_view.tracker,
+        )?;
 
         let rows = match row_opt {
             Some(row) => {
@@ -3555,7 +3794,10 @@ impl OwnedServer {
         // 1. Freeze catalog, snapshot, and plan
         let selected_partitions =
             olap::prune_partitions(table_desc, partitions, select.filter.as_ref());
-        let (snapshot, write_set) = mode.read_view(self);
+        let read_view = mode.read_view(self);
+        let snapshot = read_view.snapshot;
+        let write_set = read_view.write_set;
+        let tracker = read_view.tracker;
         let (source_columns, mapping) = olap::plan_source_columns(&select);
         let pushdown_predicate = olap::select_pushdown_predicate(select.filter.as_ref());
 
@@ -3581,6 +3823,7 @@ impl OwnedServer {
                         &table_desc.primary_key,
                         pushdown_predicate.as_ref(),
                         write_set,
+                        tracker,
                     )
                 })
                 .collect()
@@ -3601,6 +3844,7 @@ impl OwnedServer {
                     let pk = &table_desc.primary_key;
                     let pred = pushdown_predicate.as_ref();
                     let ws = write_set;
+                    let read_tracker = tracker;
 
                     handles.push(s.spawn(move || {
                         let mut res = Vec::with_capacity(worker_parts.len());
@@ -3615,6 +3859,7 @@ impl OwnedServer {
                                 pk,
                                 pred,
                                 ws,
+                                read_tracker,
                             );
                             res.push((idx, part_res));
                         }
@@ -3655,7 +3900,13 @@ pub(crate) fn scan_partition_compact(
     primary_key: &[usize],
     pushdown_predicate: Option<&Predicate>,
     write_set: Option<&WriteSet>,
+    tracker: Option<&ReadTracker>,
 ) -> Result<Vec<Row>> {
+    if let Some(tracker) = tracker {
+        // Record before overlay processing, including empty scans and overlay-only results.
+        tracker.record_partition(partition.id.as_u64());
+    }
+
     let tablet_id = partition.tablets[0];
     let tablet = catalog
         .tablet(tablet_id)
