@@ -58,7 +58,8 @@ price/performance figure or an availability date, or presented as comparable to 
 `implemented (local MVP)` component: a narrow local slice, not a benchmark implementation. See
 `docs/LIMITATIONS.md`'s "TPC-C workload kit scope and deferred features" and `docs/ARCHITECTURE.md`'s "TPC-C
 workload kit (Phase 18)" for the build history; ADR-031 and ADR-032 in `docs/DECISIONS.md` record the design
-decisions; this document is the deviations/compliance record those sections point to.
+decisions; this document is the deviations/compliance record those sections point to. Phase 19 added an opt-in
+SERIALIZABLE driver mode (ADR-033); its narrow, reviewed claim is §3 item 8a.
 
 ## 3. Deviations (TPC Policies §8.3.2)
 
@@ -157,8 +158,8 @@ test. Items that have no dedicated test say so.
    concurrent price update and does not execute a complete New-Order across the change. Prevention of the broad
    P2/P3 phenomena (Berenson et al.) and of A5B write skew is not claimed, nor is ANSI Level 3 or
    serializability, and Clause 3.4.1's Requirement 1 (Level 3 between New-Order, Payment, Delivery and
-   Order-Status) is therefore not claimed to be met; no serializable mode exists. Transactions interleave
-   statement by statement. The results rely on atomic commit/rollback, logical-key write-conflict detection
+   Order-Status) is therefore not claimed to be met by these snapshot-isolation tests (an opt-in serializable
+   mode now exists; item 8a). Transactions interleave statement by statement. The results rely on atomic commit/rollback, logical-key write-conflict detection
    including absent-key inserts, and retries at the actual transaction boundary (whole transaction for
    New-Order, Payment, Order-Status and Stock-Level; per district for Delivery). `INSERT` has upsert semantics
    and does not reject duplicate keys. See ADR-032. Code:
@@ -178,6 +179,45 @@ test. Items that have no dedicated test say so.
    transactions, T3 commits a price update) and checks fixed-snapshot price reads with plain `SELECT`s, not a
    full New-Order across the change (a New-Order runs only afterwards, on a fresh snapshot); tests 8 and 9 use
    two sessions and read-only snapshots.
+
+8a. **Serializable mode (Phase 19): an opt-in level now exists and the driver can run with it; the isolation claim
+    is re-derived, not widened.** The engine's SERIALIZABLE level (commit-time read-footprint validation, ADR-033;
+    not SSI) is selectable per session or per transaction, and the workload driver takes
+    `drivers::DriverIsolation::{SnapshotIsolation, Serializable}` through `drivers::run_with_isolation`.
+    `drivers::run` is unchanged and runs snapshot isolation; the default driver mode is snapshot isolation, and the
+    nine adapted Clause 3.4.2 tests of item 8 still run under snapshot isolation. Wording below is the same text
+    as ADR-032's "Update (Phase 19)".
+
+    > **Isolation claim (Phase 19, reviewed).** This claim is conditional on passing, for the build under review,
+    > `crates/htap-tpcc/tests/serializable.rs::{customer_balance_pair_write_skew_prevented,
+    > new_order_queue_cap_phantom_skew_prevented, five_transactions_under_serializable_keep_consistency_conditions}`,
+    > the engine suites listed in the Phase 19 row of `docs/PROGRESS.md`, and, for the unchanged snapshot-isolation
+    > claim, all 16 tests in `tests/isolation.rs`. The engine offers opt-in SERIALIZABLE through commit-time
+    > read-footprint validation against the global commit order (backward OCC, not SSI; ADR-033), and the workload
+    > driver supports it. Within the supported domain, the guarantee applies only among SERIALIZABLE transactions,
+    > with serial order equal to commit-version order; it does not extend to mixed-isolation execution. Snapshot
+    > isolation, reported as REPEATABLE READ, remains the default. Catalog and account state are outside the
+    > serializable domain. Primary-key point reads track keys; scans track whole partitions, so conservative aborts
+    > are expected. Two TPC-C-derived tests stage explicit two-transaction schedules: customer-balance write skew and
+    > a NEW-ORDER queue-cap phantom skew. Under REPEATABLE READ both transactions commit and violate the respective
+    > invariant; under SERIALIZABLE the second commit fails with a `Conflict` containing "serialization failure", and
+    > the invariant holds. A separate run covering all five transaction types uses two terminals, 230 transactions, a
+    > small hand-built dataset, and one seed. It checks consistency conditions, not serializability of the observed
+    > history: all conditions other than condition 11 must hold, condition 11 must identify exactly the districts
+    > whose delivered-order count differs from 2,100, and delivery accounting must match completed deliveries in this
+    > run. Its additional assertion that at least one validation abort occurs is scheduling-dependent; it is not
+    > deterministic evidence of enforcement. These TPC-C-derived tests establish the named schedule and consistency
+    > results, not the general guarantee, whose basis is ADR-033's soundness argument, additionally exercised by a
+    > seeded brute-force oracle over three-transaction histories on a small key-value table. This is a TPC-C-derived,
+    > unaudited workload kit: no ANSI Level 3 claim, Clause 3.4.1 Requirement 1 claim, Clause 3.4.2 result beyond the
+    > Phase 18 claim, TPC-C compliance, or comparability is claimed.
+
+    Known false aborts under SERIALIZABLE: scans track whole partitions (primary-key point reads track keys), so two
+    Delivery transactions on different districts, which both scan the `new_order` partition, are expected to abort
+    one another. The planned
+    test for that (`tpcc_delivery_districts_do_not_false_abort`) depends on the deferred narrowing and does not
+    exist. In the driver run the retry and escalation of ADR-032 absorb these aborts, and they are counted among
+    the conflict retries.
 
 9. **Tests 7-9 check snapshot reads, and the four concurrency tests are smoke tests only.** Isolation tests 8
    and 9 assert that a transaction sees no new `NEW-ORDER` row and no newer `ORDER` within its own snapshot, and
@@ -426,6 +466,12 @@ Test names below were checked against `cargo test -p htap-tpcc -- --list` and
   isolation assessment is conditional on all 16 passing (§3 item 8). Command:
   `cargo test -p htap-tpcc --test isolation`.
 
+- **Serializable driver option (Phase 19, reviewed claim; §3 item 8a).** `tests/serializable.rs` (3 tests):
+  `customer_balance_pair_write_skew_prevented`, `new_order_queue_cap_phantom_skew_prevented`,
+  `five_transactions_under_serializable_keep_consistency_conditions`. Command:
+  `cargo test -p htap-tpcc --test serializable`. The engine-level evidence is in the Phase 19 row of
+  `docs/PROGRESS.md`.
+
 - **Driver.** `drivers::tests::{deck_has_required_composition_and_minimum_mix,
   generated_default_inputs_obey_ranges_and_rates, report_labels_do_not_contain_official_metrics}`;
   `tests/drivers.rs::{run_small_consistent_dataset, rejects_zero_warehouse_count, rejects_zero_terminal_count,
@@ -447,8 +493,10 @@ Test names below were checked against `cargo test -p htap-tpcc -- --list` and
 **What this evidence does not establish:** generator conformance to the specification's own random-generation
 semantics beyond the invariants above; behaviour at any seed or warehouse count other than those run; that
 escalation, the driver's per-district Delivery resume, the 32767 terminal-count boundary or setup-before-barrier
-ordering behave as designed (none has a dedicated test); serializability, ANSI Level 3 isolation, prevention of
-the broad P2/P3 phenomena or of A5B write skew (none is claimed; §3 item 8); that each Clause 3.4.2 adaptation
+ordering behave as designed (none has a dedicated test); serializability of the TPC-C workload, ANSI Level 3
+isolation, prevention of the broad P2/P3 phenomena or of A5B write skew beyond the two schedules of §3 item 8a (none
+is claimed; §3 items 8 and 8a); that Delivery transactions on different districts do or do not false-abort under
+SERIALIZABLE (no test); that each Clause 3.4.2 adaptation
 meets every original test objective; any Clause 3.2/3.3.3/3.5 ACID test outcome; and any throughput or response-time
 property. No audited run has ever been performed.
 
@@ -479,7 +527,10 @@ recorded elapsed time, not a throughput metric.
   computed anywhere in this crate.
 - **No TPC-C compliance or comparability claim.** `drivers::run` resembles the specification's transaction mix
   but does not conform to it (§3 items 1, 3, 4, 12, 14 and 15). See §1's disclaimer.
-- **No serializability, no Level 3 isolation, no ACID-compliance claim.** See §3 items 8, 9 and 10.
+- **No serializability of the workload, no Level 3 isolation, no ACID-compliance claim.** The default driver mode is
+  snapshot isolation; the opt-in SERIALIZABLE mode (Phase 19) carries only the narrow, reviewed claim of §3
+  item 8a (the guarantee applies only among SERIALIZABLE transactions; the TPC-C tests establish only the named
+  schedules and consistency results). See §3 items 8, 8a, 9 and 10.
 - **No durability claim for TPC-C.** The engine's own crash-recovery tests are engine tests; this kit has no
   Clause 3.5 durability test.
 - **No claim beyond one warehouse.** See §3 item 15.

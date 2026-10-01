@@ -111,10 +111,11 @@ licensed under Apache-2.0.
   - `vendor/sqlparser/src/ast/mod.rs`: Re-exports `MysqlPartitionBy`, `MysqlPartitionDef`, `MysqlPartitionValues`, `MysqlLessThanBound`.
   - `vendor/sqlparser/src/ast/helpers/stmt_create_table.rs`: Adds `pub mysql_partition_by: Option<MysqlPartitionBy>` and builder method `mysql_partition_by` to `CreateTableBuilder`.
   - `vendor/sqlparser/src/parser/mod.rs`: Implements `maybe_parse_mysql_partition_by` and `parse_mysql_partition_def` to parse MySQL `PARTITION BY RANGE [COLUMNS] (...)` and `PARTITION BY LIST [COLUMNS] (...)` with `VALUES LESS THAN (...)` / `MAXVALUE` and `VALUES IN (...)`, invoked during table creation parsing; adds support in `parse_alter_table_operation` for MySQL `ALTER TABLE ... ADD PARTITION (...)`, `DROP PARTITION ...`, and `REORGANIZE PARTITION ... INTO (...)`.
+  - `vendor/sqlparser/src/parser/mod.rs` (Phase 19, commit `dfd0240`): in the `SET ... TRANSACTION` branch of the `SET` parser, `SET LOCAL TRANSACTION` and `SET SESSION TRANSACTION` now set `Set::SetTransaction.session = true` (previously always `false` for the MySQL forms, which silently dropped the `SESSION` keyword), and `SET GLOBAL TRANSACTION` is rejected with a parse error.
 - **How to Refresh / Rebase:**
   1. Obtain target upstream release or commit from `https://github.com/apache/datafusion-sqlparser-rs`.
   2. Extract files into `vendor/sqlparser`, ensuring no nested `.git` metadata is preserved.
-  3. Re-apply keyword definition in `src/keywords.rs`, MySQL partition AST definitions and ALTER partition operations in `src/ast/ddl.rs`, span implementations in `src/ast/spans.rs`, builder integration in `src/ast/helpers/stmt_create_table.rs`, module exports in `src/ast/mod.rs`, and parser hooks in `src/parser/mod.rs`.
+  3. Re-apply keyword definition in `src/keywords.rs`, MySQL partition AST definitions and ALTER partition operations in `src/ast/ddl.rs`, span implementations in `src/ast/spans.rs`, builder integration in `src/ast/helpers/stmt_create_table.rs`, module exports in `src/ast/mod.rs`, and parser hooks in `src/parser/mod.rs` (including the `SET ... TRANSACTION` session-scope change above).
   4. Ensure `vendor/sqlparser/LICENSE.TXT` and `vendor/sqlparser/Cargo.toml` are intact.
   5. Run `cargo check -p sqlparser` and workspace tests (`cargo test --workspace`) to verify compatibility.
 
@@ -186,6 +187,14 @@ Transaction Processing Performance Council. The notice reads:
 
 The TPC Policies (v6.20, November 2024) govern derived work: §8.1.4 (the "Derived from" prefix; no Primary or
 Optional Metric use), §8.1.5 (the disclaimer), §8.3.2 and §8.3.3.
+
+---
+
+## Published literature (Phase 19, SERIALIZABLE isolation)
+
+The SERIALIZABLE level (ADR-033) was re-derived from published papers (Kung and Robinson 1981; Cahill, Röhm and Fekete 2008;
+Fekete et al. 2004 and 2005; Ports and Grittner 2012; Adya 1999) and the MySQL 8.0 manual's `SET TRANSACTION` description;
+see `docs/RESEARCH.md`. No source code from any project was used for it, and none of those works is implemented as published.
 
 ---
 

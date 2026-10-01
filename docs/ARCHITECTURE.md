@@ -713,11 +713,24 @@ paragraph was reviewed by the `reasoner` model (the architect model was unreacha
   each adaptation meets every original test objective. For the exercised schedules the tests demonstrate exclusion of
   uncommitted reads (tests 1, 2, 4, 6), rejection of conflicting commits (first committer wins; tests 3 and 5), rollback
   non-interference on the asserted state (tests 4 and 6) and fixed-snapshot reads (tests 7-9). Prevention of the broad P2/P3
-  phenomena (Berenson et al.) and of A5B write skew is not claimed, nor is ANSI Level 3 or serializability; no serializable mode
-  exists. Transactions interleave statement by statement. The results rely on atomic commit/rollback, logical-key write-conflict
-  detection including absent-key inserts, and retries at the actual transaction boundary (whole transaction for New-Order,
-  Payment, Order-Status and Stock-Level; per district for Delivery). `INSERT` has upsert semantics and does not reject duplicate
-  keys.
+  phenomena (Berenson et al.) and of A5B write skew is not claimed for these snapshot-isolation tests, nor is ANSI Level 3 or
+  serializability. Transactions interleave statement by statement. The results rely on atomic commit/rollback, logical-key
+  write-conflict detection including absent-key inserts, and retries at the actual transaction boundary (whole transaction for
+  New-Order, Payment, Order-Status and Stock-Level; per district for Delivery). `INSERT` has upsert semantics and does not
+  reject duplicate keys.
+- **Serializable driver option (Phase 19; reviewed claim, full wording in ADR-032 "Update (Phase 19)").**
+  `drivers::DriverIsolation::{SnapshotIsolation (default), Serializable}` and `drivers::run_with_isolation` (`drivers::run` is
+  unchanged); under `Serializable` each terminal runs `SET SESSION transaction_isolation = 'SERIALIZABLE'` before the start
+  barrier and serialization failures (`HtapError::Conflict`) go through the existing retry and escalation. Evidence,
+  `crates/htap-tpcc/tests/serializable.rs`: `customer_balance_pair_write_skew_prevented` and
+  `new_order_queue_cap_phantom_skew_prevented` each show the anomaly under `REPEATABLE READ` and its prevention under
+  SERIALIZABLE for that one schedule; `five_transactions_under_serializable_keep_consistency_conditions` runs two terminals for
+  230 transactions on a small dataset and keeps the consistency conditions (this checks consistency conditions only, not
+  serializability of the run; its validation-abort assertion is scheduling-dependent, not deterministic evidence of
+  enforcement). The two schedule tests and the driver run establish only those named results, not the general guarantee,
+  whose basis is ADR-033. Guarantee only among SERIALIZABLE transactions (not mixed-isolation execution); primary-key point
+  reads track keys and scans track whole partitions, so Delivery transactions on different districts are expected to
+  false-abort (the planned test for that is not built). No Level 3, Clause 3.4.1, compliance or audit claim.
 - **Driver** (`drivers::run`, batch 3): a shuffled 23-card deck (10 New-Order, 10 Payment, 1 each Order-Status, Delivery,
   Stock-Level; it meets the Clause 5.2.3 minimums, but the mix is guaranteed only per completed deck, so a transaction limit
   may stop partway through a deck; the limit is a shared counter across terminals, so `tests/drivers.rs::assert_report` keeps
@@ -2225,11 +2238,17 @@ described under "Bug fixes" below, since it shares `commit_or_buffer`'s autocomm
   transaction first (MySQL semantics); turning it on redundantly leaves an open transaction untouched.
 - `SET @x = expr[, @y = expr, ...]` — evaluated with a table-less `EvalContext` against this session's own
   variables (`@x`/`@@sysvar` read back through the same session, e.g. `SET @b = @a + 1`).
-- `SET [SESSION] TRANSACTION ISOLATION LEVEL REPEATABLE READ` — the only level accepted; any other requested
-  level is rejected with `HtapError::Unsupported`, never silently downgraded.
+- `SET [SESSION | LOCAL] TRANSACTION ISOLATION LEVEL REPEATABLE READ | SERIALIZABLE`, `SET [SESSION]
+  transaction_isolation = ...` / `tx_isolation` — persistent for the session (Phase 19). `SET TRANSACTION ISOLATION LEVEL
+  ...` and an unscoped `SET @@transaction_isolation = ...` apply to the next transaction only (a one-shot that every
+  autocommit statement, including a `SELECT`, and every `START TRANSACTION` consumes, as in MySQL 8.0). `START TRANSACTION
+  ISOLATION LEVEL ...` sets that transaction's level. `READ COMMITTED`, `READ UNCOMMITTED` and `SNAPSHOT` are rejected with
+  `HtapError::Unsupported`, never silently up- or downgraded, and `SET GLOBAL` isolation is rejected. See "Serializable
+  isolation (Phase 19)" below and ADR-033.
 - `SET [SESSION] TRANSACTION READ ONLY | READ WRITE` — sets the default for the *next*
-  `BEGIN`/`START TRANSACTION` only, even when written as `SESSION`, because the vendored parser's AST does
-  not distinguish a session-persistent default from a next-transaction-only one.
+  `BEGIN`/`START TRANSACTION` only, even when written as `SESSION`. Phase 19 patched the vendored parser so
+  `SET SESSION|LOCAL TRANSACTION` carries a session scope (and `SET GLOBAL TRANSACTION` is a parse error); only the isolation
+  level honours it, the access mode stays next-transaction-only.
 - `SET NAMES ...`, known read-only variables (`sql_mode`, `character_set_*`, `time_zone`, ...) as no-ops, and
   `GLOBAL` scope rejected — MySQL connectors send these unconditionally on connect.
 - `SET CHARACTER SET <x>` / `SET CHARSET <x>` — answered by the `htap-wire` shim, not the session, because
@@ -2248,8 +2267,9 @@ is rejected with `HtapError::Unsupported` and does not poison the transaction.
 
 ### Isolation
 
-Snapshot isolation with first-writer-wins, write skew permitted, reported to clients as `REPEATABLE READ`
-(there is no weaker or stronger level to request; see `validate_isolation_level`). One snapshot is pinned at
+By default, snapshot isolation with first-writer-wins, write skew permitted, reported to clients as `REPEATABLE READ`.
+Since Phase 19 an opt-in `SERIALIZABLE` level exists (see "Serializable isolation (Phase 19)" below); no weaker level is
+offered (see `parse_isolation_level`; `validate_isolation_level` is a compatibility wrapper). One snapshot is pinned at
 `BEGIN` (or at the first statement under `autocommit = 0`) and reused for every statement in the transaction.
 Uncommitted writes are buffered in session memory only, overlaid below relational operators
 (`crate::session::overlay_rows`) for point reads, narrow analytic scans, the general executor, and `UPDATE`,
@@ -2487,6 +2507,104 @@ storage formats, poisoning/revalidation, `DurablePending` quarantine, and reopen
 (`test_wire_begin_commit_rollback_round_trip`, `test_wire_rollback_on_disconnect`,
 `test_wire_concurrent_sessions_conflict_returns_1213`, `test_wire_set_autocommit_and_user_variable_round_trip`,
 `test_wire_sysvar_reads_now_reflect_session_state`).
+
+---
+
+## Serializable isolation (Phase 19)
+
+**Status: `implemented (local MVP)`** (`htap-txn::serializable`, `htap-txn::TransactionManager`,
+`htap-server::{ReadTracker, session}`, `htap-sql::variables`, one patched line group in `vendor/sqlparser`). A narrow local
+slice, opt-in per session or transaction; snapshot isolation (`REPEATABLE READ`) stays the default. The mechanism is
+**SERIALIZABLE via commit-time read-footprint validation** (serializable snapshot validation): not SSI, which would abort
+only pivots of two rw antidependencies; this aborts a reader-writer on any rw edge to a committed concurrent writer, so it
+has more false aborts. The decision and the soundness argument are ADR-033; design references are in
+[`RESEARCH.md`](./RESEARCH.md). No on-disk format changed (no magic, no format-version bump, no recovery file): footprints
+and the recent-writes index are in memory, an open transaction is not durable, and a crash discards it.
+
+**Pin.** A serializable read-write transaction (`BEGIN`/`START TRANSACTION`, or a serializable autocommit write statement)
+calls `TransactionManager::pin_serializable()`, which under `decision_lock` takes the visible version as its snapshot and
+registers an RAII `SerializableTicket` (dropping it unregisters, and never takes `decision_lock`). A declared
+`READ ONLY` transaction uses a plain snapshot, records nothing, is never validated and never aborts. Lock order is
+`execution_lock` -> `decision_lock` -> the registry mutexes.
+
+**Read tracking.** A `ReadTracker` (`Mutex`-guarded, so analytic worker threads can share it) accumulates a `ReadFootprint`.
+Reads are recorded at the two read primitives and at the routing points, before the session write-set overlay is applied:
+
+- `LocalServer::read_with_overlay` (the R5 point path, `UPDATE`/`DELETE` by key) records the point key, present or absent,
+  even when the answer comes from the session's own write set;
+- `scan_partition_compact` (the general executor, subqueries, CTEs, `INSERT ... SELECT`, `UPDATE`/`DELETE` by filter, the
+  narrow analytic path including its worker threads) records the whole partition, so empty scans and overlay-only
+  results still record (`ANALYZE`, autocommit only, passes no tracker);
+- the table partition sets: `resolve_table_and_all_partitions` and the primary-key-routed paths record, per logical table,
+  the sorted partition ids resolved before pruning. The first set is kept; a later differing set, or one that differs from
+  the catalog at `COMMIT`, fails the commit as "serialization failure (catalog changed)".
+
+The footprint type also models half-open key ranges, but the server records none: every scan is a whole-partition read, and
+point reads promote to a whole-partition read at 100 per partition. Primary-key-prefix narrowing (follow-up Task 7) is
+deferred.
+
+**Commit.** `Session::commit_locked` skips validation when the write set is empty, revalidates the catalog (including the
+recorded read tables), builds `Transaction::new_serializable(id, ticket, footprint)` and calls `TransactionManager::commit`.
+The manager validates the footprint against `RecentWrites` (key -> last commit version of writes committed after the
+snapshot) under `decision_lock`, after every participant has prepared and before the journal `Intent`. A failure aborts all
+prepared participants, journals nothing and sets no recovery latch. After each successful apply, on the `commit()` path and
+the `recover()` replay path, the written keys (`TxnParticipant::written_keys`) are recorded at their commit version while any
+ticket is pinned. Serial order is commit-version order.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sess as Session
+    participant Trk as ReadTracker
+    participant Mgr as TransactionManager
+    participant Idx as RecentWrites
+    participant Part as RowstoreParticipant
+    participant Jrnl as Journal
+
+    Sess->>Mgr: pin_serializable()
+    Mgr-->>Sess: SerializableTicket (snapshot S)
+    Sess->>Trk: reads at S record point keys, partitions and table partition sets
+    Note over Sess,Trk: recorded before the write-set overlay, absent keys and empty scans included
+    Sess->>Mgr: commit(Transaction with ticket and footprint)
+    Note over Mgr: decision_lock held from here
+    Mgr->>Part: prepare (first-writer-wins on written keys)
+    Part-->>Mgr: prepared
+    Mgr->>Idx: validate(S, footprint)
+    alt a write to a read key or partition has version greater than S, or a floor exceeds S
+        Idx-->>Mgr: Conflict with a serialization failure message
+        Mgr->>Part: abort prepared participants
+        Mgr-->>Sess: HtapError::Conflict (nothing journaled)
+    else footprint is clean
+        Mgr->>Jrnl: append Intent (fsync), then Commit (fsync)
+        Mgr->>Part: apply
+        Mgr->>Idx: record written keys at the commit version
+        Mgr-->>Sess: CommittedTransaction
+    end
+```
+
+**Fail-closed floors.** If a participant cannot report its written keys (the `written_keys` default is `Ok(None)`) or a key
+fails to decode, the global floor rises to that commit version; every serializable transaction with an older snapshot aborts
+with "serialization failure (validation window exceeded)". The index keeps at most 10,000 point keys (overflow raises a
+per-partition floor) and a 10,000-entry version log (overflow clears it and raises the global floor), and is pruned to the
+oldest pinned snapshot. With no ticket pinned nothing is recorded.
+
+**Error surface.** `HtapError::Conflict` (MySQL 1213 / SQLSTATE 40001) with the prefixes "serialization failure
+(read-write dependency)", "(validation window exceeded)" and "(catalog changed)"; no new error variant, so the IPC error enum,
+wire error map and TPC-C retry loop are unchanged. `TransactionManager::serializable_stats()` counts dependency aborts and
+floor aborts separately.
+
+**Scope and caveats (details in `docs/LIMITATIONS.md`).** The guarantee holds only among SERIALIZABLE transactions: SI writers
+are recorded and validated against, but an SI transaction itself can still skew (mixed mode). Catalog and account state are
+outside the domain; `LocalServer::execute` (no session) stays snapshot isolation; there is no server-wide or forced level and
+no idle-transaction timeout (a leaked ticket holds the retention floor). Scans track whole partitions (primary-key point reads track keys), so false aborts are
+expected. F9: eviction at the 10,000-entry bound is O(n) under `decision_lock` (latency only).
+
+**Test evidence** (full map in the Phase 19 row of [`PROGRESS.md`](./PROGRESS.md)): `crates/htap-txn/tests/serializable_validation.rs`
+(validation before `Intent`, floors, live `recover()`, lock order, threaded stress against a model),
+`crates/htap-server/tests/serializable.rs` (each anomaly under SI and SERIALIZABLE: write skew, the read-only anomaly, range and
+absent-key phantoms, columnar and partitioned scans, subqueries and CTEs, partition reorganize and add, an import between read
+and commit), `serializable_session.rs` (SET forms, tickets, one-shots, recovery, IPC owner session), `serializable_history.rs`
+(seeded brute-force serial-replay oracle), `session_recovery.rs`, and `crates/htap-tpcc/tests/serializable.rs`.
 
 ---
 

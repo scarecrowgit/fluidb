@@ -30,6 +30,12 @@ components are **deliberately not implemented** and are out of scope for this lo
   explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, session variables) are implemented — see "Sessions and
   explicit transactions" below — but there is no locking-read syntax, no savepoints, and no distributed (XA)
   transactions. There is also no idle-transaction timeout/reaping yet.
+- **`SERIALIZABLE` (Phase 19) is an opt-in, narrow local slice, not a default and not SSI:** guarantees hold only among
+  `SERIALIZABLE` transactions (mixed mode: SI transactions can still skew); whole-partition scan footprints cause false aborts
+  (primary-key-prefix narrowing is deferred); no `READ COMMITTED`/`READ UNCOMMITTED`/`SNAPSHOT`; no server-wide or forced
+  isolation level; `LocalServer::execute` (no session) stays snapshot isolation; catalog and account state are outside the
+  serializable domain; a leaked open transaction holds the retention floor; retention is bounded and fails closed (older
+  transactions abort). See `docs/LIMITATIONS.md` "SERIALIZABLE isolation" and ADR-033.
 - **`DECIMAL` (Phase 17): supported end to end — `CREATE TABLE`/`INSERT`/queries, columnar+catalog+key-codec
   persistence, movement CSV/JSON-lines import/export, and the MySQL wire protocol — bounded at 18 digits, not
   arbitrary precision.** `DECIMAL(p, s)`/`NUMERIC`/`DEC` is a fixed-point type (signed 64-bit unscaled integer,
@@ -53,8 +59,11 @@ components are **deliberately not implemented** and are out of scope for this lo
   (Phase 18, `implemented (local MVP)`, `crates/htap-tpcc`):** the kit is a narrow local diagnostic slice — schema,
   population generator and bulk loader, the five transactions, the 12-condition consistency checker, OCC-adapted
   Clause 3.4.2 isolation tests and a workload driver — with **no compliance or comparability claim, no RTE/keying/
-  think times, no `tpmC`, price/performance or any other official metric, and no serializability claim** (isolation
-  is claimed only as far as the tests show; see the disclosure). Only one warehouse is exercised. See
+  think times, no `tpmC`, price/performance or any other official metric, and no Level 3 or workload-serializability claim** (isolation
+  is claimed only as far as the tests show; the default driver mode is snapshot isolation, and Phase 19 added an opt-in
+  SERIALIZABLE driver mode whose narrow, reviewed claim (two prevented anomaly schedules plus one consistency-only
+  driver run; the guarantee applies only among SERIALIZABLE transactions, and the TPC-C tests establish only the named
+  schedules and consistency results, not the general guarantee, whose basis is ADR-033) is in the disclosure). Only one warehouse is exercised. See
   [`docs/TPCC-DISCLOSURE.md`](./docs/TPCC-DISCLOSURE.md) for the required disclaimer, the full deviations list and
   validation evidence, and ADR-031/ADR-032 in `docs/DECISIONS.md`. **TPC-H** (Phase 17 Batch A/B checkpoint 1 +
   tasks B5b-B5c/B2/B3/F6/B6/B7/B8/B9, `implemented (narrow local slice)`): a
@@ -396,8 +405,15 @@ session for its lifetime) supporting `BEGIN`/`START TRANSACTION`, `COMMIT`, `ROL
 `@user`/`@@system` variables. Uncommitted writes are buffered in the session and never touch the WAL,
 transaction journal, or memtable — a crash before `COMMIT` is an implicit `ROLLBACK` — and are visible only
 to statements run through that same session (read-your-own-writes) until `COMMIT` runs the existing 2PC path
-once. Isolation is snapshot isolation with first-writer-wins (write skew permitted), reported as
-`REPEATABLE READ`; a concurrent write to the same row is a clean `Conflict` at `COMMIT`.
+once. The default isolation is snapshot isolation with first-writer-wins (write skew permitted), reported as
+`REPEATABLE READ`; a concurrent write to the same row is a clean `Conflict` at `COMMIT`. An opt-in `SERIALIZABLE` level
+(Phase 19, `implemented (local MVP)`, ADR-033) is "SERIALIZABLE via commit-time read-footprint validation": a serializable
+read-write transaction records what it read and is validated at `COMMIT` against writes committed after its snapshot,
+failing with a retryable `Conflict` ("serialization failure"). It is not SSI, it guarantees serializability only among
+`SERIALIZABLE` transactions (an SI transaction can still skew), and its whole-partition scan footprints cause false aborts;
+select it with `SET SESSION transaction_isolation = 'SERIALIZABLE'` or `START TRANSACTION ISOLATION LEVEL SERIALIZABLE`.
+Evidence: `crates/htap-server/tests/serializable.rs`, `serializable_session.rs`, `serializable_history.rs` and
+`crates/htap-txn/tests/serializable_validation.rs` (see `docs/PROGRESS.md`).
 
 Embedded:
 
@@ -450,8 +466,9 @@ fn main() -> Result<()> {
 ```
 
 Deferred: `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
-idle-transaction timeout/reaping, and MVCC garbage collection. Only `REPEATABLE READ` is offered (other
-isolation levels are rejected, not silently downgraded); DDL is rejected inside an open transaction (the
+idle-transaction timeout/reaping, and MVCC garbage collection. Only `REPEATABLE READ` (default) and an opt-in
+`SERIALIZABLE` are offered (`READ COMMITTED`, `READ UNCOMMITTED` and `SNAPSHOT` are rejected, not silently changed; no
+server-wide or forced level; serializable guarantees hold only among `SERIALIZABLE` transactions); DDL is rejected inside an open transaction (the
 transaction survives, unpoisoned). See "Sessions and explicit transactions (Phase 10)" in
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md), ADR-018 in [`docs/DECISIONS.md`](./docs/DECISIONS.md), and
 [`docs/LIMITATIONS.md`](./docs/LIMITATIONS.md) for the full contract, remaining gaps, and test evidence.

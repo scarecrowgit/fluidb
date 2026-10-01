@@ -302,6 +302,42 @@ and narrow SQL scope (`htap_wire::shim`, `htap_wire::error_map`).
 
 ---
 
+## Serializable isolation (Phase 19): published references
+
+Phase 19 (ADR-033, "SERIALIZABLE via commit-time read-footprint validation") was **re-derived from the published
+literature below and from this engine's own commit path; no StarRocks code or design, and no other project's source,
+was consulted or used for it.** Each reference informed the design only as described; none is implemented as published.
+
+- **Kung and Robinson, "On Optimistic Methods for Concurrency Control" (ACM TODS, 1981).** Backward validation of a
+  transaction's read set against the write sets of transactions that committed during its lifetime, performed inside a
+  serialized validation point, is the shape of the commit-time footprint check (validate under `decision_lock`, abort the
+  validating transaction, never the committed one).
+- **Cahill, Röhm and Fekete, "Serializable Isolation for Snapshot Databases" (SIGMOD 2008; ACM TODS 2009).** Defines SSI:
+  track read-write antidependencies and abort a pivot with an incoming and an outgoing edge. It is the comparison point in
+  ADR-033's options table and the named refinement path; the engine deliberately does not implement it, so its aborts are a
+  superset of SSI's.
+- **Fekete, Liarokapis, O'Neil, O'Neil and Shasha, "Making Snapshot Isolation Serializable" (ACM TODS, 2005), and Fekete,
+  O'Neil and O'Neil, "A Read-Only Transaction Anomaly Under Snapshot Isolation" (SIGMOD Record, 2004).** The dangerous
+  structure of two consecutive rw edges, and the anomaly in which a read-only transaction observes a non-serializable
+  state. They motivated the write-skew and read-only-anomaly tests (`read_only_anomaly_fekete_deposit_withdraw_report`) and
+  the rule that a declared `READ ONLY` transaction pins a plain snapshot and never aborts, while an overlapping
+  conflicting SERIALIZABLE writer is the transaction forced to abort (this does not extend to SI writers in mixed mode).
+- **Ports and Grittner, "Serializable Snapshot Isolation in PostgreSQL" (VLDB 2012).** An industrial SSI with
+  promotion of fine-grained read tracking to coarser granularity under memory pressure and retention of committed-transaction
+  state only while concurrent transactions remain. It informed the footprint cap that promotes point reads to a whole
+  partition, the whole-partition scan footprint, and the retention of recent writes only down to the oldest pinned snapshot.
+  The engine's failure mode at the retention bound (abort older transactions) is its own choice.
+- **Adya, "Weak Consistency: A Generalized Theory and Optimistic Implementations for Distributed Transactions" (MIT PhD
+  thesis, 1999).** The direct serialization graph with write-write, write-read and read-write edges is the vocabulary of
+  ADR-033's soundness argument (a serial order by commit version, no cycle through a committed serializable transaction).
+  The Phase 19 oracle (`serializable_histories_are_always_serializable`) checks brute-force serial replay, not a
+  dependency graph; a graph-based check was planned and is not built.
+- **MySQL 8.0 reference manual, `SET TRANSACTION` statement (Table 15.10; verified against
+  `dev.mysql.com/doc/refman/8.0/en/set-transaction.html`).** The scope semantics of the isolation
+  selection forms (session-persistent versus next-transaction-only, and `GLOBAL`) that `Session` follows.
+
+---
+
 ## Lessons that shaped our design
 
 - Pay the MVCC cost at write time, not at read time.
