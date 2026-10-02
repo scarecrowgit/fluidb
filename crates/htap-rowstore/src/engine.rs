@@ -47,6 +47,7 @@ use htap_common::{read_file_exact_bounded, HtapError, ProcessLock, Result, Row, 
 use parking_lot::{Mutex, RwLock};
 
 pub use crate::manifest::MAX_APPLIED_EXTERNAL_TXNS;
+use htap_common::fs::dur::{create_dir_all, remove_file, rename};
 use htap_common::fs::{atomic_publish, sync_dir};
 
 use crate::manifest::{Manifest, ManifestLedgerEntry, ManifestSstEntry};
@@ -379,13 +380,13 @@ impl Engine {
     /// 6. Apply only committed transactions to the active memtable.
     /// 7. Set `visible_version = max(SST max_versions, replayed commit versions)`.
     pub fn open(options: EngineOptions) -> Result<Self> {
-        std::fs::create_dir_all(&options.dir)?;
+        create_dir_all(&options.dir)?;
         let process_lock = ProcessLock::acquire(&options.dir)?;
 
         let wal_dir = options.dir.join("wal");
-        std::fs::create_dir_all(&wal_dir)?;
+        create_dir_all(&wal_dir)?;
         let sst_dir = options.dir.join("sst");
-        std::fs::create_dir_all(&sst_dir)?;
+        create_dir_all(&sst_dir)?;
 
         // 2. Read and validate MANIFEST
         let manifest_path = options.dir.join("MANIFEST");
@@ -412,22 +413,22 @@ impl Engine {
             .ok_or(HtapError::CounterOverflow { counter: "sst_id" })?;
 
         // 3. Best-effort delete orphan *.tmp and unlisted *.sst
-        let _ = std::fs::remove_file(options.dir.join("MANIFEST.tmp"));
-        let _ = std::fs::remove_file(options.dir.join("VISIBLE.tmp"));
+        let _ = remove_file(options.dir.join("MANIFEST.tmp"));
+        let _ = remove_file(options.dir.join("VISIBLE.tmp"));
         let valid_sst_ids: HashSet<u64> = manifest.ssts.iter().map(|s| s.id).collect();
         if let Ok(entries) = std::fs::read_dir(&sst_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
                     if file_name.ends_with(".tmp") {
-                        let _ = std::fs::remove_file(&path);
+                        let _ = remove_file(&path);
                     } else if let Some(stem) = file_name.strip_suffix(".sst") {
                         if let Ok(id) = stem.parse::<u64>() {
                             if !valid_sst_ids.contains(&id) {
-                                let _ = std::fs::remove_file(&path);
+                                let _ = remove_file(&path);
                             }
                         } else {
-                            let _ = std::fs::remove_file(&path);
+                            let _ = remove_file(&path);
                         }
                     }
                 }
@@ -1416,12 +1417,12 @@ impl Engine {
             ) {
                 Ok(meta) => meta,
                 Err(error) => {
-                    let _ = std::fs::remove_file(&tmp_path);
+                    let _ = remove_file(&tmp_path);
                     return Err(error);
                 }
             };
-            if let Err(error) = std::fs::rename(&tmp_path, &sst_path) {
-                let _ = std::fs::remove_file(&tmp_path);
+            if let Err(error) = rename(&tmp_path, &sst_path) {
+                let _ = remove_file(&tmp_path);
                 return Err(HtapError::Io(error));
             }
             sync_dir(&sst_dir)?;
@@ -1483,7 +1484,7 @@ impl Engine {
         }
 
         for path in input_paths {
-            let _ = std::fs::remove_file(path);
+            let _ = remove_file(path);
         }
 
         Ok(CompactionReport {
@@ -1718,14 +1719,14 @@ impl Engine {
             let meta = match write_res {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = std::fs::remove_file(&tmp_path);
+                    let _ = remove_file(&tmp_path);
                     return Err(e);
                 }
             };
 
             // 3. Rename to sst/<id>.sst and fsync sst/ directory
-            if let Err(e) = std::fs::rename(&tmp_path, &sst_path) {
-                let _ = std::fs::remove_file(&tmp_path);
+            if let Err(e) = rename(&tmp_path, &sst_path) {
+                let _ = remove_file(&tmp_path);
                 return Err(HtapError::Io(e));
             }
             sync_dir(&sst_dir)?;

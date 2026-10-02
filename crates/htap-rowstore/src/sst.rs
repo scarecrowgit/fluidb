@@ -88,6 +88,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use htap_common::fs::dur::{remove_file, DurFile, DurOpenOptions};
 use htap_common::{HtapError, Result, Row, Version};
 
 use crate::memtable::{InternalKey, MemtableEntry, ValueKind};
@@ -219,25 +220,29 @@ impl SstWriter {
         entries: impl IntoIterator<Item = MemtableEntry>,
         options: &SstOptions,
     ) -> Result<SstMetadata> {
-        let file = File::create(path)?;
+        let file = DurOpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
         let mut writer = BufWriter::new(file);
 
         match Self::write_internal(&mut writer, path, id, entries, options) {
             Ok(metadata) => {
                 writer.flush()?;
-                writer.get_ref().sync_all()?;
+                writer.get_ref().sync_all_site("sst:write_sync")?;
                 Ok(metadata)
             }
             Err(e) => {
                 drop(writer);
-                let _ = std::fs::remove_file(path);
+                let _ = remove_file(path);
                 Err(e)
             }
         }
     }
 
     fn write_internal(
-        writer: &mut BufWriter<File>,
+        writer: &mut BufWriter<DurFile>,
         path: &Path,
         id: u64,
         entries: impl IntoIterator<Item = MemtableEntry>,
@@ -723,6 +728,8 @@ impl SstReader {
             (b.first_partition_id, b.first_user_key.as_slice()) <= (partition_id, user_key)
         });
 
+        // Read-only handle clone preserves access after compaction unlinks the SST.
+        #[allow(clippy::disallowed_methods)]
         let mut file = self.file.try_clone()?;
 
         for block in &self.block_indexes[start_idx..end_idx] {
@@ -742,6 +749,8 @@ impl SstReader {
 
     /// Return an iterator over all entries in the SST in ascending internal key order.
     pub fn iter(&self) -> Result<impl Iterator<Item = Result<MemtableEntry>> + '_> {
+        // Read-only handle clone keeps iteration valid if compaction unlinks the SST.
+        #[allow(clippy::disallowed_methods)]
         let file = self.file.try_clone()?;
         Ok(SstIterator {
             file,
@@ -1033,7 +1042,7 @@ fn read_block_at(file: &mut File, block: &BlockIndexEntry) -> Result<Vec<Memtabl
 
 /// Write a data block frame to `file` and return its [`BlockIndexEntry`] and total frame length.
 fn flush_block(
-    file: &mut BufWriter<File>,
+    file: &mut BufWriter<DurFile>,
     entries: &[(MemtableEntry, Vec<u8>)],
     current_offset: u64,
 ) -> Result<(BlockIndexEntry, u32)> {

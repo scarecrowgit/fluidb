@@ -59,12 +59,15 @@
 //! as log corruption.
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use htap_common::{
-    bytecursor::ByteReader, envelope::encode_bare_frame, HtapError, Result, Row, Version,
+    bytecursor::ByteReader,
+    envelope::encode_bare_frame,
+    fs::dur::{create_dir_all, remove_file, sync_dir_site, DurFile, DurOpenOptions},
+    HtapError, Result, Row, Version,
 };
 use serde::{Deserialize, Serialize};
 
@@ -282,7 +285,7 @@ pub struct Wal {
     /// whenever `active` is `Some`.
     segments: Vec<SegmentMeta>,
     /// Handle to the active segment, `None` until the first append.
-    active: Option<File>,
+    active: Option<DurFile>,
     /// Byte length of the active segment.
     active_len: u64,
     /// LSN the next appended record will receive.
@@ -298,10 +301,9 @@ impl Wal {
     /// append would land behind unreadable bytes and be silently invisible to
     /// every future replay.
     pub fn open(opts: WalOptions) -> Result<Wal> {
-        std::fs::create_dir_all(&opts.dir)?;
-        // The directory entry for a freshly created WAL directory is itself
-        // only durable after its parent is fsynced; we fsync the WAL directory
-        // on segment creation below, which covers the common case.
+        // A fresh WAL directory entry is only durable after its parent is
+        // fsynced; the segment-creation directory fsync covers the common case.
+        create_dir_all(&opts.dir)?;
         let listed = list_segments(&opts.dir)?;
 
         let mut segments = Vec::with_capacity(listed.len());
@@ -347,11 +349,11 @@ impl Wal {
                 // O_APPEND, not plain O_WRONLY: a write(2) on a plain handle
                 // starts at offset 0 and would overwrite the segment's first
                 // records instead of extending it.
-                let file = OpenOptions::new().read(true).append(true).open(&path)?;
+                let file = DurOpenOptions::new().read(true).append(true).open(&path)?;
                 // Drop the torn tail so appends continue from a clean boundary.
                 if scan.valid_end != scan.file_len {
                     file.set_len(scan.valid_end)?;
-                    file.sync_all()?;
+                    file.sync_all_site("wal:repair_sync")?;
                 }
                 active_len = scan.valid_end;
                 next_lsn = scan.next_lsn;
@@ -404,7 +406,7 @@ impl Wal {
     /// fsync the active segment.
     pub fn sync(&mut self) -> Result<()> {
         if let Some(file) = self.active.as_ref() {
-            file.sync_all()?;
+            file.sync_all_site("wal:append_sync")?;
         }
         Ok(())
     }
@@ -474,7 +476,7 @@ impl Wal {
             if !superseded {
                 break;
             }
-            match std::fs::remove_file(&meta.path) {
+            match remove_file(&meta.path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
@@ -484,7 +486,7 @@ impl Wal {
         }
         if removed > 0 {
             self.segments.drain(..removed);
-            fsync_dir(&self.opts.dir)?;
+            sync_dir_site(&self.opts.dir, "wal:gc_sync")?;
         }
         Ok(removed)
     }
@@ -531,11 +533,11 @@ impl Wal {
         // Flush the outgoing segment so a crash right after the roll cannot
         // lose records that the new segment implicitly claims are behind it.
         if let Some(file) = self.active.as_ref() {
-            file.sync_all()?;
+            file.sync_all_site("wal:roll_sync")?;
         }
 
         let path = self.opts.dir.join(segment_file_name(self.next_lsn));
-        let file = OpenOptions::new()
+        let file = DurOpenOptions::new()
             .append(true)
             .create_new(true)
             .open(&path)
@@ -551,7 +553,7 @@ impl Wal {
         // metadata. Without this fsync a crash can leave a WAL whose newest
         // segment simply does not exist any more, silently losing every commit
         // in it. This is the classic missed-fsync durability bug.
-        fsync_dir(&self.opts.dir)?;
+        sync_dir_site(&self.opts.dir, "wal:roll_dir_sync")?;
 
         self.segments.push(SegmentMeta {
             first_lsn: self.next_lsn,
@@ -793,20 +795,11 @@ fn list_segments(dir: &Path) -> Result<Vec<(Lsn, PathBuf)>> {
     Ok(out)
 }
 
-/// fsync a directory so that entries created or removed in it are durable.
-// Deliberately not moved to the shared helper: unlike the five migrated
-// callers, this function is not Unix-gated, so migrating it in either
-// direction would change untested non-Unix behaviour.
-fn fsync_dir(dir: &Path) -> Result<()> {
-    let handle = File::open(dir)?;
-    handle.sync_all()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use htap_common::Value;
+    use std::fs::OpenOptions;
     use std::io::Seek;
 
     fn row(n: i64) -> Row {

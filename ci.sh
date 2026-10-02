@@ -14,9 +14,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Phase 20 durable-mutation gate; each later migration batch adds its crate to the -p list.
 # The dev-only htap-crashsim crate is intentionally excluded because it materializes crash images with raw std::fs.
 echo "========================================="
-echo "Running: CLIPPY_CONF_DIR=ci/clippy-durability cargo clippy -p htap-common --lib --bins -- -A clippy::all -D clippy::disallowed_methods"
+echo "Running: CLIPPY_CONF_DIR=ci/clippy-durability cargo clippy -p htap-common -p htap-rowstore --lib --bins -- -A clippy::all -D clippy::disallowed_methods"
 echo "========================================="
-CLIPPY_CONF_DIR=ci/clippy-durability cargo clippy -p htap-common --lib --bins -- -A clippy::all -D clippy::disallowed_methods
+CLIPPY_CONF_DIR=ci/clippy-durability cargo clippy -p htap-common -p htap-rowstore --lib --bins -- -A clippy::all -D clippy::disallowed_methods
 
 echo "========================================="
 echo "Running: cargo clippy -p htap-common --all-targets -- -D warnings"
