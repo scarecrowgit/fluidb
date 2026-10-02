@@ -624,6 +624,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "fs2",
+ "parking_lot",
  "proptest",
  "serde",
  "serde_json",
@@ -658,6 +659,15 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "htap-crashsim"
+version = "0.1.0"
+dependencies = [
+ "htap-common",
+ "parking_lot",
  "tempfile",
 ]
 
@@ -790,6 +800,7 @@ dependencies = [
 name = "htapd"
 version = "0.1.0"
 dependencies = [
+ "htap-common",
  "htap-server",
  "htap-wire",
  "tracing",

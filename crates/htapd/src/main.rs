@@ -188,6 +188,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
 }
 
 fn main() -> ExitCode {
+    if htap_common::fs::CRASHSIM_ENABLED {
+        eprintln!("error: htapd must not run with the htap-common crashsim feature enabled");
+        return ExitCode::from(1);
+    }
+
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(Some(a)) => a,
         Ok(None) => {

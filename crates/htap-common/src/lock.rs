@@ -1,12 +1,12 @@
 //! Process-exclusive advisory locking for storage root directories.
 
-use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 
 use crate::error::{HtapError, Result};
+use crate::fs::dur::{DurFile, DurOpenOptions};
 
 /// Lock file name used for exclusive directory root ownership.
 pub const LOCK_FILE_NAME: &str = "LOCK";
@@ -18,7 +18,7 @@ pub const LOCK_FILE_NAME: &str = "LOCK";
 #[derive(Debug)]
 pub struct ProcessLock {
     path: PathBuf,
-    file: File,
+    file: DurFile,
 }
 
 impl ProcessLock {
@@ -28,14 +28,14 @@ impl ProcessLock {
     /// If another process or file descriptor holds an exclusive lock on this file, returns [`HtapError::Conflict`].
     pub fn acquire(root: &Path) -> Result<Self> {
         let lock_path = root.join(LOCK_FILE_NAME);
-        let mut file = OpenOptions::new()
+        let mut file = DurOpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
 
-        match file.try_lock_exclusive() {
+        match file.as_std().try_lock_exclusive() {
             Ok(()) => {}
             Err(err) => {
                 if is_contention_error(&err) {
@@ -81,7 +81,7 @@ impl ProcessLock {
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = self.file.as_std().unlock();
     }
 }
 

@@ -15,6 +15,7 @@ members = [
     "crates/htap-tpcc",
     "crates/htap-bench",
     "crates/htap-client",
+    "crates/htap-crashsim",
     "crates/htap-wire",
     "crates/htapd",
     "vendor/sqlparser",
