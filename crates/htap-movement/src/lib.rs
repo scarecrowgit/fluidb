@@ -16,6 +16,8 @@
 //!   Cross-process concurrency is not supported.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Temporary until Phase 20 Batch D migrates this crate onto the durability shim.
+#![allow(clippy::disallowed_methods)]
 
 pub mod codec;
 pub mod export;

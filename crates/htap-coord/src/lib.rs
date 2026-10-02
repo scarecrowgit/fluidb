@@ -7,12 +7,12 @@
 #![warn(missing_docs)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{CatalogSnapshot, NodeId};
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::dur;
 use htap_common::fs::{atomic_publish as publish_file, sync_dir as sync_directory};
 use htap_common::lock::ProcessLock;
 use htap_common::{read_file_exact_bounded, FencingToken, HtapError, Result};
@@ -229,7 +229,7 @@ impl LocalCoordinator {
     /// process. Returns other [`HtapError`] variants if state reading or publishing fails.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        fs::create_dir_all(&root)?;
+        dur::create_dir_all(&root)?;
         let canonical_root = root.canonicalize()?;
         let lock_guard = ProcessLock::acquire(&canonical_root)?;
 

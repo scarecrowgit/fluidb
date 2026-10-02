@@ -1,10 +1,10 @@
 //! Local filesystem implementation of [`CatalogStore`] with crash-safe atomic updates.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::dur;
 use htap_common::fs::{
     atomic_publish as publish_file, remove_file_if_exists, sync_dir as sync_directory,
 };
@@ -47,7 +47,7 @@ impl LocalCatalogStore {
     /// If a published `CATALOG` file exists, its integrity is verified on startup.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        dur::create_dir_all(&dir)?;
 
         let store = Self {
             dir,

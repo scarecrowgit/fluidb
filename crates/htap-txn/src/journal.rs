@@ -1,11 +1,11 @@
 //! CRC32C-framed durable Intent/Commit journal with bounded frames,
 //! torn-final repair, and corruption validation.
 
-use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use htap_common::bytecursor::ByteReader;
+use htap_common::fs::dur::{self, DurFile, DurOpenOptions};
 use htap_common::{HtapError, Result, Version};
 use serde::{Deserialize, Serialize};
 
@@ -380,7 +380,7 @@ fn has_valid_frame_ahead(data: &[u8], max_frame_size: usize) -> bool {
 #[derive(Debug)]
 pub struct Journal {
     opts: JournalOptions,
-    file: File,
+    file: DurFile,
     valid_end: u64,
     /// Set once an append or sync leaves this journal handle's on-disk state unknowable or
     /// untrustworthy (storage-reviewer fix-pass round 3, item 1): either a write/sync failed and
@@ -423,14 +423,12 @@ impl Journal {
     pub fn open_with_options(opts: JournalOptions) -> Result<Self> {
         if let Some(parent) = opts.path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-                if let Ok(dir) = File::open(parent) {
-                    let _ = dir.sync_all();
-                }
+                dur::create_dir_all(parent)?;
+                let _ = dur::sync_dir_site(parent, "txn:journal_parent_create_sync");
             }
         }
 
-        let file = OpenOptions::new()
+        let file = DurOpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -711,7 +709,7 @@ impl Journal {
                 "repaired torn final record in journal"
             );
             self.file.set_len(scan.valid_end)?;
-            self.file.sync_all()?;
+            self.file.sync_all_site("txn:journal_repair_sync")?;
         }
 
         self.valid_end = scan.valid_end;
@@ -864,14 +862,14 @@ impl Journal {
     }
 
     /// Fsyncs the file, honoring [`Self::pending_sync_fault_for_test`] if set.
-    fn sync_all_checked(&mut self) -> std::io::Result<()> {
+    fn sync_all_checked(&mut self, site: &'static str) -> std::io::Result<()> {
         if self.pending_sync_fault_for_test {
             self.pending_sync_fault_for_test = false;
             return Err(std::io::Error::other(
                 "simulated fsync fault (test injection)",
             ));
         }
-        self.file.sync_all()
+        self.file.sync_all_site(site)
     }
 
     /// Append a [`JournalRecord`] to the journal.
@@ -897,7 +895,7 @@ impl Journal {
         }
 
         if self.opts.sync_on_write {
-            if let Err(err) = self.sync_all_checked() {
+            if let Err(err) = self.sync_all_checked("txn:journal_append_sync") {
                 // Fix-pass round 3, item 1(i): `write_all` above already succeeded, so the
                 // frame's bytes are physically in the file, but not proven durable — a failed
                 // fsync means the kernel's page-cache state for them is unknowable. `valid_end`
@@ -928,7 +926,7 @@ impl Journal {
     /// Explicitly fsync the journal file.
     pub fn sync(&mut self) -> Result<()> {
         self.check_poisoned()?;
-        if let Err(err) = self.sync_all_checked() {
+        if let Err(err) = self.sync_all_checked("txn:journal_sync") {
             // Fix-pass round 3, item 1(i): a failed fsync makes the kernel's page-cache state for
             // whatever was written before this call unknowable, even if a later fsync on the same
             // fd would succeed. Poison unconditionally; only a fresh reopen can be trusted again.
@@ -1131,7 +1129,10 @@ mod tests {
 
         // Simulate torn tail: append partial bytes (less than header)
         {
-            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             file.write_all(&[0xaa, 0xbb, 0xcc]).unwrap();
             file.sync_all().unwrap();
         }
