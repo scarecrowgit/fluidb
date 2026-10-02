@@ -8,7 +8,7 @@ mod materialize;
 mod model;
 mod policy;
 
-pub use harness::CrashHarness;
+pub use harness::{CrashHarness, WorkloadContext};
 pub use policy::{
     parse_recovery_repro_string, parse_repro_string, CrashInfo, CrashPolicy, RecoveryReproPoint,
     RecoveryStage,

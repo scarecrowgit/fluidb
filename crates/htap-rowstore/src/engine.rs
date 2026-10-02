@@ -47,8 +47,8 @@ use htap_common::{read_file_exact_bounded, HtapError, ProcessLock, Result, Row, 
 use parking_lot::{Mutex, RwLock};
 
 pub use crate::manifest::MAX_APPLIED_EXTERNAL_TXNS;
-use htap_common::fs::dur::{create_dir_all, remove_file, rename};
-use htap_common::fs::{atomic_publish, sync_dir};
+use htap_common::fs::dur::{remove_file, rename, sync_dir_site};
+use htap_common::fs::{atomic_publish, create_dir_all_durable};
 
 use crate::manifest::{Manifest, ManifestLedgerEntry, ManifestSstEntry};
 use crate::memtable::{InternalKey, Memtable, MemtableEntry, ValueKind};
@@ -380,13 +380,21 @@ impl Engine {
     /// 6. Apply only committed transactions to the active memtable.
     /// 7. Set `visible_version = max(SST max_versions, replayed commit versions)`.
     pub fn open(options: EngineOptions) -> Result<Self> {
-        create_dir_all(&options.dir)?;
+        create_dir_all_durable(&options.dir)?;
         let process_lock = ProcessLock::acquire(&options.dir)?;
 
         let wal_dir = options.dir.join("wal");
-        create_dir_all(&wal_dir)?;
+        create_dir_all_durable(&wal_dir)?;
         let sst_dir = options.dir.join("sst");
-        create_dir_all(&sst_dir)?;
+        create_dir_all_durable(&sst_dir)?;
+
+        let engine_parent = options
+            .dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_dir_site(engine_parent, "engine:open_parent_sync")?;
+        sync_dir_site(&options.dir, "engine:open_dir_sync")?;
 
         // 2. Read and validate MANIFEST
         let manifest_path = options.dir.join("MANIFEST");
@@ -1425,7 +1433,7 @@ impl Engine {
                 let _ = remove_file(&tmp_path);
                 return Err(HtapError::Io(error));
             }
-            sync_dir(&sst_dir)?;
+            sync_dir_site(&sst_dir, "engine:compact_sst_dir_sync")?;
             let reader = Arc::new(SstReader::open(&sst_path)?);
             commit_guard.next_sst_id = next_sst_id;
             (Some(sst_id), Some(reader), Some(meta))
@@ -1729,7 +1737,7 @@ impl Engine {
                 let _ = remove_file(&tmp_path);
                 return Err(HtapError::Io(e));
             }
-            sync_dir(&sst_dir)?;
+            sync_dir_site(&sst_dir, "engine:flush_sst_dir_sync")?;
 
             // 4. Write and fsync MANIFEST
             let committed_version = self.read_state.read().committed_version;

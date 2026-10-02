@@ -66,7 +66,8 @@ use std::path::{Path, PathBuf};
 use htap_common::{
     bytecursor::ByteReader,
     envelope::encode_bare_frame,
-    fs::dur::{create_dir_all, remove_file, sync_dir_site, DurFile, DurOpenOptions},
+    fs::create_dir_all_durable,
+    fs::dur::{remove_file, sync_dir_site, DurFile, DurOpenOptions},
     HtapError, Result, Row, Version,
 };
 use serde::{Deserialize, Serialize};
@@ -301,9 +302,17 @@ impl Wal {
     /// append would land behind unreadable bytes and be silently invisible to
     /// every future replay.
     pub fn open(opts: WalOptions) -> Result<Wal> {
-        // A fresh WAL directory entry is only durable after its parent is
-        // fsynced; the segment-creation directory fsync covers the common case.
-        create_dir_all(&opts.dir)?;
+        // Synchronize both the WAL directory entry and its contents even when
+        // adopted from an earlier process that died before its directory sync.
+        create_dir_all_durable(&opts.dir)?;
+        let wal_parent = opts
+            .dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_dir_site(wal_parent, "wal:open_parent_sync")?;
+        sync_dir_site(&opts.dir, "wal:open_dir_sync")?;
+
         let listed = list_segments(&opts.dir)?;
 
         let mut segments = Vec::with_capacity(listed.len());
@@ -351,9 +360,14 @@ impl Wal {
                 // records instead of extending it.
                 let file = DurOpenOptions::new().read(true).append(true).open(&path)?;
                 // Drop the torn tail so appends continue from a clean boundary.
+                // Bytes written by a process that died before its fsync can
+                // otherwise be replayed and published, then lost after a
+                // power loss.
                 if scan.valid_end != scan.file_len {
                     file.set_len(scan.valid_end)?;
                     file.sync_all_site("wal:repair_sync")?;
+                } else {
+                    file.sync_all_site("wal:open_adopt_sync")?;
                 }
                 active_len = scan.valid_end;
                 next_lsn = scan.next_lsn;

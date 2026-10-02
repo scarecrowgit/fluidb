@@ -111,8 +111,9 @@ pub fn sync_dir(path: impl AsRef<Path>) -> Result<()> {
 /// Creates a directory tree and synchronizes each parent directory whose child
 /// was newly created.
 ///
-/// This is currently unused. It determines the missing path levels before
-/// creating them, then syncs each newly created level's parent after creation.
+/// Used by the rowstore open paths (`Engine::open` and `Wal::open`). It
+/// determines the missing path levels before creating them, then syncs only
+/// the parent of each level created by this call.
 pub fn create_dir_all_durable(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
     let mut missing: Vec<PathBuf> = Vec::new();
