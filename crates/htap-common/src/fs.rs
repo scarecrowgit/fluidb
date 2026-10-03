@@ -15,7 +15,7 @@ use crate::error::{HtapError, Result};
 pub(crate) mod recorder;
 
 #[cfg(feature = "crashsim")]
-pub use recorder::{register, FileId, Op, Recorder, SkipSync, Snapshot};
+pub use recorder::{register, FileId, Op, Recorder, SkipSync, Snapshot, SyncFault};
 
 #[cfg(feature = "crashsim")]
 thread_local! {

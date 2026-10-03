@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use htap_common::fs::{
     current_skip_sync, parse_skip_sync_env, register, scope_skip_hits, Op, Recorder, SkipSync,
-    Snapshot,
+    Snapshot, SyncFault,
 };
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -94,6 +94,21 @@ impl CrashHarness {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Arms sync-failure injection for the recorded workload.
+    pub fn set_sync_fault(&self, sync_fault: SyncFault) {
+        self.recorder.set_sync_fault(sync_fault);
+    }
+
+    /// Returns the number of workload sync attempts since the fault was armed.
+    pub fn sync_attempts(&self) -> u64 {
+        self.recorder.sync_attempts()
+    }
+
+    /// Returns the number of workload sync failures injected since the fault was armed.
+    pub fn sync_faults_fired(&self) -> u64 {
+        self.recorder.sync_faults_fired()
     }
 
     pub fn run_workload<F>(&self, workload: F) -> io::Result<()>

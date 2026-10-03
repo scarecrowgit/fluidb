@@ -12,9 +12,9 @@ pub use harness::{
     assert_skip_kills, assert_skip_survives, clear_powerloss_failure, powerloss_failure,
     set_powerloss_failure, CrashHarness, PowerLossFailure, PowerLossFailurePhase, WorkloadContext,
 };
-pub use htap_common::fs::parse_skip_sync_env;
 #[doc(hidden)]
 pub use htap_common::fs::SkipSync as __SkipSync;
+pub use htap_common::fs::{parse_skip_sync_env, SyncFault};
 
 /// Defines a test that must fail when one sync site is skipped.
 #[macro_export]

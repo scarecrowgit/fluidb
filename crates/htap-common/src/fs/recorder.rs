@@ -87,6 +87,17 @@ pub struct Snapshot {
     pub files: BTreeMap<FileId, Vec<u8>>,
 }
 
+/// Controls which sync operation, if any, fails before reaching the filesystem.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyncFault {
+    /// Do not inject a sync failure.
+    None,
+    /// Fail the 1-based `n`th sync attempt after this fault is armed.
+    Nth(u64),
+    /// Fail the 1-based occurrence of a sync carrying `site`.
+    Site { site: &'static str, occurrence: u64 },
+}
+
 /// Controls which otherwise-successful sync operations are omitted from the
 /// crash model's operation log.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -158,6 +169,33 @@ impl Recorder {
     /// Changes which successful syncs are omitted from the operation log.
     pub fn set_skip_sync(&self, skip_sync: SkipSync) {
         self.state.lock().skip_sync = skip_sync;
+    }
+
+    /// Arms sync-failure injection and resets its matching counters.
+    pub fn set_sync_fault(&self, sync_fault: SyncFault) {
+        assert!(
+            !matches!(
+                &sync_fault,
+                SyncFault::Nth(0) | SyncFault::Site { occurrence: 0, .. }
+            ),
+            "crashsim sync fault selectors are 1-based"
+        );
+
+        let mut state = self.state.lock();
+        state.sync_fault = sync_fault;
+        state.sync_attempts = 0;
+        state.sync_site_attempts.clear();
+        state.sync_faults_fired = 0;
+    }
+
+    /// Returns the number of sync attempts since the current fault was armed.
+    pub fn sync_attempts(&self) -> u64 {
+        self.state.lock().sync_attempts
+    }
+
+    /// Returns the number of injected sync failures since the current fault was armed.
+    pub fn sync_faults_fired(&self) -> u64 {
+        self.state.lock().sync_faults_fired
     }
 
     /// Returns the number of sync operations omitted from the operation log.
@@ -447,6 +485,16 @@ pub(crate) fn set_len(handle: &FileHandle, size: u64) {
     state.set_len(handle.file_id, size);
 }
 
+pub(crate) fn pre_sync_file(
+    handle: &FileHandle,
+    _all: bool,
+    site: Option<&'static str>,
+) -> io::Result<()> {
+    let mut state = handle.state.lock();
+    state.assert_recording_thread();
+    state.check_sync_fault(site)
+}
+
 pub(crate) fn sync_file(handle: &FileHandle, _all: bool, site: Option<&'static str>) {
     let mut state = handle.state.lock();
     state.assert_recording_thread();
@@ -595,6 +643,24 @@ pub(crate) fn remove_dir(path: &Path) {
     state.rmdir(&registered.path);
 }
 
+pub(crate) fn pre_sync_dir(path: &Path, site: Option<&'static str>) -> io::Result<()> {
+    let Some(registered) = for_path(path) else {
+        return Ok(());
+    };
+    let mut state = registered.state.lock();
+    state.assert_recording_thread();
+    let relative = state.relative(&registered.path).unwrap_or_else(|| {
+        panic!(
+            "path resolved differently than recorded: '{}'",
+            path.display()
+        )
+    });
+    if state.ignored(&relative) {
+        return Ok(());
+    }
+    state.check_sync_fault(site)
+}
+
 pub(crate) fn sync_dir(path: &Path, site: Option<&'static str>) {
     let Some(registered) = for_path(path) else {
         return;
@@ -618,6 +684,24 @@ pub(crate) fn sync_dir(path: &Path, site: Option<&'static str>) {
     } else {
         state.skip_hits += 1;
     }
+}
+
+pub(crate) fn pre_sync_path(path: &Path, site: Option<&'static str>) -> io::Result<()> {
+    let Some(registered) = for_path(path) else {
+        return Ok(());
+    };
+    let mut state = registered.state.lock();
+    state.assert_recording_thread();
+    let relative = state.relative(&registered.path).unwrap_or_else(|| {
+        panic!(
+            "path resolved differently than recorded: '{}'",
+            path.display()
+        )
+    });
+    if state.ignored(&relative) {
+        return Ok(());
+    }
+    state.check_sync_fault(site)
 }
 
 pub(crate) fn sync_path(path: &Path, site: Option<&'static str>) {
@@ -653,6 +737,10 @@ struct State {
     log: Vec<Op>,
     skip_sync: SkipSync,
     skip_hits: usize,
+    sync_fault: SyncFault,
+    sync_attempts: u64,
+    sync_site_attempts: BTreeMap<&'static str, u64>,
+    sync_faults_fired: u64,
     next_file_id: FileId,
     baseline_directories: BTreeSet<PathBuf>,
     baseline_names: BTreeMap<PathBuf, FileId>,
@@ -672,6 +760,10 @@ impl State {
             log: Vec::new(),
             skip_sync: SkipSync::None,
             skip_hits: 0,
+            sync_fault: SyncFault::None,
+            sync_attempts: 0,
+            sync_site_attempts: BTreeMap::new(),
+            sync_faults_fired: 0,
             next_file_id: 1,
             baseline_directories: BTreeSet::new(),
             baseline_names: BTreeMap::new(),
@@ -764,6 +856,31 @@ impl State {
             ),
             None => self.recording_thread = Some(current),
         }
+    }
+
+    fn check_sync_fault(&mut self, site: Option<&'static str>) -> io::Result<()> {
+        self.sync_attempts += 1;
+        let site_occurrence = site.map(|site| {
+            let occurrence = self.sync_site_attempts.entry(site).or_default();
+            *occurrence += 1;
+            *occurrence
+        });
+
+        let should_fail = match &self.sync_fault {
+            SyncFault::None => false,
+            SyncFault::Nth(attempt) => self.sync_attempts == *attempt,
+            SyncFault::Site {
+                site: expected,
+                occurrence,
+            } => site == Some(*expected) && site_occurrence == Some(*occurrence),
+        };
+
+        if should_fail {
+            self.sync_faults_fired += 1;
+            return Err(io::Error::other("crashsim injected sync failure"));
+        }
+
+        Ok(())
     }
 
     fn ensure_file(

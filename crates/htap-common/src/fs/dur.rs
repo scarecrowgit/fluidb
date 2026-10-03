@@ -102,6 +102,10 @@ impl DurFile {
 
     #[inline]
     fn sync_all_inner(&self, _site: Option<&'static str>) -> io::Result<()> {
+        #[cfg(feature = "crashsim")]
+        if let Some(handle) = &self.recording {
+            recording::pre_sync_file(handle, true, _site)?;
+        }
         self.file.sync_all()?;
         #[cfg(feature = "crashsim")]
         if let Some(handle) = &self.recording {
@@ -124,6 +128,10 @@ impl DurFile {
 
     #[inline]
     fn sync_data_inner(&self, _site: Option<&'static str>) -> io::Result<()> {
+        #[cfg(feature = "crashsim")]
+        if let Some(handle) = &self.recording {
+            recording::pre_sync_file(handle, false, _site)?;
+        }
         self.file.sync_data()?;
         #[cfg(feature = "crashsim")]
         if let Some(handle) = &self.recording {
@@ -465,6 +473,8 @@ fn sync_dir_site_inner(path: &Path, _site: Option<&'static str>) -> io::Result<(
     #[cfg(unix)]
     {
         let file = File::open(path)?;
+        #[cfg(feature = "crashsim")]
+        recording::pre_sync_dir(path, _site)?;
         file.sync_all()?;
         #[cfg(feature = "crashsim")]
         recording::sync_dir(path, _site);
@@ -491,6 +501,8 @@ pub fn fsync_path_site(path: impl AsRef<Path>, site: &'static str) -> io::Result
 #[inline]
 fn fsync_path_site_inner(path: &Path, _site: Option<&'static str>) -> io::Result<()> {
     let file = File::open(path)?;
+    #[cfg(feature = "crashsim")]
+    recording::pre_sync_path(path, _site)?;
     file.sync_all()?;
     #[cfg(feature = "crashsim")]
     recording::sync_path(path, _site);
