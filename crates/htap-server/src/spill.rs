@@ -108,6 +108,8 @@ pub(crate) struct SpillWriter {
 }
 
 impl SpillWriter {
+    // This covers ephemeral runtime state outside the crash model.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn create(path: &Path, header: SpillHeader) -> Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = BufWriter::new(file);
@@ -218,6 +220,8 @@ pub(crate) struct SpillDir {
 }
 
 impl SpillDir {
+    // This covers ephemeral runtime state outside the crash model.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn create(data_root: &Path, statement_id: u64) -> Result<Self> {
         let path = data_root.join("spill").join(statement_id.to_string());
         std::fs::create_dir_all(&path)?;
@@ -248,6 +252,8 @@ impl SpillDir {
 }
 
 impl Drop for SpillDir {
+    // This covers ephemeral runtime state outside the crash model.
+    #[allow(clippy::disallowed_methods)]
     fn drop(&mut self) {
         for path in &self.files {
             if let Err(error) = std::fs::remove_file(path) {

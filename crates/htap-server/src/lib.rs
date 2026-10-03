@@ -36,7 +36,7 @@ pub use htap_catalog::{
 };
 use htap_common::encode_key;
 use htap_common::error::{HtapError, Result};
-use htap_common::fs::sync_dir;
+use htap_common::fs::dur;
 use htap_common::lock::ProcessLock;
 use htap_common::password::{constant_time_eq_20, hash_native_password};
 use htap_common::types::{ColumnDef, Mutation, Row, Schema, Value};
@@ -516,7 +516,7 @@ impl LocalServer {
     /// or transaction recovery fails.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        std::fs::create_dir_all(&root)?;
+        dur::create_dir_all(&root)?;
         let canonical_root = root.canonicalize()?;
         let lock_guard = match ProcessLock::acquire(&canonical_root) {
             Ok(lock_guard) => lock_guard,
@@ -533,7 +533,7 @@ impl LocalServer {
         };
 
         let spill_dir = canonical_root.join("spill");
-        if let Err(error) = std::fs::remove_dir_all(&spill_dir) {
+        if let Err(error) = dur::remove_dir_all(&spill_dir) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
                     "failed to remove abandoned spill directory {}: {error}",
@@ -564,7 +564,7 @@ impl LocalServer {
         let data_mover = LocalDataMover::new(movement_dir)?;
 
         let colstore_dir = canonical_root.join("colstore");
-        std::fs::create_dir_all(&colstore_dir)?;
+        dur::create_dir_all(&colstore_dir)?;
 
         OwnedServer::validate_storage_state_on_open(&catalog, &colstore_dir)?;
         OwnedServer::migrate_legacy_id_high_water(&catalog, &colstore_dir)?;
@@ -1453,7 +1453,7 @@ impl OwnedServer {
                 match self
                     .data_mover
                     .reclaim_tablet_artifacts(artifact.tablet_id, || {
-                        std::fs::remove_dir_all(htap_convert::tablet_dir(
+                        dur::remove_dir_all(htap_convert::tablet_dir(
                             &self.colstore_dir,
                             artifact.tablet_id,
                         ))
@@ -1464,7 +1464,7 @@ impl OwnedServer {
                                 Err(error.into())
                             }
                         })?;
-                        sync_dir(&self.colstore_dir)?;
+                        dur::sync_dir_site(&self.colstore_dir, "server:reclaim_colstore_sync")?;
                         self.data_mover
                             .delete_tablet_movement_artifacts(artifact.tablet_id)
                     })? {

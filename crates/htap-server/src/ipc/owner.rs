@@ -43,6 +43,8 @@ impl IpcListener {
 }
 
 impl Drop for IpcListener {
+    // This covers ephemeral runtime state outside the crash model.
+    #[allow(clippy::disallowed_methods)]
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
 
@@ -77,6 +79,8 @@ impl Drop for IpcListener {
 ///
 /// A bind failure is non-fatal because the owner lock remains authoritative for exclusive root
 /// ownership. In that case this returns `Ok(None)` and the server continues in lock-only mode.
+// IPC socket setup only touches ephemeral runtime state, not durable data.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn start(
     root: &Path,
     server: Arc<OwnedServer>,
@@ -235,6 +239,8 @@ pub(crate) fn start(
     }))
 }
 
+// IPC directory cleanup only touches ephemeral runtime state, not durable data.
+#[allow(clippy::disallowed_methods)]
 fn cleanup_stale_private_directories(root: &Path) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
