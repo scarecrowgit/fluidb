@@ -14,12 +14,12 @@
 //! - **Terminal Idempotence**: Completed jobs immediately return their recorded report as a no-op
 //!   without re-executing storage scans or disk writes.
 
-use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
 use htap_catalog::store::CatalogStore;
+use htap_common::fs::dur::{create_dir_all, remove_file, rename, DurOpenOptions};
 use htap_common::{HtapError, Result, Row};
 use htap_rowstore::{Engine, MemtableEntry, Snapshot, ValueKind};
 
@@ -251,7 +251,7 @@ fn export_to_file(
     // 2. Prepare atomic destination and temporary file path
     let dest_path = &options.path;
     let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent_dir)?;
+    create_dir_all(parent_dir)?;
 
     let file_name = dest_path
         .file_name()
@@ -261,7 +261,11 @@ fn export_to_file(
 
     // 3. Write temp file and fsync
     let write_res = (|| -> Result<()> {
-        let file = File::create(&tmp_path)?;
+        let file = DurOpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
         match format {
             DataFormat::Csv => {
                 let mut wtr = csv::WriterBuilder::new()
@@ -291,20 +295,20 @@ fn export_to_file(
             }
         }
 
-        let sync_file = File::open(&tmp_path)?;
-        sync_file.sync_all()?;
+        let sync_file = DurOpenOptions::new().read(true).open(&tmp_path)?;
+        sync_file.sync_all_site("movement:export_write_sync")?;
         Ok(())
     })();
 
     if let Err(e) = write_res {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_file(&tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
         return Err(e);
     }
 
     // 4. Atomic rename
-    if let Err(e) = fs::rename(&tmp_path, dest_path) {
-        let _ = fs::remove_file(&tmp_path);
+    if let Err(e) = rename(&tmp_path, dest_path) {
+        let _ = remove_file(&tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
         return Err(HtapError::Io(e));
     }

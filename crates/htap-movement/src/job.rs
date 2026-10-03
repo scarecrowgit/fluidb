@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use htap_catalog::{TableId, TabletId};
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::dur::{create_dir_all, remove_dir_all};
 use htap_common::fs::{
     atomic_publish as publish_file, read_file_exact_bounded, sync_dir as sync_directory,
 };
@@ -736,9 +737,9 @@ impl LocalDataMover {
     /// Open or create a local data mover repository at `<movement_root>`.
     pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self> {
         let root_dir = root_dir.into();
-        fs::create_dir_all(&root_dir)?;
-        fs::create_dir_all(root_dir.join("jobs"))?;
-        fs::create_dir_all(root_dir.join("tablets"))?;
+        create_dir_all(&root_dir)?;
+        create_dir_all(root_dir.join("jobs"))?;
+        create_dir_all(root_dir.join("tablets"))?;
 
         Ok(Self {
             root_dir,
@@ -888,7 +889,7 @@ impl LocalDataMover {
         }
 
         let package_dir = self.tablets_dir().join(tablet_id.0.to_string());
-        match fs::remove_dir_all(&package_dir) {
+        match remove_dir_all(&package_dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(HtapError::Io(e)),
@@ -912,7 +913,7 @@ impl LocalDataMover {
                 };
 
                 if job.tablet_id == tablet_id {
-                    match fs::remove_dir_all(entry.path()) {
+                    match remove_dir_all(entry.path()) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(HtapError::Io(e)),
@@ -1443,7 +1444,7 @@ impl LocalDataMover {
 
     fn persist_job_locked(&self, job: &MovementJob) -> Result<()> {
         let job_dir = self.job_dir(&job.request.job_id)?;
-        fs::create_dir_all(&job_dir)?;
+        create_dir_all(&job_dir)?;
 
         let encoded = encode_job(job)?;
 

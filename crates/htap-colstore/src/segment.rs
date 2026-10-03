@@ -72,6 +72,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use htap_common::fs::dur::{remove_file, DurFile, DurOpenOptions};
 use htap_common::types::check_decimal_precision;
 use htap_common::{ColumnDef, DataType, HtapError, Result, Row, Schema, Value};
 use serde::{Deserialize, Serialize};
@@ -176,25 +177,31 @@ impl SegmentWriter {
         validate_segment_schema(schema)?;
         options.validate()?;
 
-        let file = File::create(path)?;
+        let file = DurOpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
         let mut writer = BufWriter::new(file);
 
         match Self::write_internal(&mut writer, path, schema, rows, options) {
             Ok(metadata) => {
                 writer.flush()?;
-                writer.get_ref().sync_all()?;
+                writer
+                    .get_ref()
+                    .sync_all_site("colstore:segment_write_sync")?;
                 Ok(metadata)
             }
             Err(e) => {
                 drop(writer);
-                let _ = std::fs::remove_file(path);
+                let _ = remove_file(path);
                 Err(e)
             }
         }
     }
 
     fn write_internal(
-        writer: &mut BufWriter<File>,
+        writer: &mut BufWriter<DurFile>,
         path: &Path,
         schema: &Schema,
         rows: impl IntoIterator<Item = Row>,
@@ -318,7 +325,7 @@ impl SegmentWriter {
     }
 
     fn flush_block(
-        writer: &mut BufWriter<File>,
+        writer: &mut BufWriter<DurFile>,
         schema: &Schema,
         rows: &[Row],
         row_start: u64,

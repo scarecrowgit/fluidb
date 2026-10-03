@@ -21,6 +21,7 @@ use htap_colstore::{validate_segment_schema, ScanRequest, SegmentReader, Segment
 pub use htap_colstore::{Predicate, ScanStats, SegmentOptions};
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
 use htap_common::fs::atomic_publish;
+use htap_common::fs::dur::{create_dir_all, remove_file, rename};
 use htap_common::{
     encode_key, read_file_exact_bounded, HtapError, Result, Row, Schema, Value, Version,
 };
@@ -688,7 +689,7 @@ impl TabletColumnManifest {
 pub fn write_atomic(root_dir: &Path, manifest: &TabletColumnManifest) -> Result<()> {
     manifest.validate()?;
     let t_dir = tablet_dir(root_dir, manifest.tablet_id);
-    std::fs::create_dir_all(&t_dir)?;
+    create_dir_all(&t_dir)?;
 
     let bytes = manifest.encode()?;
     atomic_publish(
@@ -807,7 +808,7 @@ pub fn write_segment(
 
     let t_dir = tablet_dir(root_dir, tablet_id);
     let gen_dir = t_dir.join(format!("gen-{generation}"));
-    std::fs::create_dir_all(&gen_dir)?;
+    create_dir_all(&gen_dir)?;
 
     let tmp_file_name = format!("{segment_name}.tmp");
     let tmp_path = gen_dir.join(&tmp_file_name);
@@ -817,7 +818,7 @@ pub fn write_segment(
     let metadata = match SegmentWriter::write(&tmp_path, schema, rows, options) {
         Ok(m) => m,
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_file(&tmp_path);
             return Err(e);
         }
     };
@@ -826,7 +827,7 @@ pub fn write_segment(
     htap_common::fs::fsync_file(&tmp_path)?;
 
     // 3. Rename tmp to final
-    std::fs::rename(&tmp_path, &final_path)?;
+    rename(&tmp_path, &final_path)?;
 
     // 4. Fsync directory
     sync_dir(&gen_dir)?;

@@ -31,12 +31,12 @@
 //!   storage engines, Raft/Paxos consensus, placement drivers, leader election, or live
 //!   serving replica traffic handoffs.
 
-use std::fs;
 use std::time::Instant;
 
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{PartitionId, ReplicaDescriptor, ReplicaId, TableDescriptor, TableId, TabletId};
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
+use htap_common::fs::dur::{create_dir_all, remove_file, rename};
 use htap_common::fs::write_new_tmp_file;
 use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Schema, Version};
 use htap_rowstore::{Engine, Snapshot};
@@ -455,7 +455,7 @@ pub fn clone_tablet(
         options.target_replica_id,
         &options.job_id,
     )?;
-    fs::create_dir_all(&package_dir)?;
+    create_dir_all(&package_dir)?;
 
     let data_tmp_path = package_dir.join("DATA.tmp");
     let data_path = mover.tablet_data_path(
@@ -468,14 +468,14 @@ pub fn clone_tablet(
     // 1. Write DATA.tmp and fsync
     let write_data_res = write_new_tmp_file(&data_tmp_path, &data_bytes, None);
     if let Err(e) = write_data_res {
-        let _ = fs::remove_file(&data_tmp_path);
+        let _ = remove_file(&data_tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
         return Err(e);
     }
 
     // 2. Rename DATA.tmp -> DATA
-    if let Err(e) = fs::rename(&data_tmp_path, &data_path) {
-        let _ = fs::remove_file(&data_tmp_path);
+    if let Err(e) = rename(&data_tmp_path, &data_path) {
+        let _ = remove_file(&data_tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
         return Err(HtapError::Io(e));
     }
@@ -483,14 +483,14 @@ pub fn clone_tablet(
     // 3. Write MANIFEST.tmp and fsync
     let write_manifest_res = write_new_tmp_file(&manifest_tmp_path, &manifest_bytes, None);
     if let Err(e) = write_manifest_res {
-        let _ = fs::remove_file(&manifest_tmp_path);
+        let _ = remove_file(&manifest_tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
         return Err(e);
     }
 
     // 4. Rename MANIFEST.tmp -> MANIFEST
-    if let Err(e) = fs::rename(&manifest_tmp_path, &manifest_path) {
-        let _ = fs::remove_file(&manifest_tmp_path);
+    if let Err(e) = rename(&manifest_tmp_path, &manifest_path) {
+        let _ = remove_file(&manifest_tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
         return Err(HtapError::Io(e));
     }
