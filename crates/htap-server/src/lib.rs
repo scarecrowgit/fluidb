@@ -516,7 +516,7 @@ impl LocalServer {
     /// or transaction recovery fails.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        dur::create_dir_all(&root)?;
+        htap_common::fs::create_dir_all_durable(&root)?;
         let canonical_root = root.canonicalize()?;
         let lock_guard = match ProcessLock::acquire(&canonical_root) {
             Ok(lock_guard) => lock_guard,
@@ -563,8 +563,15 @@ impl LocalServer {
         let movement_dir = canonical_root.join("movement");
         let data_mover = LocalDataMover::new(movement_dir)?;
 
+        // A filesystem root has no parent directory entry to synchronize.
+        if let Some(parent) = canonical_root.parent() {
+            dur::sync_dir_site(parent, "server:open_parent_sync")?;
+            htap_common::fs::sync_ancestors_best_effort(parent)?;
+        }
+
         let colstore_dir = canonical_root.join("colstore");
-        dur::create_dir_all(&colstore_dir)?;
+        htap_common::fs::create_dir_all_durable(&colstore_dir)?;
+        dur::sync_dir_site(&canonical_root, "server:open_dir_sync")?;
 
         OwnedServer::validate_storage_state_on_open(&catalog, &colstore_dir)?;
         OwnedServer::migrate_legacy_id_high_water(&catalog, &colstore_dir)?;

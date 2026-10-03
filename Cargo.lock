@@ -715,6 +715,7 @@ dependencies = [
  "htap-catalog",
  "htap-common",
  "htap-convert",
+ "htap-crashsim",
  "htap-movement",
  "htap-rowstore",
  "htap-sql",
