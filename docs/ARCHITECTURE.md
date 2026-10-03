@@ -797,7 +797,7 @@ flowchart TD
         compact_read -->|"invokes"| col_scan["htap-colstore SegmentReader.scan"]
         col_scan -->|"then performs"| delta_merge["htap-convert delta suppression/overlay & deterministic merge"]
         delta_merge --> logical_rows["logical rows/aggregates"]
-        olap_exec -->|"Row & SnapshotPinned manifest-less Converting fallback"| row_scan["htap-rowstore logical scan / collapse"]
+        olap_exec -->|"Row & manifest-less Converting (any phase) fallback"| row_scan["htap-rowstore logical scan / collapse"]
         row_scan --> logical_rows
         route_class -->|"Route::Query"| query_exec["htap-server query_exec (general executor);<br/>Phase 14: htap-sql::optimize cost-based plan by default"]
         query_exec -->|"per slot, one snapshot per statement"| compact_read
@@ -824,7 +824,7 @@ flowchart TD
     class plan_df,plan_coord,plan_remote,plan_compact planned;
 ```
 
-The current active path operates entirely in-process within `LocalServer` for `EmbeddedClient`, and over a loopback-by-default synchronous MySQL text- and binary-protocol connection (`htap-wire` `WireServer`, `htapd`) for `RemoteClient`, without distributed dependencies: queries are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and `SnapshotPinned` manifest-less partitions). In contrast, the planned target architecture—including DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with columnar delta-to-base background compaction (the rowstore's own LSM compaction and DROP TABLE artifact reclaim are implemented as of Phase 15 — see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" below)—is deferred and strictly separated from active execution paths.
+The current active path operates entirely in-process within `LocalServer` for `EmbeddedClient`, and over a loopback-by-default synchronous MySQL text- and binary-protocol connection (`htap-wire` `WireServer`, `htapd`) for `RemoteClient`, without distributed dependencies: queries are parsed and bound with `htap-sql` against `CatalogStore`, then classified into synchronous catalog DDL modifications via `LocalCatalogStore.compare_and_set`, 2PC transactional mutations routed through `TransactionManager` and `RowstoreParticipant (ID 1)` to the rowstore engine, single-row point lookups via visible snapshots, or local analytical scans (compact reads where `htap-convert` invokes `SegmentReader.scan` then performs delta suppression/overlay and deterministic merge for materialized `Column` and manifest-bearing `Converting` partitions, or rowstore logical scan/collapse fallback for `Row`, historical pre-base, and manifest-less `Converting` partitions in any conversion phase). In contrast, the planned target architecture—including DataFusion/Arrow vectorized queries, distributed coordination via Raft/ZooKeeper, multi-tablet remote partition serving, and delete vectors with columnar delta-to-base background compaction (the rowstore's own LSM compaction and DROP TABLE artifact reclaim are implemented as of Phase 15 — see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" below)—is deferred and strictly separated from active execution paths.
 
 ### Current In-Process Execution Call Flow (Implemented Local Slice)
 
@@ -850,7 +850,7 @@ flowchart TD
         Route -->|"Route::CatalogRead<br/>(SHOW / DESCRIBE)"| CatalogRead["execute_show (CatalogSnapshot only)"]
         Route -->|"Route::Explain<br/>(EXPLAIN [ANALYZE], Phase 14)"| Explain["explain::execute_explain:<br/>single-node plan, no optimizer call, for<br/>RowstorePointRead/OlapScan inner statements"]
 
-        OlapScan -->|"Row & SnapshotPinned<br/>manifest-less fallback"| RowScan["htap_rowstore logical scan &amp; collapse<br/>(scan_partition + collapse_entries_to_rows)"]
+        OlapScan -->|"Row & manifest-less Converting<br/>(any phase) fallback"| RowScan["htap_rowstore logical scan &amp; collapse<br/>(scan_partition + collapse_entries_to_rows)"]
         OlapScan -->|"materialized Column &amp;<br/>manifest-bearing Converting"| ColCompact["htap-convert read_column_partition_compact_core<br/>at &lt;root&gt;/colstore (PK+requested union, 1 leaf pushdown)"]
         ColCompact -->|"invokes"| ColEngine["htap-colstore SegmentReader.scan<br/>(vectorized scan primitive with ScanStats)"]
         ColEngine -->|"then performs"| ConvertOverlay["htap-convert delta suppression/overlay<br/>&amp; deterministic PK merge"]
@@ -2175,7 +2175,7 @@ separate write path for updated rows:
 Verified in `crates/htap-server/tests/query_exec.rs` (`test_update_by_primary_key_and_reopen_recovery`,
 `test_update_by_filter_across_partitions_and_storage_formats_with_reopen`,
 `test_update_by_primary_key_on_column_and_converting_partitions` — point `UPDATE` against a `Column`
-partition plus reopen, and against a partition mid-conversion (`Converting`/`SnapshotPinned`), verifying the
+partition plus reopen, and against a partition mid-conversion (`Converting`/`SnapshotPinned`, a manifest-less phase served by the rowstore fallback), verifying the
 delta survives a subsequent `conversion_tick` that resumes and completes the conversion).
 
 ### Concurrency, topology, and process lock boundaries
@@ -2667,7 +2667,7 @@ A critical architectural distinction exists between storage scanning and SQL exe
 ### Fallback behavior and defensive branches
 
 - **Row format fallback:** Partitions with `StorageDescriptor::Row` always execute the rowstore scan and collapse path.
-- **SnapshotPinned manifest-less fallback:** For partitions in `StorageDescriptor::Converting` without a published manifest, if the phase is `ConversionPhase::SnapshotPinned`, `LocalServer` falls back to the rowstore scan and collapse path. If in any later phase without a manifest, `LocalServer` rejects the query with `HtapError::InvalidArgument`.
+- **Manifest-less `Converting` fallback (any phase):** For partitions in `StorageDescriptor::Converting` without a published manifest, `LocalServer` falls back to the rowstore scan and collapse path in every conversion phase (`SnapshotPinned`, `SegmentsWritten`, `ReadyToPublish`); there is no phase-based `HtapError::InvalidArgument` rejection any more. This is required because the catalog records the column manifest only in the final publish CAS, so a crash after `SegmentsWritten` or `ReadyToPublish` leaves a manifest-less `Converting` partition that a reopened server must be able to read before any `tick()`. It is correct because the rowstore stays authoritative until publish and `compaction_tick` bounds its GC horizon by every conversion snapshot in every phase, so the history needed for a caller's snapshot is preserved (BUG-PL-7, `test_server_open_serves_manifest_less_segments_written_and_ready_to_publish`). Not changed: there is no conversion resume on open (only an explicit `tick()` resumes and publishes), `DROP TABLE` still returns `Conflict` until that `tick()`, and `open` still fails closed when a `Converting` partition's on-disk manifest file is missing (surfacing as `HtapError::Io`, `test_server_open_rejects_converting_with_missing_manifest`).
 - **Pre-base historical query fallback:** In `read_column_partition_compact_core` (and `read_column_partition`), if `target_snapshot.version < base_version`, the converter core directly falls back to scanning the rowstore and collapsing rows, because columnar segments only represent state at and after `base_version`.
 - **Manifest-bearing Converting defensive branch:** In normal operation, the conversion process publishes the tablet manifest to the catalog only upon final cutover to `StorageDescriptor::Column`. However, if a converting partition in the catalog already references a valid manifest, `LocalServer` contains a defensive branch executing the compact columnar path.
 
@@ -2682,7 +2682,7 @@ whose module doc is the source of truth for this contract. Summary:
 - **Model:** Every base table side of a join is materialized as logical rows through the same storage path
   the narrow `Route::OlapScan` executor uses (`scan_partition_compact`): `Row` partitions from the LSM
   rowstore, `Column` and manifest-bearing `Converting` partitions from columnar segments with the rowstore
-  delta overlaid, `SnapshotPinned` manifest-less `Converting` partitions falling back to the rowstore path
+  delta overlaid, manifest-less `Converting` partitions (any phase) falling back to the rowstore path
   (the same fallback rules as `Route::OlapScan`). Execution then runs as separate, sequential stages over
   those materialized rows: (1) uncorrelated subqueries, executed once, and correlated subqueries (Phase 13,
   depth-1 only), executed per outer row via the `SubqueryRunner` callback against the statement's single

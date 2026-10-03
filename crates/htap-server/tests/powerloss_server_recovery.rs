@@ -233,7 +233,31 @@ fn run_conversion_workload(
     issue_step(workload, 4, || server.execute("DROP TABLE t"));
     issued += 1;
 
-    issue_step(workload, 5, || server.compaction_tick().map(|_| ()));
+    issue_step(workload, 5, || {
+        let old_tablet = old_tablet
+            .get()
+            .expect("original tablet id was not recorded before reclamation");
+
+        for _ in 0..32 {
+            server.compaction_tick()?;
+
+            let snapshot = load_catalog(workload.root());
+            let reclaim_pending = snapshot.pending_reclaim.iter().any(|entry| {
+                entry
+                    .dropped
+                    .iter()
+                    .any(|artifact| artifact.tablet_id == old_tablet)
+            });
+            if !reclaim_pending {
+                return Ok::<(), htap_common::HtapError>(());
+            }
+        }
+
+        panic!(
+            "reclamation did not remove the pending_reclaim entry for old tablet \
+             {old_tablet} after 32 compaction ticks"
+        );
+    });
     issued += 1;
 
     issue_step(workload, 6, || {
@@ -360,7 +384,6 @@ fn check_conversion_image(
 }
 
 #[test]
-#[ignore = "BUG-PL-7: conversion recovery fix lands in the next commit"]
 fn server_conversion_and_reclaim_survive() {
     let harness = CrashHarness::new("srv_conv_reclaim").unwrap();
     let issued = Cell::new(0);
@@ -592,7 +615,6 @@ fn enumerate_recovery_policy(
 }
 
 #[test]
-#[ignore = "BUG-PL-7: conversion recovery fix lands in the next commit"]
 fn server_recovery_crash_depth1() {
     let harness = CrashHarness::new("srv_recover_d1").unwrap();
     let issued = Cell::new(0);

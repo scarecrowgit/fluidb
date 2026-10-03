@@ -1602,6 +1602,8 @@ impl OwnedServer {
             }
         }
 
+        // Manifest-less Converting reads rely on preserving the conversion snapshot in every
+        // phase, including SegmentsWritten and ReadyToPublish after a crash.
         for partition in &catalog.partitions {
             let Some(conversion) = partition.conversion.as_ref() else {
                 continue;
@@ -4059,32 +4061,25 @@ pub(crate) fn scan_partition_compact(
                 compact_res.rows
             }
             None => {
-                let is_snapshot_pinned = partition
-                    .conversion
-                    .as_ref()
-                    .map(|c| c.phase == htap_catalog::ConversionPhase::SnapshotPinned)
-                    .unwrap_or(false);
-                if is_snapshot_pinned {
-                    let entries = engine.scan_partition(partition.id.as_u64(), snapshot)?;
-                    let rows = htap_convert::collapse_entries_to_rows(&entries);
-                    let mut compact_rows = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let mut values = Vec::with_capacity(internal_columns.len());
-                        for &idx in &internal_columns {
-                            let val = row.get(idx).cloned().ok_or_else(|| {
-                                HtapError::Internal(format!("row missing column index {idx}"))
-                            })?;
-                            values.push(val);
-                        }
-                        compact_rows.push(Row::new(values));
+                // The catalog records the column manifest only in the final publish CAS, so a
+                // crash after SegmentsWritten or ReadyToPublish can leave this Converting
+                // partition manifest-less. Rowstore remains authoritative until publish, and
+                // compaction_tick bounds its GC horizon by every conversion snapshot in every
+                // phase, preserving the history needed to serve this caller's snapshot.
+                let entries = engine.scan_partition(partition.id.as_u64(), snapshot)?;
+                let rows = htap_convert::collapse_entries_to_rows(&entries);
+                let mut compact_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let mut values = Vec::with_capacity(internal_columns.len());
+                    for &idx in &internal_columns {
+                        let val = row.get(idx).cloned().ok_or_else(|| {
+                            HtapError::Internal(format!("row missing column index {idx}"))
+                        })?;
+                        values.push(val);
                     }
-                    compact_rows
-                } else {
-                    return Err(HtapError::InvalidArgument(format!(
-                        "partition {} is converting without manifest but phase is not SnapshotPinned",
-                        partition.id
-                    )));
+                    compact_rows.push(Row::new(values));
                 }
+                compact_rows
             }
         },
     };

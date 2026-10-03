@@ -463,7 +463,7 @@ StorageDescriptor
 │
 └── Converting
       ├── If column manifest present: read_column_partition_compact_core
-      └── If no manifest and phase == SnapshotPinned: rowstore scan fallback
+      └── If no manifest (any phase): rowstore scan fallback
 ```
 
 1. **`StorageDescriptor::Row`:**
@@ -479,8 +479,7 @@ StorageDescriptor
      - Suppresses stale base rows and overlays delta mutations in deterministic PK order.
 3. **`StorageDescriptor::Converting`:**
    - If manifest is published: Reads columnar base plus rowstore deltas via `read_column_partition_compact_core`.
-   - If manifest is absent and phase is `ConversionPhase::SnapshotPinned`: Safely falls back to full rowstore scan (`engine.scan_partition`).
-   - If manifest is absent in any later phase: Returns `HtapError::InvalidArgument`.
+   - If manifest is absent (any phase: `SnapshotPinned`, `SegmentsWritten`, `ReadyToPublish`): Safely falls back to full rowstore scan (`engine.scan_partition`). The catalog records the manifest only in the final publish CAS, so a crash mid-conversion leaves such a partition; the rowstore stays authoritative and the GC horizon covers every conversion snapshot. There is no conversion resume on open, and `DROP TABLE` returns `Conflict` until an explicit `tick()` resumes and publishes the conversion.
 
 ### Table-Wide Conversion, Demotion, and Explicit Policy Ticks
 
