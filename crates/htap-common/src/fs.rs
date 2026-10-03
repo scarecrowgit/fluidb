@@ -17,6 +17,97 @@ pub(crate) mod recorder;
 #[cfg(feature = "crashsim")]
 pub use recorder::{register, FileId, Op, Recorder, SkipSync, Snapshot};
 
+#[cfg(feature = "crashsim")]
+thread_local! {
+    static SKIP_SYNC_STACK: std::cell::RefCell<Vec<(SkipSync, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static LAST_SCOPE_SKIP_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "crashsim")]
+struct SkipSyncGuard;
+
+#[cfg(feature = "crashsim")]
+impl Drop for SkipSyncGuard {
+    fn drop(&mut self) {
+        SKIP_SYNC_STACK.with(|stack| {
+            let (_, hits) = stack
+                .borrow_mut()
+                .pop()
+                .expect("skip-sync scope stack underflow");
+            LAST_SCOPE_SKIP_HITS.with(|last_hits| last_hits.set(hits));
+        });
+    }
+}
+
+/// Runs `f` with `skip` added to this thread's crashsim skip-sync scope.
+///
+/// The scope is restored even when `f` panics.
+#[cfg(feature = "crashsim")]
+pub fn with_skip_sync<F, T>(skip: SkipSync, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    SKIP_SYNC_STACK.with(|stack| stack.borrow_mut().push((skip, 0)));
+    let _guard = SkipSyncGuard;
+    f()
+}
+
+/// Returns the effective crashsim sync-skipping mode for this thread.
+#[cfg(feature = "crashsim")]
+pub fn current_skip_sync() -> SkipSync {
+    SKIP_SYNC_STACK.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .map(|(skip, _)| skip.clone())
+            .unwrap_or(SkipSync::None)
+    })
+}
+
+/// Increments the hit counter of the innermost active skip-sync scope.
+#[cfg(feature = "crashsim")]
+pub(crate) fn record_scope_skip_hit() {
+    SKIP_SYNC_STACK.with(|stack| {
+        if let Some((_, hits)) = stack.borrow_mut().last_mut() {
+            *hits += 1;
+        }
+    });
+}
+
+/// Returns the number of sync operations skipped by the most recently exited scope.
+#[cfg(feature = "crashsim")]
+pub fn scope_skip_hits() -> usize {
+    LAST_SCOPE_SKIP_HITS.with(std::cell::Cell::get)
+}
+
+/// Parses the `POWERLOSS_SKIP_SYNC` crashsim setting.
+///
+/// Accepted values are `file`, `dir`, `all`, and `site:<id>`.
+#[cfg(feature = "crashsim")]
+pub fn parse_skip_sync_env() -> SkipSync {
+    match std::env::var("POWERLOSS_SKIP_SYNC") {
+        Err(std::env::VarError::NotPresent) => SkipSync::None,
+        Ok(value) => {
+            if value == "file" {
+                SkipSync::File
+            } else if value == "dir" {
+                SkipSync::Directory
+            } else if value == "all" {
+                SkipSync::All
+            } else if let Some(site) = value.strip_prefix("site:") {
+                SkipSync::Site(Box::leak(site.to_owned().into_boxed_str()))
+            } else {
+                panic!("invalid POWERLOSS_SKIP_SYNC value: {value:?}");
+            }
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("POWERLOSS_SKIP_SYNC must contain valid Unicode")
+        }
+    }
+}
+
 pub mod dur;
 
 pub use dur::{DurFile, DurOpenOptions};

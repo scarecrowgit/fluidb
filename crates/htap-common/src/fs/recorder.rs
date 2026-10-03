@@ -116,6 +116,32 @@ impl SkipSync {
     }
 }
 
+fn should_skip_file_sync(skip_sync: &SkipSync, site: Option<&'static str>) -> bool {
+    let scoped_skip_sync = super::current_skip_sync();
+    if scoped_skip_sync == SkipSync::None {
+        skip_sync.skips_file(site)
+    } else {
+        let should_skip = scoped_skip_sync.skips_file(site);
+        if should_skip {
+            super::record_scope_skip_hit();
+        }
+        should_skip
+    }
+}
+
+fn should_skip_dir_sync(skip_sync: &SkipSync, site: Option<&'static str>) -> bool {
+    let scoped_skip_sync = super::current_skip_sync();
+    if scoped_skip_sync == SkipSync::None {
+        skip_sync.skips_dir(site)
+    } else {
+        let should_skip = scoped_skip_sync.skips_dir(site);
+        if should_skip {
+            super::record_scope_skip_hit();
+        }
+        should_skip
+    }
+}
+
 /// Handle returned by [`register`]. Dropping the final handle unregisters the
 /// root and prevents subsequent operations from being recorded.
 #[derive(Clone)]
@@ -132,6 +158,11 @@ impl Recorder {
     /// Changes which successful syncs are omitted from the operation log.
     pub fn set_skip_sync(&self, skip_sync: SkipSync) {
         self.state.lock().skip_sync = skip_sync;
+    }
+
+    /// Returns the number of sync operations omitted from the operation log.
+    pub fn skip_hits(&self) -> usize {
+        self.state.lock().skip_hits
     }
 
     /// Appends an explicit acknowledgement marker.
@@ -166,10 +197,27 @@ impl Recorder {
         }
     }
 
+    /// Registers a data directory whose runtime artifacts are excluded from
+    /// the durability model.
+    ///
+    /// `rel` is relative to the registered root and must not contain `..`.
+    pub fn add_ephemeral_data_root(&self, rel: impl AsRef<Path>) {
+        let rel = rel.as_ref();
+        assert!(
+            !rel.is_absolute()
+                && !rel
+                    .components()
+                    .any(|component| component == Component::ParentDir),
+            "ephemeral data root must be relative and must not contain '..': '{}'",
+            rel.display()
+        );
+        self.state.lock().add_ephemeral_data_root(rel.to_path_buf());
+    }
+
     /// Panics unless the modeled tree precisely matches the on-disk tree.
     ///
-    /// The `LOCK` entry and all entries below `spill/` are deliberately
-    /// ignored because they are external to the durability model.
+    /// Runtime artifacts directly beneath each ephemeral data root are
+    /// ignored: `LOCK`, `spill/`, `htap.sock`, and `.htap-ipc-*` entries.
     pub fn verify_tree(&self) {
         self.state.lock().verify_tree();
     }
@@ -311,7 +359,7 @@ pub(crate) fn open_file(
                 path.display()
             )
         });
-        if ignored(&relative) {
+        if state_guard.ignored(&relative) {
             return None;
         }
 
@@ -403,7 +451,8 @@ pub(crate) fn sync_file(handle: &FileHandle, _all: bool, site: Option<&'static s
     let mut state = handle.state.lock();
     state.assert_recording_thread();
     state.assert_file_matches_disk(handle.file_id);
-    if state.skip_sync.skips_file(site) {
+    if should_skip_file_sync(&state.skip_sync, site) {
+        state.skip_hits += 1;
         return;
     }
 
@@ -448,15 +497,17 @@ pub(crate) fn check_rename(from: &Path, to: &Path) {
         return;
     }
 
-    if from_registered
-        .as_ref()
-        .and_then(|registered| registered.state.lock().relative(&registered.path))
-        .is_some_and(|path| ignored(&path))
-        || to_registered
-            .as_ref()
-            .and_then(|registered| registered.state.lock().relative(&registered.path))
-            .is_some_and(|path| ignored(&path))
-    {
+    if from_registered.as_ref().is_some_and(|registered| {
+        let state = registered.state.lock();
+        state
+            .relative(&registered.path)
+            .is_some_and(|path| state.ignored(&path))
+    }) || to_registered.as_ref().is_some_and(|registered| {
+        let state = registered.state.lock();
+        state
+            .relative(&registered.path)
+            .is_some_and(|path| state.ignored(&path))
+    }) {
         panic!("unsupported in crash model: rename of ignored path");
     }
 
@@ -556,14 +607,16 @@ pub(crate) fn sync_dir(path: &Path, site: Option<&'static str>) {
             path.display()
         )
     });
-    if ignored(&relative) {
+    if state.ignored(&relative) {
         return;
     }
-    if !state.skip_sync.skips_dir(site) {
+    if !should_skip_dir_sync(&state.skip_sync, site) {
         state.log.push(Op::FsyncDir {
             path: relative,
             site,
         });
+    } else {
+        state.skip_hits += 1;
     }
 }
 
@@ -579,7 +632,7 @@ pub(crate) fn sync_path(path: &Path, site: Option<&'static str>) {
             path.display()
         )
     });
-    if ignored(&relative) {
+    if state.ignored(&relative) {
         return;
     }
     let file_id = state
@@ -588,7 +641,8 @@ pub(crate) fn sync_path(path: &Path, site: Option<&'static str>) {
         .copied()
         .unwrap_or_else(|| panic!("file is missing from crashsim model: '{}'", path.display()));
     state.assert_file_matches_disk(file_id);
-    if state.skip_sync.skips_file(site) {
+    if should_skip_file_sync(&state.skip_sync, site) {
+        state.skip_hits += 1;
         return;
     }
     state.log.push(Op::FsyncFile { file_id, site });
@@ -598,10 +652,12 @@ struct State {
     root: PathBuf,
     log: Vec<Op>,
     skip_sync: SkipSync,
+    skip_hits: usize,
     next_file_id: FileId,
     baseline_directories: BTreeSet<PathBuf>,
     baseline_names: BTreeMap<PathBuf, FileId>,
     baseline_files: BTreeMap<FileId, Vec<u8>>,
+    ephemeral_data_roots: BTreeSet<PathBuf>,
     directories: BTreeSet<PathBuf>,
     names: BTreeMap<PathBuf, FileId>,
     files: BTreeMap<FileId, Vec<u8>>,
@@ -615,10 +671,12 @@ impl State {
             root,
             log: Vec::new(),
             skip_sync: SkipSync::None,
+            skip_hits: 0,
             next_file_id: 1,
             baseline_directories: BTreeSet::new(),
             baseline_names: BTreeMap::new(),
             baseline_files: BTreeMap::new(),
+            ephemeral_data_roots: BTreeSet::from([PathBuf::new()]),
             directories: BTreeSet::from([PathBuf::new()]),
             names: BTreeMap::new(),
             files: BTreeMap::new(),
@@ -640,7 +698,7 @@ impl State {
         for entry in entries {
             let name = entry.file_name();
             let child_relative = relative.join(name);
-            if ignored(&child_relative) {
+            if self.ignored(&child_relative) {
                 continue;
             }
             let metadata = entry.metadata()?;
@@ -660,6 +718,37 @@ impl State {
         let id = self.next_file_id;
         self.next_file_id += 1;
         id
+    }
+
+    fn add_ephemeral_data_root(&mut self, relative: PathBuf) {
+        assert!(
+            self.log.is_empty() && self.open_handles.is_empty(),
+            "crashsim ephemeral data roots must be added immediately after registration"
+        );
+
+        if !self.ephemeral_data_roots.insert(relative) {
+            return;
+        }
+
+        // Registration scans disk before extra roots are known, so purge newly
+        // ignored entries from the baseline and rebuild the current model.
+        let ephemeral_data_roots = self.ephemeral_data_roots.clone();
+        self.baseline_directories
+            .retain(|path| !ignored_by(&ephemeral_data_roots, path));
+        self.baseline_names
+            .retain(|path, _| !ignored_by(&ephemeral_data_roots, path));
+
+        let baseline_ids: BTreeSet<_> = self.baseline_names.values().copied().collect();
+        self.baseline_files
+            .retain(|file_id, _| baseline_ids.contains(file_id));
+
+        self.directories = self.baseline_directories.clone();
+        self.names = self.baseline_names.clone();
+        self.files = self.baseline_files.clone();
+    }
+
+    fn ignored(&self, relative: &Path) -> bool {
+        ignored_by(&self.ephemeral_data_roots, relative)
     }
 
     fn relative(&self, path: &Path) -> Option<PathBuf> {
@@ -684,7 +773,7 @@ impl State {
         create: bool,
         existed_before_open: bool,
     ) -> Option<FileId> {
-        if ignored(relative) {
+        if self.ignored(relative) {
             return None;
         }
         if let Some(id) = self.names.get(relative) {
@@ -777,7 +866,7 @@ impl State {
         let relative = self
             .relative(path)
             .expect("created directory must be under registered root");
-        if !ignored(&relative) {
+        if !self.ignored(&relative) {
             self.directories.insert(relative.clone());
             self.log.push(Op::Mkdir { path: relative });
         }
@@ -787,7 +876,7 @@ impl State {
         let relative = self
             .relative(path)
             .expect("removed file must be under registered root");
-        if ignored(&relative) {
+        if self.ignored(&relative) {
             return;
         }
         let id = self
@@ -805,7 +894,7 @@ impl State {
         let relative = self
             .relative(path)
             .expect("removed directory must be under registered root");
-        if !ignored(&relative) {
+        if !self.ignored(&relative) {
             if !self.directories.remove(&relative) {
                 panic!("raw std::fs mutation detected under registered root");
             }
@@ -833,7 +922,7 @@ impl State {
             panic!("unsupported in crash model: directory rename");
         }
 
-        if ignored(&from_relative) || ignored(&to_relative) {
+        if self.ignored(&from_relative) || self.ignored(&to_relative) {
             return;
         }
 
@@ -913,8 +1002,14 @@ impl State {
     fn verify_tree(&self) {
         let mut real_dirs = BTreeSet::from([PathBuf::new()]);
         let mut real_files = BTreeMap::new();
-        collect_tree(&self.root, Path::new(""), &mut real_dirs, &mut real_files)
-            .expect("failed to enumerate real tree during crashsim self-check");
+        collect_tree(
+            &self.root,
+            Path::new(""),
+            &self.ephemeral_data_roots,
+            &mut real_dirs,
+            &mut real_files,
+        )
+        .expect("failed to enumerate real tree during crashsim self-check");
 
         assert_eq!(
             self.directories, real_dirs,
@@ -975,12 +1070,25 @@ fn canonical_or_normalized(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn ignored(relative: &Path) -> bool {
-    relative == Path::new("LOCK")
-        || relative
-            .components()
-            .next()
-            .is_some_and(|component| component == Component::Normal("spill".as_ref()))
+fn ignored_by(ephemeral_data_roots: &BTreeSet<PathBuf>, relative: &Path) -> bool {
+    ephemeral_data_roots.iter().any(|root| {
+        let Ok(within_root) = relative.strip_prefix(root) else {
+            return false;
+        };
+        let mut components = within_root.components();
+        let Some(Component::Normal(name)) = components.next() else {
+            return false;
+        };
+
+        if name == "spill" || name.to_string_lossy().starts_with(".htap-ipc-") {
+            return true;
+        }
+        if components.next().is_some() {
+            return false;
+        }
+
+        name == "LOCK" || name == "htap.sock"
+    })
 }
 
 fn read_all(path: &Path) -> io::Result<Vec<u8>> {
@@ -990,19 +1098,26 @@ fn read_all(path: &Path) -> io::Result<Vec<u8>> {
 fn collect_tree(
     absolute: &Path,
     relative: &Path,
+    ephemeral_data_roots: &BTreeSet<PathBuf>,
     directories: &mut BTreeSet<PathBuf>,
     files: &mut BTreeMap<PathBuf, Vec<u8>>,
 ) -> io::Result<()> {
     for entry in fs::read_dir(absolute)? {
         let entry = entry?;
         let child_relative = relative.join(entry.file_name());
-        if ignored(&child_relative) {
+        if ignored_by(ephemeral_data_roots, &child_relative) {
             continue;
         }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
             directories.insert(child_relative.clone());
-            collect_tree(&entry.path(), &child_relative, directories, files)?;
+            collect_tree(
+                &entry.path(),
+                &child_relative,
+                ephemeral_data_roots,
+                directories,
+                files,
+            )?;
         } else if metadata.is_file() {
             files.insert(child_relative, read_all(&entry.path())?);
         }

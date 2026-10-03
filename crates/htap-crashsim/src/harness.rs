@@ -1,3 +1,5 @@
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -6,7 +8,10 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use htap_common::fs::{register, Op, Recorder, Snapshot};
+use htap_common::fs::{
+    current_skip_sync, parse_skip_sync_env, register, scope_skip_hits, Op, Recorder, SkipSync,
+    Snapshot,
+};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
@@ -17,12 +22,43 @@ use crate::policy::{
     RecoveryStage,
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PowerLossFailurePhase {
+    Checker,
+    Recovery,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PowerLossFailure {
+    pub repro: String,
+    pub phase: PowerLossFailurePhase,
+    pub message: String,
+}
+
+thread_local! {
+    static POWERLOSS_FAILURE: RefCell<Option<PowerLossFailure>> = const { RefCell::new(None) };
+}
+
+pub fn clear_powerloss_failure() {
+    POWERLOSS_FAILURE.with(|failure| *failure.borrow_mut() = None);
+}
+
+pub fn set_powerloss_failure(failure: PowerLossFailure) {
+    POWERLOSS_FAILURE.with(|current| *current.borrow_mut() = Some(failure));
+}
+
+pub fn powerloss_failure() -> Option<PowerLossFailure> {
+    POWERLOSS_FAILURE.with(|failure| failure.borrow().clone())
+}
+
 /// Records a workload and enumerates its possible crash points.
 pub struct CrashHarness {
     name: String,
     temp_dir: TempDir,
     root: PathBuf,
     recorder: Recorder,
+    skip: SkipSync,
+    ephemeral_data_roots: Vec<PathBuf>,
     snapshot: Arc<Mutex<Option<Snapshot>>>,
 }
 
@@ -33,14 +69,27 @@ impl CrashHarness {
         let root = temp_dir.path().join("workload");
         fs::create_dir(&root)?;
         let recorder = register(&root)?;
+        let skip = parse_skip_sync_env();
+        recorder.set_skip_sync(skip.clone());
 
         Ok(Self {
             name,
             temp_dir,
             root,
             recorder,
+            skip,
+            ephemeral_data_roots: Vec::new(),
             snapshot: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub fn with_data_root(mut self, rel: impl AsRef<Path>) -> Self {
+        let rel = rel.as_ref().to_path_buf();
+        self.recorder.add_ephemeral_data_root(&rel);
+        if !self.ephemeral_data_roots.contains(&rel) {
+            self.ephemeral_data_roots.push(rel);
+        }
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -66,8 +115,24 @@ impl CrashHarness {
     where
         F: FnMut(&Path, &CrashInfo),
     {
+        let config = selection_config_from_env(&self.skip);
+        if let Ok(repro) = std::env::var("POWERLOSS_REPRO") {
+            match repro_fits_call(&repro, &self.name, policy, false) {
+                Ok(false) => {}
+                Ok(true) => match self.replay(&repro, &mut checker) {
+                    Ok(()) => panic!("POWERLOSS_REPLAY_NOT_REPRODUCED={repro}"),
+                    Err(error) => panic!(
+                        "POWERLOSS_REPLAY_FAILED={repro}: workload drift or invalid repro: {error}"
+                    ),
+                },
+                Err(error) => panic!(
+                    "POWERLOSS_REPLAY_FAILED={repro}: workload drift or invalid repro: {error}"
+                ),
+            }
+        }
+
         let snapshot = self.snapshot()?;
-        self.enumerate_snapshot(snapshot, policy, selection_config_from_env(), &mut checker)
+        self.enumerate_snapshot(snapshot, policy, config, &mut checker)
     }
 
     pub fn enumerate_with_env<'a, F>(
@@ -79,13 +144,30 @@ impl CrashHarness {
     where
         F: FnMut(&Path, &CrashInfo),
     {
+        let env: Vec<_> = env.into_iter().collect();
+        let config = selection_config_from_values(env.iter().copied(), &self.skip);
+        let repro = env
+            .iter()
+            .find_map(|(key, value)| (*key == "POWERLOSS_REPRO").then_some((*value).to_owned()))
+            .or_else(|| std::env::var("POWERLOSS_REPRO").ok());
+
+        if let Some(repro) = repro {
+            match repro_fits_call(&repro, &self.name, policy, false) {
+                Ok(false) => {}
+                Ok(true) => match self.replay(&repro, &mut checker) {
+                    Ok(()) => panic!("POWERLOSS_REPLAY_NOT_REPRODUCED={repro}"),
+                    Err(error) => panic!(
+                        "POWERLOSS_REPLAY_FAILED={repro}: workload drift or invalid repro: {error}"
+                    ),
+                },
+                Err(error) => panic!(
+                    "POWERLOSS_REPLAY_FAILED={repro}: workload drift or invalid repro: {error}"
+                ),
+            }
+        }
+
         let snapshot = self.snapshot()?;
-        self.enumerate_snapshot(
-            snapshot,
-            policy,
-            selection_config_from_values(env),
-            &mut checker,
-        )
+        self.enumerate_snapshot(snapshot, policy, config, &mut checker)
     }
 
     /// Replays the crash image identified by `POWERLOSS_REPRO`, if present.
@@ -142,7 +224,7 @@ impl CrashHarness {
             acked_labels: acked_labels(&snapshot.log, crash_point),
             recovery: None,
         };
-        run_checker(&self.name, &root, &info, &mut checker);
+        run_checker(&self.name, &root, &info, &mut checker, &self.skip);
         Ok(())
     }
 
@@ -215,12 +297,17 @@ impl CrashHarness {
             recovery: None,
         };
         let recorder = register(&recovery_root)?;
+        recorder.set_skip_sync(self.skip.clone());
+        for root in &self.ephemeral_data_roots {
+            recorder.add_ephemeral_data_root(root);
+        }
         run_recovery(
             &self.name,
             &recovery_root,
             &outer_info,
             &mut recover,
             &recorder,
+            &self.skip,
         );
         let recovery = recorder.snapshot();
         drop(recorder);
@@ -280,7 +367,7 @@ impl CrashHarness {
             acked_labels: acked_labels(&snapshot.log, outer_point),
             recovery: Some(recovery_stage),
         };
-        run_checker(&self.name, &root, &info, &mut check);
+        run_checker(&self.name, &root, &info, &mut check, &self.skip);
         Ok(())
     }
 
@@ -295,8 +382,23 @@ impl CrashHarness {
         R: FnMut(&Path),
         F: FnMut(&Path, &CrashInfo),
     {
+        let config = selection_config_from_env(&self.skip);
+        if let Ok(repro) = std::env::var("POWERLOSS_REPRO") {
+            match repro_fits_call(&repro, &self.name, policy, true) {
+                Ok(false) => {}
+                Ok(true) => match self.replay_recovery(&repro, &mut recover, &mut check) {
+                    Ok(()) => panic!("POWERLOSS_REPLAY_NOT_REPRODUCED={repro}"),
+                    Err(error) => panic!(
+                        "POWERLOSS_REPLAY_FAILED={repro}: workload drift or invalid repro: {error}"
+                    ),
+                },
+                Err(error) => panic!(
+                    "POWERLOSS_REPLAY_FAILED={repro}: workload drift or invalid repro: {error}"
+                ),
+            }
+        }
+
         let snapshot = self.snapshot()?;
-        let config = selection_config_from_env();
         let mut outer_images = BTreeSet::new();
 
         for crash_point in select_crash_points(&snapshot.log, &config) {
@@ -338,12 +440,17 @@ impl CrashHarness {
                 copy_tree(&outer_root, &recovery_root)?;
 
                 let recorder = register(&recovery_root)?;
+                recorder.set_skip_sync(self.skip.clone());
+                for root in &self.ephemeral_data_roots {
+                    recorder.add_ephemeral_data_root(root);
+                }
                 run_recovery(
                     &self.name,
                     &recovery_root,
                     &outer_info,
                     &mut recover,
                     &recorder,
+                    &self.skip,
                 );
                 let recovery = recorder.snapshot();
                 drop(recorder);
@@ -378,7 +485,7 @@ impl CrashHarness {
                                 acked_labels: acked_labels(&recovery.log, recovery_point),
                             }),
                         };
-                        run_checker(&self.name, &image_root, &info, &mut check);
+                        run_checker(&self.name, &image_root, &info, &mut check, &self.skip);
                     }
                 }
 
@@ -396,7 +503,13 @@ impl CrashHarness {
                         acked_labels: acked_labels(&recovery.log, recovery.log.len()),
                     }),
                 };
-                run_checker(&self.name, &recovery_root, &completed_info, &mut check);
+                run_checker(
+                    &self.name,
+                    &recovery_root,
+                    &completed_info,
+                    &mut check,
+                    &self.skip,
+                );
             }
         }
 
@@ -462,7 +575,7 @@ impl CrashHarness {
                     acked_labels: acked_labels(&snapshot.log, crash_point),
                     recovery: None,
                 };
-                run_checker(&self.name, &crash_root, &info, checker);
+                run_checker(&self.name, &crash_root, &info, checker, &self.skip);
             }
         }
 
@@ -506,8 +619,9 @@ struct SelectionConfig {
     seed_count: usize,
 }
 
-fn selection_config_from_env() -> SelectionConfig {
-    let exhaustive = std::env::var("POWERLOSS_EXHAUSTIVE").ok().as_deref() == Some("1");
+fn selection_config_from_env(harness_skip: &SkipSync) -> SelectionConfig {
+    let exhaustive = !matches!(effective_skip_sync(harness_skip), SkipSync::None)
+        || std::env::var("POWERLOSS_EXHAUSTIVE").ok().as_deref() == Some("1");
     let seed_count = std::env::var("POWERLOSS_SEEDS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -522,6 +636,7 @@ fn selection_config_from_env() -> SelectionConfig {
 
 fn selection_config_from_values<'a>(
     env: impl IntoIterator<Item = (&'a str, &'a str)>,
+    harness_skip: &SkipSync,
 ) -> SelectionConfig {
     let mut config = SelectionConfig {
         exhaustive: false,
@@ -541,7 +656,17 @@ fn selection_config_from_values<'a>(
     }
 
     assert!(config.seed_count >= 1, "POWERLOSS_SEEDS must be at least 1");
+    if !matches!(effective_skip_sync(harness_skip), SkipSync::None) {
+        config.exhaustive = true;
+    }
     config
+}
+
+fn effective_skip_sync(harness_skip: &SkipSync) -> SkipSync {
+    match current_skip_sync() {
+        SkipSync::None => harness_skip.clone(),
+        scoped => scoped,
+    }
 }
 
 fn select_crash_points(log: &[Op], config: &SelectionConfig) -> Vec<usize> {
@@ -599,6 +724,50 @@ fn policy_from_repro_variant(variant: &str, seed: u64) -> io::Result<CrashPolicy
     }
 }
 
+fn repro_fits_call(
+    repro: &str,
+    harness_name: &str,
+    policy: &CrashPolicy,
+    expects_recovery: bool,
+) -> io::Result<bool> {
+    let (name, variant, seed, is_recovery) =
+        if let Some((name, variant, seed, _)) = parse_repro_string(repro) {
+            (name, variant, seed, false)
+        } else if let Some((name, variant, seed, _, _)) = parse_recovery_repro_string(repro) {
+            (name, variant, seed, true)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid repro string",
+            ));
+        };
+
+    if name != harness_name {
+        return Ok(false);
+    }
+
+    let repro_policy = policy_from_repro_variant(&variant, seed)?;
+    Ok(is_recovery == expects_recovery && policies_equal(&repro_policy, policy))
+}
+
+fn policies_equal(left: &CrashPolicy, right: &CrashPolicy) -> bool {
+    match (left, right) {
+        (CrashPolicy::Strict, CrashPolicy::Strict) => true,
+        (
+            CrashPolicy::Torn {
+                sector_size: left_sector_size,
+                ..
+            },
+            CrashPolicy::Torn {
+                sector_size: right_sector_size,
+                ..
+            },
+        ) => left_sector_size == right_sector_size,
+        (CrashPolicy::Chaos { .. }, CrashPolicy::Chaos { .. }) => true,
+        _ => false,
+    }
+}
+
 fn policy_instances(policy: &CrashPolicy, seed_count: usize) -> Vec<CrashPolicy> {
     match policy {
         CrashPolicy::Strict => vec![CrashPolicy::Strict],
@@ -619,31 +788,173 @@ fn policy_seed(policy: &CrashPolicy) -> u64 {
     }
 }
 
-fn run_checker<F>(_name: &str, root: &Path, info: &CrashInfo, checker: &mut F)
-where
+fn run_checker<F>(
+    _name: &str,
+    root: &Path,
+    info: &CrashInfo,
+    checker: &mut F,
+    harness_skip: &SkipSync,
+) where
     F: FnMut(&Path, &CrashInfo),
 {
-    if panic::catch_unwind(AssertUnwindSafe(|| checker(root, info))).is_err() {
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| checker(root, info))) {
         let repro = info.repro_string();
-        eprintln!("POWERLOSS_REPRO={repro}");
+        record_powerloss_failure(
+            repro.clone(),
+            PowerLossFailurePhase::Checker,
+            panic_message(payload.as_ref()),
+        );
+        print_active_skip_sync(harness_skip);
+        eprintln!("POWERLOSS_LOG_FINGERPRINT={:016x}", log_fingerprint(info));
         panic!("POWERLOSS_REPRO={repro}");
     }
 }
 
-fn run_recovery<R>(_name: &str, root: &Path, info: &CrashInfo, recover: &mut R, recorder: &Recorder)
-where
+fn run_recovery<R>(
+    _name: &str,
+    root: &Path,
+    info: &CrashInfo,
+    recover: &mut R,
+    recorder: &Recorder,
+    harness_skip: &SkipSync,
+) where
     R: FnMut(&Path),
 {
-    if panic::catch_unwind(AssertUnwindSafe(|| {
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
         recover(root);
         recorder.verify_tree();
-    }))
-    .is_err()
-    {
+    })) {
         let repro = format!("{}/rk=recover", info.repro_string());
-        eprintln!("POWERLOSS_REPRO={repro}");
+        record_powerloss_failure(
+            repro.clone(),
+            PowerLossFailurePhase::Recovery,
+            panic_message(payload.as_ref()),
+        );
+        print_active_skip_sync(harness_skip);
+        eprintln!("POWERLOSS_LOG_FINGERPRINT={:016x}", log_fingerprint(info));
         panic!("POWERLOSS_REPRO={repro}");
     }
+}
+
+fn log_fingerprint(info: &CrashInfo) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut update = |value: &dyn std::fmt::Debug| {
+        for byte in format!("{value:?}").bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+
+    for op in info.ops {
+        update(op);
+    }
+    if let Some(recovery) = &info.recovery {
+        for op in recovery.ops {
+            update(op);
+        }
+    }
+    update(&info.acked_labels);
+    hash
+}
+
+fn print_active_skip_sync(harness_skip: &SkipSync) {
+    let skip = effective_skip_sync(harness_skip);
+    let spec = match skip {
+        SkipSync::None => return,
+        SkipSync::File => "file".to_owned(),
+        SkipSync::Directory => "dir".to_owned(),
+        SkipSync::All => "all".to_owned(),
+        SkipSync::Site(site) => format!("site:{site}"),
+    };
+    eprintln!("POWERLOSS_SKIP_SYNC={spec}");
+}
+
+pub fn assert_skip_kills<F>(label: &str, skip: SkipSync, body: F)
+where
+    F: FnOnce(),
+{
+    clear_powerloss_failure();
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        htap_common::fs::with_skip_sync(skip, body);
+    }));
+    let hits = scope_skip_hits();
+    let failure = powerloss_failure();
+    clear_powerloss_failure();
+
+    match result {
+        Ok(()) => panic!("{label}: mutation survived"),
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            let Some(failure) = failure else {
+                panic!("{label}: died for another reason: {message}");
+            };
+            if message != format!("POWERLOSS_REPRO={}", failure.repro) {
+                panic!("{label}: died for another reason: {message}");
+            }
+            if hits == 0 {
+                panic!("{label}: site never exercised");
+            }
+        }
+    }
+}
+
+pub fn assert_skip_survives<F>(label: &str, skip: SkipSync, body: F)
+where
+    F: FnOnce(),
+{
+    clear_powerloss_failure();
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        htap_common::fs::with_skip_sync(skip, body);
+    }));
+    let hits = scope_skip_hits();
+    clear_powerloss_failure();
+
+    if let Err(payload) = result {
+        panic!("{label}: {}", panic_message(payload.as_ref()));
+    }
+
+    if hits == 0 {
+        panic!("{label}: site never exercised");
+    }
+}
+
+fn record_powerloss_failure(repro: String, phase: PowerLossFailurePhase, message: String) {
+    if is_fail_closed_panic(&message) {
+        clear_powerloss_failure();
+        return;
+    }
+
+    set_powerloss_failure(PowerLossFailure {
+        repro,
+        phase,
+        message,
+    });
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+fn is_fail_closed_panic(message: &str) -> bool {
+    [
+        "registered root",
+        "crash model",
+        "crashsim",
+        "raw std::fs",
+        "modeled file contents",
+        "path resolved differently than recorded",
+        "recorder disappeared while resolving",
+    ]
+    .iter()
+    .any(|denied| message.contains(denied))
 }
 
 fn recreate_dir(path: &Path) -> io::Result<()> {
