@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
-use htap_common::fs::dur;
 use htap_common::fs::{
     atomic_publish as publish_file, remove_file_if_exists, sync_dir as sync_directory,
 };
+use htap_common::fs::{create_dir_all_durable, dur};
 use htap_common::{read_file_exact_bounded, HtapError, Result};
 
 use crate::model::CatalogSnapshot;
@@ -47,12 +47,20 @@ impl LocalCatalogStore {
     /// If a published `CATALOG` file exists, its integrity is verified on startup.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
-        dur::create_dir_all(&dir)?;
+        create_dir_all_durable(&dir)?;
 
         let store = Self {
             dir,
             lock: Mutex::new(()),
         };
+
+        let parent = store
+            .dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        dur::sync_dir_site(parent, "catalog:open_parent_sync")?;
+        dur::sync_dir_site(&store.dir, "catalog:open_dir_sync")?;
 
         // Reopen integrity check: verify catalog file if already present.
         let _ = store.load()?;

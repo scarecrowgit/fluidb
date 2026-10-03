@@ -11,4 +11,5 @@ serde_json = { workspace = true }
 crc32c = { workspace = true }
 
 [dev-dependencies]
+htap-crashsim = { path = "../htap-crashsim" }
 tempfile = { workspace = true }

@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{CatalogSnapshot, NodeId};
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
-use htap_common::fs::dur;
 use htap_common::fs::{atomic_publish as publish_file, sync_dir as sync_directory};
+use htap_common::fs::{create_dir_all_durable, dur};
 use htap_common::lock::ProcessLock;
 use htap_common::{read_file_exact_bounded, FencingToken, HtapError, Result};
 use parking_lot::Mutex;
@@ -229,8 +229,16 @@ impl LocalCoordinator {
     /// process. Returns other [`HtapError`] variants if state reading or publishing fails.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        dur::create_dir_all(&root)?;
+        create_dir_all_durable(&root)?;
         let canonical_root = root.canonicalize()?;
+
+        let parent = canonical_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        dur::sync_dir_site(parent, "coord:open_parent_sync")?;
+        dur::sync_dir_site(&canonical_root, "coord:open_dir_sync")?;
+
         let lock_guard = ProcessLock::acquire(&canonical_root)?;
 
         let coord_path = canonical_root.join(COORDINATOR_FILE_NAME);

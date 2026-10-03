@@ -15,4 +15,5 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+htap-crashsim = { path = "../htap-crashsim" }
 tempfile = { workspace = true }

@@ -16,5 +16,6 @@ crc32c = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+htap-crashsim = { path = "../htap-crashsim" }
 tempfile = { workspace = true }
 

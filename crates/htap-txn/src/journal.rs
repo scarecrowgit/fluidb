@@ -5,7 +5,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use htap_common::bytecursor::ByteReader;
-use htap_common::fs::dur::{self, DurFile, DurOpenOptions};
+use htap_common::fs::{
+    create_dir_all_durable,
+    dur::{self, DurFile, DurOpenOptions},
+};
 use htap_common::{HtapError, Result, Version};
 use serde::{Deserialize, Serialize};
 
@@ -264,7 +267,8 @@ pub fn decode_frame_slice(
     let expected_crc = header.read_u32_le().expect("length-checked header");
 
     if payload_len == 0 {
-        if offset + (remaining as u64) == total_len {
+        let header_ends_at_eof = offset + (HEADER_SIZE as u64) == total_len;
+        if header_ends_at_eof || !has_valid_frame_ahead(&data[1..], max_frame_size) {
             return FrameStatus::TornFinal {
                 offset,
                 reason: "zero payload length at end of file".into(),
@@ -421,12 +425,12 @@ impl Journal {
 
     /// Open or create a journal file with specific configuration options.
     pub fn open_with_options(opts: JournalOptions) -> Result<Self> {
-        if let Some(parent) = opts.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                dur::create_dir_all(parent)?;
-                let _ = dur::sync_dir_site(parent, "txn:journal_parent_create_sync");
-            }
-        }
+        let parent = opts
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        create_dir_all_durable(parent)?;
 
         let file = DurOpenOptions::new()
             .read(true)
@@ -434,6 +438,13 @@ impl Journal {
             .create(true)
             .truncate(false)
             .open(&opts.path)?;
+
+        let grandparent = parent
+            .parent()
+            .filter(|grandparent| !grandparent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        dur::sync_dir_site(parent, "txn:journal_parent_sync")?;
+        dur::sync_dir_site(grandparent, "txn:journal_grandparent_sync")?;
 
         let metadata = file.metadata()?;
         let file_len = metadata.len();
@@ -464,6 +475,7 @@ impl Journal {
             journal.valid_end = scan.valid_end;
         }
 
+        journal.file.sync_all_site("txn:journal_open_sync")?;
         journal.file.seek(SeekFrom::Start(journal.valid_end))?;
         Ok(journal)
     }
@@ -517,7 +529,16 @@ impl Journal {
             let expected_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
 
             if payload_len == 0 {
-                if pos + HEADER_SIZE as u64 == file_len {
+                let at_eof = pos + HEADER_SIZE as u64 == file_len;
+                let probe_res = if at_eof {
+                    Ok(false)
+                } else {
+                    self.has_valid_frame_ahead_stream(pos + 1, file_len)
+                };
+                let _ = self.file.seek(SeekFrom::Start(self.valid_end));
+                let has_ahead = probe_res?;
+
+                if at_eof || !has_ahead {
                     torn_final = Some((pos, "zero payload length at end of file".into()));
                 } else {
                     middle_corrupt = Some((pos, "zero payload length inside journal".into()));
@@ -709,7 +730,13 @@ impl Journal {
                 "repaired torn final record in journal"
             );
             self.file.set_len(scan.valid_end)?;
-            self.file.sync_all_site("txn:journal_repair_sync")?;
+            if let Err(err) = self.sync_all_checked("txn:journal_repair_sync") {
+                self.poison(format!(
+                    "fsync failed after repairing torn final record ({err}); the kernel's \
+                     page-cache state for the repaired journal is now unknowable"
+                ));
+                return Err(HtapError::Io(err));
+            }
         }
 
         self.valid_end = scan.valid_end;
@@ -1156,6 +1183,106 @@ mod tests {
     }
 
     #[test]
+    fn repair_sync_failure_poison_journal_handle() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let mut journal =
+            Journal::open_with_options(JournalOptions::new(&path).with_auto_repair(false)).unwrap();
+        journal
+            .append(&JournalRecord::Commit {
+                txn_id: TransactionId::new(1),
+                version: Version::new(1),
+            })
+            .unwrap();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&[0xaa]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        journal.inject_sync_fault_for_test();
+        assert!(journal.repair_torn_final().is_err());
+        assert!(journal.is_poisoned());
+        assert!(journal
+            .append(&JournalRecord::Abort {
+                txn_id: TransactionId::new(2),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn zero_filled_tail_is_repaired_as_torn_final() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let mut journal = Journal::open(&path).unwrap();
+        journal.append(&baseline_record()).unwrap();
+        let valid_end = journal.valid_bytes();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&[0; HEADER_SIZE + 1]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let scan = journal.scan().unwrap();
+        assert_eq!(scan.valid_end, valid_end);
+        assert!(matches!(
+            scan.torn_final,
+            Some((offset, _)) if offset == valid_end
+        ));
+
+        assert_eq!(
+            journal.repair_torn_final().unwrap(),
+            (HEADER_SIZE + 1) as u64
+        );
+        assert_eq!(journal.valid_bytes(), valid_end);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_end);
+    }
+
+    #[test]
+    fn zero_header_before_valid_frame_is_middle_corruption() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let mut journal = Journal::open(&path).unwrap();
+        journal.append(&baseline_record()).unwrap();
+        let zero_header_offset = journal.valid_bytes();
+        let following_frame = encode_frame(
+            &JournalRecord::Abort {
+                txn_id: TransactionId::new(8),
+            },
+            DEFAULT_MAX_FRAME_SIZE,
+        )
+        .unwrap();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&[0; HEADER_SIZE]).unwrap();
+            file.write_all(&following_frame).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let scan = journal.scan().unwrap();
+        assert!(matches!(
+            scan.middle_corrupt,
+            Some((offset, _)) if offset == zero_header_offset
+        ));
+        assert!(scan.torn_final.is_none());
+    }
+
+    #[test]
     fn test_middle_corruption_detected() {
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
@@ -1289,5 +1416,225 @@ mod tests {
             DEFAULT_MAX_FRAME_SIZE,
         );
         assert!(matches!(trailing, FrameStatus::TornFinal { .. }));
+    }
+}
+
+#[cfg(test)]
+mod zero_header_tail_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn zero_length_header_at_eof_is_repaired_as_torn_final() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .append(&JournalRecord::Commit {
+                txn_id: TransactionId::new(1),
+                version: Version::new(1),
+            })
+            .unwrap();
+        let valid_end = journal.valid_bytes();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&[0; HEADER_SIZE]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let scan = journal.scan().unwrap();
+        assert_eq!(scan.valid_end, valid_end);
+        assert!(matches!(
+            scan.torn_final,
+            Some((offset, _)) if offset == valid_end
+        ));
+        assert!(scan.middle_corrupt.is_none());
+
+        assert_eq!(journal.repair_torn_final().unwrap(), HEADER_SIZE as u64);
+        assert_eq!(journal.valid_bytes(), valid_end);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_end);
+    }
+
+    #[test]
+    fn zero_length_header_with_trailing_bytes_is_repaired_as_torn_final() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .append(&JournalRecord::Commit {
+                txn_id: TransactionId::new(2),
+                version: Version::new(2),
+            })
+            .unwrap();
+        let valid_end = journal.valid_bytes();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&[0; HEADER_SIZE + 3]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let scan = journal.scan().unwrap();
+        assert_eq!(scan.valid_end, valid_end);
+        assert!(matches!(
+            scan.torn_final,
+            Some((offset, _)) if offset == valid_end
+        ));
+        assert!(scan.middle_corrupt.is_none());
+
+        assert_eq!(
+            journal.repair_torn_final().unwrap(),
+            (HEADER_SIZE + 3) as u64
+        );
+        assert_eq!(journal.valid_bytes(), valid_end);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_end);
+    }
+
+    #[test]
+    fn zero_length_header_before_valid_frame_is_middle_corruption() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .append(&JournalRecord::Commit {
+                txn_id: TransactionId::new(3),
+                version: Version::new(3),
+            })
+            .unwrap();
+        let zero_header_offset = journal.valid_bytes();
+
+        let following_frame = encode_frame(
+            &JournalRecord::Abort {
+                txn_id: TransactionId::new(4),
+            },
+            DEFAULT_MAX_FRAME_SIZE,
+        )
+        .unwrap();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&[0; HEADER_SIZE]).unwrap();
+            file.write_all(&following_frame).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let scan = journal.scan().unwrap();
+        assert!(matches!(
+            scan.middle_corrupt,
+            Some((offset, _)) if offset == zero_header_offset
+        ));
+        assert!(scan.torn_final.is_none());
+        assert!(journal.repair_torn_final().is_err());
+    }
+
+    #[test]
+    fn zero_length_header_finds_valid_frame_beyond_streaming_chunk() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .append(&JournalRecord::Commit {
+                txn_id: TransactionId::new(5),
+                version: Version::new(5),
+            })
+            .unwrap();
+        let zero_header_offset = journal.valid_bytes();
+
+        let scratch = NamedTempFile::new().unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        {
+            let mut scratch_journal = Journal::open(&scratch_path).unwrap();
+            scratch_journal
+                .append(&JournalRecord::Abort {
+                    txn_id: TransactionId::new(6),
+                })
+                .unwrap();
+        }
+        let following_frame = std::fs::read(&scratch_path).unwrap();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&[0; HEADER_SIZE]).unwrap();
+            file.write_all(&[0; 10_000]).unwrap();
+            file.write_all(&following_frame).unwrap();
+            file.sync_all().unwrap();
+        }
+        let bytes_before_repair = std::fs::read(&path).unwrap();
+
+        let scan = journal.scan().unwrap();
+        assert!(matches!(
+            scan.middle_corrupt,
+            Some((offset, _)) if offset == zero_header_offset
+        ));
+        assert!(scan.torn_final.is_none());
+        assert!(journal.repair_torn_final().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before_repair);
+
+        drop(journal);
+        assert!(
+            Journal::open_with_options(JournalOptions::new(&path).with_auto_repair(false)).is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before_repair);
+    }
+
+    #[test]
+    fn default_open_repairs_zero_tail_and_allows_clean_append() {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_path_buf();
+
+        let first = JournalRecord::Commit {
+            txn_id: TransactionId::new(7),
+            version: Version::new(7),
+        };
+        let second = JournalRecord::Abort {
+            txn_id: TransactionId::new(8),
+        };
+        let third = JournalRecord::Commit {
+            txn_id: TransactionId::new(9),
+            version: Version::new(9),
+        };
+
+        {
+            let mut journal = Journal::open(&path).unwrap();
+            journal.append(&first).unwrap();
+            journal.append(&second).unwrap();
+        }
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&[0; 40]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        {
+            let mut journal = Journal::open(&path).unwrap();
+            journal.append(&third).unwrap();
+            journal.sync().unwrap();
+        }
+
+        let mut journal = Journal::open(&path).unwrap();
+        let (records, torn_explanation) = journal.recover_records().unwrap();
+        assert_eq!(records, vec![first, second, third]);
+        assert!(torn_explanation.is_none());
     }
 }

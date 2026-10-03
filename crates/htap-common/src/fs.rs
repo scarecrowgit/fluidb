@@ -100,6 +100,13 @@ pub fn read_file_exact_bounded_from_file(
     Ok(buf)
 }
 
+/// Returns `path`'s parent, mapping empty or bare paths to the current directory.
+fn parent_or_current_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// Fsync a directory so metadata operations such as rename are durable.
 ///
 /// Non-Unix platforms preserve the repository's existing no-op behavior.
@@ -111,9 +118,9 @@ pub fn sync_dir(path: impl AsRef<Path>) -> Result<()> {
 /// Creates a directory tree and synchronizes each parent directory whose child
 /// was newly created.
 ///
-/// Used by the rowstore open paths (`Engine::open` and `Wal::open`). It
-/// determines the missing path levels before creating them, then syncs only
-/// the parent of each level created by this call.
+/// Used by persistent component open paths, including the rowstore, journal,
+/// catalog, and coordinator. It determines the missing path levels before
+/// creating them, then syncs only the parent of each level created by this call.
 pub fn create_dir_all_durable(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
     let mut missing: Vec<PathBuf> = Vec::new();
@@ -138,11 +145,10 @@ pub fn create_dir_all_durable(path: impl AsRef<Path>) -> Result<()> {
     dur::create_dir_all(path)?;
 
     for created in missing.iter().rev() {
-        let parent = created
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        dur::sync_dir_site(parent, "create_dir_all_durable:parent_sync")?;
+        dur::sync_dir_site(
+            parent_or_current_dir(created),
+            "create_dir_all_durable:parent_sync",
+        )?;
     }
 
     Ok(())
@@ -224,6 +230,7 @@ pub fn atomic_publish(
 
     let tmp_path = dir.join(tmp_name);
     let final_path = dir.join(final_name);
+    let publish_dir = parent_or_current_dir(&tmp_path);
 
     if let Err(e) = write_new_tmp_file(&tmp_path, bytes, unix_mode) {
         if cleanup_tmp_on_failure {
@@ -239,7 +246,7 @@ pub fn atomic_publish(
         return Err(HtapError::Io(e));
     }
 
-    dur::sync_dir_site(dir, "atomic_publish:dir_sync")?;
+    dur::sync_dir_site(publish_dir, "atomic_publish:dir_sync")?;
     Ok(())
 }
 
@@ -248,6 +255,13 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn parent_or_current_dir_maps_empty_and_bare_paths() {
+        assert_eq!(parent_or_current_dir(Path::new("")), Path::new("."));
+        assert_eq!(parent_or_current_dir(Path::new("a")), Path::new("."));
+        assert_eq!(parent_or_current_dir(Path::new("a/b")), Path::new("a"));
+    }
 
     #[test]
     fn test_not_found_preserved() {
