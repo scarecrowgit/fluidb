@@ -22,9 +22,10 @@ use std::path::{Path, PathBuf};
 
 use htap_catalog::{TableId, TabletId};
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
-use htap_common::fs::dur::{create_dir_all, remove_dir_all};
+use htap_common::fs::dur::remove_dir_all;
 use htap_common::fs::{
-    atomic_publish as publish_file, read_file_exact_bounded, sync_dir as sync_directory,
+    atomic_publish as publish_file, create_dir_all_durable, parent_or_current_dir,
+    read_file_exact_bounded, sync_dir as sync_directory,
 };
 use htap_common::{HtapError, Result, Row, Version};
 use serde::{Deserialize, Serialize};
@@ -737,9 +738,14 @@ impl LocalDataMover {
     /// Open or create a local data mover repository at `<movement_root>`.
     pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self> {
         let root_dir = root_dir.into();
-        create_dir_all(&root_dir)?;
-        create_dir_all(root_dir.join("jobs"))?;
-        create_dir_all(root_dir.join("tablets"))?;
+        create_dir_all_durable(&root_dir)?;
+        create_dir_all_durable(root_dir.join("jobs"))?;
+        create_dir_all_durable(root_dir.join("tablets"))?;
+        htap_common::fs::dur::sync_dir_site(
+            parent_or_current_dir(&root_dir),
+            "movement:open_parent_sync",
+        )?;
+        htap_common::fs::dur::sync_dir_site(&root_dir, "movement:open_dir_sync")?;
 
         Ok(Self {
             root_dir,
@@ -1444,7 +1450,7 @@ impl LocalDataMover {
 
     fn persist_job_locked(&self, job: &MovementJob) -> Result<()> {
         let job_dir = self.job_dir(&job.request.job_id)?;
-        create_dir_all(&job_dir)?;
+        create_dir_all_durable(&job_dir)?;
 
         let encoded = encode_job(job)?;
 
@@ -1457,8 +1463,8 @@ impl LocalDataMover {
             true,
         )?;
 
-        // Fsync jobs directory
-        let _ = sync_dir(&self.jobs_dir());
+        // Persist the new job directory entry before returning the durable job state.
+        sync_dir(&self.jobs_dir())?;
 
         Ok(())
     }

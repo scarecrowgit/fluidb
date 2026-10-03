@@ -101,7 +101,9 @@ pub fn read_file_exact_bounded_from_file(
 }
 
 /// Returns `path`'s parent, mapping empty or bare paths to the current directory.
-fn parent_or_current_dir(path: &Path) -> &Path {
+///
+/// This is suitable for directory fsync calls when a path has no explicit parent.
+pub fn parent_or_current_dir(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))

@@ -163,7 +163,9 @@ impl SegmentWriter {
     ///
     /// # Durability
     /// Flushes and fsyncs the file to durable storage before returning. If an error occurs
-    /// during writing, any partially written output file is removed.
+    /// during writing, any partially written output file is removed. This method truncates its
+    /// destination in place and does not synchronize the containing directory; callers must use
+    /// a temporary path and atomically publish the completed file with a directory sync.
     ///
     /// # Errors
     /// Returns [`HtapError::InvalidArgument`] if options, schema, or rows fail validation.

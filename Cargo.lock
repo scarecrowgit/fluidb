@@ -613,6 +613,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "htap-common",
+ "htap-crashsim",
  "serde",
  "serde_json",
  "tempfile",
@@ -641,6 +642,7 @@ dependencies = [
  "htap-catalog",
  "htap-colstore",
  "htap-common",
+ "htap-crashsim",
  "htap-rowstore",
  "serde",
  "serde_json",
@@ -681,6 +683,7 @@ dependencies = [
  "csv",
  "htap-catalog",
  "htap-common",
+ "htap-crashsim",
  "htap-rowstore",
  "htap-txn",
  "parking_lot",

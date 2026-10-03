@@ -15,11 +15,11 @@
 //!   without re-executing storage scans or disk writes.
 
 use std::io::{BufWriter, Write};
-use std::path::Path;
 use std::time::Instant;
 
 use htap_catalog::store::CatalogStore;
-use htap_common::fs::dur::{create_dir_all, remove_file, rename, DurOpenOptions};
+use htap_common::fs::dur::{remove_file, rename, DurOpenOptions};
+use htap_common::fs::{create_dir_all_durable, parent_or_current_dir};
 use htap_common::{HtapError, Result, Row};
 use htap_rowstore::{Engine, MemtableEntry, Snapshot, ValueKind};
 
@@ -250,8 +250,8 @@ fn export_to_file(
 
     // 2. Prepare atomic destination and temporary file path
     let dest_path = &options.path;
-    let parent_dir = dest_path.parent().unwrap_or_else(|| Path::new("."));
-    create_dir_all(parent_dir)?;
+    let parent_dir = parent_or_current_dir(dest_path);
+    create_dir_all_durable(parent_dir)?;
 
     let file_name = dest_path
         .file_name()
@@ -313,11 +313,35 @@ fn export_to_file(
         return Err(HtapError::Io(e));
     }
 
-    // 5. Fsync directory metadata
+    // 5. Sync the destination parent strictly, then ancestors best-effort for unsupported
+    // directory fsync errors. Relative paths also sync "." before the walk terminates.
     sync_dir(parent_dir)?;
-    let _ = sync_dir(mover.root_dir());
 
-    // 6. Complete job only after file is durably renamed
+    let mut ancestor = parent_dir.parent();
+    while let Some(path) = ancestor {
+        let (path, stop) = if path.as_os_str().is_empty() {
+            (std::path::Path::new("."), true)
+        } else {
+            (path, false)
+        };
+        match sync_dir(path) {
+            Ok(()) => {}
+            Err(HtapError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::Unsupported
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        if stop {
+            break;
+        }
+        ancestor = path.parent();
+    }
+
+    // 6. Complete job only after the file and destination directory are durable.
     let row_count = rows.len() as u64;
     let report = CopyReport {
         job_id: options.job_id.clone(),

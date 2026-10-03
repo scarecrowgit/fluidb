@@ -20,8 +20,8 @@ pub use htap_catalog::{MAX_MANIFEST_ROWS, MAX_MANIFEST_SEGMENTS};
 use htap_colstore::{validate_segment_schema, ScanRequest, SegmentReader, SegmentWriter};
 pub use htap_colstore::{Predicate, ScanStats, SegmentOptions};
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
-use htap_common::fs::atomic_publish;
-use htap_common::fs::dur::{create_dir_all, remove_file, rename};
+use htap_common::fs::dur::{remove_file, rename};
+use htap_common::fs::{atomic_publish, create_dir_all_durable, parent_or_current_dir};
 use htap_common::{
     encode_key, read_file_exact_bounded, HtapError, Result, Row, Schema, Value, Version,
 };
@@ -689,7 +689,9 @@ impl TabletColumnManifest {
 pub fn write_atomic(root_dir: &Path, manifest: &TabletColumnManifest) -> Result<()> {
     manifest.validate()?;
     let t_dir = tablet_dir(root_dir, manifest.tablet_id);
-    create_dir_all(&t_dir)?;
+    create_dir_all_durable(&t_dir)?;
+    sync_dir(parent_or_current_dir(root_dir))?;
+    sync_dir(root_dir)?;
 
     let bytes = manifest.encode()?;
     atomic_publish(
@@ -808,7 +810,9 @@ pub fn write_segment(
 
     let t_dir = tablet_dir(root_dir, tablet_id);
     let gen_dir = t_dir.join(format!("gen-{generation}"));
-    create_dir_all(&gen_dir)?;
+    create_dir_all_durable(&gen_dir)?;
+    sync_dir(parent_or_current_dir(root_dir))?;
+    sync_dir(root_dir)?;
 
     let tmp_file_name = format!("{segment_name}.tmp");
     let tmp_path = gen_dir.join(&tmp_file_name);

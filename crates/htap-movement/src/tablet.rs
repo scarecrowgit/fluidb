@@ -36,8 +36,8 @@ use std::time::Instant;
 use htap_catalog::store::CatalogStore;
 use htap_catalog::{PartitionId, ReplicaDescriptor, ReplicaId, TableDescriptor, TableId, TabletId};
 use htap_common::envelope::{decode_envelope, encode_envelope, EnvelopeError, SizeCheckMode};
-use htap_common::fs::dur::{create_dir_all, remove_file, rename};
-use htap_common::fs::write_new_tmp_file;
+use htap_common::fs::dur::{remove_file, rename, sync_dir_site};
+use htap_common::fs::{create_dir_all_durable, parent_or_current_dir, write_new_tmp_file};
 use htap_common::{read_file_exact_bounded, HtapError, Result, Row, Schema, Version};
 use htap_rowstore::{Engine, Snapshot};
 use serde::{Deserialize, Serialize};
@@ -222,6 +222,23 @@ struct ResolvedTabletTopology {
     _target_replica: ReplicaDescriptor,
 }
 
+/// Synchronize the published package directory and every ancestor through the movement root.
+fn sync_package_dir_chain(mover: &LocalDataMover, package_dir: &std::path::Path) -> Result<()> {
+    let mut current = Some(package_dir);
+
+    while let Some(dir) = current {
+        sync_dir(dir)?;
+        if dir == mover.root_dir() {
+            break;
+        }
+        current = dir.parent();
+    }
+
+    sync_dir(parent_or_current_dir(mover.root_dir()))?;
+
+    Ok(())
+}
+
 /// Resolve and strictly validate single-tablet local topology from CatalogStore.
 ///
 /// Ensures:
@@ -365,6 +382,8 @@ fn resolve_clone_topology(
 /// - Employs atomic two-phase write: temporary file write, fsync, atomic rename, and directory fsync.
 /// - Semantically idempotent: If invoked again with the same `job_id`, it validates the
 ///   completed package on disk and returns the existing manifest without re-executing storage scans.
+/// - The retry path returns `Conflict` when the job is Failed, and `NotFound` when the job record
+///   is missing.
 pub fn clone_tablet(
     mover: &LocalDataMover,
     options: &TabletCloneOptions,
@@ -374,22 +393,55 @@ pub fn clone_tablet(
     options.validate()?;
     let start_instant = Instant::now();
 
+    // Serialize the existence check, verification, and package publication for this tablet.
+    let _tablet_lease = mover.acquire_tablet_leases(&[options.source_tablet_id])?;
+
     let manifest_path = mover.tablet_manifest_path(
         options.source_tablet_id,
         options.target_replica_id,
         &options.job_id,
     )?;
 
-    // Idempotent retry: if package manifest already exists, validate completed package
+    // Idempotent retry: restore directory barriers and complete an interrupted lifecycle update.
     if manifest_path.exists() {
-        return verify_package(mover, options, catalog);
+        let manifest = verify_package_internal(mover, options, catalog)?;
+
+        let package_dir = mover.tablet_package_dir(
+            options.source_tablet_id,
+            options.target_replica_id,
+            &options.job_id,
+        )?;
+        sync_package_dir_chain(mover, &package_dir)?;
+
+        let job = mover
+            .load_job(&options.job_id)?
+            .ok_or_else(|| HtapError::NotFound(format!("job '{}' not found", options.job_id)))?;
+        if job.is_failed() {
+            return Err(HtapError::Conflict(format!(
+                "job '{}' previously failed: {}",
+                job.job_id(),
+                job.error.as_deref().unwrap_or("unknown error")
+            )));
+        }
+        if !job.is_complete() {
+            mover.complete_job(
+                &options.job_id,
+                CopyReport {
+                    job_id: options.job_id.clone(),
+                    records_read: manifest.row_count,
+                    records_committed: manifest.row_count,
+                    rows_written: manifest.row_count,
+                    records_skipped: 0,
+                    duration_ms: 0,
+                },
+            )?;
+        }
+
+        return Ok(manifest);
     }
 
     // Resolve topology and enforce local one-tablet topology
     let topology = resolve_clone_topology(catalog, options)?;
-
-    // Acquire the movement lease before persisting a Running job.
-    let _tablet_lease = mover.acquire_tablet_leases(&[options.source_tablet_id])?;
 
     // Register job in LocalDataMover to track lifecycle
     let job_request = MovementJobRequest {
@@ -455,7 +507,7 @@ pub fn clone_tablet(
         options.target_replica_id,
         &options.job_id,
     )?;
-    create_dir_all(&package_dir)?;
+    create_dir_all_durable(&package_dir)?;
 
     let data_tmp_path = package_dir.join("DATA.tmp");
     let data_path = mover.tablet_data_path(
@@ -480,7 +532,13 @@ pub fn clone_tablet(
         return Err(HtapError::Io(e));
     }
 
-    // 3. Write MANIFEST.tmp and fsync
+    // 3. Persist the DATA rename before making MANIFEST publishable.
+    if let Err(e) = sync_dir_site(&package_dir, "movement:package_data_dir_sync") {
+        let _ = mover.fail_job(&options.job_id, e.to_string());
+        return Err(HtapError::Io(e));
+    }
+
+    // 4. Write MANIFEST.tmp and fsync
     let write_manifest_res = write_new_tmp_file(&manifest_tmp_path, &manifest_bytes, None);
     if let Err(e) = write_manifest_res {
         let _ = remove_file(&manifest_tmp_path);
@@ -488,22 +546,17 @@ pub fn clone_tablet(
         return Err(e);
     }
 
-    // 4. Rename MANIFEST.tmp -> MANIFEST
+    // 5. Rename MANIFEST.tmp -> MANIFEST
     if let Err(e) = rename(&manifest_tmp_path, &manifest_path) {
         let _ = remove_file(&manifest_tmp_path);
         let _ = mover.fail_job(&options.job_id, e.to_string());
         return Err(HtapError::Io(e));
     }
 
-    // 5. Fsync directories
-    sync_dir(&package_dir)?;
-    if let Some(parent) = package_dir.parent() {
-        let _ = sync_dir(parent);
-    }
-    let _ = sync_dir(&mover.tablets_dir());
-    let _ = sync_dir(mover.root_dir());
+    // 6. Persist package and intermediate directory entries before acknowledging completion.
+    sync_package_dir_chain(mover, &package_dir)?;
 
-    // 6. Complete job in LocalDataMover
+    // 7. Complete job in LocalDataMover
     let report = CopyReport {
         job_id: options.job_id.clone(),
         records_read: row_count,
@@ -735,16 +788,16 @@ fn verify_package_internal(
 /// Reconcile and repair an unhealthy replica by validating the clone package and CAS-updating its health status.
 ///
 /// # Semantics and Guarantees
-/// - First validates the durable package via [`verify_package`]. If the package is corrupt,
-///   truncated, or mismatched in ID/schema/base/row-count, health restoration is refused
-///   and catalog state is **never** modified.
-/// - Performs an atomic compare-and-set update against [`CatalogStore`]:
-///   - Updates only target [`ReplicaDescriptor::healthy`] to `true`.
-///   - Increments target [`ReplicaDescriptor::generation`] by 1.
-///   - Increments cluster [`htap_catalog::CatalogSnapshot::generation`] by 1.
-///   - Preserves all tables, partitions, tablets, and other replica descriptors unchanged.
-/// - Idempotent retry: If the target replica is already healthy (e.g., following recovery
-///   or repeated execution), returns the current healthy descriptor as an idempotent no-op.
+/// - Validates the durable package before modifying catalog state. Corrupt, truncated, or
+///   mismatched package data is rejected and leaves the catalog unchanged.
+/// - Restores package directory durability barriers before consulting replica health.
+/// - Requires the clone job record; a missing record returns `NotFound`, while a Failed job
+///   returns `Conflict`. A Running job is durably completed from the verified manifest first.
+/// - Only after these prerequisites, returns the current descriptor without a catalog update
+///   when the target is already healthy.
+/// - Otherwise performs an atomic compare-and-set update against [`CatalogStore`], setting only
+///   target [`ReplicaDescriptor::healthy`] to `true`, incrementing its generation and the catalog
+///   generation, and preserving all tables, partitions, tablets, and other replicas unchanged.
 pub fn repair_tablet(
     mover: &LocalDataMover,
     options: &TabletCloneOptions,
@@ -755,6 +808,31 @@ pub fn repair_tablet(
 
     // 1. Strictly validate package first; refuse repair if corrupt or mismatched.
     let manifest = verify_package_internal(mover, options, catalog)?;
+
+    let package_dir = mover.tablet_package_dir(
+        options.source_tablet_id,
+        options.target_replica_id,
+        &options.job_id,
+    )?;
+    sync_package_dir_chain(mover, &package_dir)?;
+
+    // Complete an interrupted clone lifecycle update before repairing the target replica.
+    let job = mover
+        .load_job(&options.job_id)?
+        .ok_or_else(|| HtapError::NotFound(format!("job '{}' not found", options.job_id)))?;
+    if !job.is_complete() {
+        mover.complete_job(
+            &options.job_id,
+            CopyReport {
+                job_id: options.job_id.clone(),
+                records_read: manifest.row_count,
+                records_committed: manifest.row_count,
+                rows_written: manifest.row_count,
+                records_skipped: 0,
+                duration_ms: 0,
+            },
+        )?;
+    }
 
     // 2. CAS loop to update replica health while the tablet remains leased.
     let mut attempts = 0;

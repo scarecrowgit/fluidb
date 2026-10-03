@@ -12,4 +12,5 @@ serde_json.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+htap-crashsim = { path = "../htap-crashsim" }
 tempfile.workspace = true
