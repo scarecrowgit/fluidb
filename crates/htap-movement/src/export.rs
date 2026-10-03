@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use htap_catalog::store::CatalogStore;
 use htap_common::fs::dur::{remove_file, rename, DurOpenOptions};
-use htap_common::fs::{create_dir_all_durable, parent_or_current_dir};
+use htap_common::fs::{create_dir_all_durable, parent_or_current_dir, sync_ancestors_best_effort};
 use htap_common::{HtapError, Result, Row};
 use htap_rowstore::{Engine, MemtableEntry, Snapshot, ValueKind};
 
@@ -313,33 +313,9 @@ fn export_to_file(
         return Err(HtapError::Io(e));
     }
 
-    // 5. Sync the destination parent strictly, then ancestors best-effort for unsupported
-    // directory fsync errors. Relative paths also sync "." before the walk terminates.
+    // 5. Sync the destination parent strictly, then its ancestors best-effort.
     sync_dir(parent_dir)?;
-
-    let mut ancestor = parent_dir.parent();
-    while let Some(path) = ancestor {
-        let (path, stop) = if path.as_os_str().is_empty() {
-            (std::path::Path::new("."), true)
-        } else {
-            (path, false)
-        };
-        match sync_dir(path) {
-            Ok(()) => {}
-            Err(HtapError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::PermissionDenied
-                        | std::io::ErrorKind::InvalidInput
-                        | std::io::ErrorKind::Unsupported
-                ) => {}
-            Err(error) => return Err(error),
-        }
-        if stop {
-            break;
-        }
-        ancestor = path.parent();
-    }
+    sync_ancestors_best_effort(parent_dir)?;
 
     // 6. Complete job only after the file and destination directory are durable.
     let row_count = rows.len() as u64;

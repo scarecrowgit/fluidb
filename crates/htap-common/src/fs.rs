@@ -2,8 +2,8 @@
 //!
 //! Durable helpers use crashsim sync-site identifiers to distinguish their
 //! persistence barriers: `create_dir_all_durable:parent_sync`,
-//! `sync_dir:sync`, `write_new_tmp_file:sync`, `fsync_file:sync`, and
-//! `atomic_publish:dir_sync`.
+//! `sync_dir:sync`, `sync_ancestors:sync`, `write_new_tmp_file:sync`,
+//! `fsync_file:sync`, and `atomic_publish:dir_sync`.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -114,6 +114,49 @@ pub fn parent_or_current_dir(path: &Path) -> &Path {
 /// Non-Unix platforms preserve the repository's existing no-op behavior.
 pub fn sync_dir(path: impl AsRef<Path>) -> Result<()> {
     dur::sync_dir_site(path, "sync_dir:sync")?;
+    Ok(())
+}
+
+fn is_best_effort_sync_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::Unsupported
+    )
+}
+
+/// Synchronizes the ancestors of `path` on a best-effort basis.
+///
+/// The caller is expected to have already synchronized `path` strictly. This
+/// lexical walk starts at `path.parent()`, never synchronizes `path` itself,
+/// performs no canonicalization, and does not resolve `..` components. For an
+/// absolute path it ends at the filesystem root; for a relative path it ends by
+/// synchronizing the current directory (`.`). Directory-sync errors of kind
+/// `PermissionDenied`, `InvalidInput`, and `Unsupported` are tolerated and the
+/// walk continues; all other errors are propagated.
+pub fn sync_ancestors_best_effort(path: impl AsRef<Path>) -> Result<()> {
+    let mut ancestor = path.as_ref().parent();
+
+    while let Some(path) = ancestor {
+        let (path, stop) = if path.as_os_str().is_empty() {
+            (Path::new("."), true)
+        } else {
+            (path, false)
+        };
+
+        match dur::sync_dir_site(path, "sync_ancestors:sync") {
+            Ok(()) => {}
+            Err(error) if is_best_effort_sync_error(error.kind()) => {}
+            Err(error) => return Err(HtapError::Io(error)),
+        }
+
+        if stop {
+            break;
+        }
+        ancestor = path.parent();
+    }
+
     Ok(())
 }
 
@@ -266,6 +309,44 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_sync_error_classifier_tolerates_only_expected_kinds() {
+        assert!(is_best_effort_sync_error(
+            std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(is_best_effort_sync_error(std::io::ErrorKind::InvalidInput));
+        assert!(is_best_effort_sync_error(std::io::ErrorKind::Unsupported));
+        assert!(!is_best_effort_sync_error(std::io::ErrorKind::NotFound));
+        assert!(!is_best_effort_sync_error(std::io::ErrorKind::Other));
+    }
+
+    #[test]
+    fn sync_ancestors_best_effort_handles_relative_single_component_path() {
+        sync_ancestors_best_effort(Path::new("single-component")).unwrap();
+    }
+
+    #[test]
+    fn sync_ancestors_best_effort_propagates_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("certainly-does-not-exist")
+            .join("ancestor")
+            .join("file");
+
+        let err = sync_ancestors_best_effort(&path).unwrap_err();
+        match err {
+            HtapError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("expected HtapError::Io(NotFound), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_ancestors_best_effort_skips_invalid_input_and_continues() {
+        let path = Path::new("invalid\0ancestor/child/file");
+        sync_ancestors_best_effort(path).unwrap();
+    }
+
+    #[test]
     fn test_not_found_preserved() {
         let non_existent = Path::new("/path/to/definitely/nonexistent/file/12345");
         let err = read_file_exact_bounded(non_existent, 1024).unwrap_err();
@@ -409,6 +490,41 @@ mod tests {
         )
         .is_err());
         assert_eq!(fs::read(dir.path().join("publish.tmp")).unwrap(), b"bytes");
+    }
+
+    #[cfg(feature = "crashsim")]
+    #[test]
+    fn sync_ancestors_best_effort_records_ancestors_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = register(dir.path()).unwrap();
+        let deepest = recorder.root().join("a").join("b").join("c");
+
+        create_dir_all_durable(&deepest).unwrap();
+        recorder.take_log();
+
+        sync_ancestors_best_effort(&deepest).unwrap();
+
+        let snapshot = recorder.snapshot();
+        let synced_paths: Vec<_> = snapshot
+            .log
+            .iter()
+            .filter_map(|op| match op {
+                Op::FsyncDir {
+                    path,
+                    site: Some("sync_ancestors:sync"),
+                } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            synced_paths,
+            vec![
+                PathBuf::from("a").join("b"),
+                PathBuf::from("a"),
+                PathBuf::new(),
+            ]
+        );
+        recorder.verify_tree();
     }
 
     #[cfg(feature = "crashsim")]
