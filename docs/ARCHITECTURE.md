@@ -9,7 +9,8 @@ This document describes the intended system. Every component carries a status:
 **Current state of the repository.** The cargo workspace skeleton, `htap-common`
 (the `Version` MVCC domain, `FencingToken`, shared error types, and — since stage R — the shared durability
 module: `fs::{sync_dir, atomic_publish, write_new_tmp_file, remove_file_if_exists, fsync_file,
-read_file_exact_bounded}`, `envelope::{encode_envelope, decode_envelope, encode_bare_frame}`, and the checked
+read_file_exact_bounded}` and, since Phase 20, the recordable durability shim `fs::dur` (`DurFile`, `DurOpenOptions`,
+`sync_dir_site`) and the optional `crashsim` recorder `fs::recorder`, `envelope::{encode_envelope, decode_envelope, encode_bare_frame}`, and the checked
 `bytecursor::ByteReader`, used by every crate below that publishes a durable file),
 `htap-rowstore` (WAL, memtable, SST writer/reader, and LSM row-store engine), and
 `htap-colstore` (immutable encoded/compressed segments, typed zone maps, and vectorized scans)
@@ -274,6 +275,14 @@ JSON-lines; see `docs/OPERATIONS.md` section 2 for the operator-facing statement
 (task 5 — a `DECIMAL` result column and parameter both work over the text and binary protocols, bounded at the
 engine's own 18-digit maximum, not arbitrary precision). See `docs/PROGRESS.md`'s Phase 17 row for the full
 task-by-task test evidence and `docs/LIMITATIONS.md` for the disclosed gaps.
+Phase 20 has a completed local MVP for power-loss crash consistency under a modelled filesystem: every durable file
+mutation goes through the `htap_common::fs` shim, the dev-only `htap-crashsim` crate replays the recorded operation log
+into crash images under a strict-POSIX contract (Strict and Torn are the required image classes; Chaos is a fixed-seed,
+non-gating triage probe), the `powerloss_*` suites check acknowledged-data
+survival and recovery oracles, per-site skip-sync witnesses and a static gate prove each of the 37 production sync sites
+is either killed by a witness or explicitly justified, and `sync_fault_*` sweeps prove sync errors propagate. Seven
+crash-durability bugs (BUG-PL-1 to BUG-PL-7) were found and fixed. This is crash consistency under a stated model, not a
+power-loss proof; see "Power-loss simulation harness (Phase 20)" below, ADR-034, and `docs/LIMITATIONS.md`.
 
 ### Derived `DECIMAL` precision and scale rules (Phase 17)
 
@@ -1617,13 +1626,257 @@ separately from the legacy floor, for its schema to legally declare a `DECIMAL` 
 (OLAP) (`htap-colstore`)" below and ADR-008's decimal addendum in `docs/DECISIONS.md` for the full contract,
 including why every other envelope in the table above did not need a matching bump.
 
-`htap-rowstore/src/wal.rs::fsync_dir` is a directory-fsync helper with the same intent as the five migrated
-`sync_dir` copies but is not `cfg(unix)`-gated (unconditional on every platform); it was deliberately left
-un-migrated rather than unified onto either behavior, since non-Unix targets are untested here (see
-[`docs/PROBLEMS.md`](./PROBLEMS.md) P1).
+`htap-rowstore/src/wal.rs::fsync_dir` no longer exists. Stage R deliberately left it un-migrated (it was not
+`cfg(unix)`-gated, unlike the five migrated `sync_dir` copies); Phase 20 (Batch B, commit `4891f13`) replaced it with
+the shim's low-level `htap_common::fs::dur::sync_dir_site` (the shared helper is `htap_common::fs::sync_dir`, a thin
+wrapper that tags site `sync_dir:sync`; both reach the same inner implementation), so every directory sync in the
+workspace now goes through one implementation. That implementation is a no-op off Unix (the old WAL helper ran on every platform), so durability of
+directory entries is Unix-only; this is a disclosed limitation, see "Power-loss simulation harness (Phase 20)" below and
+[`docs/LIMITATIONS.md`](./LIMITATIONS.md).
 
 Verified against a golden-bytes test per envelope (see [`docs/PROGRESS.md`](./PROGRESS.md), Stage R row) and
 `docs/DECISIONS.md`'s stage R note.
+
+---
+
+## Power-loss simulation harness (Phase 20)
+
+**Status: `implemented (local MVP)`** (`htap-common` `fs` shim, `htap-crashsim`, the `powerloss_*` and `sync_fault_*`
+suites in the component crates, the mutation-control static gate, and the workspace durability clippy gate). This is
+**crash consistency under a stated, modelled filesystem contract, not a power-loss proof**: power loss is *simulated* by
+replaying a recorded operation log into crash images, no real device, kernel, or drive cache is involved, and no
+hardware proof exists (real-device and kernel-level proof are `deferred`; see `docs/LIMITATIONS.md` and ADR-034 in
+`docs/DECISIONS.md`). Everything below is local, single-node, and Unix-only for directory syncs.
+
+### Components
+
+| Component | Where | Role |
+| --- | --- | --- |
+| Durability shim | `crates/htap-common/src/fs.rs`, `crates/htap-common/src/fs/dur.rs` | `DurFile`, `DurOpenOptions` and the `dur::{rename, remove_file, remove_dir, remove_dir_all, create_dir, create_dir_all, sync_dir, sync_dir_site, fsync_path, fsync_path_site}` functions, plus the shared helpers `fs::{atomic_publish, write_new_tmp_file, sync_dir, sync_ancestors_best_effort, fsync_file, create_dir_all_durable}`. Every durable file mutation in production code goes through it. With the `htap-common` `crashsim` cargo feature off, the shim is a thin `#[inline]` delegation to `std::fs`; with it on, each *successful* operation under a registered root is recorded. |
+| Recorder | `crates/htap-common/src/fs/recorder.rs` (`Recorder`, `Op`, `Snapshot`, `SkipSync`, `SyncFault`) | Appends `Mkdir`, `Create`, `Write`, `SetLen`, `Rename`, `Unlink`, `Rmdir`, `FsyncFile`, `FsyncDir` and `Ack` operations to a log with inode-like file identities (a rename keeps the id), and keeps a shadow tree. `verify_tree` panics at the end of a workload unless the shadow tree matches the real tree (the shim self-check). |
+| Materializer | `crates/htap-crashsim/src/model.rs`, `materialize.rs` | `CrashImage::compute` decides, for a crash point `k`, which logged operations are *forced* durable by later syncs; `materialize` writes the resulting tree for a policy. |
+| Policies | `crates/htap-crashsim/src/policy.rs` (`CrashPolicy::{Strict, Torn, Chaos}`) | See "Crash policies". Strict and Torn are the required image classes; Chaos is a fixed-seed, non-gating triage probe (one ordinary test uses it: `tablet_package_rename_order_chaos`). |
+| Harness | `crates/htap-crashsim/src/harness.rs` (`CrashHarness`, `WorkloadContext`, `assert_skip_kills`, `assert_skip_survives`) and the `crashsim_witness!`, `crashsim_control!`, `crashsim_survivor!` macros in `lib.rs` | Records a workload, enumerates crash points, materializes images, runs the suite's checker on each, enumerates a second crash inside recovery, replays a failure from a repro string, and runs the skip-sync mutation controls. |
+
+`htap-crashsim` is dev-only (`publish = false`) and is a dev-dependency of the component crates; `ci.sh` excludes it
+from the `cargo build` and `cargo bench --no-run` steps and from the durability clippy gate (`--exclude htap-crashsim`),
+`ci.sh` fails if `htapd` enables the `htap-common` `crashsim` feature, and `htapd` itself refuses to start when
+`htap_common::fs::CRASHSIM_ENABLED` is true.
+The clippy gate `ci/clippy-durability` (run by `ci.sh` as `CLIPPY_CONF_DIR=ci/clippy-durability cargo clippy --workspace
+--exclude htap-crashsim --lib --bins -- -A clippy::all -D clippy::disallowed_methods`) rejects raw `std::fs` mutation
+(`rename`, `remove_*`, `create_dir*`, `write`, `copy`, `hard_link`, `File::{create, create_new, sync_all, sync_data, set_len,
+try_clone}`, `OpenOptions::open`, `FileExt::write_at`, `set_permissions`, `symlink`) in every production `lib` and `bin`
+target; `ci.sh` additionally restricts `#[allow(clippy::disallowed_methods)]` to four files. The ephemeral exceptions
+outside the crash model are the server spill directory (`crates/htap-server/src/spill.rs`), the IPC listener socket
+(`crates/htap-server/src/ipc/owner.rs`), and read-only SST handle clones (`crates/htap-rowstore/src/sst.rs`); the recorder
+also ignores `LOCK`, `spill/`, `htap.sock` and `.htap-ipc-*` entries below an *ephemeral data root* (the registered root
+itself is one by default; nested server roots are added with `CrashHarness::with_data_root`, test: `ephemeral_root_ignores_lock_spill_sock_and_ipc_dirs_under_nested_root`).
+Scanner blind spots of the static gate are listed at the top of `crates/htap-crashsim/tests/mutation_controls.rs`.
+
+### Crash contract (strict POSIX model)
+
+- `fsync(file)` persists that inode's data and size only, not any directory entry that names it.
+- `fsync(dir)` persists that directory's entry map only (its creates, renames, unlinks), not the directory's own entry in
+  its parent. A nested `create_dir_all` therefore needs one parent sync per level.
+- `rename` is atomic; production and recorded renames stay within one directory. Cross-directory renames and directory
+  renames fail closed: the recorder panics with `unsupported in crash model` rather than modelling them.
+- A logged write, truncate, or namespace operation is *forced* iff a later file sync on the inode (data) or a directory
+  sync on every affected directory (namespace) precedes the crash point; everything else may be lost.
+- Sector atomicity (for torn writes) is configurable per policy; there is no sub-sector tearing.
+
+Tests pinning the model itself: `crates/htap-crashsim/tests/model_semantics.rs` (for example `strict_loses_unsynced_write`,
+`file_fsync_without_dir_fsync_loses_entry`, `dir_fsync_does_not_publish_own_entry`, `nested_mkdir_needs_parent_fsync_per_level`,
+`unlink_without_dir_fsync_resurrects`) and `crates/htap-crashsim/tests/dir_generations.rs`.
+
+### Crash policies and selection
+
+- `Strict`: only forced operations persist. **Required** class.
+- `Torn { seed, sector_size }`: metadata is strict; for each file, a seeded subset of the dirty sectors since the last
+  sync is kept (extensions zero-filled). **Required** class. It mixes only the strict image with the final observed bytes
+  (no intermediate versions), so it is a bounded torn-write probe.
+- `Chaos { seed }`: each unforced logged operation is kept or dropped independently, in log order (a whole `Write` or
+  `SetLen` operation, not a sector; only `Torn` mixes per sector). A **fixed-seed triage probe**, not a gating class (for
+  example `tablet_package_rename_order_chaos` samples it with three seeds).
+- Suites that enumerate `Strict` only (follow-up F21, `deferred`): `powerloss_wal_open`, `powerloss_wal_segment`,
+  `powerloss_wal_tail`, `powerloss_engine_open`, `powerloss_movement_clone` (plus its `Chaos` probe) and
+  `powerloss_movement_repair`; torn-sector behavior on those paths is unexercised.
+- Crash points: each file or directory sync contributes both the pre-sync and the post-sync boundary; create, rename,
+  unlink, mkdir, rmdir and ack operations contribute the post-operation boundary; write and truncate boundaries are
+  sampled (up to eight) unless exhaustive mode is on; equal images are deduplicated by `(tree hash, acknowledged label set)`
+  except in exhaustive mode (`POWERLOSS_EXHAUSTIVE=1`, or any skip-sync scope, which forces it).
+- Recovery depth 1: for selected outer images the harness records recovery itself and crashes it again; the second crash
+  is always `Strict` (`CrashHarness::enumerate_recovery`).
+
+### Oracles (all suites)
+
+1. Plain-`std` reopen succeeds, and no `Corruption` is reported on a Strict or Torn image (Torn only in suites that enumerate it, F21).
+2. Every operation acknowledged before the crash is present with the correct value, and acknowledged deletes do not
+   resurrect. An *ack* is recorded (`WorkloadContext::ack`) only after the API returned `Ok`; `DurablePending` and
+   `RecoveryRequired` never ack.
+3. The recovered state equals some prefix of the serial history, with `acked <= len <= issued`.
+4. A second reopen is idempotent.
+5. Crash during recovery (depth 1, second crash Strict) satisfies the same oracles (WAL tail repair, journal
+   `repair_torn_final`, engine orphan removal, server conversion/reclaim recovery).
+6. A published (non-`.tmp`) envelope never has an invalid CRC.
+
+Workloads are tiny, seeded, and single-threaded; thread interleavings are not explored.
+
+### Controls, witnesses, and the static completeness gate
+
+- **Skip-sync mutation controls.** `POWERLOSS_SKIP_SYNC=file|dir|all|site:<id>` (or the `crashsim_control!`,
+  `crashsim_witness!`, `crashsim_survivor!` macros) omit sync operations from the recorded log, so the suite must fail
+  with a `POWERLOSS_REPRO=...` panic (`assert_skip_kills`) or must survive (`assert_skip_survives`). A kill with zero
+  skipped syncs ("site never exercised") or with an unrelated panic is rejected. Each `powerloss_*` suite carries
+  file and directory controls or a reasoned exemption (`CONTROL_EXEMPTIONS`, currently empty), enforced by the static gate. Tests of the controls themselves: `crates/htap-crashsim/tests/skip_controls.rs`
+  (`assert_skip_kills_accepts_a_real_kill`, `assert_skip_kills_rejects_untagged_panic`, `assert_skip_kills_rejects_zero_hits`,
+  `assert_skip_kills_rejects_survivor`, `witness_scope_forces_exhaustive_no_dedupe`) and `skip_env.rs` (`scope_overrides_env`).
+- **Witnesses.** A witness is a `crashsim_witness!(witness_<id>, site = "<id>", body = <suite test body>)` test proving that
+  skipping *that one site* produces a failing crash image. A witness proves a failing image exists, not breadth of coverage.
+- **Static gate.** `cargo test -p htap-crashsim --test mutation_controls` parses the workspace sources with `syn` and
+  checks, among others: every production sync site id has a killing witness or a reasoned allowlist entry
+  (`every_observed_sync_site_has_a_killing_witness_or_a_reasoned_allowlist_entry`), allowlist entries are not stale
+  (`allowlist_entries_are_not_stale`), shared helper ids have a witness or a scoped, reasoned allowlist entry in each calling
+  crate (`every_shared_helper_id_has_a_witness_in_each_calling_crate`; `create_dir_all_durable:parent_sync` and
+  `fsync_file:sync` have no production witness), the "Durability-point catalog" table below lists exactly the observed ids
+  (`every_sync_site_is_listed_in_the_architecture_catalog` parses only that table and fails on a missing, stale, or duplicate
+  id), every `powerloss_*` suite has file and directory controls
+  (`every_powerloss_suite_has_file_and_dir_controls_or_a_reasoned_exemption`), every witness row names a real macro and test
+  (`every_witness_row_names_an_existing_macro_and_test`), site ids are unique (`every_production_site_id_is_used_at_one_location`),
+  no production sync is untagged (`no_production_sync_is_untagged`), and the scanner sees the workspace
+  (`scanner_observes_the_workspace`). The data lives in `crates/htap-crashsim/tests/mutation_controls_tables/mod.rs`:
+  `SYNC_SITE_WITNESSES`, `UNATTRIBUTED_WITNESSES` (witnesses killed only through a test fixture's own setup sync, which do not
+  count as production witnesses), `ALLOWLIST` with the reason enum `AllowReason::{SubsumedByLaterSync, CoveredByOtherSync,
+  OracleGap, IdempotentResurrection, ErrorPathOnly, NonUnixOnly, NoProductionCaller}`, `HELPER_SITES`, and `CONTROL_EXEMPTIONS`.
+  Each allowlist entry carries a survivor proof: either a `crashsim_survivor!` test showing the suite survives the skip, or a
+  data-only evidence note (the C5 discovery sweep).
+- **Sync-failure sweeps (propagation only).** `SyncFault::{Nth, Site}` makes the n-th sync attempt fail, and the
+  `sync_fault_*` tests assert that no injected failure is swallowed: `clone_sync_failure_is_never_swallowed`,
+  `repair_sync_failure_is_never_swallowed`, `export_sync_failure_is_never_swallowed`,
+  `job_persist_sync_failure_is_never_swallowed`, `delete_artifacts_sync_failure_is_never_swallowed` (all
+  `crates/htap-movement/tests/sync_fault_*.rs`) and `reclaim_sync_failure_is_never_swallowed`
+  (`crates/htap-server/tests/sync_fault_reclaim.rs`); the injector is tested in `crates/htap-crashsim/tests/sync_fault.rs`.
+  This proves error propagation only, not recovery after an fsync error. Trailing post-rename ordinals can return `Err`
+  while the new file is already visible (the F12 ambiguous outcome) and retry fast paths can return `Ok` without restoring
+  the failed barrier (F20); both are `deferred` in `docs/LIMITATIONS.md`.
+
+### Bugs found and fixed by the suites
+
+Red evidence (a failing repro on the unfixed code) is recorded in the commit messages for BUG-PL-1, 3, 5, 6 and 7
+(BUG-PL-6 is a log-order assertion, not a `POWERLOSS_REPRO` image); BUG-PL-2 had no red test in its commit, and BUG-PL-2 and
+BUG-PL-4 are guarded by the tests listed in `docs/LIMITATIONS.md`. Details are in the commit messages and
+`docs/PROGRESS.md` (R7 row).
+
+| Bug | Fix commit | Summary |
+| --- | --- | --- |
+| BUG-PL-1 | `01ca864` | `Engine::open` / `Wal::open` created directories without syncing parents. |
+| BUG-PL-2 | `01ca864` | `Wal::open` adopted a segment whose directory entry was never synced. |
+| BUG-PL-3 | `01ca864` | `Wal::open` fsynced the adopted final segment only after a torn-tail repair. |
+| BUG-PL-4 | `4321287` | A zero-filled journal tail was classified as mid-log corruption, so torn-tail repair refused. |
+| BUG-PL-5 | `033c503` | A fresh or volatile multi-level `LocalServer` root was lost after an acknowledged open. A one-level root was already safe (journal grandparent sync, ADR-034). |
+| BUG-PL-6 | `033c503` | The `colstore/` entry created at open was not followed by a root directory sync (log-order oracle only). |
+| BUG-PL-7 | `6315e2a` | A manifest-less `Converting` partition was unreadable after a crash until a `tick()`. |
+
+### `LocalServer::open` durability sequence (Phase 20)
+
+`LocalServer::open` (`crates/htap-server/src/lib.rs`) creates the root with `create_dir_all_durable`, takes the `LOCK`,
+opens catalog, rowstore engine, transaction journal and data mover (each syncs its own directory and its parent), then
+syncs the canonical root's parent strictly (`server:open_parent_sync`; skipped for a parentless `/` root) and the
+parent's ancestors best effort (`sync_ancestors_best_effort`), creates `colstore/` with `create_dir_all_durable`, and runs
+one unconditional root directory sync (`server:open_dir_sync`) before storage validation. That last sync also covers
+root children left volatile by a killed earlier lifetime. All errors propagate; every sync is open-time only, none is on a
+hot path, and the IPC client branch performs no syncs. Tests: `server_fresh_root_bootstrap_durable`,
+`server_preexisting_volatile_root_durable`, `server_reopen_syncs_volatile_root_children`,
+`server_open_syncs_colstore_entry_before_ack` (`crates/htap-server/tests/powerloss_server.rs`). Open-time syncs cover only
+the immediate parent plus a best-effort ancestor chain; see `docs/LIMITATIONS.md`.
+
+### How to run
+
+```bash
+# One power-loss suite (default: sampled crash points, 2 Torn seeds; Chaos uses a fixed seed)
+cargo test -p htap-rowstore --test powerloss_wal
+
+# More seeds / every crash point
+POWERLOSS_SEEDS=8 POWERLOSS_EXHAUSTIVE=1 cargo test -p htap-rowstore --test powerloss_wal
+
+# Mutation control: skip one site (forces exhaustive mode); the suite is expected to fail with POWERLOSS_REPRO=...
+POWERLOSS_SKIP_SYNC=site:wal:append_sync cargo test -p htap-rowstore --test powerloss_wal
+
+# Static gate and the witness/survivor/control tests
+cargo test -p htap-crashsim --test mutation_controls
+cargo test --workspace --tests -- witness_ survivor_ control_
+
+# Replay one failing image (the repro name equals the harness name, which equals the test name by convention).
+# This value was printed by the skip-sync run of site wal:roll_dir_sync, so the same skip spec is passed.
+POWERLOSS_SKIP_SYNC=site:wal:roll_dir_sync POWERLOSS_REPRO='wal_fresh_dir_entry_durable/strict/0/k=9' \
+  cargo test -p htap-rowstore --test powerloss_wal wal_fresh_dir_entry_durable
+```
+
+Environment variables: `POWERLOSS_SEEDS` (number of Torn seeds, default 2, at least 1; Chaos always runs exactly the fixed seed the suite supplies), `POWERLOSS_EXHAUSTIVE=1`,
+`POWERLOSS_SKIP_SYNC` (`file`, `dir`, `all`, `site:<id>`), `POWERLOSS_REPRO`. A failing image prints its
+`POWERLOSS_SKIP_SYNC` setting, a `POWERLOSS_LOG_FINGERPRINT=<hex>` and panics with `POWERLOSS_REPRO=<test>/<policy>/<seed>/k=<n>`
+(recovery-stage images append `/rk=<n>`). Replay success is the reproduced oracle panic; `POWERLOSS_REPLAY_NOT_REPRODUCED`
+means the image now passes (workload drift, or the bug is fixed). Replay behavior is tested in
+`crates/htap-crashsim/tests/repro_env.rs` (`replay_env_replays_exactly_one_image`,
+`replay_env_not_reproduced_panics_with_distinct_prefix`, `replay_env_recovery_stage_roundtrip`).
+
+### Durability-point catalog
+
+One row per production sync-site id (37 ids; the ids are the strings passed to `sync_all_site`, `sync_dir_site`,
+`fsync_path_site` or `sync_all_checked` in production code, identical to the keys of `SYNC_SITE_WITNESSES` and `ALLOWLIST` in
+`crates/htap-crashsim/tests/mutation_controls_tables/mod.rs`). 24 ids have a production witness; the other 13 rely only
+on a reasoned allowlist entry (some witnessed shared helper ids additionally carry crate-scoped allowlist rows) (`create_dir_all_durable:parent_sync` was killed in the discovery sweep only through the colstore fixture's own
+setup sync, so it is allowlisted rather than witnessed). The shared helper ids appear in several crates; each crate's
+witness or scoped allowlist entry is listed. Witness and survivor paths are relative to `crates/`; the test names are
+exactly the ones in `SYNC_SITE_WITNESSES` and `ALLOWLIST`. *Class*: `file` = fsync of file data and size,
+`dir` = fsync of a directory's entry map; `open` = open-time, `op` = per operation.
+
+| Id | File and function | Makes durable | Witness test, or allowlist reason and covered-by | Class |
+| --- | --- | --- | --- | --- |
+| `wal:open_parent_sync` | `htap-rowstore/src/wal.rs` `Wal::open` | the WAL directory's entry in its parent (fresh or left volatile) | `htap-rowstore/tests/powerloss_wal_open.rs::witness_wal_open_parent_sync` | dir, open |
+| `wal:open_dir_sync` | `htap-rowstore/src/wal.rs` `Wal::open` | the WAL directory's entries, including an adopted unsynced segment's dentry (BUG-PL-2) | `htap-rowstore/tests/powerloss_wal_segment.rs::witness_wal_open_dir_sync` | dir, open |
+| `wal:repair_sync` | `htap-rowstore/src/wal.rs` `Wal::open` | the `set_len` truncation of a torn WAL tail and, on that branch, the adopted unsynced valid prefix before publish (BUG-PL-3; on a torn tail this site replaces `wal:open_adopt_sync`) | `htap-rowstore/tests/powerloss_wal_tail.rs::witness_wal_repair_sync` (body `torn_tail_repair_syncs_adopted_prefix_before_publish`) | file, open |
+| `wal:open_adopt_sync` | `htap-rowstore/src/wal.rs` `Wal::open` | the adopted active segment before publish when the tail is not torn (a torn tail takes `wal:repair_sync` instead; BUG-PL-3) | `htap-rowstore/tests/powerloss_wal_tail.rs::witness_wal_open_adopt_sync` | file, open |
+| `wal:append_sync` | `htap-rowstore/src/wal.rs` `Wal::sync` | appended WAL frames (the commit durability barrier) | `htap-rowstore/tests/powerloss_wal.rs::witness_wal_append_sync` | file, op |
+| `wal:gc_sync` | `htap-rowstore/src/wal.rs` `Wal::gc` | the unlink of superseded prefix segments | allowlist `IdempotentResurrection` (resurrected segments stay a contiguous prefix and are replayed idempotently); survivor `htap-rowstore/tests/powerloss_wal.rs::survivor_wal_gc_sync` | dir, op |
+| `wal:roll_sync` | `htap-rowstore/src/wal.rs` `Wal::roll_segment` | the outgoing WAL segment's tail, before the new segment is created | `htap-rowstore/tests/powerloss_wal.rs::witness_wal_roll_sync` | file, op |
+| `wal:roll_dir_sync` | `htap-rowstore/src/wal.rs` `Wal::roll_segment` | the new segment's directory entry | `htap-rowstore/tests/powerloss_wal.rs::witness_wal_roll_dir_sync` | dir, op |
+| `sst:write_sync` | `htap-rowstore/src/sst.rs` `SstWriter::write` | SST file contents before the publishing rename | `htap-rowstore/tests/powerloss_engine.rs::witness_sst_write_sync` | file, op |
+| `engine:open_parent_sync` | `htap-rowstore/src/engine.rs` `Engine::open` | the engine directory's entry in its parent | `htap-rowstore/tests/powerloss_engine_open.rs::witness_engine_open_parent_sync` | dir, open |
+| `engine:open_dir_sync` | `htap-rowstore/src/engine.rs` `Engine::open` | the engine directory's own entries (`wal/`, `sst/`) | allowlist `CoveredByOtherSync`; covered by `wal:open_parent_sync`; survivor `htap-rowstore/tests/powerloss_engine_open.rs::survivor_engine_open_dir_sync` | dir, open |
+| `engine:compact_sst_dir_sync` | `htap-rowstore/src/engine.rs` `Engine::compact_once` | the `sst/` directory right after the compaction output rename (input removal comes later via best-effort `remove_file` with no directory sync) | `htap-rowstore/tests/powerloss_engine.rs::witness_engine_compact_sst_dir_sync` | dir, op |
+| `engine:flush_sst_dir_sync` | `htap-rowstore/src/engine.rs` `Engine::flush_locked` | the `sst/` directory after the flush output rename | `htap-rowstore/tests/powerloss_engine.rs::witness_engine_flush_sst_dir_sync` | dir, op |
+| `txn:journal_parent_sync` | `htap-txn/src/journal.rs` `Journal::open_with_options` | the directory holding `txn.journal` (the file's directory entry; the server root under `LocalServer`) | `htap-txn/tests/powerloss_txn.rs::witness_txn_journal_parent_sync` | dir, open |
+| `txn:journal_grandparent_sync` | `htap-txn/src/journal.rs` `Journal::open_with_options` | the journal directory's own entry in its parent (a pre-existing volatile journal directory, and the one-level server root's entry) | `htap-txn/tests/powerloss_txn.rs::witness_txn_journal_grandparent_sync` | dir, open |
+| `txn:journal_open_sync` | `htap-txn/src/journal.rs` `Journal::open_with_options` | an adopted unsynced journal tail | allowlist `CoveredByOtherSync`; covered by `txn:journal_sync` (`recover()` syncs before applying); survivor `htap-txn/tests/powerloss_txn.rs::survivor_txn_journal_open_sync` | file, open |
+| `txn:journal_repair_sync` | `htap-txn/src/journal.rs` `Journal::repair_torn_final_with_max_journal_size` | the truncation of a torn final frame | allowlist `SubsumedByLaterSync`; covered by `txn:journal_open_sync`, `txn:journal_sync`; data-only survivor proof (`txn_repair_torn_final_crash_depth1` non-vacuity guard) | file, open |
+| `txn:journal_append_sync` | `htap-txn/src/journal.rs` `Journal::append` | the `sync_on_write` fsync of one appended record | allowlist `SubsumedByLaterSync`; covered by `txn:journal_sync` (the manager always follows with an explicit `sync()`, a double fsync, F17); survivor `htap-txn/tests/powerloss_txn.rs::survivor_txn_journal_append_sync` | file, op |
+| `txn:journal_sync` | `htap-txn/src/journal.rs` `Journal::sync` | journal INTENT/COMMIT/ABORT frames (the 2PC durability barrier) | `htap-txn/tests/powerloss_txn.rs::witness_txn_journal_sync` | file, op |
+| `catalog:open_parent_sync` | `htap-catalog/src/local.rs` `LocalCatalogStore::open` | the catalog directory's entry in its parent | `htap-catalog/tests/powerloss_catalog.rs::witness_catalog_open_parent_sync` | dir, open |
+| `catalog:open_dir_sync` | `htap-catalog/src/local.rs` `LocalCatalogStore::open` | the catalog directory's own entries (a `CATALOG` rename left unsynced by an earlier lifetime) | allowlist `OracleGap` (F15: no workload observes it); survivor `htap-catalog/tests/powerloss_catalog.rs::survivor_catalog_open_dir_sync` | dir, open |
+| `coord:open_parent_sync` | `htap-coord/src/lib.rs` `LocalCoordinator::open` | the coordinator directory's entry in its parent | `htap-coord/tests/powerloss_coord.rs::witness_coord_open_parent_sync` | dir, open |
+| `coord:open_dir_sync` | `htap-coord/src/lib.rs` `LocalCoordinator::open` | the coordinator directory's own entries | allowlist `OracleGap` (F15); survivor `htap-coord/tests/powerloss_coord.rs::survivor_coord_open_dir_sync` | dir, open |
+| `colstore:segment_write_sync` | `htap-colstore/src/segment.rs` `SegmentWriter::write` | segment file contents before the publishing rename | `htap-colstore/tests/powerloss_segment.rs::witness_colstore_segment_write_sync` | file, op |
+| `movement:open_parent_sync` | `htap-movement/src/job.rs` `LocalDataMover::new` | the movement root's entry in its parent | `htap-movement/tests/powerloss_movement.rs::witness_movement_open_parent_sync` | dir, open |
+| `movement:open_dir_sync` | `htap-movement/src/job.rs` `LocalDataMover::new` | the movement root's own entries (`jobs/`, `tablets/`; the entries created just above) | allowlist `OracleGap` (F15: needs both `jobs/` and `tablets/` volatile); survivor `htap-movement/tests/powerloss_movement.rs::survivor_movement_open_dir_sync` | dir, open |
+| `movement:package_data_dir_sync` | `htap-movement/src/tablet.rs` `clone_tablet` | the package directory after the `DATA` rename, before `MANIFEST` is publishable (D-M2 barrier) | allowlist `SubsumedByLaterSync`; covered by `sync_dir:sync` (F16: no shipped Strict, Torn, or Chaos test kills a skip of it, including the `tablet_package_rename_order_chaos` probe; only the op-log order test `clone_publish_has_data_dir_barrier` guards it); survivor `htap-movement/tests/powerloss_movement_clone.rs::survivor_movement_package_data_dir_sync` | dir, op |
+| `movement:export_write_sync` | `htap-movement/src/export.rs` `export_to_file` | exported file contents before the publishing rename | `htap-movement/tests/powerloss_movement_export.rs::witness_movement_export_write_sync` | file, op |
+| `server:open_parent_sync` | `htap-server/src/lib.rs` `LocalServer::open` | the server root's entry in its parent (BUG-PL-5) | allowlist `CoveredByOtherSync`; covered by `txn:journal_grandparent_sync`; survivor `htap-server/tests/powerloss_server.rs::survivor_server_open_parent_sync` | dir, open |
+| `server:open_dir_sync` | `htap-server/src/lib.rs` `LocalServer::open` | the server root's entries (`colstore/`, children left volatile by killed lifetimes; BUG-PL-5/6) | allowlist `CoveredByOtherSync`; covered by `catalog:open_parent_sync`, `engine:open_parent_sync`, `txn:journal_parent_sync`, `movement:open_parent_sync`; data-only survivor proof (the survivor run exceeds the 30 s budget); site-specific structural guards `server_reopen_syncs_volatile_root_children`, `server_open_syncs_colstore_entry_before_ack` | dir, open |
+| `server:reclaim_colstore_sync` | `htap-server/src/lib.rs` `reclaim_tick_locked` | the `colstore/` directory after a dropped tablet's directory is removed (before movement artifacts are deleted) | `htap-server/tests/powerloss_server_recovery.rs::witness_server_reclaim_colstore_sync` | dir, op |
+| `atomic_publish:dir_sync` | `htap-common/src/fs.rs` `atomic_publish` | the destination directory after the temp-file-to-final rename (every published envelope) | witnessed per calling crate: `htap-rowstore/tests/powerloss_wal_tail.rs`, `htap-catalog/tests/powerloss_catalog.rs`, `htap-coord/tests/powerloss_coord.rs`, `htap-convert/tests/powerloss_convert.rs`, `htap-movement/tests/powerloss_movement.rs` (all `witness_atomic_publish_dir_sync`); `htap-txn`: allowlist `CoveredByOtherSync` (scoped), covered by `txn:journal_parent_sync` (checkpoint rewrite is followed by a journal reopen) | dir, op |
+| `write_new_tmp_file:sync` | `htap-common/src/fs.rs` `write_new_tmp_file` | temp-file contents before the publishing rename | witnessed in `htap-catalog/tests/powerloss_catalog.rs` and `htap-movement/tests/powerloss_movement.rs` (`witness_write_new_tmp_file_sync`); also killed through the `htap-txn` fixture's own setup sync (an `UNATTRIBUTED_WITNESSES` entry, not a production witness) | file, op |
+| `sync_dir:sync` | `htap-common/src/fs.rs` `sync_dir` | a directory's entry map (conversion tablet/generation dirs, movement jobs, package chains) | witnessed in `htap-convert/tests/powerloss_convert.rs` and `htap-movement/tests/powerloss_movement.rs` (`witness_sync_dir_sync`); `htap-catalog` and `htap-coord`: allowlist `NoProductionCaller` (scoped; only the unused `pub` wrappers call it) | dir, op |
+| `sync_ancestors:sync` | `htap-common/src/fs.rs` `sync_ancestors_best_effort` | the ancestor chain above an export destination or the server root's parent (best effort, tolerated kinds only) | witnessed in `htap-movement/tests/powerloss_movement_export.rs` and `htap-server/tests/powerloss_server.rs` (`witness_sync_ancestors_sync`) | dir, open/op |
+| `create_dir_all_durable:parent_sync` | `htap-common/src/fs.rs` `create_dir_all_durable` | each newly created directory level's entry in its parent | allowlist `CoveredByOtherSync` (global, plus one scoped entry per calling crate), covered by the component's own open-parent sync (`catalog:open_parent_sync`, `wal:open_parent_sync`, `txn:journal_parent_sync`, `movement:open_parent_sync`, `coord:open_parent_sync`, `txn:journal_grandparent_sync`, `sync_dir:sync`); killed in discovery only through the `htap-colstore` fixture (`UNATTRIBUTED_WITNESSES`), data-only survivor proofs | dir, open/op (also called per operation: `clone_tablet`, conversion tablet and generation directories, export) |
+| `fsync_file:sync` | `htap-common/src/fs.rs` `fsync_file` | a file reopened by path, used for the conversion segment temp file | allowlist `CoveredByOtherSync`; covered by `colstore:segment_write_sync` (the writer already fsynced it, so this site cannot be killed by design); survivor `htap-convert/tests/powerloss_convert.rs::survivor_fsync_file_sync` | file, op |
+
+### Not covered
+
+Device write caches and FUA, lying drives, `fsync` `EIO` and the post-error filesystem state (propagation only is tested),
+`ENOSPC`, sub-sector tearing, bit rot, `mmap` and `O_DIRECT`, thread interleavings, non-Unix platforms (the directory sync
+is a no-op there), and real hardware. Open follow-ups F10 through F21 (including the F12 ambiguous post-rename outcome, the
+F13 nominal Torn coverage of the server SQL workload, and the F15 `OracleGap` sites above) are tracked in
+`docs/LIMITATIONS.md`; a LazyFS cross-check is `deferred` (build toolchain unavailable).
 
 ---
 
@@ -2939,6 +3192,7 @@ The rowstore remains the single authority for all writes and point reads:
 - **No atomic cross-format transactions:** Transactions never mutate rowstore and columnstore simultaneously.
 - **Metadata demotion vs. physical reverse transcode:** Metadata-only Column-to-Row demotion is implemented (`LocalServer::convert_table_to_row` / `demote_partition_to_row`), switching the catalog storage descriptor back to `Row` and clearing `column_manifest` via atomic CAS, while keeping the rowstore authoritative and retaining existing column segment files on disk. Physical reverse data transcoding and physical deletion/reclamation of column files remain deferred.
 - **No autonomous background scheduler:** Conversion and demotion execute strictly via synchronous method calls (`conversion_tick`, `tick`, `convert_table_to_column`, `convert_table_to_row`); `tick()` resumes persisted jobs only without initiating new conversions, and no autonomous background scheduler thread or daemon is implemented.
+- **Crash-durable open (Phase 20):** `LocalServer::open` creates the root durably, syncs the root's parent (`server:open_parent_sync`) and its ancestors best effort, creates `colstore/` durably, and syncs the root directory (`server:open_dir_sync`) before validation; see "Power-loss simulation harness (Phase 20)" above for the full sequence and tests.
 - **Fail-closed startup storage validation:** `LocalServer::open` validates that catalog metadata for `Column` and `Converting` partitions matches `<root>/colstore` manifests and segments on disk, failing closed (returning `HtapError::Corruption` or `HtapError::Io` depending on the cause) on any mismatch.
 - **No delete vectors:** Column segments have no bitmap delete vectors; deletions post-base are tracked as rowstore tombstones in the delta overlay.
 - **No delta-to-base background compaction:** Rowstore deltas accumulated after a conversion's base snapshot are never merged back into new base columnar files; `ConversionDescriptor.snapshot_version` never advances on its own. As of Phase 15, the rowstore's own LSM compaction (`Engine::compact_once`, generic, unrelated to columnar conversion) does physically collapse superseded MVCC versions and reclaim dropped-partition bytes in the rowstore, including for converted tables — see "Rowstore compaction, garbage collection, and DROP TABLE reclaim (Phase 15)" above — but it never touches the columnar base or the conversion's own state.

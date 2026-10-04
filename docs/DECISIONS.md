@@ -2547,6 +2547,10 @@ contract rather than re-derive it.
   silent no-op elsewhere) or unifying the other five onto its unconditional behavior would each change
   non-Unix behavior that no test in this repository exercises. Approved by the validator as an explicit,
   documented non-migration rather than a silent choice; a comment at its definition says so.
+  **Superseded (Phase 20, ADR-034):** this function no longer exists. The power-loss audit this note anticipated is
+  Phase 20; it migrated the WAL's directory syncs onto the shared shim in commit `4891f13` (`refactor(rowstore)`),
+  so `htap-rowstore/src/wal.rs` has no private `fsync_dir`. The cost is the one this note foresaw: directory sync is now
+  a no-op off Unix (`docs/LIMITATIONS.md`, unix-only durability).
 - `HTAPMAN1`'s single exact-size check (`SizeCheckMode::ExactMatch`): the other five envelopes report a
   truncated and a trailing-bytes input as two distinct messages; the rowstore manifest reports both as one
   "size mismatch" message. `HTAPMAN1` gates WAL/SST manifest recovery, the single most crash-critical file in
@@ -2564,12 +2568,13 @@ one real near-duplicate found in this audit) produces slightly different wording
 corruption path. No test asserted the old text; a new test (`test_manifest_read_from_file_trailing_content_rejected`)
 pins the new one so it cannot silently drift again.
 
-**Consequences.** Seven crates now share one implementation of each migrated durability primitive — except the
-deliberately retained `htap-rowstore/src/wal.rs::fsync_dir`, which stays a second, non-identical directory-sync
-implementation for the reason above. A future format
+**Consequences.** Seven crates now share one implementation of each migrated durability primitive. (As written on
+2026-09-20 this sentence excepted the deliberately retained `htap-rowstore/src/wal.rs::fsync_dir`; that function was
+migrated in Phase 20, commit `4891f13`, see the superseded note above, so there is again one directory-sync
+implementation.) A future format
 (Phase 15 journal compaction, Phase 16 multiprocess ownership) gets `atomic_publish`/`decode_envelope`/
-`ByteReader` for free instead of a new hand-rolled copy. The eventual power-loss safety audit now has one
-implementation per primitive to audit instead of five to seven. No on-disk format changed, so this note does
+`ByteReader` for free instead of a new hand-rolled copy. The power-loss safety audit this note anticipated had one
+implementation per primitive to audit instead of five to seven, and it is Phase 20 (ADR-034). No on-disk format changed, so this note does
 not update the storage-format compatibility table's "versions accepted"/"CRC scope" columns — see the table in
 `docs/ARCHITECTURE.md` ("Dual-format storage") for the format facts themselves, and `docs/PROGRESS.md`'s
 Stage R row for the full test list.
@@ -5051,3 +5056,364 @@ range_edges_merge_and_ticket_drop}`; `crates/htap-txn/src/manager.rs::tests::for
 `crates/htap-tpcc/tests/serializable.rs`; `htap_sql::variables::tests::parse_isolation_level_accepts_serializable_and_repeatable_read_only`.
 The full requirement-to-test map is the Phase 19 row of `docs/PROGRESS.md`; the design is described in
 "Serializable isolation (Phase 19)" in `docs/ARCHITECTURE.md`; design references are in `docs/RESEARCH.md`.
+
+
+---
+
+## ADR-034: Power-loss crash consistency under a modelled filesystem (strict POSIX): recording shim and crash-image harness
+
+`Status: Accepted`
+`Date: 2026-10-04`
+
+**What this ADR claims, and what it does not.** This is **crash consistency under a stated model, not a power-loss
+proof.** Every durable mutation in the engine's local crates now goes through one recording shim, and CI enumerates
+simulated crash images of the recorded operation log under a stated strict-POSIX filesystem contract. A green suite means
+"no image the harness enumerated violated the oracles" (write and truncate boundaries are sampled, at most eight per log,
+unless exhaustive mode is on; Torn uses a fixed number of seeds; equal images are deduplicated); it does not mean the engine survives a real power cut on real
+hardware. Device caches, lying drives, `fsync` failure semantics, and the other items in "Explicit non-coverage" below are
+outside the model. Real-device and kernel-level proof stays `deferred`.
+
+### Context
+
+Until Phase 20 durability was verified by code inspection and by `kill -9` crash tests (`htap-rowstore/tests/wal_crash.rs`,
+`engine_crash.rs`, `htap-coord/tests/local_coordinator.rs`, `htap-server/tests/ipc_multiprocess.rs`). A killed process
+leaves the page cache intact, so those tests cannot observe a missing `fsync` or a missing directory sync; the mutation
+table in `docs/LIMITATIONS.md` shows the old suites still pass with every `sync_all` stubbed out. The Stage R
+note ("shared durability primitives module", above) had collapsed the file-durability helpers onto one implementation per
+primitive so that this audit would have one thing to audit.
+
+Phase 20 replaces "no power-loss proof" with CI-gated evidence under an explicit filesystem model. The researcher inventory of
+the durable write paths that preceded the harness expected, and the harness then confirmed, that the open paths of nearly every component created directories
+without syncing their parents, so a crash could drop a whole component directory together with acknowledged data.
+Those findings are listed under "Bugs found" and are why the harness was worth building.
+
+### Options considered
+
+- **(a1) A full virtual filesystem under the engine.** Rejected: every durable crate would need an injected VFS handle,
+  an invasive change with its own fidelity questions and no gain over recording the real calls.
+- **(a2) A recording shim in `htap_common::fs` plus an offline crash-image materializer.** Chosen. The shim runs the real
+  syscall and then appends to a per-test operation log; images are computed from log prefixes after the fact.
+- **(b) `dm-flakey` device-mapper fault injection.** Rejected as a gate: needs root and a block device, is not
+  enumerable from one recorded workload, and is not runnable from `cargo test` on a developer laptop.
+- **(c) A VM that is power-cycled.** Rejected: no hypervisor in CI, not enumerable, slow.
+- **(d) A process-global "crash mode" switch.** Rejected: parallel `cargo test` binaries and threads share the process, so a
+  global switch would make recorded workloads interfere. The shim is instead keyed by a canonical root prefix, so tests
+  run in parallel.
+- **(e) LazyFS (a FUSE filesystem that drops unsynced data) as the gating mechanism.** Rejected as a gate: needs
+  `cmake` and `libfuse3-dev` (unavailable in this environment), and it is an outside tool whose model we would still have
+  to state and trust.
+  Kept as an optional non-gating cross-check; see "How to reverse it" and `docs/LIMITATIONS.md` (E4, `deferred`).
+- **Relaxed (ext4-like) contract as the gating model.** Rejected: strict-to-relaxed is cheap to loosen later, the reverse
+  is expensive (a suite proven only under a relaxed model does not demonstrate the sync was needed). Chaos keeps a
+  non-gating relaxed probe.
+
+### Decision
+
+#### Crash contract (strict POSIX)
+
+The model each oracle is checked against:
+
+- `fsync(file)` persists that inode's data and size only. It does **not** persist the file's directory entry.
+- `fsync(dir)` persists that directory's entry map (creates, renames, unlinks inside it) only. It does **not** persist the
+  directory's own entry in its parent. Creating `a/b/c` therefore needs a parent sync **per level**.
+- `rename` is atomic. Production code renames only within one directory; the recorder fails closed on a cross-directory
+  rename or a directory rename rather than guessing their persistence rules.
+- Writes and file extensions not covered by a later `fsync` of that inode before the crash point may be lost or torn;
+  directory operations not covered by a later `fsync` of every affected directory may be lost.
+- Sector atomicity is configurable (`CrashPolicy::Torn { sector_size, .. }`; suites use 16, 512, and 4096).
+
+Image classes, per crash point:
+
+- **Strict**: only forced persists survive. Required.
+- **Torn(seed, sector)**: metadata as Strict; for each file, starting from the last synced snapshot, a seeded subset of its
+  dirty sectors survives and an extended region that never fully persisted is zero-filled. Required. Torn mixes only the
+  strict bytes and the final observed bytes of a sector: it has no intermediate versions of a sector (review note R3-N4).
+- **Chaos(seed)**: each unforced logged operation is kept or dropped independently, in log order: a namespace operation with
+  probability 3/4, and a whole logged `Write` or `SetLen` operation with probability 1/2 (`materialize.rs`). Chaos does not
+  mix per sector; only Torn does. This is a **fixed-seed triage probe**, not a required class. One ordinary test uses it in the normal run
+  (`tablet_package_rename_order_chaos`, fixed seeds); `chaos_*` model tests pin its semantics.
+- **Depth-1 recovery crash**: for suites that exercise recovery writes (WAL tail repair, journal `repair_torn_final`,
+  engine orphan removal), the harness also crashes **during** recovery at every boundary of the recovery log. That second
+  crash is **always Strict**, even under an outer Torn image. Deeper recursion is not explored.
+- **Strict-only suites (follow-up F21).** Six suites enumerate `Strict` images only: `powerloss_wal_open`,
+  `powerloss_wal_segment`, `powerloss_wal_tail`, `powerloss_engine_open`, `powerloss_movement_clone` (`Strict` plus the
+  `Chaos` probe) and `powerloss_movement_repair`. Torn-sector behavior on those paths is unexercised. The other suites
+  enumerate Torn in at least one test (`powerloss_txn` only in its depth-1 recovery test).
+
+Crash points: each file or directory sync contributes both the pre-sync and the post-sync boundary; namespace operations
+(create, rename, unlink, mkdir, rmdir) and acknowledgements contribute the post-operation boundary; write boundaries are
+sampled, up to eight (`POWERLOSS_EXHAUSTIVE=1` takes every index). Ordinary enumeration deduplicates images by
+`(tree hash, acknowledged label set)`; recovery-stage images are keyed by `(tree hash, outer acknowledged labels)`. Dedupe is
+turned off whenever exhaustive mode is on: `POWERLOSS_EXHAUSTIVE=1` by itself, or any active skip-sync mutation (witnesses and
+controls), which forces exhaustive mode.
+
+#### Harness design
+
+- **Shim (`htap-common/src/fs.rs`, `fs/dur.rs`, `fs/recorder.rs`).** `DurFile` and `DurOpenOptions` wrap `std::fs::File` and
+  `OpenOptions`; free functions wrap `rename`, `remove_file`, `create_dir`, `create_dir_all`, `remove_dir`,
+  `remove_dir_all` (decomposed into per-entry operations while recording), `sync_dir`, and path-based `fsync`. The
+  existing helpers (`sync_dir`, `write_new_tmp_file`, `remove_file_if_exists`, `fsync_file`, `atomic_publish`) are built on
+  the shim. The `crashsim` cargo feature on `htap-common` is enabled only through a dev-dependency of the new
+  dev-only crate `htap-crashsim` (`publish = false`); with the feature off the shim is an `#[inline]` pass-through, and
+  `htapd` refuses to start if `htap_common::fs::CRASHSIM_ENABLED` is true.
+- **Recorder.** A registry keyed by canonical root prefix lets parallel tests record independently. The real
+  syscall runs first, before the recorder lock is taken; only the model update and the append of the successful operation
+  run under the recorder lock: `Mkdir`, `Create`, `Write{id, offset, bytes}`,
+  `SetLen`, `FsyncFile`, `FsyncDir`, `Rename`, `Unlink`, `Rmdir`, `Ack(label)`. Files have inode-like ids (rename-over
+  tracks the replaced id), and `O_APPEND` offsets come from the model length. The write is logged below any `BufWriter`
+  at the real flush. Self-checks: at each `FsyncFile` the reconstructed content must equal the real file, and at workload
+  end the shadow tree must equal the real tree; raw `std::fs` mutation under a registered root fails the self-check.
+- **Fail-closed rules.** The recorder panics (the test fails) on `..` paths that escape the root, symlinks that escape,
+  cross-directory and directory renames, files or names the model has no record of (a raw `std::fs` mutation), and
+  recording from more than one thread. Workloads are tiny,
+  seeded, and single-threaded (`with_scan_workers(1)`, `with_query_parallelism(1)` in server tests).
+- **Ephemeral data roots.** The registered root is itself an ephemeral data root by default (`State::from_disk` registers
+  the empty relative path), so `LOCK`, `spill/`, `htap.sock`, and `.htap-ipc-*` entries directly beneath it are ignored. A
+  server root nested under the harness root additionally has its own such entries ignored through
+  `CrashHarness::with_data_root` (called before `run_workload`; later registration fails closed). These are ephemeral
+  runtime state outside the crash model. The other exceptions to "all durable mutation goes through the shim" are the
+  `htap-server` spill scratch and IPC socket code, which carry item-scoped lint allows.
+- **Materializer (`htap-crashsim`).** Computes a crash image for `(log prefix, policy)` into a temp directory, which the
+  suite then opens with plain `std` and the production API.
+- **Ack labels.** A workload acknowledges a step only after the API returned `Ok`; `DurablePending` and
+  `RecoveryRequired` never acknowledge (CLAUDE.md invariant). An image at crash point `k` must contain every operation
+  acknowledged before `k`.
+- **Oracles (per suite).** (1) the production API reopens every enumerated Strict and Torn image (Torn only in the suites that enumerate it, F21) with no `Corruption`; (2) every
+  acknowledged operation is present with its value and acknowledged deletes are not resurrected; (3) the recovered state is
+  some prefix of the serial history with `acked <= len <= issued`; (4) a second reopen is idempotent and the two reopens
+  agree; (5) crash-during-recovery at depth 1; (6) a published (non-`.tmp`) envelope never has an invalid CRC.
+- **Replay.** A failure prints `POWERLOSS_REPRO=<harness>/<policy>/<seed>/k=<n>` (recovery images add `/rk=<n>`).
+  Setting the environment variable replays exactly that image: the repro name must equal the harness name (equal to the
+  test name by convention). Success is the reproduced oracle panic; `POWERLOSS_REPLAY_NOT_REPRODUCED` means the image now
+  passes (fixed, or workload drift). Other knobs: `POWERLOSS_SEEDS`, `POWERLOSS_EXHAUSTIVE`, `POWERLOSS_SKIP_SYNC`.
+- **Static completeness gate.** `ci.sh` runs `CLIPPY_CONF_DIR=ci/clippy-durability cargo clippy --workspace --exclude
+  htap-crashsim --lib --bins -- -A clippy::all -D clippy::disallowed_methods` over the whole workspace, so raw `std::fs`
+  mutation, `File::sync_all`/`sync_data`/`set_len`/`try_clone`, `OpenOptions::open`, `FileExt::write_at`,
+  `set_permissions`, and `symlink` are rejected outside the shim. A second `ci.sh` step requires that the set of source
+  files mentioning `disallowed_methods` equals exactly `htap-common/src/fs/dur.rs`, `htap-rowstore/src/sst.rs` (two
+  read-only `try_clone` calls), `htap-server/src/spill.rs`, and `htap-server/src/ipc/owner.rs`, and rejects lint-group
+  allows (`clippy::all`, `clippy::style`, `warnings`) and a `[lints]` table in any `Cargo.toml`. The server spill and IPC allows are item-scoped with a "ephemeral, not durable"
+  comment.
+
+#### Durability conventions
+
+These are the contracts the fixes below establish and the oracles enforce:
+
+- **Open-time REQUIRED syncs (immediate parent only).** The rowstore engine, WAL, journal, catalog, coordinator,
+  movement root, and `LocalServer` create their directory with `create_dir_all_durable` (parent sync for every level the
+  call creates) and then, **unconditionally and with errors propagated**, sync the directory itself and its **immediate
+  parent**. "Unconditionally" matters: a directory created by an earlier process that was killed before its parent sync is
+  not trusted to be durable. For the engine, WAL, journal, catalog, and movement root the parent is taken from the path
+  text (`parent_or_current_dir`; empty maps to `.`), so a symlinked component or `..` is not resolved.
+  `LocalCoordinator::open` and `LocalServer::open` canonicalize the root first and sync the canonical parent.
+- **D1: the `LocalServer` root and export destinations split strict from best-effort.** The root's immediate parent (and
+  an export destination's parent) is synced strictly. Ancestors above it are synced by
+  `sync_ancestors_best_effort`, a lexical walk to the filesystem root (or `.` for a relative path) that tolerates only
+  `PermissionDenied`, `InvalidInput`, and `Unsupported` and propagates every other error (`EIO`, `ENOENT`, `ESTALE`,
+  `EROFS` on a far ancestor therefore fails the open or export). The contract is "the nearest durable ancestor is the
+  anchor": a multi-level fresh root is durable once its levels are created durably and its parent is synced, and
+  ancestors that were already volatile before this call are repaired best-effort, not as a strict guarantee. The panel
+  that reviewed this was split (an explicit durable-anchor contract versus a best-effort walk); the strict/best-effort
+  split was chosen because it makes the fixed cases green without claiming more than the filesystem lets us check.
+  The best-effort claim is not part of the crash-image proof (see "Explicit non-coverage").
+- **One-level fresh root was already safe.** A fresh server root exactly one level below a durable directory was already
+  durable before BUG-PL-5's fix: `Journal::open` syncs the journal's grandparent, which is that root's parent. Only roots two
+  or more levels below a durable directory, or volatile ancestors above the immediate parent, were lost. The tests
+  therefore use roots of depth 1 (green control) and 3 (the red case); see the BUG-PL-5 entry.
+- **Per-operation chain syncs.** A tablet package publish syncs the package directory between the `DATA` and `MANIFEST`
+  renames and then the package directory chain (`sync_package_dir_chain`: package dir up through the movement root and its
+  parent) before the job is marked `Complete`; an export syncs the destination parent strictly and its ancestors
+  best-effort before completion; conversion syncs the colstore root and its parent before the first publish and the tablet
+  and generation directories after each segment publish.
+- **Every path syncs an adopted WAL active segment before publish.** `Wal::open` syncs the adopted final segment on both
+  branches: `wal:open_adopt_sync` when the tail is not torn, and, when a torn tail is truncated, `wal:repair_sync` after
+  `set_len`, which is then the barrier for the adopted unsynced valid prefix (the two sites are alternatives, not both run).
+  Before BUG-PL-3 only the torn-tail branch synced, so a frame written by a killed process could be replayed, published,
+  and then lost.
+- **Instrumentation commits never fix bugs; no hot-path syncs.** All added syncs run at open, per conversion, per clone,
+  per export, or per job persist, never per commit or per row. No on-disk format changed, so no format-version bump was
+  needed.
+- **Unix only.** The shim's directory sync is a no-op off Unix (the old `wal.rs::fsync_dir`, which ran on every platform
+  and likely failed on Windows, no longer exists). Durability is therefore a Unix-only claim.
+
+#### Bug policy
+
+Fix in-phase only local missing-sync, directory-sync, or ordering defects that need no format change, no framing change,
+no acknowledgement-order change, and no hot-path `fsync`. Anything else (the oracle or contract is indicted, two
+subsystems are involved, a format or ordering change is needed) stops the batch and is reported. More than five findings
+in one subsystem would have triggered a design ADR; that breaker was not tripped. Each batch was intended to land as a
+red/green pair: a behavior-preserving migration commit (instrumentation, no fixes), then a commit with the failing suite and
+the fix. Red evidence (a failing repro captured on the unfixed code) is recorded in the commit messages for BUG-PL-1, 3, 5, 6
+and 7 (BUG-PL-6 is a log-order assertion, not a `POWERLOSS_REPRO` image); BUG-PL-2 had no red test in its commit, and BUG-PL-2
+and BUG-PL-4 are guarded by the tests listed in `docs/LIMITATIONS.md`. A pinned `KNOWN_RED` allowlist
+that may only shrink was the rule for tests that must stay red across commits; none exists in the tree. BUG-PL-7's two
+tests were `#[ignore]`d for exactly one commit (`033c503`) and re-enabled by the fix (`6315e2a`).
+
+#### Mutation-control design
+
+A passing suite proves nothing if the model cannot fail it. The controls:
+
+- **`SkipSync` scopes.** The recorder can omit the *log entry* of a sync (the real syscall still runs) for `File`,
+  `Directory`, `All`, or one `Site("<id>")`. A scope is applied with `with_skip_sync`, is thread-local, nests, restores on
+  panic, is re-applied to the recorders of recovery stages, and counts how many syncs it suppressed (`scope_skip_hits`). The
+  `POWERLOSS_SKIP_SYNC=file|dir|all|site:<id>` environment variable applies a skip to a whole run; any active skip forces
+  exhaustive, undeduplicated enumeration.
+- **Witnesses, controls, survivors.** Every production sync site carries a string id. `crashsim_witness!(fn, site = "<id>",
+  body = <suite test>)` re-runs a suite with that one site skipped and requires a recorded oracle
+  failure (`assert_skip_kills`: the harness stores a typed failure record and the panic must be exactly the
+  `POWERLOSS_REPRO=...` re-panic), rejecting an unrelated panic, a surviving run, and a zero-hit run (`site never
+  exercised`).
+  `crashsim_control!` does the same for `File`, `Directory`, or `All`, and every `powerloss_*` suite must contain
+  controls (or a reasoned exemption). `crashsim_survivor!` proves the opposite for a site that is redundant by design (the
+  suite must still pass, and the site must be exercised).
+- **Static site checker.** `htap-crashsim/tests/mutation_controls.rs` parses the production sources with `syn`, extracts
+  every site id passed to a shim sync, and requires that each id has a witness in `SYNC_SITE_WITNESSES` or an `ALLOWLIST`
+  entry with a **reason from a closed enum**: `SubsumedByLaterSync`, `CoveredByOtherSync`, `IdempotentResurrection`,
+  `ErrorPathOnly`, `NonUnixOnly`, `NoProductionCaller`, `OracleGap`. An allowlist entry must carry survivor proof (a
+  `crashsim_survivor!` test or a documented data-only argument), `CoveredByOtherSync` must name a witnessed site, and a
+  scoped entry must match a real call. Site ids must be unique, no production sync may be untagged, every shared helper id
+  (`sync_dir:sync`, `write_new_tmp_file:sync`, `fsync_file:sync`, `atomic_publish:dir_sync`,
+  `create_dir_all_durable:parent_sync`) needs a witness or a scoped, reasoned allowlist entry in each calling crate
+  (`create_dir_all_durable:parent_sync` and `fsync_file:sync` have no production witness), and `UNATTRIBUTED_WITNESSES`
+  lists witnesses that a test fixture, not production code, kills. A further test,
+  `every_sync_site_is_listed_in_the_architecture_catalog`, parses only the "Durability-point catalog" table of
+  `docs/ARCHITECTURE.md` and fails on a missing, stale, or duplicate id. At the time of this ADR the scanner sees 37
+  production site ids: 24 with a production witness and 13 relying only on a reasoned allowlist entry (some witnessed shared helper ids also carry crate-scoped allowlist rows; `wal:repair_sync` is witnessed
+  by `witness_wal_repair_sync`). `OracleGap` marks sites no workload observes (catalog, coordinator, and movement `open_dir_sync`, follow-up F15).
+  The scanner has documented blind spots (UFCS, aliases, glob imports, macro-wrapped calls); raw `std`/`libc` syncs are
+  caught by the clippy gate instead.
+- **Witnesses prove existence of a failing image, not breadth.** A witness shows that skipping the site yields at least one
+  image that fails an oracle. It does not show that every dependent path is covered. Shared-helper ids are killed
+  per (id, workload), not per call site: skipping `sync_dir:sync` suppresses every caller in that workload at once.
+- **`SyncFault` is propagation-only.** `SyncFault::Nth(n)` / `SyncFault::Site{site, occurrence}` makes the 1-based nth sync
+  attempt in the workload region return an error before the syscall. The `sync_fault_*` sweeps fail each sync ordinal in
+  turn and assert that **no injected failure is silently dropped** (the error reaches the caller, or for server `DROP`
+  reclaim is logged with the pending entry left retryable); they do not
+  materialize crash images and do not model what the filesystem does after a failed `fsync` (`EIO` semantics are out of
+  scope). A sweep need not make every sync fail for every API.
+- **F12: ambiguous outcome after the rename.** When the directory sync that follows `atomic_publish`'s rename fails, the API
+  returns `Err` although the new file is already visible in the running process. The sweeps pin the exact set of
+  tolerated trailing ordinals for each API (clone, repair, export, job persist, artifact delete, server `DROP` reclaim) as
+  `AMBIGUOUS_AFTER_RENAME`-style tables, and tie each rename row to its sync with a site-targeted companion run. Callers
+  must treat such an `Err` as "outcome unknown". The catalog CAS and the coordinator can diverge from disk. This is
+  recorded in `docs/LIMITATIONS.md` ("Ambiguous outcome after a post-rename directory-sync failure (F12)"), together with
+  the retry fast-path gap F20.
+- **Real-source mutations (E3).** Manual mutations of the production sync code (stubbed `DurFile` sync, stubbed
+  `sync_dir`, a dropped roll or SST-rename directory sync), run in a scratch git worktree with its own `CARGO_TARGET_DIR`
+  against the old kill-9 suites and the new power-loss suites, are a separate evidence step recorded in
+  `docs/PROGRESS.md`. This ADR's claims rest on the witnesses and controls above, not on that table.
+
+#### Explicit non-coverage
+
+The model does **not** cover: device write caches and FUA/flush semantics; drives that lie about flush; `fsync` `EIO` and
+post-error state (the kernel may drop dirty pages after a failed sync; F10 records the WAL gap); `ENOSPC`; sub-sector
+tearing and bit rot; `mmap` and `O_DIRECT` (the engine uses neither); thread interleavings and concurrent crashes (one
+thread is recorded); non-Unix platforms; and any real hardware or real kernel. It also does not prove: that Torn images
+contain intermediate sector versions (they do not); that the second crash in recovery can be Torn (always Strict); that the
+server SQL workload produces Torn-distinct crash trees (measured `POWERLOSS_TORN_DISTINCT=0`, follow-up F13); that the
+open-time syncs cover ancestors beyond the immediate parent (best-effort only, and ancestors outside the harness root are
+not recorded); that a missing required conversion manifest is classified as `Corruption` (it is `Io`, F14); that
+`movement:package_data_dir_sync` has a crash-image witness (no shipped Strict, Torn, or Chaos test kills its skip, including
+the `tablet_package_rename_order_chaos` probe; only the op-log order test `clone_publish_has_data_dir_barrier` guards it, F16);
+that Torn images are enumerated for the six Strict-only suites (F21); or that every `OracleGap` site is observed.
+Open-time `EACCES`/`EINVAL` on an unreadable or unsyncable parent now fails closed, and a checkpoint-reopen `fsync` failure
+becomes `recovery-required`. The full list with follow-up ids F10 to F21 is in `docs/LIMITATIONS.md`.
+
+### Bugs found
+
+The harness found seven defects (red evidence is recorded in the commit messages for BUG-PL-1, 3, 5, 6 and 7; BUG-PL-2 and
+BUG-PL-4 are guarded by tests; full list with commit and evidence in `docs/PROGRESS.md` and `docs/LIMITATIONS.md`):
+
+- **BUG-PL-1** (`01ca864`): `Engine::open`/`Wal::open` created directories without syncing parents and trusted a directory
+  left by an earlier killed process; the whole engine, with acknowledged commits, could vanish.
+- **BUG-PL-2** (`01ca864`): `Wal::open` adopted a segment whose directory entry was never synced.
+- **BUG-PL-3** (`01ca864`): the adopted active WAL segment was `fsync`ed only after a torn-tail repair, so an unsynced
+  commit frame could be replayed and published and then lost, leaving visible newer than recovered (reopen `Corruption`).
+- **BUG-PL-4** (`4321287`): a zero payload-length journal header followed by more than one header of bytes was classified
+  as middle corruption without probing for a later valid frame, so a zero-filled tail after power loss made the database
+  unopenable.
+- **BUG-PL-5** (`033c503`, high): a fresh or volatile `LocalServer` root two or more levels below a durable directory was
+  lost after an acknowledged open (neither the root nor its ancestors were synced). One-level roots were not affected.
+- **BUG-PL-6** (`033c503`, low, log order only): the `colstore/` directory entry was not followed by a root directory sync
+  before `open` returned.
+- **BUG-PL-7** (`6315e2a`, availability only, no data lost): a crash after the `SegmentsWritten` or `ReadyToPublish`
+  catalog step left a manifest-less `Converting` partition whose reads failed until `tick()`; the read path now serves it
+  from the rowstore in every phase (the rowstore stays authoritative until publish).
+
+Fixes without a numbered id (journal file entry, state directories, tablet clone chain, `DATA`/`MANIFEST` barrier,
+swallowed syncs) are in the commit messages of `4321287` and `02a238d`.
+
+### Consequences
+
+- Phase 20 is `implemented (local MVP)`: simulated power loss under the model above across the rowstore, journal, catalog,
+  coordinator, column store, conversion, movement, and `LocalServer` open/conversion/reclaim paths. Real-device, kernel,
+  and fault-injection-below-the-filesystem proof is `deferred`.
+- New dev-only crate `htap-crashsim`; the workspace has 16 `htap-*` crates plus `htapd` (17 crates, plus `vendor/sqlparser`). It is never linked into production.
+- Every new durable file or directory mutation must go through `htap_common::fs` (clippy gate), and every new sync site
+  needs a string id and a killing witness or a reasoned allowlist entry (static checker), or CI fails.
+- Added test wall time (the server suites dominate; `server_recovery_crash_depth1` is slow in exhaustive mode,
+  follow-up F18). Measured runtimes are recorded in `docs/PROGRESS.md`.
+- Open-time latency increases by a handful of directory syncs per component open (follow-up F17 records a redundant double
+  `fsync` in the journal append-and-sync path; performance only).
+- A site's witness proves one failing image exists; coverage per shared helper is per (id, workload).
+- No on-disk format, WAL, or journal framing changed; no ack ordering changed.
+
+### How to reverse it
+
+Remove the `crashsim` feature wiring and the `htap-crashsim` crate; the shim is a pass-through with the feature off, so no
+production behaviour depends on it. The fixes are plain extra directory and file syncs and can stay. Loosening the model
+is a configuration change: gate on Torn only, or demote Strict to a triage run, without touching the shim. To add an
+external cross-check, run the existing kill-9 workloads under LazyFS (`deferred` until `cmake` and `libfuse3-dev` are
+available), keeping it non-gating; the reopen condition is a CI image that has both.
+
+### Verification
+
+Model and harness semantics: `crates/htap-crashsim/tests/model_semantics.rs`
+(`strict_loses_unsynced_write`, `file_fsync_without_dir_fsync_loses_entry`, `dir_fsync_publishes_entry`,
+`dir_fsync_does_not_publish_own_entry`, `nested_mkdir_needs_parent_fsync_per_level`,
+`rename_without_dir_fsync_keeps_old_name`, `unlink_without_dir_fsync_resurrects`,
+`torn_keeps_sector_aligned_subset`, `torn_extension_zero_filled`, `chaos_reaches_rename_before_data_sync`,
+`images_deterministic_for_same_seed`, `repro_string_roundtrips`), `dir_generations.rs`, `recovery_baseline.rs`,
+`recovery_panic.rs`, `recovery_repro.rs`, `torn_extension.rs`, `chaos_parent_mkdir.rs`, `chaos_type_conflicts.rs`,
+`repro_env.rs` (`replay_env_replays_exactly_one_image`, `replay_env_not_reproduced_panics_with_distinct_prefix`),
+`ephemeral_roots.rs`, `skip_controls.rs` (`assert_skip_kills_accepts_a_real_kill`, `assert_skip_kills_rejects_survivor`,
+`assert_skip_kills_rejects_zero_hits`, `recovery_recorders_inherit_skip`, `witness_scope_forces_exhaustive_no_dedupe`),
+`skip_env.rs`, `sync_fault.rs`, and `review_controls.rs`. Ancestor helper units in `htap-common/src/fs.rs`:
+`sync_ancestors_best_effort_propagates_not_found`, `sync_ancestors_best_effort_skips_invalid_input_and_continues`,
+`sync_ancestors_best_effort_records_ancestors_inside_root` (the last one needs `--features crashsim`).
+
+Crash-image suites (each reopens Strict images and all but the six Strict-only suites of F21 also reopen Torn images; the full per-suite test list is the R7 row of
+`docs/PROGRESS.md`): `htap-rowstore/tests/powerloss_{wal,wal_open,wal_segment,wal_tail,engine,engine_open}.rs`
+(`wal_acked_commits_survive_strict`, `wal_fresh_dir_entry_durable`, `wal_open_syncs_adopted_unsynced_segment`,
+`adopted_unsynced_wal_tail_is_synced_before_publish`, `torn_tail_repair_syncs_adopted_prefix_before_publish`,
+`engine_fresh_open_dirs_durable`),
+`htap-txn/tests/powerloss_txn.rs` (`txn_fresh_journal_entry_durable`, `txn_repair_torn_final_crash_depth1`),
+`htap-catalog/tests/powerloss_catalog.rs`, `htap-coord/tests/powerloss_coord.rs`,
+`htap-colstore/tests/powerloss_segment.rs`, `htap-convert/tests/powerloss_convert.rs`,
+`htap-movement/tests/powerloss_movement{,_clone,_export,_import,_repair}.rs`
+(`clone_survives_fresh_tablet_dirs`, `clone_publish_has_data_dir_barrier`, `export_to_fresh_nested_destination`), and
+`htap-server/tests/powerloss_server.rs` (`server_fresh_root_bootstrap_durable`, `server_preexisting_volatile_root_durable`,
+`server_reopen_syncs_volatile_root_children`, `server_open_syncs_colstore_entry_before_ack`),
+`powerloss_server_recovery.rs` (`server_conversion_and_reclaim_survive`, `server_recovery_crash_depth1`),
+`conversion_crash_recovery.rs` (`test_server_open_serves_manifest_less_segments_written_and_ready_to_publish`).
+
+Mutation controls: each `powerloss_*` suite ends with `witness_*`, `control_*`, and `survivor_*` macro tests (run
+`cargo test --workspace --tests -- witness_ survivor_ control_`); the static gate is
+`crates/htap-crashsim/tests/mutation_controls.rs`
+(`every_observed_sync_site_has_a_killing_witness_or_a_reasoned_allowlist_entry`, `allowlist_entries_are_not_stale`,
+`every_shared_helper_id_has_a_witness_in_each_calling_crate`,
+`every_powerloss_suite_has_file_and_dir_controls_or_a_reasoned_exemption`, `every_witness_row_names_an_existing_macro_and_test`,
+`every_production_site_id_is_used_at_one_location`, `every_sync_site_is_listed_in_the_architecture_catalog`,
+`scanner_observes_the_workspace`, `no_production_sync_is_untagged`).
+
+Sync-failure propagation (F12 pinned sets): `cargo test -p htap-movement --test sync_fault_clone --test sync_fault_repair
+--test sync_fault_export --test sync_fault_jobs` (`clone_sync_failure_is_never_swallowed`,
+`repair_sync_failure_is_never_swallowed`, `export_sync_failure_is_never_swallowed`,
+`job_persist_sync_failure_is_never_swallowed`, `delete_artifacts_sync_failure_is_never_swallowed`) and
+`cargo test -p htap-server --test sync_fault_reclaim` (`reclaim_sync_failure_is_never_swallowed`).
+
+Static gate: `./ci.sh` (the `CLIPPY_CONF_DIR=ci/clippy-durability` step and the `disallowed_methods` file-set guard).
+Replay recipe: `POWERLOSS_REPRO=<value> [POWERLOSS_SKIP_SYNC=<spec>] cargo test -p <crate> --test <file> <test_name>`.
+The architecture is in "Power-loss simulation harness (Phase 20)" in `docs/ARCHITECTURE.md`, the requirement map in the R7
+row and Phase 20 row of `docs/PROGRESS.md`, the gaps in `docs/LIMITATIONS.md`, and the design references in
+`docs/RESEARCH.md`.

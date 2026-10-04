@@ -16,7 +16,7 @@ crate:
 
 | Primitive | Copies |
 |---|---|
-| `sync_dir` | Six copies, not five as originally counted: `htap-catalog/src/local.rs`, `htap-coord/src/lib.rs`, `htap-movement/src/job.rs` (reused by `htap-movement/src/tablet.rs`), `htap-convert/src/lib.rs`, `htap-rowstore/src/manifest.rs` (reused by `htap-rowstore/src/engine.rs`) — all five byte-identical and `cfg(unix)`-gated — plus a sixth, non-identical copy, `htap-rowstore/src/wal.rs::fsync_dir`, which is unconditional (not `cfg(unix)`-gated). |
+| `sync_dir` | Six copies, not five as originally counted: `htap-catalog/src/local.rs`, `htap-coord/src/lib.rs`, `htap-movement/src/job.rs` (reused by `htap-movement/src/tablet.rs`), `htap-convert/src/lib.rs`, `htap-rowstore/src/manifest.rs` (reused by `htap-rowstore/src/engine.rs`) — all five byte-identical and `cfg(unix)`-gated — plus a sixth, non-identical copy, `htap-rowstore/src/wal.rs::fsync_dir`, which was unconditional (not `cfg(unix)`-gated). Stage R consolidated the five identical copies; the sixth (WAL) copy was left in place then and was migrated in Phase 20 Batch B (commit `4891f13`, which also moved SST and engine directory syncs) onto the `htap-common` shim, so no private copy remains (the shim's directory sync is a no-op off Unix, see `docs/LIMITATIONS.md`, "Power-loss testing is a modelled-filesystem harness"). |
 | atomic publish (temp → `sync_all` → `rename` → `sync_dir`) | `htap-catalog/src/local.rs` (`atomic_publish`), `htap-coord/src/lib.rs` (`atomic_publish`), `htap-convert/src/lib.rs` (`write_atomic`, `write_atomic_to`), `htap-rowstore/src/manifest.rs` (`atomic_publish`) |
 | envelope framing (magic + format version + CRC32C) | about 10 files: rowstore `wal.rs`, `sst.rs`, `manifest.rs`; colstore `segment.rs`; catalog `local.rs`; txn `journal.rs`; movement `job.rs`, `tablet.rs`; coord `lib.rs`; convert `lib.rs` |
 | little-endian byte decoding with manual bounds checks | each of the files above, e.g. `htap-colstore/src/encoding.rs` and `htap-rowstore/src/sst.rs` |
@@ -25,7 +25,8 @@ crate:
 reclaim, rowstore compaction/GC, journal checkpoint — now done, see the Schedule below) added three new durable
 files/format bumps (`HTAPMAN1` v3, `HTAPCAT1` v5, `HTAPTXC1`) built on exactly the Stage R helpers this section
 describes, confirming the investment; Phase 16 (multiprocess ownership) will add more. The power-loss safety
-phase would have had to audit every copy.
+phase would have had to audit every copy; it did not have to: Phase 20 audited and instrumented the single shared
+implementation (see the Schedule).
 
 **Fix (shipped, stage R).** Added one shared module to `htap-common` (`fs.rs`, `envelope.rs`, `bytecursor.rs`)
 providing:
@@ -41,8 +42,10 @@ Migrated all seven crates (`htap-catalog`, `htap-coord`, `htap-movement`, `htap-
 `htap-txn`, `htap-colstore`) onto it with **zero on-disk byte changes and zero pre-existing test edits**: every
 existing recovery/crash test still passes unchanged, plus a golden-bytes test per envelope and per-fault-class
 error-text tests. `htap-rowstore/src/wal.rs::fsync_dir` — the sixth, non-`cfg(unix)`-gated `sync_dir` copy found
-during this stage — was deliberately **not** migrated: unlike the five identical copies, moving it in either
-direction would change untested non-Unix behavior, so it was left in place with a comment explaining why. One
+during this stage — was deliberately **not** migrated in stage R: unlike the five identical copies, moving it in either
+direction would change untested non-Unix behavior, so it was left in place with a comment explaining why. It was migrated
+later, in Phase 20 Batch B (commit `4891f13`), as the "eventual power-loss audit" this note anticipated; the non-Unix
+behavior change (the shim's directory sync is a no-op off Unix) is recorded in `docs/LIMITATIONS.md`. One
 message text legitimately changed as part of this stage: `Manifest::read_from_file`'s untested trailing-probe
 error text, now produced by the shared `read_file_exact_bounded` and pinned by a new test. See
 [`docs/PROGRESS.md`](./PROGRESS.md) (Stage R row), the storage-format compatibility table in
@@ -143,7 +146,7 @@ dedicated stage.
 | **done** | **Phase 16 — multiprocess owner + IPC** | P3 (fixed, see above). No P4-listed function was touched by this diff. |
 | **done** | **Phases 17–18 — TPC-H, TPC-C workload kits** (unaudited, no compliance claim; see `docs/TPCH-DISCLOSURE.md`, `docs/TPCC-DISCLOSURE.md`) | — |
 | **done** | **Phase 19 — SERIALIZABLE isolation** (commit-time read-footprint validation, not SSI; opt-in, `implemented (local MVP)`; see ADR-033 and `docs/PROGRESS.md`) | — |
-| then | Power-loss safety | audits R's single implementation |
+| **done** | **Phase 20 — Power-loss crash consistency under a modelled filesystem** (simulated power loss only, `implemented (local MVP)`; no hardware proof; see ADR-034, `docs/LIMITATIONS.md` and `docs/PROGRESS.md`) | audited and instrumented R's single implementation: `ffaff48` (shim and harness), `4891f13`, `5bc4521`, `f4ecaf4`, `c5abdb9` (migrations), `01ca864`, `4321287`, `02a238d`, `033c503`, `6315e2a` (BUG-PL-1 to BUG-PL-7 fixes), `49d61ec`, `8ca21b2`, `952d368`, `b40aae1` (controls, witnesses, sync-failure sweeps) |
 | then | Docker | — |
 
 Stage R followed the normal non-trivial workflow: researcher plan, validator plan gate, implementer, **storage-reviewer**,

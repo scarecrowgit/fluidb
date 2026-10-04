@@ -2,7 +2,9 @@
 
 Single-node, in-process Rust HTAP engine: LSM rowstore + columnar segments, snapshot isolation MVCC,
 2PC transactions, row→column conversion, data movement, fenced local coordination, and a narrow SQL
-layer (sqlparser, MySQL dialect). Workspace: `crates/htap-*` (12 crates) + `vendor/sqlparser`.
+layer (sqlparser, MySQL dialect). Workspace: `crates/htap-*` (16 crates, including the dev-only `htap-crashsim`) + `crates/htapd` + `vendor/sqlparser`.
+`htap-crashsim` is the power-loss test harness: `publish = false`, never linked into production, and `htapd` refuses to
+start if `htap_common::fs::CRASHSIM_ENABLED` (`ci.sh` also fails if `htapd` enables the `htap-common` `crashsim` feature).
 
 Read before non-trivial work: `docs/ARCHITECTURE.md` (component statuses), `docs/DECISIONS.md` (ADRs),
 `docs/LIMITATIONS.md` (deferred scope), `docs/PROGRESS.md` (requirement → test evidence map).
@@ -14,6 +16,11 @@ Read before non-trivial work: `docs/ARCHITECTURE.md` (component statuses), `docs
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`.
 - Benchmarks: `cargo bench -p htap-bench` (see `docs/BENCHMARKS.md`; record results with its template).
 - Toolchain is pinned to Rust 1.95.0 (`rust-toolchain.toml`).
+- Power-loss suites (`crates/*/tests/powerloss_*.rs`, harness in `crates/htap-crashsim`): `POWERLOSS_SEEDS=<n>` (number of Torn
+  seeds, default 2; Chaos uses a fixed seed), `POWERLOSS_EXHAUSTIVE=1` (every crash point, no sampling), `POWERLOSS_SKIP_SYNC=file|dir|all|site:<id>` (mutation
+  control: omit syncs, forces exhaustive). A failure panics with `POWERLOSS_REPRO=<test>/<policy>/<seed>/k=<n>`; replay it with
+  `POWERLOSS_REPRO=<value> [POWERLOSS_SKIP_SYNC=<spec>] cargo test -p <crate> --test <file> <test_name>` (success = the reproduced
+  oracle panic; `POWERLOSS_REPLAY_NOT_REPRODUCED` = the image now passes or the workload drifted). See `docs/OPERATIONS.md`.
 
 ## Hard rules
 
@@ -34,6 +41,14 @@ Read before non-trivial work: `docs/ARCHITECTURE.md` (component statuses), `docs
   - Rowstore is authoritative during conversion (base-plus-delta overlay); `DurablePending` must never be reported as committed.
   - R5: complete-PK point reads route to `RowstorePointRead` and never touch the analytical path.
   - Catalog mutations go through CAS; coordinator-fenced paths must check `FencingToken`.
+- **Durable file mutations go through the `htap_common::fs` shim** (`fs.rs`, `fs/dur.rs`). The clippy gate `ci/clippy-durability`
+  (run by `./ci.sh`) rejects raw `std::fs` mutation, `File::sync_all`/`set_len`/`try_clone`, `OpenOptions::open`, etc. in
+  production `lib`/`bin` targets; `#[allow(clippy::disallowed_methods)]` is allowed only in the files `ci.sh` lists. Ephemeral
+  exceptions outside the crash model: the server spill directory (`htap-server/src/spill.rs`), the IPC socket
+  (`htap-server/src/ipc/owner.rs`), and read-only SST handle clones (`htap-rowstore/src/sst.rs`).
+  Every new sync site needs a string id (a `*_site` call) and either a killing witness (`crashsim_witness!`) or a reasoned
+  allowlist entry in `crates/htap-crashsim/tests/mutation_controls_tables/mod.rs` (`SYNC_SITE_WITNESSES` / `ALLOWLIST`), plus a
+  row in the durability-point catalog in `docs/ARCHITECTURE.md`. Gate: `cargo test -p htap-crashsim --test mutation_controls`.
 - **Evidence.** A requirement or feature claim in docs must name a runnable test or benchmark (`docs/PROGRESS.md`).
 - **Commits:** conventional style with crate scope, e.g. `feat(sql): …`, `fix(rowstore): …`, `docs(olap): …`.
 

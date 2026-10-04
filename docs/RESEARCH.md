@@ -338,6 +338,51 @@ was consulted or used for it.** Each reference informed the design only as descr
 
 ---
 
+## Power-loss crash consistency (Phase 20): published references
+
+Phase 20 (ADR-034, "Power-loss crash consistency under a modelled filesystem") was **re-derived from the published
+descriptions below and from this engine's own durable write paths; no StarRocks code or design, and no other project's
+source, was consulted or used for it.** The harness is crash consistency under a stated model, not a power-loss proof, and
+each reference informed the design only as described; none is implemented as published. Citations are given from the
+published titles and described methods; the tools' source was not read.
+
+- **Pillai, Chidambaram, Alagappan, Al-Kiswany, Arpaci-Dusseau and Arpaci-Dusseau, "All File Systems Are Not Created
+  Equal: On the Complexity of Crafting Crash-Consistent Applications" (OSDI 2014; the ALICE tool).** Records the
+  system-call trace of an application workload, derives the persistence-relevant operations (including that a file `fsync`
+  does not persist its directory entry, and that directory operations need their own ordering), and enumerates the crash
+  states a stated file-system model permits, checking each with an application-level checker. This is the shape of the
+  harness: record a workload once, materialize crash images offline from log prefixes under an explicit persistence
+  contract, and run oracles over each image. The strict contract in ADR-034 (a parent sync per created level, no
+  persistence of a directory's own entry by its own sync) follows the vulnerability classes that paper describes.
+- **Mohan, Martinez, Kadekodi, Chidambaram et al., "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing"
+  (OSDI 2018; the CrashMonkey and Ace tools).** Bounded, systematic crash-point enumeration with oracles that check that
+  acknowledged (persisted) operations survive. It informed the crash-point selection (syncs contribute both
+  pre-sync and post-sync boundaries, namespace operations and acknowledgements contribute post-operation boundaries,
+  with sampled write boundaries and an exhaustive mode), the "acknowledged
+  operations must be present" oracle, and the deduplication of identical images. The harness enumerates images from a
+  recorded log in-process; it does not use CrashMonkey's block-device wrapper.
+- **Bornholt, Kaufmann, Li, Krishnamurthy, Torlak and Wang, "Specifying and Checking File System Crash-Consistency Models"
+  (ASPLOS 2016; the Ferrite tool).** The argument for stating a crash-consistency model explicitly and checking against it,
+  rather than against one file system's observed behavior. It motivated stating the contract in ADR-034 (with strict and
+  torn image classes as the gate and a non-gating chaos probe) instead of gating on whatever one local file system does.
+- **Zheng, Tucek, Huang, Qin, Dai, Tomkins and Zhao, "Torturing Databases for Fun and Profit" (OSDI 2014).** Evidence that
+  real databases lose data under real power faults even when file-system-level reasoning looks correct. It is cited as the
+  motivation for treating the model as incomplete: the harness does **not** reproduce hardware power faults, and device
+  caches and lying drives are listed as explicit non-coverage in ADR-034.
+- **Rebello, Patel, Arpaci-Dusseau and Arpaci-Dusseau, "Can Applications Recover from fsync Failures?" (USENIX ATC 2020).**
+  Documents that applications cannot assume the state of dirty pages after a failed `fsync`. It is why `fsync` error
+  semantics are outside the crash model: the `SyncFault` sweeps test only that a failed sync is propagated to the caller,
+  and the post-error state is recorded as follow-up F10 in `docs/LIMITATIONS.md`.
+- **Linux `fsync(2)` manual page.** States that `fsync` of a file does not necessarily persist the directory entry that names
+  it and that a directory file descriptor must also be synced. This is the basis of the "file sync does not persist the
+  entry" half of the contract.
+- **LazyFS (a FUSE-based file system that discards data which was not `fsync`ed; INESC TEC / `dsrhaslab`).** Considered as
+  an **external cross-check idea, `deferred`**: re-running the existing kill-9 workloads under a file system that drops
+  unsynced data would corroborate the model from outside this repository. Building it needs `cmake` and `libfuse3-dev`,
+  which are not available here, so it is not part of the gate. The re-open condition is a CI image with both.
+
+---
+
 ## Lessons that shaped our design
 
 - Pay the MVCC cost at write time, not at read time.

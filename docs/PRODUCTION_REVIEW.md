@@ -14,7 +14,7 @@ matching roadmap line in section 5 (`txn.journal` compaction, stale as of Phase 
 
 **This project is a hardened local embedded MVP, not a production-ready database system.**
 
-The storage, transaction, and coordination components have undergone focused hardening against concurrency hazards, crash recovery boundaries, transaction commit irrevocability, and persistence bounds. However, **production readiness is not claimed**. The system operates strictly as an in-process embedded library without daemon lifecycle management, client networking, distributed consensus, or power-loss fault verification.
+The storage, transaction, and coordination components have undergone focused hardening against concurrency hazards, crash recovery boundaries, transaction commit irrevocability, and persistence bounds. However, **production readiness is not claimed**. The system operates strictly as an in-process embedded library without daemon lifecycle management, client networking, distributed consensus, or hardware power-loss verification (simulated power loss is covered by a modelled-filesystem harness only; see item 3 under "Remaining Open Issues").
 
 ---
 
@@ -114,8 +114,8 @@ The following limitations and architectural boundaries remain explicitly open:
 2. **Possible Later Flush-Boundary Duplicate SST Publication After Crash:**
    If a crash occurs immediately after an SST file is published to disk but before reader registration, manifest update, or checkpoint advance, a subsequent reopen/flush cycle may republish duplicate SST data. Full resolution requires a future staged flush recovery mechanism.
 
-3. **No Power-Loss Proof:**
-   Integration crash tests verify process `SIGKILL` termination, torn-tail truncation, and log reassembly across process death. They do not prove durability against true physical power outages, operating system kernel panics, or un-flushed disk controller write caches (no `dm-flakey` or FUSE power-cut testing).
+3. **Power-Loss Testing Is a Modelled-Filesystem Harness, Not a Hardware Proof (Phase 20, `implemented (local MVP)` for simulated power loss only):**
+   Integration crash tests verify process `SIGKILL` termination, torn-tail truncation, and log reassembly across process death. Since Phase 20, the dev-only `htap-crashsim` harness additionally reopens crash images generated under a stated strict-POSIX filesystem contract (unsynced data and unsynced directory entries may be lost; `Strict` and `Torn` images; a second crash during recovery) for the WAL, engine, transaction journal, catalog, coordinator, columnar segments, conversion, data movement, and `LocalServer` open; a static gate requires every sync site to have a killing witness or a reasoned allowlist entry (`cargo test -p htap-crashsim`, the per-crate `powerloss_*` suites, and `--test mutation_controls`). This is crash consistency under a model, not a power-loss proof: it does not prove durability against true physical power outages, operating system kernel panics, un-flushed disk controller write caches or lying drives, `fsync` `EIO` post-error state, or non-Unix platforms. Known open items include the rowstore WAL partial-write and post-`fsync`-error gap (F10), ambiguous publish outcomes after a failed post-rename directory sync (F12), and retry fast paths that skip a failed barrier (F20). No `dm-flakey`, LazyFS, VM, or real-hardware power-cut testing exists (all `deferred`). See `docs/LIMITATIONS.md` ("Power-loss testing is a modelled-filesystem harness (no hardware proof)") and ADR-034.
 
 4. **No Distributed Consensus, Remote Replica Serving, or Real HA:**
    Coordination is strictly single-node via local filesystem binary envelopes (`HTAPCRD1`). No Raft consensus (`openraft`), ZooKeeper ensemble backend, network session heartbeats, ephemeral watches, remote RPC replica streaming, or active HA failover exists.
@@ -158,7 +158,8 @@ The following limitations and architectural boundaries remain explicitly open:
                                        v
 +-----------------------------------------------------------------------------+
 | P2 — Distribution, Analytics & Full Durability                              |
-| - Power-loss chaos validation harness (dm-flakey / FUSE)                    |
+| - Power-loss validation: modelled harness implemented (local MVP), Phase 20;|
+|   dm-flakey, LazyFS/FUSE, real-hardware power-cut proof open (deferred)     |
 | - Distributed consensus backend (Raft / ZooKeeper) and remote replication   |
 | - Streaming non-materializing conversion, clone, and export pipelines       |
 | - Network server daemon, MySQL wire protocol, and auth security boundary    |

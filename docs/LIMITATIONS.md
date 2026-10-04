@@ -21,7 +21,7 @@ Targeted hardening units have resolved critical and high-priority consistency bl
 The following architectural limitations remain explicitly open:
 - As of Phase 15, `txn.journal` itself is checkpointed/compacted (`TransactionManager::checkpoint()`, a new `HTAPTXC1` baseline envelope) — see "Transaction journal checkpoint scope and deferred features" below. The `MANIFEST` v2 external-apply ledger's own hard cap is unrelated and unaddressed: it still eventually blocks new external applies once `MAX_APPLIED_EXTERNAL_TXNS` entries are used, with no compaction of that cap. Do not conflate the two.
 - Possible later flush-boundary duplicate SST publication after crash before reader/checkpoint, requiring future staged flush recovery.
-- No power-loss proof (testing bounded by process `SIGKILL`).
+- Power-loss testing is a modelled-filesystem harness, not a hardware proof (Phase 20, `implemented (local MVP)` for simulated power loss only): crash images are generated under a stated strict-POSIX contract and checked with `cargo test -p htap-crashsim` and the per-crate `powerloss_*` suites; real-device and kernel power-loss proof, the LazyFS cross-check, and fsync-error (`EIO`) post-state are `deferred`. See "Power-loss testing is a modelled-filesystem harness" below and follow-ups F10-F21.
 - No distributed consensus/Raft/ZK/remote replica serving or real HA.
 - Whole-dataset materialization in conversion, export (exports materialize full logical partition before writing), and clone.
 - No full SQL analytics. A network MySQL daemon (`htapd`/`htap-wire`) is now implemented (Phase 8) with a
@@ -162,20 +162,92 @@ The transaction manager (`htap-txn`) coordinates two-phase commit across partici
 
 ---
 
-## Durability testing is bounded by process-level fault injection (no power-loss proof)
+## Power-loss testing is a modelled-filesystem harness (no hardware proof)
 
-The write-ahead log and LSM engine in `htap-rowstore` are covered by integration
-tests (`crates/htap-rowstore/tests/wal_crash.rs`, test
+**Status: `implemented (local MVP)` for *simulated* power loss only (Phase 20). Real-device, kernel, and storage-hardware
+power-loss proof is `deferred`.** Phase 20 replaced "testing bounded by process `SIGKILL`" with a dev-only crash-image
+harness (`crates/htap-crashsim`, behind the `crashsim` feature of `htap-common`; never linked into `htapd`, which refuses
+to start when `CRASHSIM_ENABLED`). Every durable file mutation in the storage crates goes through the `htap_common::fs`
+recording shim; the harness records a workload's operation log, materializes crash images from it under a stated
+filesystem model, reopens each image with the real APIs, and checks recovery oracles (every acknowledged operation is
+present, the recovered state is a prefix of the serial history, a second reopen is idempotent). This is
+**crash consistency under a stated modelled-filesystem contract, not a power-loss proof**: nothing here exercises a real
+disk, a real kernel page cache, or a real power cut. See ADR-034 in `docs/DECISIONS.md` and "Power-loss simulation
+harness (Phase 20)" in `docs/ARCHITECTURE.md`.
+
+### The modelled-filesystem contract (what an image may and may not lose)
+
+- `fsync(file)` persists that inode's data and size and nothing else. Unsynced writes may be lost.
+- `fsync(directory)` persists that directory's entry map only. It does **not** persist the directory's own entry in its
+  parent, so every level of a freshly created chain needs its own parent sync.
+- `rename` is atomic and, in production code, same-directory only; the recorder fails closed on cross-directory renames,
+  `..` paths, and unknown pre-existing files. An unlink or rename without a directory sync may be rolled back.
+- Sector atomicity is a configurable model parameter (the default is 4096 bytes).
+- Image classes: `Strict` (only synced state survives) and `Torn` (sector-wise mixes) are the required, CI-gated classes.
+  `Chaos` is a fixed-seed triage probe that keeps or drops each whole logged operation (not each sector). Recovery itself is
+  crashed once (depth 1) with a `Strict` second crash. Six suites enumerate `Strict` only (`powerloss_wal_open`,
+  `powerloss_wal_segment`, `powerloss_wal_tail`, `powerloss_engine_open`, `powerloss_movement_clone` (plus its `Chaos` probe),
+  `powerloss_movement_repair`; follow-up F21); the other suites enumerate `Torn` in at least one test (`powerloss_txn` only
+  in its depth-1 recovery test).
+
+### Evidence (runnable)
+
+- The model itself: `cargo test -p htap-crashsim` (for example, in `--test model_semantics`: `strict_loses_unsynced_write`,
+  `file_fsync_without_dir_fsync_loses_entry`, `dir_fsync_does_not_publish_own_entry`,
+  `nested_mkdir_needs_parent_fsync_per_level`, `torn_keeps_sector_aligned_subset`; in `--test recovery_baseline`:
+  `recovery_atomic_publish_requires_directory_sync`).
+- Per-subsystem suites, one `powerloss_*.rs` file per area: `cargo test -p htap-rowstore --test powerloss_wal`,
+  `--test powerloss_engine`, `--test powerloss_wal_open`, `--test powerloss_wal_segment`, `--test powerloss_wal_tail`,
+  `--test powerloss_engine_open`; `cargo test -p htap-txn --test powerloss_txn`; `cargo test -p htap-catalog --test powerloss_catalog`;
+  `cargo test -p htap-coord --test powerloss_coord`; `cargo test -p htap-colstore --test powerloss_segment`;
+  `cargo test -p htap-convert --test powerloss_convert`; `cargo test -p htap-movement --test powerloss_movement
+  --test powerloss_movement_clone --test powerloss_movement_export --test powerloss_movement_import --test powerloss_movement_repair`;
+  `cargo test -p htap-server --test powerloss_server --test powerloss_server_recovery`. The complete test list is in the R7 row
+  of `docs/PROGRESS.md`.
+- The mutation controls: every sync site has a string id, and a static gate requires each id to have either a killing
+  witness (`crashsim_witness!`: skipping that one sync makes an oracle fail under exhaustive, undeduplicated enumeration; `assert_skip_kills` accepts any `POWERLOSS_REPRO` failure, including a `Torn` image) or a
+  reasoned allowlist entry (reason enum including `CoveredByOtherSync` and `OracleGap`): `cargo test -p htap-crashsim --test mutation_controls`
+  (`every_observed_sync_site_has_a_killing_witness_or_a_reasoned_allowlist_entry`, `allowlist_entries_are_not_stale`,
+  `every_shared_helper_id_has_a_witness_in_each_calling_crate`, `every_powerloss_suite_has_file_and_dir_controls_or_a_reasoned_exemption`,
+  `every_witness_row_names_an_existing_macro_and_test`, `every_production_site_id_is_used_at_one_location`,
+  `scanner_observes_the_workspace`, `no_production_sync_is_untagged`). The scanner's blind spots are listed at the top of
+  `crates/htap-crashsim/tests/mutation_controls.rs`; raw `std`/`libc` mutation calls are rejected separately by the
+  durability clippy gate (`ci/clippy-durability`, run by `./ci.sh`). The mutation results against real production sources
+  are recorded in `docs/PROGRESS.md`.
+- Sync-failure propagation (not crash images): the `sync_fault_*` sweeps, see the F12 subsection below.
+- Reproducing a failing image: "Reproducing a power-loss failure" in `docs/OPERATIONS.md`.
+
+### Bugs found and fixed by the harness
+
+All were local missing-sync or ordering defects (no format, framing, or ack-order change). Red evidence before the fix is recorded in the commit messages for BUG-PL-1, 3, 5, 6 and 7; BUG-PL-2 and BUG-PL-4 are guarded by the tests listed.
+
+| Bug | Defect | Fix commit | Test(s) |
+| --- | ------ | ---------- | ----------- |
+| BUG-PL-1 | `Engine::open` / `Wal::open` created directories without syncing parents and trusted a directory left by a killed earlier process | `01ca864` | `engine_fresh_open_dirs_durable` (`powerloss_engine`), `wal_fresh_dir_entry_durable` (`powerloss_wal`) |
+| BUG-PL-2 | `Wal::open` adopted a segment whose directory entry was never synced | `01ca864` | `wal_open_syncs_adopted_unsynced_segment` (`powerloss_wal_segment`), `wal_open_syncs_preexisting_volatile_dir` |
+| BUG-PL-3 | `Wal::open` fsynced the adopted final segment only after a torn-tail repair, so a replayed unsynced commit frame could vanish after being made visible | `01ca864` | `adopted_unsynced_wal_tail_is_synced_before_publish`, `torn_tail_repair_syncs_adopted_prefix_before_publish` (both `powerloss_wal_tail`; the latter is the `wal:repair_sync` witness body) |
+| BUG-PL-4 | A zero-filled journal tail with trailing bytes was classified as middle corruption, so recovery refused to open | `4321287` | `zero_length_header_with_trailing_bytes_is_repaired_as_torn_final` (`htap-txn` lib unit test), `txn_repair_torn_final_crash_depth1` |
+| BUG-PL-5 | A fresh or volatile `LocalServer` root two or more levels below a durable directory was lost after an acknowledged open (a one-level root was already safe through the journal's grandparent sync) | `033c503` | `server_fresh_root_bootstrap_durable`, `server_preexisting_volatile_root_durable` |
+| BUG-PL-6 | The `colstore/` entry created at open was not followed by a root directory sync before the open acknowledgement (log-order oracle only) | `033c503` | `server_open_syncs_colstore_entry_before_ack`, `server_reopen_syncs_volatile_root_children` |
+| BUG-PL-7 | After a crash in `SegmentsWritten` or `ReadyToPublish`, a manifest-less `Converting` partition was unreadable until an explicit `tick()` (no data loss) | `6315e2a` | `server_conversion_and_reclaim_survive`, `server_recovery_crash_depth1`, `test_server_open_serves_manifest_less_segments_written_and_ready_to_publish` |
+
+Batch C-E findings without a `BUG-PL` number (journal, catalog and coordinator directory durability, tablet package chain,
+DATA/MANIFEST rename order, export destination syncs) are described in the commit messages of `4321287` and `02a238d`
+and covered by the suites above (for example `clone_survives_fresh_tablet_dirs`, `clone_publish_has_data_dir_barrier`,
+`catalog_fresh_dir_durable`, `coord_fresh_dir_durable`, `txn_fresh_journal_entry_durable`).
+
+### Historical context: the `SIGKILL` evidence and its mutation table (kept)
+
+Before Phase 20 there was no modelled-filesystem power-loss evidence; process-kill tests (plus torn-tail and reopen-recovery tests) were the crash evidence. The write-ahead log and LSM engine in `htap-rowstore` are
+still covered by integration tests (`crates/htap-rowstore/tests/wal_crash.rs`, test
 `kill_9_loses_no_committed_data`, and `crates/htap-rowstore/tests/engine_crash.rs`,
 test `engine_kill_9_recovers_all_reported_commits`) that spawn a real child process,
 let it durably commit transactions and report their ids (including periodic SST flushes),
 then terminate it with `SIGKILL` and assert that every reported commit is recovered upon
 reopening.
 
-### What this proves, and what it does not
-
-The test proves **replay integrity across abrupt process death**. It does not
-prove **fsync durability or power-loss resilience**. This was verified by mutation testing:
+These tests prove **replay integrity across abrupt process death**. On their own they do not
+prove **fsync durability**. This was verified by mutation testing before Phase 20:
 
 | Mutation | Result |
 | -------- | ------ |
@@ -184,20 +256,53 @@ prove **fsync durability or power-loss resilience**. This was verified by mutati
 
 The reason is that `SIGKILL` destroys the process but not the operating system
 page cache. Bytes written with `write_all` but never fsynced remain readable by
-a subsequent reader on the same machine. Only a machine-level failure — power
-loss, kernel panic, or a simulated block-device failure — distinguishes the two
-cases. There is **no power-loss proof**.
+a subsequent reader on the same machine. That blind spot is what the Phase 20 crash-image
+harness addresses: a skipped sync removes the unsynced state from the crash image, so the
+corresponding witness fails. The kill-9 tests remain as a complementary process-death check.
 
-### Completion plan
+### What remains unproven (known gaps of the harness)
 
-To close this gap, either (a) run the crash child inside a VM or container
-whose storage is dropped without flushing, (b) interpose a FUSE or
-device-mapper layer that discards non-fsynced writes on fault injection, or
-(c) use a filesystem fault-injection tool such as `dm-flakey` in a future
-storage chaos test harness (deferred from local MVP).
-
-Until one of these is in place, the fsync path is verified by code inspection
-and process crash tests only.
+- **The modelled filesystem is not hardware.** Not covered: device write caches and FUA, lying drives, `fsync` returning
+  `EIO` and the post-error state of the page cache, `ENOSPC`, sub-sector tearing, bit rot, `mmap` and `O_DIRECT`,
+  thread interleavings (recording is single-threaded and fails closed otherwise), and real kernel or filesystem behavior.
+  Real-device, kernel, VM-dropped-storage, `dm-flakey`, and FUSE-based proof is `deferred`.
+- **LazyFS cross-check deferred (E4).** The optional, non-gating cross-check against a real FUSE filesystem that drops unsynced
+  data (LazyFS) was not run: building it needs `cmake` and `libfuse3-dev`, which are unavailable in this environment. It can be
+  re-opened when that toolchain is available; the harness gates do not depend on it.
+- **Unix-only durability.** The shim's directory sync is a no-op off Unix, whereas the pre-Phase-20 `wal.rs::fsync_dir`
+  ran on every platform. Directory-entry durability on non-Unix platforms is not claimed and not tested (B-N3).
+- **`Torn` mixes only the strict image with the final observed bytes** of each file (no intermediate versions; R3-N4).
+  The second crash during recovery is always `Strict`. Sector atomicity is a configurable model parameter, not a
+  property of any device (`torn_keeps_sector_aligned_subset`, `torn_zero_only_extension_reachable`).
+- **`Chaos` is a fixed-seed triage probe,** not a gate; it samples one seeded subset of legal reorderings.
+- **Witnesses prove existence, not breadth.** A witness shows that skipping one sync makes at least one image fail an oracle;
+  it does not show that all dependent states are covered. Site ids are shared by helper functions
+  (`sync_dir:sync`, `atomic_publish:dir_sync`, ...), so a per-id witness cannot prove each call site; the per-crate witness
+  requirement (`every_shared_helper_id_has_a_witness_in_each_calling_crate`) and the sync-failure attempt-ordinal sweeps narrow this
+  but do not remove it. The static scanner fails closed on dynamic ids but has documented blind spots.
+- **Recovery dedupe caveat.** The recovery-stage image dedupe key ignores recovery acknowledgement labels; witness runs disable
+  dedupe (`witness_scope_forces_exhaustive_no_dedupe`), routine runs do not.
+- **Open-time syncs cover only the immediate parent for the engine, WAL, journal, catalog, coordinator, and movement roots.**
+  For the engine, WAL, journal, catalog, and movement root the parent is derived from the path text (a symlinked or
+  `..`-containing path is not followed to its real parent); `LocalCoordinator::open` and `LocalServer::open` canonicalize the
+  root first.
+  Ancestors above the immediate parent are synced best-effort for the `LocalServer` root and for export destinations
+  (`PermissionDenied`, `InvalidInput`, and `Unsupported` errors on an ancestor are tolerated, all other error kinds such as
+  `NotFound` propagate; the walk is lexical, so symlinked components use their lexical parents;
+  `sync_ancestors_best_effort_propagates_not_found`, `sync_ancestors_best_effort_skips_invalid_input_and_continues` in `htap-common`). Open-time `EACCES` or `EINVAL` on an unreadable or unsyncable immediate
+  parent now fails closed, and an `fsync` failure while reopening after a checkpoint becomes recovery-required. The
+  filesystem root's own durability is outside the model.
+- **Export edge cases.** A write-and-exec-only destination parent fails after the rename (pre-existing behavior);
+  relative-destination export is untested because the process working directory is global; retry semantics are
+  `Conflict` for a `Failed` job and `NotFound` for a missing job.
+- **Dead and test-only recorder paths.** The mid-way `create_dir_all` recording branch is unreachable and untested, and
+  `Recorder::take_log` is test-only.
+- **Coverage statements.** The swallowed-sync class (D-H2) is checked only for the swept APIs (movement clone, repair, export,
+  job persist and artifact delete, and server `DROP` reclaim) by the `SyncFault` propagation sweeps
+  (`clone_sync_failure_is_never_swallowed` and the other `sync_fault_*` tests), not by crash images; sync-error propagation in
+  the rowstore, txn, catalog, coord, convert, and colstore crates is not swept; DATA-before-MANIFEST
+  rename order (D-M2) is proven only by the op-log order test `clone_publish_has_data_dir_barrier`, since `Strict` images alone
+  cannot show it. The remaining conversion-resume and `DROP` liveness limits of BUG-PL-7 are in "HTAP conversion local MVP scope and deferred features" below.
 
 ### Ambiguous outcome after a post-rename directory-sync failure (F12)
 
@@ -220,7 +325,7 @@ readers in the same process and is not durable until a later sync. Callers must 
   that safe).
 
 By design, a crash before the next sync can roll the state back only to an earlier self-recovering state (job
-`Running`, replica unhealthy, entry unreclaimed). The sync-failure sweeps below do not materialize crash images,
+`Running`, replica unhealthy, entry unreclaimed). The sync-failure sweeps do not materialize crash images,
 so they do not prove this; the crash-image `powerloss_*` suites cover the publish points themselves.
 
 **Known gap (follow-up F20, `deferred`):** the retry fast paths return `Ok` without restoring the failed barrier:
@@ -239,6 +344,27 @@ Evidence (runnable): `cargo test -p htap-movement --test sync_fault_clone --test
 (`AMBIGUOUS_AFTER_RENAME`; in `sync_fault_jobs.rs`, `JOB_PERSIST_AMBIGUOUS_AFTER_RENAME` and
 `DELETE_ARTIFACTS_AMBIGUOUS_AFTER_UNLINK`), and each rename row is tied to its sync by a site-targeted companion run. These are simulated sync-failure injections
 through `htap-crashsim`, not physical power-loss proof.
+
+### Phase 20 follow-ups (open; every item is `deferred` unless noted)
+
+| Id | Gap | Evidence / where |
+| -- | --- | ---------------- |
+| F10 | **Error-path durability gap (real, not modelled).** `Wal::append` does not truncate after a partial `write_all`, and a failed `fsync` does not poison the rowstore WAL handle (the transaction journal has a poison latch; the rowstore WAL does not). After an `fsync` error the page-cache contents are unmodelled. A retry or repair can also leave a visible-but-volatile `Complete` job (F6 class), and `complete_job` / `start_job` return an already-visible `Complete` job without re-syncing after an `EIO`. | The harness injects only pre-syscall sync failures and checks propagation, not post-error state: `sync_fault_nth_fails_exactly_once_and_logs_nothing` (`htap-crashsim`). No test fixes or proves the post-error behavior. |
+| F11 | Temp-file creation and `atomic_publish` follow symlinks; no symlink hardening. | None; not exercised by the harness (the recorder fails closed on paths that resolve outside the harness root). |
+| F12 | Ambiguous `atomic_publish` outcome: `Err` although the renamed file is already visible when the post-rename directory sync fails; catalog CAS and coordinator state can diverge from disk. | See "Ambiguous outcome after a post-rename directory-sync failure (F12)" above. |
+| F13 | The `LocalServer` SQL workload in `powerloss_server` never yields a `Torn` image that differs from the `Strict` one, so `Torn` coverage there is nominal. The distinct-image counter is informational only: it measured `POWERLOSS_TORN_DISTINCT=0 of 48` (also `0` under `POWERLOSS_EXHAUSTIVE=1`). | `powerloss_support/mod.rs` in `htap-server`'s tests; `cargo test -p htap-server --test powerloss_server -- --nocapture`. `Strict` is the server-level evidence. |
+| F14 | A missing required conversion manifest is classified `HtapError::Io`, not `Corruption`. | `test_server_open_rejects_converting_with_missing_manifest` (`htap-server`). |
+| F15 | `OracleGap`: `catalog:open_dir_sync`, `coord:open_dir_sync`, and `movement:open_dir_sync` are allowlisted because no workload observes them (a pre-existing directory with unsynced children that is reopened and whose loaded state is acknowledged would). Their survivor proofs show the mutation survives, which is not proof the sync is unneeded. | `ALLOWLIST` in the `mutation_controls_tables` module of `htap-crashsim`'s tests; gate `allowlist_entries_are_not_stale`. |
+| F16 | `movement:package_data_dir_sync` is allowlisted as `SubsumedByLaterSync`; no shipped crash-image test (`Strict`, `Torn`, or the `Chaos` probe) kills a skip of it, and `Chaos` is triage, not a gate. A targeted workload or a forced crash point is needed to expose its absence; only the op-log order test `clone_publish_has_data_dir_barrier` guards it. | Same `ALLOWLIST`; `tablet_package_rename_order_chaos` (`powerloss_movement_clone`) does **not** kill a skip (`POWERLOSS_SKIP_SYNC=site:movement:package_data_dir_sync` passes it), so it is not evidence for this site. |
+| F17 | Redundant double `fsync` in the journal append-and-sync path (performance only; correctness unaffected). | Not benchmarked. |
+| F18 | `server_recovery_crash_depth1` is too slow in exhaustive mode (`POWERLOSS_EXHAUSTIVE=1`), so it is not part of an exhaustive nightly pass. | `powerloss_server_recovery` (`htap-server`). |
+| F19 | Flaky TPC-C driver mix-percentage check (unrelated to power loss; observed during the Phase 20 CI run, passed on rerun). | `assert_report` in `drivers.rs` of `htap-tpcc`'s tests (`run_small_consistent_dataset`). |
+| F20 | Retry fast paths return `Ok` without restoring the failed barrier (details in the F12 subsection above). | `complete_job`, `export`, clone retry, repair. |
+| F21 | `Torn` image enumeration is missing in six `Strict`-only suites (`powerloss_wal_open`, `powerloss_wal_segment`, `powerloss_wal_tail`, `powerloss_engine_open`, `powerloss_movement_clone` (plus its `Chaos` probe), `powerloss_movement_repair`), so torn-sector behavior on those paths is unexercised. | Each suite's `enumerate(&CrashPolicy::Strict, ...)` calls (`crates/*/tests/powerloss_*.rs`); no test enumerates `Torn` there. |
+
+Further harness-scope residuals, none of which is covered by a crash-image test: the `LocalServer` IPC client branch performs no
+syncs by design (the owner does), and the ephemeral roots (`spill/`, `htap.sock`, IPC directories, `LOCK`) are deliberately not
+modelled (`ephemeral_root_ignores_lock_spill_sock_and_ipc_dirs_under_nested_root`).
 
 ---
 
@@ -2129,7 +2255,7 @@ covered by `tests/schema_ddl.rs`, `tests/load.rs` and the crate's unit tests (ig
 | Phase | Status | Known gaps |
 | ----- | ------ | ---------- |
 | Phase 0 — Research and workspace bootstrap | `Complete` | None. |
-| Phase 1 — Row store | `Complete (hardened local MVP)` | C1 fixed by MANIFEST v2 ledger (`f7a4975`); H2 fixed by DurablePending retry/recovery (`c5ee281`). Open: no power-loss proof; no ledger compaction (hard cap eventually blocks external applies); possible flush-boundary duplicate SST publication after crash before checkpoint. |
+| Phase 1 — Row store | `Complete (hardened local MVP)` | C1 fixed by MANIFEST v2 ledger (`f7a4975`); H2 fixed by DurablePending retry/recovery (`c5ee281`). Open: no hardware power-loss proof (Phase 20 added a modelled-filesystem crash-image harness for simulated power loss, see the Phase 20 row; the rowstore WAL partial-write and post-`fsync`-error gap is follow-up F10); no ledger compaction (hard cap eventually blocks external applies); possible flush-boundary duplicate SST publication after crash before checkpoint. |
 | Phase 2 — Columnar store | `Complete` | Standalone columnar segments, zone-map pruning, and vectorized scans implemented. Deferred: delta/delete vectors, MVCC visibility, conversion/catalog integration, richer predicates/joins/aggregates, Arrow/DataFusion, and atomic publication/manifest integration. |
 | Phase 3 — SQL layer | `Complete (local MVP)` | Completed local slice: sqlparser MySQL dialect parsing, strict binder with typed `PointSelect` and `AnalyticSelect`, structural route classifier, durable catalog with reopen recovery, synchronous `LocalServer` executing across unpartitioned tables (SQL `CREATE TABLE`) and partitioned tables created via SQL DDL (`CREATE TABLE ... PARTITION BY RANGE/LIST`) or native non-SQL API `LocalServer::create_partitioned_table` (finite Range/List, 1 bucket-0 tablet and 1 healthy leader per partition). Supports multi-row INSERT routing across partitions in one commit version, complete-PK DELETE and SELECT routed by partition key (preserving rowstore fast path), and narrow OLAP scans across all partitions over rowstore or base-plus-delta rows using `<root>/colstore` with projection-aware compact reads (PK+requested column union, single safe predicate-leaf SegmentReader pushdown, delta suppression/overlay, and residual SQL evaluation; conservative finite range/list partition pruning, bounded in-process partition scan workers, and deterministic global merge/order are implemented for narrow local OLAP; distributed fanout, disk spilling, query cancellation, and resource quotas remain deferred), and `EmbeddedClient` façade. Supported partition grammar includes MySQL `CREATE TABLE ... PARTITION BY RANGE [COLUMNS]` and `PARTITION BY LIST [COLUMNS]` (with optional final `MAXVALUE` for range), as well as typed partition lifecycle DDL (`ALTER TABLE <table> ADD/DROP/REORGANIZE PARTITION`) on empty source partitions with rowstore collapse safety gates and native `LocalServer::alter_partitions` API. Remaining exclusions: partition options (`ENGINE`, `COMMENT`, `TABLESPACE`, `DATA DIRECTORY`), subpartitioning (`SUBPARTITION BY`), expressions in partition keys, multi-column `COLUMNS`, non-final `MAXVALUE`, populated DROP/REORGANIZE, and generic non-partition ALTER statements are strictly rejected. Format conversion guarded to single-partition tables for `convert_table`. Verified by `crates/htap-server/tests/local_server.rs` (including `test_sql_range_partitioning_ddl_and_maxvalue_routing`, `test_sql_list_partitioning_ddl_and_routing`, `test_server_sql_alter_partition_lifecycle`, `test_server_alter_partitions_drop_empty_and_populated_guard`, `test_server_alter_partitions_reorganize_empty_and_populated_guard`), `crates/htap-catalog/tests/catalog_recovery.rs`, `crates/htap-sql/tests/parse_bind.rs`, `crates/htap-sql/tests/route.rs`, and `crates/htap-client/tests/embedded_client.rs`. Deferred: populated partition reorganization data migration, physical data reclamation for dropped partitions (`DROP TABLE`'s own artifacts are reclaimed as of Phase 15, see that row; `ALTER TABLE ... DROP/REORGANIZE PARTITION` reclamation remains deferred, and is inert today since that path only ever operates on empty partitions), multi-partition movement, hash tablets, distributed serving/failover, compound AND pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, multi-tablet/distributed scans, quotas/spill/cancellation, DataFusion/Arrow, and broader auth/security boundary (RBAC, per-user credentials, TLS). MySQL wire protocol serving (`htapd`/`htap-wire`) is implemented as of Phase 8 (see that row); joins/CTEs/subqueries/`UNION`/expressions/`ORDER BY` expressions/aliases/`LIMIT`/`OFFSET`/`HAVING`/`OR`/`NOT`/arithmetic/casts/`AVG`/`DISTINCT` aggregates and non-PK DML (`UPDATE`, `DROP TABLE`) are implemented as of Phase 9 (see that row); sessions/`BEGIN`/`COMMIT`/`ROLLBACK` are implemented as of Phase 10 (see that row); window functions, correlated subqueries, `FULL OUTER`/`NATURAL`/`USING` joins, recursive CTEs, and `EXCEPT`/`INTERSECT` are implemented as of Phase 13 (see that row); cost-based query optimization remains deferred. |
 | Phase 4 — HTAP conversion | `Complete (local MVP)` | Completed local Row-to-Column conversion MVP (`htap-convert`) with converter APIs `read_column_partition` / `read_column_partition_compact` and `LocalServer` base-plus-delta OLAP scans over `<root>/colstore` with compact base scan pushdown. Table-wide conversion reports (`convert_table_to_column`), Column-to-Row metadata demotion (`convert_table_to_row`) retaining rowstore authority and column files on disk, explicit synchronous policy ticks (`conversion_tick`, `tick`), and fail-closed startup validation on reopen (`LocalServer::open`) are implemented. Open/deferred: whole-dataset materialization in conversion; autonomous background conversion scheduling deferred (ticks are explicit); physical reverse data transcoding deferred; delete vectors, delta-to-base background columnar compaction, compound AND pushdown beyond one leaf, `!=` pushdown, vectorized aggregation / operator pipelines, and distributed partition/table conversion semantics deferred (physical rowstore reclamation and the rowstore's own generic LSM compaction were delivered in Phase 15, see that row — columnar-side reclamation/compaction above remains deferred). |
@@ -2149,6 +2275,7 @@ covered by `tests/schema_ddl.rs`, `tests/load.rs` and the crate's unit tests (ig
 | Phase 17 (continued) — TPC-H workload kit: prerequisites (Batch A), query-kit foundations (Batch B checkpoint 1), full correctness-fixture coverage (tasks B5b-B5c), a from-specification row generator (task B2), a bulk loader (task B3), an independent oracle (task B6), refresh functions (task B7), power/throughput drivers (task B8), and the compliance/deviations disclosure document (task B9) | `Implemented (narrow local slice)` | Batch A (complete): movement's timestamp text import now accepts calendar date/datetime text as well as raw microseconds; regression tests pinned the exact TPC-H correlated-subquery and doubly-referenced-CTE query shapes the kit needs against pre-existing support, no code change required; reproduced specification query text carries the TPC copyright/permission notice. Batch B checkpoint 1 (new `crates/htap-tpch` crate, in progress): eight-table schema, all 22 published query texts with validation-default parameters, an exact-integer scale-factor helper. Three previously-undocumented SQL binder features this kit depends on: derived-table column lists, non-recursive-CTE column lists, and the `DATE(string)` function form. Task B5b added hand-derived correctness fixtures for 7 more queries (9, 10, 11, 12, 13, 14, 15), bringing validated coverage to 12 of 22; the new data lives in a subdirectory test module (`crates/htap-tpch/tests/fixtures/`) rather than extending the checkpoint-1 fixture, so as not to perturb `test_q1`'s complete-result-set assertion, and so it compiles into the existing test binary rather than a new one. `test_q13` is the first correctness check (not just bind/execute) that a `LEFT OUTER JOIN` with a non-equality `ON` predicate alongside the equality predicate is evaluated correctly, and `test_q13`/`test_q15` are the first regression coverage against returned rows for the derived-table and non-recursive-CTE column-list features respectively. A test-only follow-up stopped every fixture loader from leaking its temporary directory, unified the fixture layout (the original top-level `fixture.rs` moved into `fixtures/correctness.rs`), de-duplicated the `compare_results` helper, and added the first coverage of row-limit truncation itself, over a synthetic table (`crates/htap-server/tests/limit_truncation.rs`). Task B5c then closed the remaining 10 queries (5, 7, 8, and 16-22) plus one extra test — 11 new tests across five new fixture submodules (`nation_region`, `anti_join`, `quantity_threshold`, `part_predicates`, `customer_avg`), each on its own server — bringing correctness-validated coverage to all 22 of 22, and newly establishing that an aggregate over an empty input returns `NULL` (`test_q17_zero_qualifying_rows_is_null`), that an `EXISTS`/`NOT EXISTS` pair over a doubly-aliased table with an inequality behaves correctly (`test_q21`), and that a three-way bracketed disjunction with a conjunct repeated in each bracket behaves correctly (`test_q19`). Task B2 then adds a from-specification row generator (`generate::generate`, `crates/htap-tpch/src/generate/`), producing all eight tables as typed in-memory rows deterministically from a scale factor and seed, using a hand-rolled two-stream splitmix64 PRNG (the specification names no PRNG algorithm for row data), reproducing the specification's fixed reference tables/domain lists/formulas verbatim while using original text for comment/address vocabulary; it discloses two additions of its own (a Query 13 O_COMMENT forced phrase and the O_TOTALPRICE rounding convention) and records, without reconciling, the specification's own `REG AIR`/`AIR REG` shipmode quirk — 28 new tests, invariants only, not an audited implementation. See "TPC-H workload kit scope and deferred features" and "General query executor scope and deferred features" above, `docs/PROGRESS.md`'s Phase 17 (continued) row, and ADR-027 (no new ADR for B5c, the follow-up, or B2: B5c/the follow-up are test-only, and B2 is pure in-memory generation with no format/protocol/durability-path change). Task B3 then adds a bulk loader (`load_dataset`, `crates/htap-tpch/src/load.rs`) streaming a generated dataset into a fresh database through the existing CSV movement path with bounded (~64 KiB) memory, verified end to end (`crates/htap-tpch/tests/load.rs::row_counts_copy_reports_and_round_trip_values`) and rejected cleanly on a non-fresh target (`::second_load_rejection`); it also caught a generator gap B2's SF-0.01-only tests had missed (`ScaleFactorError::DuplicatePartsuppSupplierKeys`, hit at SF 0.001) and produced the first query-performance measurement at any TPC-H scale — release-mode SF 0.01: load 7.8s, 16 of 22 queries under 1.2s, but Queries 4/21 time out at 120s and 17/19/20/22 take 9.7-61s, all six needing the already-deferred semi-join rewrite of `IN`/`EXISTS` (Query 19 also nests a join equality inside an `OR`) — a performance, not correctness, finding. Disclosed: batches commit independently with no whole-table rollback, a retry after dropping and recreating the TPC-H tables fails loudly with a movement-job `Conflict` (fixed job IDs, IDs never reused), the post-load counter check counts attempted upserts rather than distinct rows (primary-key collisions are instead covered by the generator's own key-uniqueness tests), and CSV quoting is proven only by a synthetic unit test. No new ADR for B3: it reuses the existing movement CSV import path unchanged. Task B6 (test-only; see `docs/PROGRESS.md`'s Phase 17 (continued) row) then adds an independent re-aggregation oracle (`crates/htap-tpch/tests/oracle/`) that re-derives each of the 22 queries' expected result directly from the generated `Dataset`, with no SQL engine involved, and matches the engine exactly at SF 0.01 (SF 0.03 for Q17/Q18, SF 0.1 for Q20), seed 42; it does not prove specification conformance of the generator itself. Task B7 then adds the `RF1`/`RF2` refresh functions (`crates/htap-tpch::refresh`) as one transaction per order (ADR-029, spec-permitted by Clause 2.5.2), with RF1 covering streams 1-3000 and RF2 streams 1-1000 (Clause 4.2.4's full 4,000-pair quarter-reuse cycle is not implemented), RF2 keyed independently of any generated `Dataset`, and a mutated-dataset Q1/Q6 oracle cross-check confirming both functions agree with the independent oracle after applying (`test_refresh_rf1_rf2_stream_one_updates_q1_and_q6`, ignored). Task B8 then closes F3 (`queries::query` now returns `Result<String, QueryError>` instead of panicking or returning `None`) and adds `power_test`/`throughput_test` (`crates/htap-tpch::drivers`), reproducing TPC-H Appendix A's query-order permutation table and Table 11's stream counts, computing no official TPC-H metric anywhere (ADR-030), using the fixed validation parameters for every stream, taking the refresh key-stream number from the caller, and disclosing that `htap-server`'s process-wide `execution_lock` makes `throughput_test`'s concurrency submission- and session-level only, never genuinely parallel statement execution; extended the mutated-dataset oracle cross-check to all 22 queries in Appendix A order (`test_refresh_rf1_rf2_stream_one_all_queries`, ignored). The TPC compliance/deviations disclosure document (task B9) is implemented; see [`docs/TPCH-DISCLOSURE.md`](./TPCH-DISCLOSURE.md). TPC-C is Phase 18 (see the next row and the TPC-C section above). |
 | Phase 18 — TPC-C workload kit (`crates/htap-tpcc`: schema, generator, loader, five transactions, 12-condition consistency checker, OCC-adapted isolation tests, workload driver, SQL-literal escaping fix, disclosure and ADR-031/ADR-032) | `implemented (local MVP)` | Unaudited, no compliance or comparability claim, no official metric, no serializability or Level 3 claim for the snapshot-isolation kit (Phase 19 added an opt-in SERIALIZABLE driver mode with its own narrow, reviewed claim), one warehouse exercised. Evidence and the full deviations list: [`docs/TPCC-DISCLOSURE.md`](./TPCC-DISCLOSURE.md), `docs/PROGRESS.md`'s Phase 18 row. |
 | Phase 19 — SERIALIZABLE isolation via commit-time read-footprint validation (serializable snapshot validation; not SSI) | `implemented (local MVP)` | Opt-in; narrow local slice. Open: mixed mode (guarantee only among SERIALIZABLE transactions), scans track whole partitions (point reads track keys) so false aborts (PK-prefix narrowing deferred, Task 7), no READ COMMITTED/READ UNCOMMITTED/SNAPSHOT, no server-wide or forced level, no idle-transaction timeout, catalog and accounts outside the domain, bounded fail-closed retention, F9 eviction latency. See the "SERIALIZABLE isolation" bullet under "Sessions and explicit transaction control", ADR-033, `docs/PROGRESS.md`'s Phase 19 row. |
+| Phase 20 — Power-loss crash consistency under a modelled filesystem (recording shim `htap_common::fs`, dev-only `htap-crashsim` crash-image harness, per-subsystem `powerloss_*` suites, sync-site mutation witnesses and static completeness gate, sync-failure propagation sweeps; BUG-PL-1 to BUG-PL-7 fixed) | `implemented (local MVP)` | **Simulated power loss only** under a stated strict-POSIX contract (`ffaff48`, `4891f13`, `01ca864`, `5bc4521`, `4321287`, `f4ecaf4`, `02a238d`, `c5abdb9`, `1963d2b`, `49d61ec`, `8ca21b2`, `033c503`, `6315e2a`, `952d368`, `b40aae1`, `e0d6f69`); not a power-loss proof. Real-device and kernel power-loss proof `deferred`; LazyFS cross-check `deferred` (E4, no `cmake`/`libfuse3-dev`). Open: not hardware (device caches/FUA, lying drives, `EIO` post-state, `ENOSPC`, sub-sector tearing, `mmap`/`O_DIRECT`, thread interleavings, non-Unix); unix-only directory durability; `Torn` mixes only strict versus final bytes and the recovery crash is always `Strict`; open-time syncs cover only the immediate parent (ancestors best-effort); witnesses prove existence not breadth and site ids are shared by helpers; follow-ups F10 (WAL partial write / no poison latch after `fsync` error), F11 (symlink hardening), F12 (ambiguous outcome after a failed post-rename directory sync), F13 (server `Torn` coverage nominal), F14 (missing manifest classified `Io`), F15 (`OracleGap` open-dir syncs), F16 (`package_data_dir_sync` has no crash-image witness; not even the `Chaos` probe kills its skip), F17 (journal double `fsync`), F18 (slow exhaustive depth-1 server test), F19 (flaky TPC-C mix check), F20 (retry fast paths skip the failed barrier), F21 (no `Torn` enumeration in six `Strict`-only suites). See "Power-loss testing is a modelled-filesystem harness", ADR-034, `docs/PROGRESS.md` (R7 row). |
 
 ---
 

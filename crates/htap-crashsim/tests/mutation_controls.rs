@@ -529,3 +529,125 @@ fn no_production_sync_is_untagged() {
 
     fail_with_errors("no_production_sync_is_untagged", errors);
 }
+
+#[test]
+fn every_sync_site_is_listed_in_the_architecture_catalog() {
+    let result = scan();
+    let observed: BTreeSet<String> = observed_sites(&result)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let architecture_path = mutation_controls_scan::workspace_root().join("docs/ARCHITECTURE.md");
+    let architecture = std::fs::read_to_string(&architecture_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", architecture_path.display()));
+    let lines: Vec<&str> = architecture.lines().collect();
+    let mut errors = Vec::new();
+    let mut catalog = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+
+    let heading_index = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        let hashes = trimmed
+            .chars()
+            .take_while(|character| *character == '#')
+            .count();
+        hashes > 0
+            && trimmed
+                .get(hashes..)
+                .is_some_and(|text| text.trim().contains("Durability-point catalog"))
+    });
+
+    match heading_index {
+        None => errors.push(format!(
+            "{} has no heading containing \"Durability-point catalog\"",
+            architecture_path.display()
+        )),
+        Some(heading_index) => {
+            let table_start = lines
+                .iter()
+                .enumerate()
+                .skip(heading_index + 1)
+                .take_while(|(_, line)| !line.trim_start().starts_with('#'))
+                .find(|(_, line)| line.contains('|'))
+                .map(|(index, _)| index);
+
+            match table_start {
+                None => errors.push(format!(
+                    "{} has no markdown table following the durability-point catalog heading",
+                    architecture_path.display()
+                )),
+                Some(table_start) => {
+                    let table_rows: Vec<&str> = lines
+                        .iter()
+                        .skip(table_start)
+                        .take_while(|line| {
+                            let trimmed = line.trim_start();
+                            !trimmed.starts_with('#') && line.contains('|')
+                        })
+                        .copied()
+                        .collect();
+
+                    if table_rows.len() < 2 {
+                        errors.push(format!(
+                            "durability-point catalog in {} has no header and separator rows",
+                            architecture_path.display()
+                        ));
+                    } else {
+                        for (offset, row) in table_rows.iter().enumerate().skip(2) {
+                            let first_cell = row
+                                .trim()
+                                .trim_start_matches('|')
+                                .split('|')
+                                .next()
+                                .unwrap_or_default()
+                                .trim();
+                            let Some(site) = first_cell
+                                .strip_prefix('`')
+                                .and_then(|cell| cell.strip_suffix('`'))
+                                .filter(|site| !site.is_empty() && !site.contains('`'))
+                            else {
+                                errors.push(format!(
+                                    "durability-point catalog row {} has no backticked id in its first cell",
+                                    table_start + offset + 1
+                                ));
+                                continue;
+                            };
+
+                            if !catalog.insert(site.to_owned()) {
+                                duplicates.insert(site.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if observed.is_empty() {
+        errors.push("scanner observed no production sync-site ids".to_owned());
+    }
+    if catalog.is_empty() {
+        errors.push("durability-point catalog contains no production sync-site ids".to_owned());
+    }
+
+    for site in observed.difference(&catalog) {
+        errors.push(format!(
+            "production sync-site id {site:?} is missing from the durability-point catalog"
+        ));
+    }
+    for site in catalog.difference(&observed) {
+        errors.push(format!(
+            "durability-point catalog contains stale sync-site id {site:?}"
+        ));
+    }
+    for site in duplicates {
+        errors.push(format!(
+            "durability-point catalog contains duplicate rows for sync-site id {site:?}"
+        ));
+    }
+
+    fail_with_errors(
+        "every_sync_site_is_listed_in_the_architecture_catalog",
+        errors,
+    );
+}

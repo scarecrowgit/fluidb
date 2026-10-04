@@ -522,7 +522,7 @@ numeric literal (no arbitrary-precision decimal type); `TIME`-typed parameters a
 
 ## Workspace Architecture
 
-The workspace consists of 16 modular crates (plus the vendored `vendor/sqlparser`) separated by architectural boundaries:
+The workspace consists of 17 crates (16 `htap-*` crates plus the `htapd` binary; `htap-crashsim` is dev-only), plus the vendored `vendor/sqlparser`, separated by architectural boundaries:
 
 | Crate | Role & Status |
 | ----- | ------------- |
@@ -542,6 +542,7 @@ The workspace consists of 16 modular crates (plus the vendored `vendor/sqlparser
 | `crates/htap-wire` | Hand-written, synchronous MySQL text- and binary-protocol server (`WireServer`) exposing `LocalServer` over TCP, including prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`/`SEND_LONG_DATA`), `COM_RESET_CONNECTION`/`COM_CHANGE_USER`, and the `WireClient` used by `RemoteClient`. |
 | `crates/htapd` | Network daemon binary: opens a `LocalServer` root and serves it via `htap-wire::WireServer`. |
 | `crates/htap-bench` | Criterion microbenchmark suite (`benches/local_mvp.rs`) measuring rowstore point lookups, columnar zone-map scans, conversion, CSV import, and coordination. |
+| `crates/htap-crashsim` | Dev-only power-loss test harness (`implemented (local MVP)`, Phase 20; `publish = false`, never linked into production, and `htapd` refuses to start if the `htap-common` `crashsim` feature is on): materializes crash images from the operation log recorded by the `htap_common::fs` shim under a stated strict-POSIX model, and drives the `powerloss_*` suites, the skip-sync mutation controls and the sync-failure sweeps. Crash consistency under a modelled filesystem, not a power-loss proof; see "Power-loss simulation harness (Phase 20)" in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md). |
 
 ---
 
@@ -967,7 +968,14 @@ cargo bench --workspace --no-run
 
 # Run full CI script
 ./ci.sh
+
+# Power-loss (crash-image) suites, e.g. the WAL suite; simulated power loss under a modelled filesystem, no hardware proof
+cargo test -p htap-rowstore --test powerloss_wal
 ```
+
+The `powerloss_*` suites, the skip-sync mutation controls (`POWERLOSS_SKIP_SYNC`) and the replay recipe
+(`POWERLOSS_REPRO`) are described in "Power-loss simulation harness (Phase 20)" in
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md); the modelled-filesystem scope is in [`docs/LIMITATIONS.md`](./docs/LIMITATIONS.md).
 
 ---
 
