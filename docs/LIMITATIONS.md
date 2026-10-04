@@ -199,6 +199,47 @@ storage chaos test harness (deferred from local MVP).
 Until one of these is in place, the fsync path is verified by code inspection
 and process crash tests only.
 
+### Ambiguous outcome after a post-rename directory-sync failure (F12)
+
+When a durable publish (`atomic_publish`: temp file, fsync, rename, directory fsync), or the parent-directory
+sync that follows it, fails **after** the rename, the API returns `Err` but the new state is already visible to
+readers in the same process and is not durable until a later sync. Callers must treat such an `Err` as
+"outcome unknown". The sync-failure propagation sweeps observed this at:
+
+- movement `complete_job` (the job file is `Complete` and visible);
+- `clone_tablet` (the job is `Complete`);
+- `export` (the job is `Complete`);
+- `repair_tablet` (the replica is marked healthy in the catalog);
+- delete of tablet movement artifacts (`delete_tablet_movement_artifacts`): unlink is not transactional, so the
+  package and job directories are already gone when a later sync fails; at the server level the `Err` leaves the
+  table's pending reclaim entry unfinished, so reclaim retries (the reclaim sweep below observes this as `Pending`);
+- server `DROP TABLE` itself: a failure of the catalog publish's post-rename sync returns `Err` although the drop
+  and its pending reclaim entry are already visible;
+- server `DROP TABLE` reclaim: the reclaim error is logged and `DROP` returns `Ok`; the pending entry may already
+  be marked reclaimed, and a crash rolls it back to unreclaimed, so reclaim re-runs (`NotFound` handling makes
+  that safe).
+
+By design, a crash before the next sync can roll the state back only to an earlier self-recovering state (job
+`Running`, replica unhealthy, entry unreclaimed). The sync-failure sweeps below do not materialize crash images,
+so they do not prove this; the crash-image `powerloss_*` suites cover the publish points themselves.
+
+**Known gap (follow-up F20, `deferred`):** the retry fast paths return `Ok` without restoring the failed barrier:
+`complete_job` on an already-`Complete` job (`crates/htap-movement/src/job.rs`, ~line 1184), `export` on an
+already-complete job (`crates/htap-movement/src/export.rs`, ~line 229), clone retry (it re-syncs the package
+chain but not the job directory), and repair on an already-healthy replica (no catalog directory sync). A retry
+can therefore return `Ok` while the `Complete`/healthy state is still not durable. For clone and repair this
+self-heals. For export without a pinned version, a later retry with the same job id can re-scan and overwrite
+output that was already acknowledged.
+
+Evidence (runnable): `cargo test -p htap-movement --test sync_fault_clone --test sync_fault_repair --test sync_fault_export --test sync_fault_jobs`
+(`clone_sync_failure_is_never_swallowed`, `repair_sync_failure_is_never_swallowed`,
+`export_sync_failure_is_never_swallowed`, `job_persist_sync_failure_is_never_swallowed`,
+`delete_artifacts_sync_failure_is_never_swallowed`) and `cargo test -p htap-server --test sync_fault_reclaim`
+(`reclaim_sync_failure_is_never_swallowed`). Every one of these tests pins the exact set of tolerated ordinals
+(`AMBIGUOUS_AFTER_RENAME`; in `sync_fault_jobs.rs`, `JOB_PERSIST_AMBIGUOUS_AFTER_RENAME` and
+`DELETE_ARTIFACTS_AMBIGUOUS_AFTER_UNLINK`), and each rename row is tied to its sync by a site-targeted companion run. These are simulated sync-failure injections
+through `htap-crashsim`, not physical power-loss proof.
+
 ---
 
 ## Column-store MVP scope and deferred features
