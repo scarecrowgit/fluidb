@@ -483,3 +483,26 @@ fn coord_fresh_dir_durable() {
         );
     }
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_coord_open_parent_sync,
+    site = "coord:open_parent_sync",
+    body = coord_preexisting_volatile_dir
+);
+htap_crashsim::crashsim_witness!(
+    witness_atomic_publish_dir_sync,
+    site = "atomic_publish:dir_sync",
+    body = coord_fresh_dir_durable
+);
+htap_crashsim::crashsim_survivor!(
+    survivor_coord_open_dir_sync,
+    site = "coord:open_dir_sync",
+    body = coord_fresh_dir_durable
+);
+htap_crashsim::crashsim_control!(control_file, skip = File, body = coord_fresh_dir_durable);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = coord_fresh_dir_durable
+);

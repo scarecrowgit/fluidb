@@ -187,3 +187,15 @@ fn import_only_on_fresh_root_keeps_complete_job() {
         );
     }
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = import_only_on_fresh_root_keeps_complete_job
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = import_only_on_fresh_root_keeps_complete_job
+);

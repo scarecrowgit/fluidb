@@ -685,3 +685,45 @@ fn txn_fresh_journal_entry_durable() {
         "expected an acknowledged commit crash image to be checked"
     );
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_txn_journal_parent_sync,
+    site = "txn:journal_parent_sync",
+    body = txn_fresh_journal_entry_durable
+);
+htap_crashsim::crashsim_witness!(
+    witness_txn_journal_sync,
+    site = "txn:journal_sync",
+    body = txn_fresh_journal_entry_durable
+);
+htap_crashsim::crashsim_witness!(
+    witness_txn_journal_grandparent_sync,
+    site = "txn:journal_grandparent_sync",
+    body = txn_preexisting_volatile_journal_dir
+);
+htap_crashsim::crashsim_witness!(
+    witness_write_new_tmp_file_sync,
+    site = "write_new_tmp_file:sync",
+    body = txn_fresh_journal_entry_durable
+);
+htap_crashsim::crashsim_survivor!(
+    survivor_txn_journal_open_sync,
+    site = "txn:journal_open_sync",
+    body = txn_commits_survive_journal_and_wal
+);
+htap_crashsim::crashsim_survivor!(
+    survivor_txn_journal_append_sync,
+    site = "txn:journal_append_sync",
+    body = txn_fresh_journal_entry_durable
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = txn_fresh_journal_entry_durable
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = txn_fresh_journal_entry_durable
+);

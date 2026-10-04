@@ -459,3 +459,20 @@ fn clone_publish_has_data_dir_barrier() {
         "package data directory durability barrier must precede manifest publication"
     );
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_survivor!(
+    survivor_movement_package_data_dir_sync,
+    site = "movement:package_data_dir_sync",
+    body = clone_survives_fresh_tablet_dirs
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = clone_retry_completes_interrupted_job
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = clone_retry_completes_interrupted_job
+);

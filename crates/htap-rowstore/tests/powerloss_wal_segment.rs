@@ -84,3 +84,20 @@ fn wal_open_syncs_adopted_unsynced_segment() {
         "expected an acknowledged commit crash image to be checked"
     );
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_wal_open_dir_sync,
+    site = "wal:open_dir_sync",
+    body = wal_open_syncs_adopted_unsynced_segment
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = wal_open_syncs_adopted_unsynced_segment
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = wal_open_syncs_adopted_unsynced_segment
+);

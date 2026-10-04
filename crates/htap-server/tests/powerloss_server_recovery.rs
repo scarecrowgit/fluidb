@@ -653,3 +653,25 @@ fn server_recovery_crash_depth1() {
     flags.borrow().assert_complete();
     proof.borrow().assert_complete();
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_server_reclaim_colstore_sync,
+    site = "server:reclaim_colstore_sync",
+    body = server_conversion_and_reclaim_survive
+);
+htap_crashsim::crashsim_witness!(
+    witness_sync_dir_sync,
+    site = "sync_dir:sync",
+    body = server_conversion_and_reclaim_survive
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = server_conversion_and_reclaim_survive
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = server_conversion_and_reclaim_survive
+);

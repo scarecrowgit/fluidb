@@ -100,3 +100,25 @@ fn adopted_unsynced_wal_tail_is_synced_before_publish() {
         "expected an acknowledged publish crash image to be checked"
     );
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_wal_open_adopt_sync,
+    site = "wal:open_adopt_sync",
+    body = adopted_unsynced_wal_tail_is_synced_before_publish
+);
+htap_crashsim::crashsim_witness!(
+    witness_atomic_publish_dir_sync,
+    site = "atomic_publish:dir_sync",
+    body = adopted_unsynced_wal_tail_is_synced_before_publish
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = adopted_unsynced_wal_tail_is_synced_before_publish
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = adopted_unsynced_wal_tail_is_synced_before_publish
+);

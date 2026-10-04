@@ -195,3 +195,30 @@ fn segment_torn_write_never_decodes_silently() {
          checked {checked_images} images with final segment length {final_segment_len}"
     );
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_colstore_segment_write_sync,
+    site = "colstore:segment_write_sync",
+    body = segment_torn_write_never_decodes_silently
+);
+htap_crashsim::crashsim_witness!(
+    witness_sync_dir_sync,
+    site = "sync_dir:sync",
+    body = segment_torn_write_never_decodes_silently
+);
+htap_crashsim::crashsim_witness!(
+    witness_create_dir_all_durable_parent_sync,
+    site = "create_dir_all_durable:parent_sync",
+    body = segment_torn_write_never_decodes_silently
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = segment_torn_write_never_decodes_silently
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = segment_torn_write_never_decodes_silently
+);

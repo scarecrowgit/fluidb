@@ -671,3 +671,33 @@ fn server_workload_logs_are_deterministic() {
         "normalized server workload logs differ; POWERLOSS_REPRO would not be deterministic"
     );
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_atomic_publish_dir_sync,
+    site = "atomic_publish:dir_sync",
+    body = server_acked_sql_survives_power_loss
+);
+htap_crashsim::crashsim_witness!(
+    witness_sync_ancestors_sync,
+    site = "sync_ancestors:sync",
+    body = server_preexisting_volatile_root_durable
+);
+htap_crashsim::crashsim_survivor!(
+    survivor_server_open_parent_sync,
+    site = "server:open_parent_sync",
+    body = server_fresh_root_bootstrap_durable
+);
+// The server:open_dir_sync survivor proof is recorded as data-only in
+// crates/htap-crashsim/tests/mutation_controls.rs because its exhaustive run exceeds the 30 s
+// budget; the discovery sweep is the evidence.
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = server_acked_sql_survives_power_loss
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = server_acked_sql_survives_power_loss
+);

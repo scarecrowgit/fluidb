@@ -76,3 +76,20 @@ fn wal_open_syncs_preexisting_volatile_dir() {
         "expected an acknowledged commit crash image to be checked"
     );
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_wal_open_parent_sync,
+    site = "wal:open_parent_sync",
+    body = wal_open_syncs_preexisting_volatile_dir
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = wal_open_syncs_preexisting_volatile_dir
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = wal_open_syncs_preexisting_volatile_dir
+);

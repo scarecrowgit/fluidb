@@ -134,6 +134,7 @@ fn delete_artifacts_no_resurrection() {
             dur::fsync_path(&orphan_tmp).unwrap();
             dur::rename(&orphan_tmp, &orphan).unwrap();
             sync_dir(&artifact_dir).unwrap();
+            workload.ack("artifact-durable");
 
             mover
                 .reclaim_tablet_artifacts(TABLET_ID, || {
@@ -147,6 +148,7 @@ fn delete_artifacts_no_resurrection() {
 
     let mut checked_count = 0;
     let mut checked_with_ack = false;
+    let mut checked_durable_artifact_before_delete = false;
     harness
         .enumerate(&CrashPolicy::Strict, |root, info| {
             checked_count += 1;
@@ -163,6 +165,10 @@ fn delete_artifacts_no_resurrection() {
                 .exists();
             assert_eq!(second, first, "a second reopen changed deletion state");
 
+            if acked(info, "artifact-durable") && !acked(info, "deleted") && first {
+                checked_durable_artifact_before_delete = true;
+            }
+
             if acked(info, "deleted") {
                 checked_with_ack = true;
                 assert!(!first, "acknowledged artifact deletion resurrected");
@@ -172,6 +178,10 @@ fn delete_artifacts_no_resurrection() {
 
     assert!(checked_count > 1, "expected multiple crash images");
     assert!(checked_with_ack, "expected an acknowledged delete image");
+    assert!(
+        checked_durable_artifact_before_delete,
+        "expected a pre-delete crash image containing the durable artifact"
+    );
 }
 
 fn run_job_dir_workload(workload: &htap_crashsim::WorkloadContext, volatile: bool) {
@@ -235,3 +245,36 @@ fn movement_preexisting_volatile_job_dir() {
         .unwrap();
     check_job_dir_images(&harness);
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_movement_open_parent_sync,
+    site = "movement:open_parent_sync",
+    body = movement_preexisting_volatile_job_dir
+);
+htap_crashsim::crashsim_witness!(
+    witness_atomic_publish_dir_sync,
+    site = "atomic_publish:dir_sync",
+    body = movement_fresh_dir_durable
+);
+htap_crashsim::crashsim_witness!(
+    witness_write_new_tmp_file_sync,
+    site = "write_new_tmp_file:sync",
+    body = movement_fresh_dir_durable
+);
+htap_crashsim::crashsim_witness!(
+    witness_sync_dir_sync,
+    site = "sync_dir:sync",
+    body = movement_preexisting_volatile_job_dir
+);
+htap_crashsim::crashsim_survivor!(
+    survivor_movement_open_dir_sync,
+    site = "movement:open_dir_sync",
+    body = movement_preexisting_volatile_job_dir
+);
+htap_crashsim::crashsim_control!(control_file, skip = File, body = movement_fresh_dir_durable);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = movement_fresh_dir_durable
+);

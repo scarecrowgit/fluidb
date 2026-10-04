@@ -252,3 +252,31 @@ fn catalog_fresh_dir_durable() {
         );
     }
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_catalog_open_parent_sync,
+    site = "catalog:open_parent_sync",
+    body = catalog_preexisting_volatile_dir
+);
+htap_crashsim::crashsim_witness!(
+    witness_atomic_publish_dir_sync,
+    site = "atomic_publish:dir_sync",
+    body = catalog_fresh_dir_durable
+);
+htap_crashsim::crashsim_witness!(
+    witness_write_new_tmp_file_sync,
+    site = "write_new_tmp_file:sync",
+    body = catalog_fresh_dir_durable
+);
+htap_crashsim::crashsim_survivor!(
+    survivor_catalog_open_dir_sync,
+    site = "catalog:open_dir_sync",
+    body = catalog_fresh_dir_durable
+);
+htap_crashsim::crashsim_control!(control_file, skip = File, body = catalog_fresh_dir_durable);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = catalog_fresh_dir_durable
+);

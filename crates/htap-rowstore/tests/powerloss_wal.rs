@@ -393,3 +393,35 @@ fn wal_fresh_dir_entry_durable() {
         "expected an acknowledged commit crash image to be checked"
     );
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_wal_append_sync,
+    site = "wal:append_sync",
+    body = wal_acked_commits_survive_strict
+);
+htap_crashsim::crashsim_witness!(
+    witness_wal_roll_sync,
+    site = "wal:roll_sync",
+    body = wal_segment_roll_and_gc_survive
+);
+htap_crashsim::crashsim_witness!(
+    witness_wal_roll_dir_sync,
+    site = "wal:roll_dir_sync",
+    body = wal_fresh_dir_entry_durable
+);
+htap_crashsim::crashsim_survivor!(
+    survivor_wal_gc_sync,
+    site = "wal:gc_sync",
+    body = wal_segment_roll_and_gc_survive
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = wal_acked_commits_survive_strict
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = wal_acked_commits_survive_strict
+);

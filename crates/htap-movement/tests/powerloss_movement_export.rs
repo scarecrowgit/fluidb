@@ -260,3 +260,25 @@ fn export_to_fresh_nested_destination() {
         assert!(checked_with_ack, "expected an acknowledged export image");
     }
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_movement_export_write_sync,
+    site = "movement:export_write_sync",
+    body = export_file_complete_or_absent
+);
+htap_crashsim::crashsim_witness!(
+    witness_sync_ancestors_sync,
+    site = "sync_ancestors:sync",
+    body = export_preexisting_volatile_destination
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = export_file_complete_or_absent
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = export_file_complete_or_absent
+);

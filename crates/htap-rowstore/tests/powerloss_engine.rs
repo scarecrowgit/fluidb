@@ -619,3 +619,30 @@ fn engine_visible_marker_monotonic() {
         );
     }
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_sst_write_sync,
+    site = "sst:write_sync",
+    body = engine_commit_flush_compact_prefix_consistent
+);
+htap_crashsim::crashsim_witness!(
+    witness_engine_flush_sst_dir_sync,
+    site = "engine:flush_sst_dir_sync",
+    body = engine_commit_flush_compact_prefix_consistent
+);
+htap_crashsim::crashsim_witness!(
+    witness_engine_compact_sst_dir_sync,
+    site = "engine:compact_sst_dir_sync",
+    body = engine_commit_flush_compact_prefix_consistent
+);
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = engine_commit_flush_compact_prefix_consistent
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = engine_commit_flush_compact_prefix_consistent
+);

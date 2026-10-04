@@ -415,3 +415,26 @@ fn segment_published_name_never_torn() {
         );
     }
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_witness!(
+    witness_atomic_publish_dir_sync,
+    site = "atomic_publish:dir_sync",
+    body = convert_fresh_dir_durable
+);
+htap_crashsim::crashsim_witness!(
+    witness_sync_dir_sync,
+    site = "sync_dir:sync",
+    body = convert_fresh_dir_durable
+);
+htap_crashsim::crashsim_survivor!(
+    survivor_fsync_file_sync,
+    site = "fsync_file:sync",
+    body = convert_fresh_dir_durable
+);
+htap_crashsim::crashsim_control!(control_file, skip = File, body = convert_fresh_dir_durable);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = convert_fresh_dir_durable
+);

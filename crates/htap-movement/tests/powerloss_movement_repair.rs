@@ -288,3 +288,15 @@ fn repair_after_unsynced_publish_requires_durable_package() {
     assert!(checked_count > 1, "expected multiple crash images");
     assert!(checked_with_ack, "expected an acknowledged repaired image");
 }
+
+// Mutation-control witnesses checked by crates/htap-crashsim/tests/mutation_controls.rs.
+htap_crashsim::crashsim_control!(
+    control_file,
+    skip = File,
+    body = repair_after_unsynced_publish_requires_durable_package
+);
+htap_crashsim::crashsim_control!(
+    control_dir,
+    skip = Directory,
+    body = repair_after_unsynced_publish_requires_durable_package
+);
