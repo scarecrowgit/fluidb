@@ -69,6 +69,12 @@ pub const SYNC_SITE_WITNESSES: &[(&str, &str, &str, &str)] = &[
         "witness_wal_open_adopt_sync",
     ),
     (
+        "wal:repair_sync",
+        "htap-rowstore",
+        "crates/htap-rowstore/tests/powerloss_wal_tail.rs",
+        "witness_wal_repair_sync",
+    ),
+    (
         "atomic_publish:dir_sync",
         "htap-rowstore",
         "crates/htap-rowstore/tests/powerloss_wal_tail.rs",
@@ -253,15 +259,6 @@ pub const UNATTRIBUTED_WITNESSES: &[(
 ];
 
 pub const ALLOWLIST: &[AllowEntry] = &[
-    AllowEntry {
-        site: "wal:repair_sync",
-        crate_scope: None,
-        reason: AllowReason::IdempotentResurrection,
-        covered_by: &["wal:append_sync"],
-        proof: SurvivorProof::DataOnly {
-            evidence: "C5 discovery sweep: only reaching test wal_recovery_repair_crash_depth1 fails its non-vacuity guard under the skip",
-        },
-    },
     AllowEntry {
         site: "wal:gc_sync",
         crate_scope: None,
