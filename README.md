@@ -25,7 +25,14 @@ components are **deliberately not implemented** and are out of scope for this lo
   accounts/privileges are implemented (Phase 12) — see "Network server (`htapd`)" below — but there are no
   roles, no way to delegate a subset of superuser authority to another account (`WITH GRANT OPTION` parses but
   is rejected), only the `%` host is accepted, and there is no `caching_sha2_password` support.
-- **No Docker image or Docker Compose deployment:** No `Dockerfile`, `docker-compose.yml`, or container images are provided or required.
+- **Docker/Compose packaging (Phase 21) is a narrow local slice, not a production deployment story:** a `Dockerfile` and
+  `docker-compose.yml` (plus a TLS override) run one `htapd` container per data volume, tested only on linux/amd64 (nothing in the Dockerfile or compose enforces a
+  platform), built locally.
+  Not provided: an in-process graceful SIGTERM drain (`docker stop` is crash-equivalent, exit 143, no drain), `SIGHUP`
+  TLS reload, multi-arch or registry-published images, SBOM/signing, Kubernetes/Helm, and Docker-based ZooKeeper
+  ensemble testing. No durability claim beyond ADR-034: a named volume is a local POSIX filesystem directory
+  (NFS, FUSE and Docker Desktop file sharing are outside the model). See "Docker and Compose (Phase 21)" below and
+  `docs/OPERATIONS.md` section 7. Docker is not required to build, test or run anything else in this repository.
 - **No `SELECT ... FOR UPDATE`, locking reads, savepoints, or XA:** Sessions and
   explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, session variables) are implemented — see "Sessions and
   explicit transactions" below — but there is no locking-read syntax, no savepoints, and no distributed (XA)
@@ -371,6 +378,50 @@ cleartext query text and result rows, so binding a non-loopback address without 
 network or an SSH tunnel. See "TLS and compression (Phase 12)" in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md),
 ADR-020, and [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) for cert provisioning, reload, and the full
 protocol scope.
+
+### Docker and Compose (Phase 21)
+
+A multi-stage `Dockerfile` builds only `htapd` (non-root uid 10001, `tini` as PID 1, crashsim-free by construction), and
+`docker-compose.yml` runs it with a named data volume, a file-mounted root password, a read-only root filesystem and all
+capabilities dropped. Quick start (needs Docker with Compose and BuildKit, and network access for the first build):
+
+```bash
+# 1. Secrets: a 0700 directory with a 0444 file (the container user, uid 10001, must be able to read it).
+mkdir -p secrets && chmod 0700 secrets
+openssl rand -hex 24 | tr -d '\n' > secrets/htapd_root_password
+chmod 0444 secrets/htapd_root_password
+
+# 2. Build and start; --wait returns when the health check passes.
+docker compose up -d --wait
+
+# 3. Connect (published on host loopback 127.0.0.1:3307 by default; HTAPD_PUBLISH_PORT changes the port).
+mysql -h 127.0.0.1 -P 3307 -u root -p
+
+# 4. Stop (data stays in the named volume) or remove everything including the data volume.
+docker compose stop
+docker compose down -v
+```
+
+To serve TLS and refuse plaintext, put `htapd.crt` and `htapd.key` in a directory and add the override
+(`HTAPD_TLS_DIR` is required; the key must be readable by uid 10001, so mode 0444 inside a 0700 directory):
+
+```bash
+HTAPD_TLS_DIR=/path/to/tls docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --wait
+```
+
+What this does and does not promise:
+
+- **`docker stop` is crash-equivalent.** `htapd` has no signal handler; `tini` delivers SIGTERM and the process dies at once
+  (exit 143, no drain). Committed data is recovered on the next start exactly as after `kill -9` (ADR-004/008/009). Bypassing
+  the entrypoint (`--entrypoint htapd`, a Kubernetes `command:` override) reintroduces the PID-1 problem.
+- **The password file is bootstrap-only.** It seeds `root` on the first start of a data volume; changing the file later does
+  not rotate the password (use `ALTER USER`).
+- **The health check is listener readiness only** (it reads the MySQL handshake), not authenticated SQL health.
+- **One container per data volume**, tested only on linux/amd64 (nothing in the Dockerfile or compose enforces a platform), pinned inputs (digest-pinned base images, `--locked`) but not a
+  bit-reproducible image. Durability claims are ADR-034's and nothing more: the volume must be a local POSIX filesystem.
+- Evidence: the opt-in `./ci.sh --docker` (`ci/docker-smoke.sh`, needs Docker and network) drives
+  `crates/htap-client/tests/docker_smoke.rs` against a real container. The default `./ci.sh` stays Docker-free apart from
+  hermetic script checks. Full operator guide: [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) section 7; design: ADR-035.
 
 ### Accounts and per-user privileges (Phase 12)
 

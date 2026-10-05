@@ -1,0 +1,15 @@
+services:
+  htapd:
+    environment:
+      HTAPD_TLS_CERT: /run/tls/htapd.crt
+      HTAPD_TLS_KEY: /run/tls/htapd.key
+      HTAPD_REQUIRE_SECURE_TRANSPORT: "true"
+    volumes:
+      - type: bind
+        source: ${HTAPD_TLS_DIR:?set HTAPD_TLS_DIR to the directory containing htapd.crt and htapd.key}/htapd.crt
+        target: /run/tls/htapd.crt
+        read_only: true
+      - type: bind
+        source: ${HTAPD_TLS_DIR:?set HTAPD_TLS_DIR to the directory containing htapd.crt and htapd.key}/htapd.key
+        target: /run/tls/htapd.key
+        read_only: true

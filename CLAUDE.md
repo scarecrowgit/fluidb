@@ -15,6 +15,9 @@ Read before non-trivial work: `docs/ARCHITECTURE.md` (component statuses), `docs
 - Fast loop: `cargo test -p htap-<crate>`, `cargo test -p htap-<crate> --test <file>`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`.
 - Benchmarks: `cargo bench -p htap-bench` (see `docs/BENCHMARKS.md`; record results with its template).
+- Docker (opt-in, needs Docker + Compose + BuildKit + network, fail-closed): `./ci.sh --docker` runs `ci/docker-smoke.sh` after the normal gate
+  (builds the image, drives `crates/htap-client/tests/docker_smoke.rs`). Default `./ci.sh` stays Docker-free (hermetic `bash -n` and
+  `ci/check-docker-pins.sh` only). See `docs/OPERATIONS.md` section 7 and ADR-035.
 - Toolchain is pinned to Rust 1.95.0 (`rust-toolchain.toml`).
 - Power-loss suites (`crates/*/tests/powerloss_*.rs`, harness in `crates/htap-crashsim`): `POWERLOSS_SEEDS=<n>` (number of Torn
   seeds, default 2; Chaos uses a fixed seed), `POWERLOSS_EXHAUSTIVE=1` (every crash point, no sampling), `POWERLOSS_SKIP_SYNC=file|dir|all|site:<id>` (mutation

@@ -283,6 +283,11 @@ survival and recovery oracles, per-site skip-sync witnesses and a static gate pr
 is either killed by a witness or explicitly justified, and `sync_fault_*` sweeps prove sync errors propagate. Seven
 crash-durability bugs (BUG-PL-1 to BUG-PL-7) were found and fixed. This is crash consistency under a stated model, not a
 power-loss proof; see "Power-loss simulation harness (Phase 20)" below, ADR-034, and `docs/LIMITATIONS.md`.
+Phase 21 has a completed local MVP for container packaging: a multi-stage `Dockerfile` (`htapd` only, non-root uid 10001,
+`tini` as PID 1), a hardened `docker-compose.yml` with a named data volume and file-mounted secrets, an optional TLS
+override, and an opt-in `ci/docker-smoke.sh` (`./ci.sh --docker`). No storage, WAL, MVCC or on-disk format change and no new
+durability claim beyond ADR-034; `docker stop` is crash-equivalent (no drain). See "Container packaging (Phase 21)" below,
+ADR-035, and `docs/OPERATIONS.md` section 7.
 
 ### Derived `DECIMAL` precision and scale rules (Phase 17)
 
@@ -646,7 +651,7 @@ a compliant or audited TPC-C or TPC-H benchmark (only the derived, unaudited, no
 multi-tablet/distributed scans, quotas/cancellation, DataFusion/Arrow integration,
 `SELECT ... FOR UPDATE`/locking reads, savepoints, XA,
 idle-transaction timeout/reaping, MVCC garbage collection as a user-facing feature (the internal `gc_low_water` mechanism added in Phase 15 supports compaction only; there is no operator-facing GC command),
-Docker image/Compose deployment, and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors; server-side cursors via `COM_STMT_FETCH`, arbitrary-precision DECIMAL over the wire protocol specifically (the engine's own bounded `DECIMAL` type, including a decimal result column over both the text and binary protocols, is implemented as of Phase 17 — see above — but only up to the engine's own 18-digit maximum, not arbitrary precision), and `TIME`-typed bound parameters also remain deferred — see "Prepared statements and binary protocol (Phase 11)" below);
+and broad MySQL compatibility (including MySQL implicit string<->number coercion: comparisons between incompatible types are bind errors; server-side cursors via `COM_STMT_FETCH`, arbitrary-precision DECIMAL over the wire protocol specifically (the engine's own bounded `DECIMAL` type, including a decimal result column over both the text and binary protocols, is implemented as of Phase 17 — see above — but only up to the engine's own 18-digit maximum, not arbitrary precision), and `TIME`-typed bound parameters also remain deferred — see "Prepared statements and binary protocol (Phase 11)" below);
 note that metadata-only `Column -> Row` demotion via catalog CAS is implemented while physical reverse transcode and physical reclamation of demoted column files remain deferred — this is unrelated to Phase 15's `DROP TABLE` reclaim, which only reclaims a *dropped* table's artifacts, not a demoted table's retained column files).
 See [`PROGRESS.md`](./PROGRESS.md).
 
@@ -1038,8 +1043,9 @@ daemon, with one `htap_server::Session` per connection for `BEGIN`/`COMMIT`/`ROL
 see "Sessions and explicit transactions" below), the binary protocol and prepared statements (Phase 11;
 see "Prepared statements and binary protocol" below), and TLS, MySQL compressed-packet framing, and
 catalog-backed per-user accounts/privileges (Phase 12; see "TLS and compression (Phase 12)" and "Accounts and
-privileges (Phase 12)" below); Docker packaging, roles, delegated administration, and `SIGHUP`-triggered
-TLS cert reload remain planned/deferred).
+privileges (Phase 12)" below), and Docker/Compose container packaging (Phase 21, `implemented (local MVP)`; see
+"Container packaging (Phase 21)" below); roles, delegated administration, an in-process graceful SIGTERM drain, and
+`SIGHUP`-triggered TLS cert reload remain planned/deferred).
 
 `htap-wire` implements a hand-written, synchronous MySQL protocol on top of `Arc<LocalServer>`: one
 accept thread plus one thread per connection (std::net, no async runtime), statements serialized by the
@@ -1548,6 +1554,38 @@ placeholder-in-`ORDER BY` coverage via `test_case_in_order_by_resolves_output_sc
 `test_wire_prepared_decimal_param_round_trips_exactly_into_bigint_column`); and
 `crates/htap-client/tests/prepared.rs` (`test_remote_prepared_statement_matches_embedded_literal_execution`,
 `test_remote_prepared_statement_close_then_execute_errors`).
+
+---
+
+## Container packaging (Phase 21)
+
+**Status: `implemented (local MVP)`, tested only on linux/amd64 (nothing in the Dockerfile or compose enforces a platform).** A narrow local slice: one `htapd` container per data volume,
+built from this repository, run through Docker Compose. It adds packaging only: no change to storage, WAL, MVCC, any
+on-disk envelope or sync site, and **no durability claim beyond ADR-034** (a named volume is a local POSIX filesystem
+directory; NFS, FUSE, Docker Desktop file sharing, volume plugins and the overlay layer itself are outside the model).
+Deferred: an in-process graceful SIGTERM drain, `SIGHUP` TLS reload, roles, multi-arch or registry-published images,
+SBOM/signing, Kubernetes/Helm, and Docker-based ZooKeeper ensemble testing (see `docs/LIMITATIONS.md`).
+
+| Piece | Behavior |
+| ----- | -------- |
+| `Dockerfile` | Multi-stage. Builder: `rust:1.95.0-bookworm@sha256:...` (a guard fails the build if `rustc -V` differs from the `rust-toolchain.toml` channel), `cargo build --release --locked -p htapd` with `CARGO_PROFILE_RELEASE_DEBUG=0` / `CARGO_PROFILE_RELEASE_STRIP=symbols` (no `Cargo.toml` change), then `ci/check-htapd-no-crashsim.sh` inside the build. Runtime: `debian:bookworm-slim@sha256:...`, pinned `tini` (`0.19.0-1+b3`), user/group uid/gid 10001 with no login shell, `/var/lib/htapd` owned by 10001, no `VOLUME` instruction, no secrets or password in the image. |
+| Entrypoint | `tini -- entrypoint.sh htapd --root /var/lib/htapd --listen 0.0.0.0:3307`. The shim maps `HTAPD_PASSWORD_FILE` to `HTAPD_PASSWORD` (bootstrap only), rejects setting both, refuses an empty password unless `HTAPD_ALLOW_EMPTY_PASSWORD=1`, then `exec`s so `htapd` is `tini`'s direct child. |
+| Signals | `htapd` has no signal handler and `unsafe` is forbidden. As PID 1 it would ignore SIGTERM; as `tini`'s child the default disposition kills it, so `docker stop` exits 143 immediately. This is crash-equivalent (no drain; recovery per ADR-004/008/009), the same contract as `docs/OPERATIONS.md` section 6. Bypassing the entrypoint (`--entrypoint htapd`, a Kubernetes `command:` override) restores the PID-1 problem. |
+| Health probe | `docker/healthcheck.sh` (bash `/dev/tcp`, `timeout 3`) reads 5 bytes of the MySQL handshake and requires sequence `00` and protocol version `0a`. **Listener and bootstrap readiness only, not authenticated SQL health**; it also works under `--require-secure-transport` because the handshake precedes TLS negotiation. |
+| Compose | `docker-compose.yml`: published on host loopback by default, named volume `htapd-data`, file-backed secret `htapd_root_password`, `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `restart: unless-stopped`, `stop_grace_period: 15s` (a safety bound only), capped `json-file` logs. `docker-compose.tls.yml` adds `HTAPD_TLS_CERT`/`HTAPD_TLS_KEY`/`HTAPD_REQUIRE_SECURE_TRANSPORT` and read-only cert/key bind mounts (env only, never `command`, because `htapd` validates `HTAPD_TLS_*` env before flags). |
+| `htapd` | The non-loopback "traffic is cleartext" warning is logged whenever secure transport is not required (no TLS, or optional TLS) and is silent only with `--require-secure-transport`/`HTAPD_REQUIRE_SECURE_TRANSPORT`, which the TLS override sets (the container always binds `0.0.0.0`). |
+
+Everything `htapd` writes lives under `--root` (`LOCK`, `htap.sock`, `spill/`, WAL and data), so the read-only root
+filesystem needs no `tmpfs`. One container per data volume: a second container on the same volume is unsupported.
+The image is a pinned-input build (digest-pinned bases, pinned `tini`, `--locked`), **not** a bit-reproducible one.
+
+Evidence: `ci/docker-smoke.sh` scenarios A (static image checks, including an asserted image-size budget `HTAPD_IMAGE_SIZE_BUDGET`, default 43000000 bytes, and the entrypoint's missing-password-source message on stderr), B (plain: stop gives exit 143, `SIGKILL` gives exit 137,
+data survives both, read-only rootfs, uid 10001), C (TLS: healthy, TLS accepted, plaintext and wrong server name
+rejected), driving `crates/htap-client/tests/docker_smoke.rs` (`smoke_write`, `smoke_verify`,
+`smoke_wrong_password_rejected`, `smoke_tls_ok`, `smoke_plaintext_rejected_when_secure_transport_required`,
+`smoke_tls_bad_server_name_rejected`), plus the hermetic `ci/check-htapd-no-crashsim.sh` and `ci/check-docker-pins.sh`.
+The smoke script is opt-in (`./ci.sh --docker`, needs Docker and network). Operator guide: `docs/OPERATIONS.md` section 7;
+design: ADR-035.
 
 ---
 

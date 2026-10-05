@@ -232,8 +232,10 @@ fn main() -> ExitCode {
         password_required = args.config.password.is_some(),
         "htapd ready"
     );
-    if !wire.local_addr().ip().is_loopback() {
-        tracing::warn!("listening on a non-loopback address without TLS: traffic is cleartext");
+    if !wire.local_addr().ip().is_loopback() && !args.config.require_secure_transport {
+        tracing::warn!(
+            "listening on a non-loopback address while accepting plaintext connections: traffic may be cleartext"
+        );
     }
     loop {
         std::thread::park();

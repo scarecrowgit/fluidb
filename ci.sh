@@ -3,10 +3,36 @@ set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
+run_docker_smoke=false
+case "$#" in
+    0) ;;
+    1)
+        if [[ "$1" != "--docker" ]]; then
+            echo "error: unknown argument: $1" >&2
+            exit 2
+        fi
+        run_docker_smoke=true
+        ;;
+    *)
+        echo "error: expected no arguments or --docker" >&2
+        exit 2
+        ;;
+esac
+
 echo "========================================="
 echo "Running: cargo fmt --all -- --check"
 echo "========================================="
 cargo fmt --all -- --check
+
+echo "========================================="
+echo "Checking: Docker and CI shell syntax"
+echo "========================================="
+bash -n docker/*.sh ci/*.sh
+
+echo "========================================="
+echo "Checking: Docker base-image pins"
+echo "========================================="
+ci/check-docker-pins.sh
 
 echo "========================================="
 echo "Running: cargo clippy --workspace --all-targets -- -D warnings"
@@ -133,11 +159,7 @@ cargo test -p htap-common
 echo "========================================="
 echo "Checking: htapd must not enable the htap-common crashsim feature"
 echo "========================================="
-tree_output="$(cargo tree -e normal,features -p htapd -i htap-common)"
-if grep -q 'feature "crashsim"' <<<"$tree_output"; then
-    echo "error: htapd enables the htap-common crashsim feature" >&2
-    exit 1
-fi
+ci/check-htapd-no-crashsim.sh
 
 echo "========================================="
 echo "Running: cargo build --workspace --exclude htap-crashsim"
@@ -153,6 +175,13 @@ echo "========================================="
 echo "Running: cargo bench --workspace --exclude htap-crashsim --no-run"
 echo "========================================="
 cargo bench --workspace --exclude htap-crashsim --no-run
+
+if [[ "$run_docker_smoke" == true ]]; then
+    echo "========================================="
+    echo "Running: ci/docker-smoke.sh"
+    echo "========================================="
+    ci/docker-smoke.sh
+fi
 
 echo "========================================="
 echo "CI checks completed successfully!"

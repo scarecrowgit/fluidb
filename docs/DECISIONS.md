@@ -287,7 +287,9 @@ Option **(a)**.
 
 - Future demo can expose unified frontend/backend roles. Update (Phase 8, ADR-016): the `htapd` daemon binary
   and network listener (`htap-wire`) are now implemented as a single process always running both roles
-  together; a selectable single-role mode and Docker/Compose packaging remain deferred future work. The
+  together; a selectable single-role mode and Docker/Compose packaging remain deferred future work. Update
+  (Phase 21, ADR-035): Docker/Compose packaging is now `implemented (local MVP)` (a narrow local slice); the selectable
+  single-role mode stays deferred. The
   in-process `LocalServer`/`EmbeddedClient` façade is unchanged and still has no daemon or network dependency.
 - The module boundary must be **policed by crate dependencies**, so that
   splitting into separate processes remains possible.
@@ -520,7 +522,7 @@ Option **(b)**.
 3. **Embedded client façade (`htap-client`):**
    - Synchronous, direct in-process façade (`EmbeddedClient`) over `LocalServer` executing single-partition `CREATE TABLE`, literal `INSERT`, PK `DELETE`, complete-PK `SELECT`, and narrow analytical scans (`AnalyticSelect` / `Route::OlapScan`) with structured error mapping and recovery across reopen.
 4. **Operational documentation:**
-   - Created root `README.md`, `docs/BENCHMARKS.md`, and `docs/OPERATIONS.md` documenting filesystem layouts (`catalog`, `rowstore`, `txn.journal`, `movement`, `COORDINATOR`), recovery boundaries, and explicit non-features at the time (no daemon, no MySQL wire protocol, no network sockets, no Docker/Compose, no TPC-C/TPC-H compliance). Update (Phase 8, ADR-016): the daemon, MySQL wire protocol, and network sockets have since been implemented (`htapd`, `htap-wire`); Docker/Compose and TPC-C/TPC-H compliance remain non-features.
+   - Created root `README.md`, `docs/BENCHMARKS.md`, and `docs/OPERATIONS.md` documenting filesystem layouts (`catalog`, `rowstore`, `txn.journal`, `movement`, `COORDINATOR`), recovery boundaries, and explicit non-features at the time (no daemon, no MySQL wire protocol, no network sockets, no Docker/Compose, no TPC-C/TPC-H compliance). Update (Phase 8, ADR-016): the daemon, MySQL wire protocol, and network sockets have since been implemented (`htapd`, `htap-wire`); Docker/Compose and TPC-C/TPC-H compliance remain non-features. Update (Phase 21, ADR-035): a Docker image and Compose deployment have since been implemented as a narrow local slice (`Dockerfile`, `docker-compose.yml`); TPC-C/TPC-H compliance remains a non-feature.
 
 ### Consequences
 
@@ -5417,3 +5419,106 @@ Replay recipe: `POWERLOSS_REPRO=<value> [POWERLOSS_SKIP_SYNC=<spec>] cargo test 
 The architecture is in "Power-loss simulation harness (Phase 20)" in `docs/ARCHITECTURE.md`, the requirement map in the R7
 row and Phase 20 row of `docs/PROGRESS.md`, the gaps in `docs/LIMITATIONS.md`, and the design references in
 `docs/RESEARCH.md`.
+
+---
+
+## ADR-035: Container packaging: tini as PID 1 with no in-process signal handler, a handshake health probe, mounted-file secrets, and pinned (not reproducible) inputs
+
+`Status: Accepted`
+`Date: 2026-10-05`
+
+**What this ADR claims, and what it does not.** This is packaging: a Docker image and a Compose file for the existing `htapd`
+binary. It changes no storage, WAL, MVCC, envelope or sync-site behavior and adds **no durability claim beyond ADR-034**. A
+named volume is a local POSIX filesystem directory; NFS, FUSE, Docker Desktop file sharing, volume plugins and the overlay
+layer are outside that model. `docker stop` is a crash-equivalent stop, not a graceful shutdown. The image is built from
+pinned inputs and is **not** claimed to be bit-reproducible. Tested only on linux/amd64 (nothing in the Dockerfile or compose
+enforces a platform).
+
+### Context
+
+ARCHITECTURE, README and OPERATIONS listed Docker/Compose packaging as deferred or "not provided" since Phase 7/8, and the
+user asked for it. `htapd` ends in a park loop (`loop { std::thread::park() }`), has no signal handler, and the repository
+forbids `unsafe` (no signal crate is in `Cargo.lock`). The kernel does not apply default signal actions to PID 1 of a PID namespace, so as a
+container's PID 1 `htapd` would ignore SIGTERM and `docker stop` would wait out the grace period and then SIGKILL. OPERATIONS
+section 6 already documents the process-level contract: no drain, crash-safe by construction (ADR-004/008/009), recovery on
+the next start, and `kill -9` recovery is tested. `htapd` reads configuration from flags and environment only, has no
+`*_FILE` variants and no health-check flag, and validates `HTAPD_TLS_*` environment variables before flags. The first-start
+`root` password is bootstrap-only (the `accounts_initialized` latch). Compose 5.4.0 file-backed secrets keep the host
+file's ownership and mode (measured), they do not appear root-owned.
+
+### Options considered
+
+- **(D1a) `tini` as PID 1, no code change in `htapd`.** Chosen. `htapd` becomes `tini`'s child, the default SIGTERM
+  disposition applies and it exits 143 at once. Same contract as the documented process-level stop.
+- **(D1b) A SIGTERM handler in `htapd` for a graceful exit 0.** Rejected for Phase 21. It needs a new signal-handling
+  dependency, a new shutdown path, and a bounded drain (`WireServer::shutdown` joins connection threads with no deadline),
+  which makes it a storage-reviewer item, not packaging. Recorded as `deferred`, together with `SIGHUP` TLS reload.
+- **(D1c) Docker's `--init` / `init: true` instead of an image `ENTRYPOINT`.** Not chosen: it depends on the operator's
+  invocation rather than the image; a baked-in entrypoint works for plain `docker run`.
+- **(D2a) A shell handshake probe (`docker/healthcheck.sh`).** Chosen. Reads 5 bytes of the MySQL greeting under a `timeout`
+  and requires sequence `00` and protocol version `0a` (so it rejects EOF, truncation, an ERR packet and an arbitrary
+  listener). `htapd` sends the greeting immediately on accept, before TLS negotiation, so it also works under
+  `--require-secure-transport` and logs nothing above debug for the pre-auth drop. Listener and bootstrap readiness only.
+- **(D2b) An `htapd --healthcheck <addr>` flag.** Rejected: grows the daemon CLI for something a probe script does. It stays
+  the fallback if the shell probe proves flaky, and would be needed for a distroless image.
+- **(D3a) Mounted-file secrets with a `0700` host directory and `0444` files; container uid 10001.** Chosen. Because
+  file secrets keep host ownership and mode, uid 10001 must be able to read the file; the directory mode keeps other host
+  users out. The `entrypoint.sh` shim reads `HTAPD_PASSWORD_FILE`, exports `HTAPD_PASSWORD`, unsets the `_FILE` variable,
+  rejects both being set, rejects an unreadable or empty file, and refuses an empty password unless
+  `HTAPD_ALLOW_EMPTY_PASSWORD=1`. It is bootstrap-only by nature of the `htapd` latch. TLS uses environment variables only.
+- **(D3b) A root entrypoint that fixes ownership and drops privileges.** Rejected for now: it needs `SETUID`/`SETGID`,
+  which conflicts with `cap_drop: ALL`. Running the container as the host uid was also rejected (breaks named-volume
+  ownership).
+- **(D6) Distroless runtime image.** Rejected: the secret shim and probe need a shell and coreutils; the size win is small
+  against the debian-slim base.
+- **(D6) `cargo-chef` layer caching.** Rejected: BuildKit cache mounts for the registry and target directory are simpler and
+  the binary is copied out in the same `RUN`.
+- **(D7a) Pinned inputs: base images as `tag@sha256`, a version-pinned `tini`, `cargo build --locked`, a `rustc -V` guard
+  against the `rust-toolchain.toml` channel.** Chosen, with no reproducibility claim: apt state, base-image updates and
+  timestamps still vary. A Debian snapshot mirror was not adopted (extra maintenance).
+- **(D4) Opt-in verification.** Chosen: `./ci.sh --docker` runs `ci/docker-smoke.sh` and is fail-closed (a missing Docker,
+  Compose, BuildKit, daemon or registry is a hard failure, never a skip); default `./ci.sh` stays Docker-free and only gains
+  hermetic checks (`bash -n`, `ci/check-docker-pins.sh`). The crashsim guard moved into `ci/check-htapd-no-crashsim.sh`,
+  shared by `./ci.sh` and the image build.
+- **(D5) A one-line `htapd` log fix.** Adopted: the non-loopback "traffic is cleartext" warning is logged whenever secure
+  transport is not required, which covers both no TLS and optional TLS, and is silent only with `--require-secure-transport`/
+  `HTAPD_REQUIRE_SECURE_TRANSPORT`. The container always binds `0.0.0.0`, so the TLS override (which requires secure transport)
+  is the configuration that is silent; merely configuring TLS is not enough.
+
+### Decision
+
+Ship a multi-stage `Dockerfile` (builder and runtime on the same Debian release, uid/gid 10001, `tini` entrypoint, no
+`VOLUME`, no secrets in the image, a handshake `HEALTHCHECK`), a `docker-compose.yml` (loopback publish, named volume,
+file-backed secret, `read_only`, `cap_drop: ALL`, `no-new-privileges`, `stop_grace_period: 15s` as a safety bound only,
+single replica) and a `docker-compose.tls.yml` override. Stop semantics are exit 143, crash-equivalent, with no drain.
+Document: bypassing the entrypoint restores the PID-1 hang; the password file is bootstrap-only; the probe is not SQL health;
+the volume must be a local POSIX filesystem.
+
+### Consequences
+
+- A container deployment exists with evidence: `ci/docker-smoke.sh` scenarios A/B/C driving
+  `crates/htap-client/tests/docker_smoke.rs` (`smoke_write`, `smoke_verify`, `smoke_wrong_password_rejected`, `smoke_tls_ok`,
+  `smoke_plaintext_rejected_when_secure_transport_required`, `smoke_tls_bad_server_name_rejected`), opt-in and fail-closed.
+- Still `deferred`: graceful in-process drain, `SIGHUP` TLS reload, multi-arch or registry-published images, SBOM and
+  signing, Kubernetes/Helm, Docker-based ZooKeeper ensemble testing (ADR-006 is unchanged), roles.
+- Certificate rotation and every stop need a restart that is crash-equivalent; operators must wait for health after any
+  lifecycle step.
+- The rebuild cadence for base-image security updates is an operator decision, not enforced by CI. Image size is a measured
+  number on one host (35.6 MB by `docker image inspect`, about 139 MB unpacked by `docker images`). `ci/docker-smoke.sh` does assert
+  the `docker image inspect` size against `HTAPD_IMAGE_SIZE_BUDGET` (default 43000000 bytes, the measured 35655375 plus about 20%),
+  but only in the opt-in smoke run; the unpacked size is not gated.
+
+### How to reverse it
+
+Delete `Dockerfile`, `.dockerignore`, `docker/`, `docker-compose*.yml`, `ci/docker-smoke.sh`, `ci/check-docker-pins.sh` and the
+`--docker` flag and hermetic checks in `./ci.sh`, and `crates/htap-client/tests/docker_smoke.rs`. Nothing in the engine
+depends on them; `ci/check-htapd-no-crashsim.sh` and the `htapd` warning fix can stay. Adding a graceful drain later is a
+separate `htapd` change (signal handling, a bounded `WireServer::shutdown`, a storage-reviewer pass); the accepted exit code in
+`ci/docker-smoke.sh` scenario B would then become 0.
+
+### Verification
+
+`ci/docker-smoke.sh` (opt-in, `./ci.sh --docker`), `crates/htap-client/tests/docker_smoke.rs` (the six tests named above, run
+with `--ignored` and the `HTAP_DOCKER_SMOKE_*` environment by the script), `ci/check-docker-pins.sh` and
+`ci/check-htapd-no-crashsim.sh` (hermetic, in default `./ci.sh`). The smoke script also asserts the image-size budget and that a
+no-password start fails with the entrypoint message on stderr. Operator guide: `docs/OPERATIONS.md` section 7.

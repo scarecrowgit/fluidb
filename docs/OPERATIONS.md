@@ -25,8 +25,11 @@ The core engine (`LocalServer` / `LocalCoordinator`) is an in-process, synchrono
 
 The following operational facilities and production features are **explicitly not implemented or open**:
 
-- **No Daemon Supervisor Management:** No `systemd` units or init scripts are provided; `htapd` (below) is a
-  plain foreground process with no signal handler beyond the OS default (Ctrl-C/SIGTERM stop it hard).
+- **No Daemon Supervisor Management (host install):** No `systemd` units or init scripts are provided; `htapd` (below) is a
+  plain foreground process with no signal handler beyond the OS default (Ctrl-C/SIGTERM stop it hard). Since Phase 21 a
+  Docker image and a Compose file exist (section 7): `restart: unless-stopped` and `tini` supervise it inside a container
+  (tested only on linux/amd64, nothing in the Dockerfile or compose enforces a platform; one container per data volume), but there is still no graceful drain, no `SIGHUP` reload, no Kubernetes/Helm
+  packaging and no registry-published image.
 - **TLS and per-user accounts are implemented (Phase 12), but not roles or delegated administration:**
   `htapd`/`htap-wire` support optional TLS and catalog-backed per-user accounts/privileges; see "Running
   `htapd`" below for the full security contract. There is no role-based access control (RBAC), no delegation
@@ -593,7 +596,8 @@ prepared statement's buffered `COM_STMT_SEND_LONG_DATA` bytes — and can also b
    thread (see "Root account lifecycle and break-glass recovery" below). It then logs `"htapd ready"` (via
    `tracing`, controlled by `RUST_LOG`), and parks the main thread until the process is killed. There is no
    signal handler; Ctrl-C or SIGTERM stops the
-   process unconditionally.
+   process unconditionally. (In the container, `tini` is PID 1 and `htapd` is its child, so SIGTERM from `docker stop`
+   reaches the default disposition and kills it, exit 143; see section 7.)
 2. **Root lock is exclusive, but a second process is no longer just rejected (Phase 16, ADR-025):**
    `LocalServer::open` acquires the same `<root>/LOCK` advisory lock as any other caller (section 3.0 above);
    exactly one process ever touches storage directly. A second `htapd` (bound to a different `--listen`
@@ -610,7 +614,9 @@ prepared statement's buffered `COM_STMT_SEND_LONG_DATA` bytes — and can also b
 3. **Shutdown:** There is no graceful drain API exposed by the binary itself. Stop the process (Ctrl-C /
    SIGTERM); in-flight statements are not drained, but storage is crash-safe by construction
    (ADR-004/008/009), so committed state is recovered on the next start exactly as after a `SIGKILL` of any
-   other `LocalServer` host process. `WireServer::shutdown` (used by tests, not by the `htapd` binary itself)
+   other `LocalServer` host process. A container stop (`docker stop`, `docker compose stop`) is the same
+   crash-equivalent stop: `tini` forwards SIGTERM, there is no drain, and the exit code is 143 (section 7).
+   `WireServer::shutdown` (used by tests, not by the `htapd` binary itself)
    performs an orderly stop: it sets a flag, stops accepting, calls `Shutdown::Both` on every live connection
    via a `live_connections` registry (Phase 11), and joins every connection thread — a connection thread
    blocked mid-read on a partial packet is force-closed immediately rather than left waiting indefinitely for
@@ -618,7 +624,8 @@ prepared statement's buffered `COM_STMT_SEND_LONG_DATA` bytes — and can also b
    any other disconnect.
 4. **Logging:** Structured logs via `tracing-subscriber`, controlled by the `RUST_LOG` environment variable
    (defaults to `info`). `htapd` logs the listen address, root path, whether a password is required, and
-   warns if bound to a non-loopback address.
+   warns if bound to a non-loopback address whenever secure transport is not required (no TLS, or TLS configured but optional); the
+   warning is silent only with `--require-secure-transport`/`HTAPD_REQUIRE_SECURE_TRANSPORT` (Phase 21).
 
 ### Root account lifecycle and break-glass recovery (Phase 12)
 
@@ -662,8 +669,8 @@ Identical to the "Security model", "TLS and compression (Phase 12)", and "Accoun
 subsections of `docs/ARCHITECTURE.md`:
 
 - Default bind is `127.0.0.1:3307` (loopback only); binding elsewhere is an explicit `--listen` opt-in and
-  triggers a startup warning. Prefer also setting `--require-secure-transport` for a non-loopback bind (see
-  above).
+  triggers a startup cleartext warning unless `--require-secure-transport` is set (the warning also fires for optional TLS). Prefer
+  setting `--require-secure-transport` for a non-loopback bind (see above).
 - Per-user accounts (Phase 12): the client-supplied username is authenticated against a catalog account, not
   logged-but-unchecked. `COM_CHANGE_USER` re-authenticates against the account store and can switch principal.
   See "Root account lifecycle and break-glass recovery" above and "Accounts and privileges (Phase 12)" in
@@ -689,3 +696,139 @@ Verified in `crates/htap-wire/tests/wire_server.rs` (`test_handshake_empty_passw
 `crates/htap-wire/tests/tls.rs`, `crates/htap-wire/tests/compression.rs`,
 `crates/htap-wire/tests/accounts.rs`, and `crates/htap-server/tests/{accounts,bootstrap}.rs` (root bootstrap,
 adoption, and no-resurrection-after-drop).
+
+---
+
+## 7. Container deployment (Phase 21)
+
+**Status: `implemented (local MVP)`, tested only on linux/amd64 (nothing in the Dockerfile or compose enforces a platform).** Packaging only: no storage, WAL, MVCC or on-disk format change, no
+new sync site, and **no durability claim beyond ADR-034**. Design: ADR-035. Evidence: the opt-in `ci/docker-smoke.sh`
+(`./ci.sh --docker`; needs Docker, Compose, BuildKit and network, fails closed when any is missing) driving
+`crates/htap-client/tests/docker_smoke.rs`, plus the hermetic `ci/check-htapd-no-crashsim.sh` and `ci/check-docker-pins.sh`
+that the default `./ci.sh` runs. Measured on the development host (Docker 29.7.2, Compose 5.4.0): build context 9.27 MB;
+`docker image inspect --format '{{.Size}}'` 35.6 MB and `docker images` about 139 MB unpacked (two different measures);
+healthy in about 5-6 s; `docker stop` returns immediately with exit 143. These are recorded measurements for this
+host and arch, not guarantees. The only size gate is `ci/docker-smoke.sh`, which asserts that `docker image inspect --format '{{.Size}}'`
+is at most `HTAPD_IMAGE_SIZE_BUDGET` (default 43000000 bytes, the measured 35655375 plus about 20%) and fails otherwise; it is a
+regression tripwire on this measure, not a claim about the unpacked size or other hosts. Scenario A also asserts that a start with no
+password source exits non-zero with the entrypoint's missing-password-source message on stderr. The harness replaces the base `ports:`
+with a single Docker-allocated loopback port and sets `restart: "no"` for the test run (the shipped compose keeps `unless-stopped`).
+`ci/check-docker-pins.sh` also checks that `.dockerignore` excludes `target`, `.git`, `secrets/`, `*.pem` and `*.key`, and that base-image
+digests are lowercase hex.
+
+### Image layout
+
+- Multi-stage `Dockerfile`: a `rust:1.95.0-bookworm@sha256:...` builder runs `cargo build --release --locked -p htapd`
+  (stripped, no debug info, via `CARGO_PROFILE_RELEASE_*` environment overrides; `Cargo.toml` is untouched), fails if
+  `rustc -V` differs from the `rust-toolchain.toml` channel, and runs `ci/check-htapd-no-crashsim.sh` so a crashsim-enabled
+  `htapd` cannot be built into the image. (At runtime `htapd` also refuses to start if `CRASHSIM_ENABLED`, so a container that
+  starts at all carries a crashsim-free binary.) The runtime stage is `debian:bookworm-slim@sha256:...` (same Debian release
+  as the builder) with `tini` pinned to `0.19.0-1+b3`, `htapd`, `entrypoint.sh` and `healthcheck.sh`. It contains no secrets and no
+  password environment variable, and declares no `VOLUME` (persistence is declared by Compose).
+- Runs as uid/gid 10001 (no login shell). `/var/lib/htapd` is owned by 10001, so a fresh named volume inherits that.
+- Entrypoint: `tini -- entrypoint.sh`, default command `htapd --root /var/lib/htapd --listen 0.0.0.0:3307`. Everything
+  `htapd` writes lives under `--root` (`LOCK`, `htap.sock`, `spill/`, WAL, data), so the read-only root filesystem works with
+  no `tmpfs` (verified under the full hardened profile).
+
+### Quick start
+
+```bash
+mkdir -p secrets && chmod 0700 secrets
+openssl rand -hex 24 | tr -d '\n' > secrets/htapd_root_password
+chmod 0444 secrets/htapd_root_password
+docker compose up -d --wait        # builds the image, starts htapd, waits for the health check
+docker compose logs htapd          # look for "htapd ready"
+docker compose stop                # crash-equivalent stop (exit 143), data kept in the named volume
+docker compose down -v             # also deletes the data volume
+```
+
+Compose settings (variables in parentheses): image `fluidb/htapd:local` (`HTAPD_IMAGE`); host publish on loopback
+`127.0.0.1:3307` (`HTAPD_PUBLISH_PORT`; publishing on a non-loopback address is an explicit edit and needs TLS); secrets
+directory `./secrets` (`HTAPD_SECRETS_DIR`); named volume `htapd-data` at `/var/lib/htapd`; `read_only: true`,
+`cap_drop: [ALL]`, `no-new-privileges`; `restart: unless-stopped`; `stop_grace_period: 15s`; `json-file` logs capped at
+3 x 10 MB. Compose errors if the secret file is missing, so there is no empty-password default. Do not set
+`deploy.replicas` or `--scale`.
+
+### Secrets and the permission model
+
+- Compose 5.4.0 file-backed secrets keep the **host** ownership and mode of the source file (measured); they do not appear
+  root-owned. The container user (uid 10001) must therefore be able to read the host file. The model is: a host `secrets/`
+  directory with mode `0700` (keeps other host users out) and secret files with mode `0444` (so uid 10001 can read them).
+  `secrets/` is git-ignored and excluded from the Docker build context; never commit it.
+- `HTAPD_PASSWORD_FILE` is read by `entrypoint.sh`, which exports `HTAPD_PASSWORD` and unsets the `_FILE` variable. Trailing
+  newlines are stripped. Setting both `HTAPD_PASSWORD` and `HTAPD_PASSWORD_FILE`, an unreadable or empty file, or no source
+  at all (without `HTAPD_ALLOW_EMPTY_PASSWORD=1`) makes the container exit non-zero with a message and never logs the value.
+- **The password is bootstrap-only.** It seeds `root` once, the first time a data volume is opened (the
+  `accounts_initialized` latch; see "Root account lifecycle" in section 6). Replacing the secret file later does **not**
+  rotate the password, and `htapd` logs a warning if the configured password no longer matches the stored hash. Rotate with
+  `ALTER USER root IDENTIFIED BY '...'`.
+- With the file form, `entrypoint.sh` reads the file after the container starts and exports `HTAPD_PASSWORD` into the `htapd`
+  process environment. `docker inspect` shows only the configured environment (`HTAPD_PASSWORD_FILE`, a path), **not** the exported
+  value; the password is visible to the running `htapd` process environment (for example `/proc/<pid>/environ` for the same uid, or
+  root). If the operator instead sets `HTAPD_PASSWORD` directly in the container configuration, the value **is** visible in
+  `docker inspect`. It is never in the image. Never pass it as `--password` (it would show in the command line).
+- Bind-mounting a host directory instead of the named volume requires `chown 10001:10001 <dir>` first. Rootless Docker and
+  user-namespace remapping shift uids and need extra care; they are not tested.
+- Rejected here: running as the host uid (breaks named-volume ownership) and a root entrypoint that drops privileges
+  (needs `SETUID`/`SETGID`, which conflicts with `cap_drop: ALL`). See ADR-035.
+
+### TLS
+
+```bash
+HTAPD_TLS_DIR=/path/to/tls docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --wait
+```
+
+`HTAPD_TLS_DIR` must contain `htapd.crt` and `htapd.key`; the override bind-mounts them read-only, sets
+`HTAPD_TLS_CERT`, `HTAPD_TLS_KEY` and `HTAPD_REQUIRE_SECURE_TRANSPORT=true`, and does not replace the image `command`.
+The key follows the same model as the secrets (host ownership kept, so a `0700` directory and a `0444` key file). Use env
+only for TLS: `htapd` validates `HTAPD_TLS_*` before flags, so a half-set env fails even when flags are valid. With TLS
+configured, `HTAPD_REQUIRE_SECURE_TRANSPORT=true` makes `htapd` silent about the "traffic is cleartext" warning; TLS configured
+but optional would still log it. **Certificate rotation needs a restart**
+(`docker compose restart`, which is a crash-equivalent stop plus start): there is no `SIGHUP` handler, and
+`WireServer::reload_tls_certs()` is not reachable from the standalone binary (section 6).
+
+### Health probe
+
+`docker/healthcheck.sh` connects to `127.0.0.1:3307` (`HTAPD_HEALTHCHECK_PORT`), reads 5 bytes under a 3 s `timeout`, and
+passes only if the packet sequence byte is `00` and the protocol-version byte is `0a` (a MySQL handshake v10). It rejects
+EOF, a truncated read, an ERR packet and an arbitrary listener, and works under `--require-secure-transport` because the
+handshake is sent before TLS negotiation. It means **listener and bootstrap readiness only, not authenticated SQL health**.
+At `--max-connections` saturation the probe may fail, and Compose does not restart a container because it is unhealthy.
+Interval 10 s, timeout 5 s, start period 30 s, 5 retries.
+
+### Stop semantics
+
+`htapd` ends in a park loop with no signal handler (and `unsafe` is forbidden). As PID 1 it would ignore SIGTERM and
+`docker stop` would hang for the grace period and then SIGKILL. With `tini` as PID 1 and `htapd` as its child, the default
+SIGTERM disposition kills it: **exit 143, immediately, no drain**: in-flight statements are not completed and
+uncommitted transactions are simply never committed. Storage is recovered on the next start as after `kill -9`
+(ADR-004/008/009); a SIGKILL gives exit 137. The 15 s `stop_grace_period` is only a safety bound. If a handler is added
+later (deferred) an exit code of 0 would become acceptable. **Bypassing the entrypoint** (`docker run --entrypoint htapd`, a
+Kubernetes `command:` override) restores the PID-1 hang. After any stop, kill or restart, wait for the container to be
+healthy before connecting (`docker compose up -d --wait`).
+
+### Single replica and filesystem notes
+
+- One container per data volume. The root lock and `htap.sock` live in the volume; two containers on one volume, or
+  `docker compose up --scale htapd=2`, are unsupported. (A second process inside the same container would follow the
+  Phase 16 owner and IPC rules like any second process on a host; the image ships no tool that does this, and it is not
+  tested in a container.)
+- A named volume is a directory on the host filesystem. ADR-034's strict-POSIX model (`flock`, unix sockets, same-directory
+  `rename`, `fsync`) assumes a local POSIX filesystem such as ext4 or xfs. NFS, FUSE, Docker Desktop file sharing, volume
+  plugins and the container overlay layer are **outside the model**; the smoke test shows that data survives container stop
+  and SIGKILL on the test host, **not power-loss safety**. There is no new durability row, sync site or witness.
+
+### Reproducibility, refresh and cadence
+
+Inputs are pinned (base images as `tag@sha256`, `tini` version, `cargo --locked`), but the image is **not** claimed to be
+bit-reproducible (apt state, base-image updates and timestamps vary). To refresh a base image: resolve the new digest with
+`docker buildx imagetools inspect <tag>`, update the `ARG` in `Dockerfile`, look up the `tini` version with
+`apt-cache policy tini` inside the new base, and run `ci/check-docker-pins.sh` (checks that the Dockerfile rust tag equals
+the `rust-toolchain.toml` channel and that both bases carry `@sha256:` digests) then `./ci.sh --docker`. Rebuild periodically
+to pick up base-image security updates; the cadence is an operator decision and is not enforced by CI.
+
+### Not provided (deferred)
+
+An in-process graceful SIGTERM drain, `SIGHUP` certificate reload, multi-arch or registry-published images, SBOM and
+signing, Kubernetes or Helm, a root-entrypoint option for non-readable secret ownership, `htapd --healthcheck`, and
+Docker-based ZooKeeper ensemble testing. See `docs/LIMITATIONS.md` "Container packaging scope (Phase 21)".

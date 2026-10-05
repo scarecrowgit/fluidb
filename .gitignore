@@ -4,5 +4,6 @@ target/
 target
 *.log
 data/
+secrets/
 .DS_Store
 __pycache__/

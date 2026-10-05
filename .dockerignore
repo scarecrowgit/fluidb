@@ -1,0 +1,17 @@
+target
+target/
+examples
+.git
+.claude
+docs
+bench
+*.log
+opencode.log
+benchmark.md
+secrets/
+data/
+*.pem
+*.key
+smoke/
+smoke-artifacts/
+.docker-smoke-*
